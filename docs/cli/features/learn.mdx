@@ -3,11 +3,9 @@ title: Learn (Path Discovery)
 description: Trace commands to discover required filesystem paths
 ---
 
-The `learn` command uses `strace` to trace a command's file accesses and report which paths it needs. This helps you build accurate profiles without guessing.
+The `learn` command traces a command's file accesses and reports which paths it needs. This helps you build accurate profiles without guessing.
 
-<Warning>
-`nono learn` is Linux-only. It requires `strace` to be installed.
-</Warning>
+`nono learn` is supported on **Linux** (via `strace`) and **macOS** (via LLDB). See [requirements](#requirements) below.
 
 ## Basic Usage
 
@@ -15,15 +13,15 @@ The `learn` command uses `strace` to trace a command's file accesses and report 
 nono learn -- my-command --with-args
 ```
 
-nono runs the command under `strace`, captures all file access syscalls, and produces a summary:
+nono traces the command, captures all file access syscalls, and produces a summary:
 
 ```
 Read access needed:
-  /home/luke/.config/my-tool/config.yaml
-  /home/luke/data/input/
+  /home/user/.config/my-tool/config.yaml
+  /home/user/data/input/
 
 Write access needed:
-  /home/luke/data/output/
+  /home/user/data/output/
   /tmp/my-tool-cache/
 
 (15 paths already covered by system defaults)
@@ -39,7 +37,7 @@ Use `--profile` to see only the paths that a profile doesn't already cover:
 nono learn --profile my-agent -- my-command
 ```
 
-This shows the gap between what the profile grants and what the command actually needs - useful for tightening or expanding a profile.
+This shows the gap between what the profile grants and what the command actually needs — useful for tightening or expanding a profile.
 
 ## JSON Output
 
@@ -52,8 +50,8 @@ nono learn --json -- my-command
 ```json
 {
   "filesystem": {
-    "allow": ["/home/luke/project"],
-    "read": ["/home/luke/data"],
+    "allow": ["/home/user/project"],
+    "read": ["/home/user/data"],
     "write": ["/tmp/my-tool-cache"]
   }
 }
@@ -69,21 +67,58 @@ nono learn --json -- my-command
 | `--all` | Show all accessed paths, including those covered by system defaults |
 | `--verbose` | Show detailed trace output |
 
+## Requirements
+
+### Linux
+
+Requires `strace` to be installed:
+
+```bash
+# Debian/Ubuntu
+sudo apt install strace
+
+# Fedora/RHEL
+sudo dnf install strace
+```
+
+### macOS
+
+Requires Xcode Command Line Tools (provides LLDB):
+
+```bash
+xcode-select --install
+```
+
+<Note>
+On macOS, `nono learn` uses LLDB to trace file syscalls. It does not require root or SIP modification. SIP-hardened system binaries (e.g. `/bin/ls`, `/usr/bin/true`) cannot be traced directly — use the equivalent binary from Homebrew or your own toolchain instead.
+</Note>
+
 ## How It Works
 
-Under the hood, `nono learn` runs:
+### Linux
+
+`nono learn` runs the command under `strace`:
 
 ```
 strace -f -e openat,open,access,stat,execve,creat,mkdir,rename,unlink -- <command>
 ```
 
-It then:
+It then parses all file access syscalls from the trace output and categorizes each access as read or write.
 
-1. Parses all file access syscalls from the trace output
-2. Categorizes each access as read, write, or readwrite
-3. Filters out paths already covered by base groups (system libraries, etc.)
-4. Collapses individual file paths to parent directories where appropriate
-5. Produces the summary or JSON output
+### macOS
+
+`nono learn` uses the LLDB Python API to set breakpoints on file syscall wrappers in `libsystem_kernel.dylib` (`open`, `openat`, `stat64`, `access`, `execve`, `mkdir`, `unlink`, `rename`, etc.).
+
+To trace child processes, a small dylib is injected via `DYLD_INSERT_LIBRARIES` that makes forked children send themselves `SIGSTOP`, allowing LLDB to attach before they execute.
+
+### Common Processing
+
+On both platforms, after tracing:
+
+1. Each access is categorized as read or write
+2. Paths already covered by base groups (system libraries, etc.) are filtered out
+3. Individual file paths are collapsed to parent directories where appropriate
+4. The summary or JSON output is produced
 
 ## Workflow
 
@@ -100,14 +135,14 @@ name = "my-agent"
 version = "1.0.0"
 
 [filesystem]
-read = ["/home/luke/data"]
+read = ["/home/user/data"]
 write = ["/tmp/my-tool-cache"]
-allow = ["/home/luke/project"]
+allow = ["/home/user/project"]
 EOF
 
 # 3. Verify the profile covers everything
 nono learn --profile my-agent -- my-agent
-# Should show: "All paths covered by profile"
+# Should show: "No additional paths needed."
 
 # 4. Run with the profile
 nono run --profile my-agent -- my-agent

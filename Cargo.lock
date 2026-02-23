@@ -1377,6 +1377,7 @@ dependencies = [
  "dirs",
  "keyring",
  "landlock",
+ "libc",
  "nix",
  "nono",
  "nono-proxy",

@@ -56,6 +56,7 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", features = ["process", "signal", "fs", "user"] }
 keyring = { version = "3", features = ["apple-native"] }
+libc = "0.2"
 
 [build-dependencies]
 toml = "1.0"

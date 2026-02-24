@@ -48,16 +48,4 @@ fn main() {
         fs::write(out_path.join("nono-hook.sh"), &content)
             .expect("Failed to write hook script to OUT_DIR");
     }
-
-    // === Embed macOS learn mode data files ===
-    // fork_interpose.c: C source compiled at runtime to a DYLD interpose dylib
-    let interpose_path = Path::new("data/fork_interpose.c");
-    if interpose_path.exists() {
-        let content = fs::read_to_string(interpose_path).expect("Failed to read fork_interpose.c");
-        fs::write(out_path.join("fork_interpose.c"), &content)
-            .expect("Failed to write fork_interpose.c to OUT_DIR");
-    } else {
-        println!("cargo:warning=data/fork_interpose.c not found");
-    }
-
 }

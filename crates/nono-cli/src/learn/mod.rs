@@ -2,7 +2,7 @@
 //!
 //! Platform implementations:
 //! - Linux: uses strace (`learn/linux.rs`)
-//! - macOS: uses DYLD interpose (`learn/macos/`)
+//! - macOS: uses Seatbelt report-mode (`learn/macos/`)
 //! - Other: unsupported
 
 pub mod common;
@@ -24,7 +24,7 @@ pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
     linux::run_learn(args)
 }
 
-/// Run learn mode — macOS DYLD interpose implementation.
+/// Run learn mode — macOS Seatbelt report-mode implementation.
 #[cfg(target_os = "macos")]
 pub fn run_learn(args: &LearnArgs) -> Result<LearnResult> {
     macos::run_learn(args)

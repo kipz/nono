@@ -121,7 +121,21 @@ fn run_learn(args: LearnArgs, silent: bool) -> Result<()> {
 
     let result = learn::run_learn(&args)?;
 
-    if args.json {
+    if let Some(ref output_path) = args.output_file {
+        // Write JSON to the specified file; do not print to stdout so the
+        // traced command's output is not mixed with the policy.
+        let json = result.to_json();
+        std::fs::write(output_path, &json).map_err(|e| {
+            NonoError::LearnError(format!(
+                "Failed to write policy to {}: {}",
+                output_path.display(),
+                e
+            ))
+        })?;
+        if !silent {
+            eprintln!("\nPolicy saved to {}", output_path.display());
+        }
+    } else if args.json {
         println!("{}", result.to_json());
     } else {
         println!("{}", result.to_summary());

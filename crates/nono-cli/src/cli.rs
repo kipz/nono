@@ -457,6 +457,11 @@ pub struct LearnArgs {
     #[arg(long)]
     pub json: bool,
 
+    /// Write the discovered policy as JSON to this file instead of stdout.
+    /// The traced command's stdout/stderr are unaffected. Implies --json.
+    #[arg(long, value_name = "FILE")]
+    pub output_file: Option<PathBuf>,
+
     /// Timeout in seconds (default: run until command exits)
     #[arg(long, value_name = "SECS")]
     pub timeout: Option<u64>,

@@ -339,10 +339,12 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     profile.push_str("(allow mach-task-name)\n");
     profile.push_str("(deny mach-priv*)\n");
 
-    // IPC: allow only POSIX shared memory operations
+    // IPC: allow POSIX shared memory and semaphore operations.
+    // Semaphores are required for GraalVM native images (sem_open for signal handling).
     profile.push_str("(allow ipc-posix-shm-read-data)\n");
     profile.push_str("(allow ipc-posix-shm-write-data)\n");
     profile.push_str("(allow ipc-posix-shm-write-create)\n");
+    profile.push_str("(allow ipc-posix-sem*)\n");
 
     profile.push_str("(allow signal)\n");
     profile.push_str("(allow system-socket)\n");

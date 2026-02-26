@@ -153,6 +153,7 @@ impl ProfileDef {
             hooks: self.hooks.clone(),
             rollback: self.rollback.clone(),
             interactive: self.interactive,
+            extends: None,
         })
     }
 }

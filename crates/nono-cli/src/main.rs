@@ -90,6 +90,48 @@ fn run_setup(args: SetupArgs) -> Result<()> {
 }
 
 /// Learn mode: trace file accesses to discover required paths
+/// Return the CWD plus all git worktrees of the current repository.
+///
+/// These are paths that the sandboxed agent reads as part of its own project
+/// context and do not need to appear in the learned policy (the CWD is
+/// already granted at run time via `--allow "$PWD"`; worktrees are siblings
+/// in the same repository and equally project-internal).
+///
+/// Falls back to just the CWD if git is unavailable or the directory is not
+/// a git repository.
+fn collect_project_paths() -> Vec<std::path::PathBuf> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return vec![];
+    };
+
+    // Ask git for all worktrees (main + linked). Each "worktree <path>" line
+    // in the porcelain output is a root we want to strip.
+    let worktrees = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&cwd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|line| line.strip_prefix("worktree "))
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        });
+
+    match worktrees {
+        Some(mut paths) if !paths.is_empty() => {
+            // Ensure the CWD itself is included even if git listed it differently.
+            if !paths.contains(&cwd) {
+                paths.push(cwd);
+            }
+            paths
+        }
+        _ => vec![cwd],
+    }
+}
+
 fn run_learn(args: LearnArgs, silent: bool) -> Result<()> {
     // Warn user that the command runs unrestricted
     if !silent && !args.yes {
@@ -121,10 +163,34 @@ fn run_learn(args: LearnArgs, silent: bool) -> Result<()> {
 
     let result = learn::run_learn(&args)?;
 
+    // Strip the CWD and all git worktrees of the current repo. The CWD is
+    // covered at run time by --allow "$PWD"; worktrees are project context
+    // that the agent reads incidentally but which need no policy grant.
+    let project_paths = collect_project_paths();
+    let result = if !project_paths.is_empty() {
+        result.without_paths(&project_paths)
+    } else {
+        result
+    };
+
+    let result = if let Some(threshold) = args.collapse {
+        result.collapse(threshold, args.collapse_min_depth)
+    } else {
+        result
+    };
+
     if let Some(ref output_path) = args.output_file {
         // Write JSON to the specified file; do not print to stdout so the
         // traced command's output is not mixed with the policy.
-        let json = result.to_json();
+        //
+        // When --profile is also set, emit a full merged profile (base profile
+        // settings + new paths) so the saved file can be used directly with
+        // --profile at run time without needing a separate --profile flag.
+        let json = if let Some(ref profile_name) = args.profile {
+            result.to_composed_profile_json(profile_name)
+        } else {
+            result.to_json()
+        };
         std::fs::write(output_path, &json).map_err(|e| {
             NonoError::LearnError(format!(
                 "Failed to write policy to {}: {}",

@@ -470,6 +470,27 @@ pub struct LearnArgs {
     #[arg(long)]
     pub all: bool,
 
+    /// Collapse parent directories when N or more siblings are covered.
+    ///
+    /// After tracing, if N or more paths share a common parent directory,
+    /// they are replaced by that parent. Applied iteratively so grandparents
+    /// collapse too if they accumulate enough children. Each access category
+    /// (read, write, readwrite) is collapsed independently.
+    ///
+    /// Example: with --collapse 3, accessing /foo/a, /foo/b, /foo/c
+    /// produces /foo instead of three separate entries.
+    #[arg(long, value_name = "N")]
+    pub collapse: Option<usize>,
+
+    /// Minimum path depth for collapse targets (default: 4).
+    ///
+    /// Prevents collapsing to paths shallower than N components (counting
+    /// the root). Depth 4 means at least /a/b/c, which on macOS keeps
+    /// collapsing from reaching /Users/<name> (depth 3) or above.
+    /// Only relevant when --collapse is set.
+    #[arg(long, value_name = "N", default_value = "4")]
+    pub collapse_min_depth: usize,
+
     /// Skip the confirmation prompt
     #[arg(long, short = 'y')]
     pub yes: bool,

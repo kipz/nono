@@ -185,6 +185,12 @@ pub struct Profile {
     /// App has interactive UI that needs TTY preserved (implies --exec mode)
     #[serde(default)]
     pub interactive: bool,
+    /// Base profile to extend. When set, the named profile is loaded first and
+    /// this profile's filesystem paths are overlaid on top. All other settings
+    /// (network, workdir, hooks, security groups, etc.) are inherited from the
+    /// base unless explicitly set in this profile.
+    #[serde(default)]
+    pub extends: Option<String>,
 }
 
 /// Load a profile by name or file path
@@ -230,7 +236,9 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
 /// Load a profile from a direct file path.
 ///
 /// The path must exist and point to a valid JSON profile file.
-/// Base groups are merged automatically.
+/// Base groups are merged automatically. If the profile contains an `extends`
+/// field, the named base profile is loaded first and this profile's filesystem
+/// paths are overlaid on top; all other settings are inherited from the base.
 pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
     if !path.exists() {
         return Err(NonoError::ProfileRead {
@@ -240,9 +248,42 @@ pub fn load_profile_from_path(path: &Path) -> Result<Profile> {
     }
 
     tracing::info!("Loading profile from path: {}", path.display());
-    let mut profile = load_from_file(path)?;
+    let profile = load_from_file(path)?;
+
+    if let Some(ref base_name) = profile.extends.clone() {
+        let base = load_profile(base_name)?;
+        return Ok(apply_extends(base, profile));
+    }
+
+    let mut profile = profile;
     merge_base_groups(&mut profile)?;
     Ok(profile)
+}
+
+/// Overlay `extending`'s filesystem paths and security groups onto `base`.
+///
+/// All other settings (network, workdir, hooks, interactive, undo, meta) are
+/// inherited from `base`. This is intentional: the extending profile (e.g., a
+/// per-project learned profile) only carries the additional paths it needs;
+/// everything else comes from the named base.
+fn apply_extends(mut base: Profile, extending: Profile) -> Profile {
+    let merge_vec = |base_vec: &mut Vec<String>, extra: Vec<String>| {
+        for item in extra {
+            if !base_vec.contains(&item) {
+                base_vec.push(item);
+            }
+        }
+    };
+
+    merge_vec(&mut base.filesystem.allow, extending.filesystem.allow);
+    merge_vec(&mut base.filesystem.read, extending.filesystem.read);
+    merge_vec(&mut base.filesystem.write, extending.filesystem.write);
+    merge_vec(&mut base.filesystem.allow_file, extending.filesystem.allow_file);
+    merge_vec(&mut base.filesystem.read_file, extending.filesystem.read_file);
+    merge_vec(&mut base.filesystem.write_file, extending.filesystem.write_file);
+    merge_vec(&mut base.security.groups, extending.security.groups);
+
+    base
 }
 
 /// Merge base_groups from policy.json into a user profile.

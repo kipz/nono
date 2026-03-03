@@ -522,6 +522,10 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[allow(dead_code)]
     pub trust_groups: Vec<String>,
+    /// Commands to allow even when blocked by default policy (e.g. `["rm"]`).
+    /// Applied before CLI `--allow-command` overrides.
+    #[serde(default)]
+    pub allowed_commands: Vec<String>,
 }
 
 /// Rollback snapshot configuration in a profile
@@ -752,6 +756,7 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
             security: SecurityConfig {
                 groups: def.security.groups.clone(),
                 trust_groups: def.trust_groups.clone(),
+                allowed_commands: def.security.allowed_commands.clone(),
             },
             filesystem: def.filesystem.clone(),
             network: def.network.clone(),
@@ -780,6 +785,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         security: SecurityConfig {
             groups: dedup_append(&base.security.groups, &child.security.groups),
             trust_groups: dedup_append(&base.security.trust_groups, &child.security.trust_groups),
+            allowed_commands: dedup_append(
+                &base.security.allowed_commands,
+                &child.security.allowed_commands,
+            ),
         },
         filesystem: FilesystemConfig {
             allow: dedup_append(&base.filesystem.allow, &child.filesystem.allow),
@@ -1176,7 +1185,7 @@ mod tests {
         let mut profile = Profile {
             security: SecurityConfig {
                 groups: vec!["node_runtime".to_string()],
-                trust_groups: vec![],
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1227,6 +1236,7 @@ mod tests {
             security: SecurityConfig {
                 groups: vec!["node_runtime".to_string()],
                 trust_groups: vec!["dangerous_commands".to_string()],
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1249,6 +1259,7 @@ mod tests {
             security: SecurityConfig {
                 groups: vec![],
                 trust_groups: vec!["deny_credentials".to_string()],
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -1721,6 +1732,32 @@ mod tests {
         assert!(validate_custom_credential("test", &cred).is_ok());
     }
 
+    #[test]
+    fn test_security_config_allowed_commands_deserializes() {
+        let json = r#"{
+            "meta": { "name": "rm-test" },
+            "filesystem": { "allow": ["/tmp"] },
+            "security": { "allowed_commands": ["rm", "dd"] }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("rm-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        assert_eq!(profile.security.allowed_commands, vec!["rm", "dd"]);
+    }
+
+    #[test]
+    fn test_security_config_allowed_commands_defaults_empty() {
+        let json = r#"{
+            "meta": { "name": "no-cmds" },
+            "filesystem": { "allow": ["/tmp"] }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("no-cmds.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        assert!(profile.security.allowed_commands.is_empty());
+    }
     // ============================================================================
     // Profile inheritance (extends) tests
     // ============================================================================
@@ -1738,6 +1775,7 @@ mod tests {
             security: SecurityConfig {
                 groups: vec!["base_group".to_string()],
                 trust_groups: vec!["base_trust".to_string()],
+                ..Default::default()
             },
             filesystem: FilesystemConfig {
                 allow: vec!["/base/rw".to_string()],
@@ -1787,6 +1825,7 @@ mod tests {
             security: SecurityConfig {
                 groups: vec!["child_group".to_string()],
                 trust_groups: vec![],
+                ..Default::default()
             },
             filesystem: FilesystemConfig {
                 allow: vec!["/child/rw".to_string()],

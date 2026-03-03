@@ -81,7 +81,7 @@ For corporate environments with a mandatory outbound proxy:
 nono run --allow-cwd --network-profile enterprise --external-proxy squid.corp:3128 -- my-agent
 ```
 
-CONNECT requests are chained through the corporate proxy. The default deny list (cloud metadata, RFC1918) is still enforced as a floor.
+CONNECT requests are chained through the corporate proxy. Cloud metadata endpoints are still denied.
 
 ## Network Profiles
 
@@ -129,27 +129,26 @@ User profiles can specify a network profile in the `network` section:
 
 ## Default Deny List
 
-The following destinations are always blocked, regardless of configuration. These cannot be overridden.
+The following cloud metadata destinations are always blocked, regardless of configuration. These cannot be overridden.
 
-### Cloud Metadata
+### Denied Hostnames
 
-| Host/CIDR | Service |
-|-----------|---------|
+| Host | Service |
+|------|---------|
 | 169.254.169.254 | AWS/GCP/Azure instance metadata |
 | metadata.google.internal | GCP metadata alias |
+| metadata.azure.internal | Azure metadata alias |
 
-### Private Networks
+### Link-Local IP Protection
 
-| CIDR | Range |
-|------|-------|
-| 10.0.0.0/8 | RFC1918 Class A |
-| 172.16.0.0/12 | RFC1918 Class B |
-| 192.168.0.0/16 | RFC1918 Class C |
-| 169.254.0.0/16 | Link-local |
-| 127.0.0.0/8 | Loopback (except proxy port) |
-| ::1/128 | IPv6 loopback |
-| fc00::/7 | IPv6 unique local |
+Resolved IPs in the link-local range are always blocked after DNS resolution to prevent DNS rebinding attacks targeting cloud metadata services:
+
+| Range | Description |
+|-------|-------------|
+| 169.254.0.0/16 | IPv4 link-local |
 | fe80::/10 | IPv6 link-local |
+
+Private network addresses (RFC1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16) are allowed to support enterprise environments.
 
 ## Platform Behavior
 

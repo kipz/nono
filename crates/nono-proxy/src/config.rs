@@ -3,7 +3,6 @@
 //! Defines the configuration for the proxy server, including allowed hosts,
 //! credential routes, and external proxy settings.
 
-use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
@@ -38,10 +37,6 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
 
-    /// Additional CIDR ranges to deny (on top of built-in defaults).
-    #[serde(default)]
-    pub deny_cidrs: Vec<IpNet>,
-
     /// Reverse proxy credential routes.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
@@ -62,7 +57,6 @@ impl Default for ProxyConfig {
             bind_addr: default_bind_addr(),
             bind_port: 0,
             allowed_hosts: Vec::new(),
-            deny_cidrs: Vec::new(),
             routes: Vec::new(),
             external_proxy: None,
             max_connections: 256,

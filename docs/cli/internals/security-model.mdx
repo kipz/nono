@@ -232,13 +232,13 @@ Tokens are compared using constant-time equality to prevent timing attacks. This
 
 ### DNS Rebinding Protection
 
-The proxy resolves DNS itself and checks all resolved IP addresses against the deny list before connecting. This prevents attacks where:
+The proxy resolves DNS itself and checks all resolved IP addresses against the link-local range before connecting. This prevents attacks where:
 
 1. An attacker controls DNS for an allowed hostname
-2. DNS returns an RFC1918 address (e.g., `10.0.0.1`) or cloud metadata (`169.254.169.254`)
-3. The proxy would connect to an internal host thinking it's an allowed external API
+2. DNS returns a link-local address (e.g., `169.254.169.254`)
+3. The proxy would connect to the cloud metadata service thinking it's an allowed external API
 
-The deny list (cloud metadata, RFC1918, link-local, loopback) is hardcoded and cannot be overridden by configuration.
+Link-local IPs (169.254.0.0/16, fe80::/10) are always blocked after DNS resolution. Cloud metadata hostnames are also hardcoded as denied. Private network addresses (RFC1918) are allowed to support enterprise environments.
 
 ### Credential Isolation
 

@@ -123,7 +123,7 @@ pub async fn handle_reverse_proxy(
 
     let (upstream_host, upstream_port, upstream_path_full) = parse_upstream_url(&upstream_url)?;
 
-    // DNS resolve + CIDR check via the filter (prevents rebinding TOCTOU)
+    // DNS resolve + host check via the filter
     let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();

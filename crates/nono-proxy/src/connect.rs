@@ -2,7 +2,7 @@
 //!
 //! Handles `CONNECT host:port HTTP/1.1` requests by:
 //! 1. Validating the session token
-//! 2. Checking the host against the filter (deny CIDRs, then allowlist)
+//! 2. Checking the host against the filter (cloud metadata deny list, then allowlist)
 //! 3. Establishing a TCP connection to the upstream
 //! 4. Returning `200 Connection Established`
 //! 5. Relaying bytes bidirectionally (transparent TLS tunnel)
@@ -57,7 +57,7 @@ pub async fn handle_connect(
 
     // Connect to the resolved IP directly — NOT re-resolving the hostname.
     // This eliminates the DNS rebinding TOCTOU: the IPs were already checked
-    // against deny CIDRs in check_host() above.
+    // against the link-local range in check_host() above.
     let resolved = &check.resolved_addrs;
     if resolved.is_empty() {
         let reason = "DNS resolution returned no addresses".to_string();

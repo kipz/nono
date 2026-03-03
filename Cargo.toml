@@ -44,9 +44,6 @@ hyper = { version = "1", features = ["http1", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
 
-# Network filtering
-ipnet = { version = "2", features = ["serde"] }
-
 # Testing
 tempfile = "3"
 

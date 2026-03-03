@@ -130,7 +130,7 @@ Sign instruction files directly within GitHub Actions workflows. Users can then 
 
 ### Network Filtering
 
-Allowlist-based host filtering via a local proxy. The sandbox blocks all direct outbound connections — the agent can only reach explicitly allowed hosts. Cloud metadata endpoints and private network ranges are hardcoded as denied. DNS rebinding protection checks resolved IPs against the deny list before connecting.
+Allowlist-based host filtering via a local proxy. The sandbox blocks all direct outbound connections — the agent can only reach explicitly allowed hosts. Cloud metadata endpoints are hardcoded as denied.
 
 ```bash
 nono run --supervised --proxy-allow api.openai.com --proxy-allow api.anthropic.com -- my-agent

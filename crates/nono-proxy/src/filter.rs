@@ -1,7 +1,8 @@
 //! Async host filtering wrapping the library's [`HostFilter`](nono::HostFilter).
 //!
-//! Performs DNS resolution via `tokio::net::lookup_host()` and checks
-//! resolved IPs against deny CIDRs before checking the hostname allowlist.
+//! Performs DNS resolution via `tokio::net::lookup_host()`, checks resolved
+//! IPs against the link-local range (cloud metadata SSRF protection), and
+//! validates the hostname against the cloud metadata deny list and allowlist.
 
 use crate::error::Result;
 use nono::net_filter::{FilterResult, HostFilter};
@@ -35,7 +36,7 @@ impl ProxyFilter {
         }
     }
 
-    /// Create a filter that allows all hosts (except deny list).
+    /// Create a filter that allows all hosts (except cloud metadata).
     #[must_use]
     pub fn allow_all() -> Self {
         Self {
@@ -46,8 +47,8 @@ impl ProxyFilter {
     /// Check a host against the filter with async DNS resolution.
     ///
     /// Resolves the hostname to IP addresses, then checks all resolved IPs
-    /// against the deny CIDR list. If any IP is denied, the request is blocked
-    /// (DNS rebinding protection).
+    /// against the link-local deny range (cloud metadata SSRF protection).
+    /// If any resolved IP is link-local, the request is blocked.
     ///
     /// On success, returns both the filter result and the resolved socket
     /// addresses. Callers MUST use `resolved_addrs` to connect to the upstream
@@ -122,10 +123,18 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_filter_denies_private_ips() {
+    fn test_proxy_filter_allows_private_networks() {
         let filter = ProxyFilter::allow_all();
         let private_ip = vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))];
         let result = filter.check_host_with_ips("corp.internal", &private_ip);
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_proxy_filter_denies_link_local() {
+        let filter = ProxyFilter::allow_all();
+        let link_local = vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))];
+        let result = filter.check_host_with_ips("evil.com", &link_local);
         assert!(!result.is_allowed());
     }
 }

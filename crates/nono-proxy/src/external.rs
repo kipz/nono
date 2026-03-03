@@ -1,9 +1,8 @@
 //! External proxy passthrough handler (Mode 3 — Enterprise).
 //!
 //! Chains CONNECT requests to an upstream enterprise proxy (Squid, Cisco WSA,
-//! Zscaler, etc.). Nono's `default_deny` (cloud metadata, RFC1918) applies as
-//! a security floor before forwarding. The enterprise proxy makes the final
-//! allow/deny decision.
+//! Zscaler, etc.). Cloud metadata endpoints are still denied before forwarding.
+//! The enterprise proxy makes the final allow/deny decision.
 
 use crate::audit;
 use crate::config::ExternalProxyConfig;
@@ -18,7 +17,7 @@ use zeroize::Zeroizing;
 /// Handle a CONNECT request by chaining it to an external proxy.
 ///
 /// 1. Validate session token
-/// 2. Check host against default_deny (SSRF floor)
+/// 2. Check host against cloud metadata deny list
 /// 3. Connect to enterprise proxy
 /// 4. Send CONNECT to enterprise proxy (with optional Proxy-Authorization)
 /// 5. Wait for enterprise proxy 200
@@ -38,11 +37,8 @@ pub async fn handle_external_proxy(
     // Validate session token
     validate_proxy_auth(remaining_header, session_token)?;
 
-    // Check default_deny (SSRF protection floor).
-    // For external proxy mode, we connect to the enterprise proxy (not the resolved
-    // IP directly), so the DNS rebinding TOCTOU doesn't apply — the enterprise proxy
-    // does its own resolution. But we still check deny CIDRs on the resolved IPs here
-    // to prevent requesting known-bad targets even through the enterprise proxy.
+    // Check cloud metadata deny list.
+    // Cloud metadata endpoints are always blocked even through enterprise proxies.
     let check = filter.check_host(&host, port).await?;
     if !check.result.is_allowed() {
         let reason = check.result.reason();

@@ -3,8 +3,8 @@
 //! `nono-proxy` provides three proxy modes:
 //!
 //! 1. **CONNECT tunnel** (`connect`) - Host-filtered HTTPS tunnelling.
-//!    The proxy validates the target host against an allowlist and CIDR
-//!    deny ranges, then establishes a raw TCP tunnel.
+//!    The proxy validates the target host against an allowlist and cloud
+//!    metadata deny list, then establishes a raw TCP tunnel.
 //!
 //! 2. **Reverse proxy** (`reverse`) - Credential injection for API calls.
 //!    Requests arrive at `http://127.0.0.1:<port>/<service>/...`, the proxy

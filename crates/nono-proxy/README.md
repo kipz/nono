@@ -10,14 +10,14 @@ Network filtering proxy for the [nono](https://crates.io/crates/nono) sandbox.
 
 | Mode | Module | Description |
 |------|--------|-------------|
-| CONNECT tunnel | `connect` | Host-filtered HTTPS tunnelling. Validates the target host against an allowlist and CIDR deny ranges, then establishes a raw TCP tunnel. TLS is end-to-end. |
+| CONNECT tunnel | `connect` | Host-filtered HTTPS tunnelling. Validates the target host against an allowlist and cloud metadata deny list, then establishes a raw TCP tunnel. TLS is end-to-end. |
 | Reverse proxy | `reverse` | Credential injection for API calls. Requests to `http://127.0.0.1:<port>/<service>/...` are forwarded upstream with the real API key injected as an HTTP header. |
-| External proxy | `external` | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy with the default deny list enforced as a floor. |
+| External proxy | `external` | Enterprise proxy passthrough. CONNECT requests are chained through a corporate proxy with cloud metadata endpoints still denied. |
 
 ## Security Properties
 
-- **Default deny list is hardcoded** -- Cloud metadata endpoints (169.254.169.254), RFC1918 private networks, link-local, and loopback ranges are always blocked regardless of allowlist configuration.
-- **DNS rebinding protection** -- The proxy resolves DNS and checks all resolved IPs against deny CIDRs before connecting. Callers connect to resolved addresses, not re-resolved hostnames.
+- **Cloud metadata deny list is hardcoded** -- Cloud metadata hostnames (169.254.169.254, metadata.google.internal, metadata.azure.internal) are always blocked regardless of allowlist configuration. Private network addresses (RFC1918) are allowed to support enterprise environments.
+- **DNS rebinding protection** -- The proxy resolves DNS, checks all resolved IPs against the link-local range (169.254.0.0/16, fe80::/10), and connects to resolved addresses (not re-resolved hostnames). This prevents DNS rebinding attacks targeting cloud metadata.
 - **Session token authentication** -- Each session generates a 256-bit random token. CONNECT requests use `Proxy-Authorization` (Basic or Bearer); reverse proxy requests use `X-Nono-Token`.
 - **Credential isolation** -- API keys are loaded from the OS keyring, stored in `Zeroizing<String>`, injected at the HTTP header level, and never exposed to the sandboxed process.
 - **Constant-time token comparison** -- Prevents timing side-channel attacks on session token validation.

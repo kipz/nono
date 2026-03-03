@@ -267,7 +267,7 @@ See [Credential Injection](/cli/features/credential-injection) for complete docu
 
 #### `--external-proxy`
 
-Chain outbound connections through an external (enterprise) proxy. The default deny list (cloud metadata, private networks) is still enforced.
+Chain outbound connections through an external (enterprise) proxy. Cloud metadata endpoints are still denied.
 
 ```bash
 nono run --allow-cwd --network-profile enterprise --external-proxy squid.corp:3128 -- my-agent

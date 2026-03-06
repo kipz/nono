@@ -5,6 +5,7 @@
 mod audit_commands;
 mod capability_ext;
 mod cli;
+mod mediation;
 mod config;
 mod exec_strategy;
 mod hooks;
@@ -926,6 +927,7 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
             open_url_allow_localhost: prepared.open_url_allow_localhost,
             allow_launch_services_active: prepared.allow_launch_services_active,
             override_deny_paths: prepared.override_deny_paths,
+            mediation: prepared.mediation,
         },
     )
 }
@@ -1135,6 +1137,8 @@ struct ExecutionFlags {
     allow_launch_services_active: bool,
     /// Canonicalized paths exempted from deny groups via override_deny
     override_deny_paths: Vec<std::path::PathBuf>,
+    /// Command mediation config (intercept rules, env block/inject)
+    mediation: mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -1180,6 +1184,7 @@ impl ExecutionFlags {
             open_url_allow_localhost: false,
             allow_launch_services_active: false,
             override_deny_paths: Vec::new(),
+            mediation: mediation::MediationConfig::default(),
         })
     }
 }
@@ -1248,7 +1253,21 @@ pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
     ports
 }
 
-/// Apply sandbox pre-fork for Direct mode (both parent+child confined).
+/// Select execution strategy from user/runtime flags.
+///
+/// Threat-model boundary:
+/// - `Supervised` is selected when `--rollback` (snapshots), proxy, or mediation is active.
+///   All require an unsandboxed parent.
+/// - `Direct` is the default for non-interactive, non-rollback, non-mediation paths.
+fn select_execution_strategy(flags: &ExecutionFlags) -> exec_strategy::ExecStrategy {
+    if flags.rollback || flags.proxy_active || flags.mediation.is_active() {
+        exec_strategy::ExecStrategy::Supervised
+    } else {
+        flags.strategy
+    }
+}
+
+/// Apply sandbox pre-fork for strategies that require both parent+child confinement.
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
@@ -1471,7 +1490,7 @@ fn execute_sandboxed(
         }
     }
 
-    let strategy = flags.strategy;
+    let strategy = select_execution_strategy(&flags);
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         output::print_supervised_info(flags.silent, flags.rollback, flags.proxy_active);
@@ -1540,6 +1559,59 @@ fn execute_sandboxed(
     let current_dir = execution_start_dir(&flags.workdir, &caps)?;
 
     // Apply sandbox BEFORE fork for Direct mode.
+    // Set up command mediation session (Supervised mode only).
+    // Must run before apply_pre_fork_sandbox so we can add seatbelt rules to caps.
+    let mediation_session = if matches!(strategy, exec_strategy::ExecStrategy::Supervised)
+        && flags.mediation.is_active()
+    {
+        match mediation::session::setup(&flags.mediation) {
+            Ok(Some(session)) => {
+                // Add shim dir as readable (shims are symlinks, need read+exec)
+                if let Ok(cap) = nono::FsCapability::new_dir(&session.shim_dir, nono::AccessMode::Read) {
+                    caps.add_fs(cap);
+                }
+                // Also allow read of the session dir (for socket path metadata)
+                if let Ok(cap) = nono::FsCapability::new_dir(&session.session_dir, nono::AccessMode::Read) {
+                    caps.add_fs(cap);
+                }
+                // Seatbelt: deny exec of the real binaries (force shim usage)
+                #[cfg(target_os = "macos")]
+                for binary in &session.blocked_binaries {
+                    if let Some(path_str) = binary.to_str() {
+                        let rule = format!(
+                            "(deny process-exec (literal \"{}\"))",
+                            path_str.replace('\\', "\\\\").replace('"', "\\\"")
+                        );
+                        if let Err(e) = caps.add_platform_rule(&rule) {
+                            warn!("mediation: failed to add seatbelt deny rule for {}: {}", path_str, e);
+                        }
+                    }
+                }
+                // Seatbelt: allow exec of shims
+                #[cfg(target_os = "macos")]
+                {
+                    if let Some(shim_dir_str) = session.shim_dir.to_str() {
+                        let rule = format!(
+                            "(allow process-exec (subpath \"{}\"))",
+                            shim_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
+                        );
+                        if let Err(e) = caps.add_platform_rule(&rule) {
+                            warn!("mediation: failed to add seatbelt allow rule for shim dir: {}", e);
+                        }
+                    }
+                }
+                Some(session)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Apply sandbox BEFORE fork for Direct and Monitor modes.
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
     // Build environment variables for the command
@@ -1553,6 +1625,28 @@ fn execute_sandboxed(
         env_vars.push((k.as_str(), v.as_str()));
     }
 
+    // Add mediation env vars: socket path and injected credentials.
+    // These strings are kept alive until `env_vars` is consumed by exec.
+    let mediation_socket_path_str: String = mediation_session
+        .as_ref()
+        .map(|s| s.socket_path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mediation_env_inject_strs: Vec<(String, String)> = mediation_session
+        .as_ref()
+        .map(|s| {
+            s.env_inject
+                .iter()
+                .map(|inj| (inj.var.clone(), inj.value.as_str().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if mediation_session.is_some() {
+        env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_path_str));
+        for (k, v) in &mediation_env_inject_strs {
+            env_vars.push((k.as_str(), v.as_str()));
+        }
+    }
+
     // Determine threading context for fork safety.
     // Secret loading uses the keyring backend which may spawn background threads
     // (macOS Security framework XPC dispatch). However, get_password() is synchronous
@@ -1563,13 +1657,11 @@ fn execute_sandboxed(
     // fork over because: (1) the synchronous call completed, (2) idle XPC workers
     // behave like idle tokio workers (parked on kqueue), (3) the child applies
     // sandbox then immediately calls execve which replaces the address space.
-    let threading = if !loaded_secrets.is_empty() && !flags.proxy_active {
+    let threading = if !loaded_secrets.is_empty() && !flags.proxy_active && mediation_session.is_none() {
         exec_strategy::ThreadingContext::KeyringExpected
-    } else if flags.trust_interception_active || flags.proxy_active || !loaded_secrets.is_empty() {
-        // Proxy uses tokio threads (parked on epoll/kqueue, safe for fork+exec).
-        // Keyring threads are idle XPC dispatch workers when proxy is also active.
-        // Trust policy signature verification and runtime attestation may also
-        // leave crypto worker threads parked before we fork.
+    } else if flags.trust_interception_active || flags.proxy_active || !loaded_secrets.is_empty() || mediation_session.is_some() {
+        // Proxy and mediation server use tokio threads parked on epoll/kqueue —
+        // safe for fork+exec because the child immediately calls execve.
         exec_strategy::ThreadingContext::CryptoExpected
     } else {
         exec_strategy::ThreadingContext::Strict
@@ -1629,6 +1721,12 @@ fn execute_sandboxed(
         }
     };
 
+    // Collect env vars to block from the child (from mediation.env.block).
+    let mediation_env_block: Vec<String> = mediation_session
+        .as_ref()
+        .map(|s| s.env_block.clone())
+        .unwrap_or_default();
+
     // Create execution config
     let config = exec_strategy::ExecConfig {
         command: &command,
@@ -1643,6 +1741,7 @@ fn execute_sandboxed(
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
+        extra_blocked_env: &mediation_env_block,
     };
 
     // Execute based on strategy
@@ -2045,6 +2144,8 @@ struct PreparedSandbox {
     open_url_allow_localhost: bool,
     /// Canonicalized paths exempted from deny groups via override_deny
     override_deny_paths: Vec<std::path::PathBuf>,
+    /// Command mediation config from profile (intercept rules, env block/inject)
+    mediation: mediation::MediationConfig,
 }
 
 fn parse_env_credential_map_args(values: &[String]) -> Result<Vec<(String, String)>> {
@@ -2305,6 +2406,10 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         .as_ref()
         .and_then(|p| p.allow_launch_services)
         .unwrap_or(false);
+    let profile_mediation = loaded_profile
+        .as_ref()
+        .map(|p| p.mediation.clone())
+        .unwrap_or_default();
 
     // On Linux, pre-create paths that the claude-code profile grants but
     // may not exist yet. Non-existent paths are skipped during capability
@@ -2536,6 +2641,7 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         open_url_origins,
         open_url_allow_localhost,
         override_deny_paths,
+        mediation: profile_mediation,
     })
 }
 
@@ -2766,6 +2872,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -2808,6 +2915,7 @@ mod tests {
             open_url_origins: Vec::new(),
             open_url_allow_localhost: false,
             override_deny_paths: Vec::new(),
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

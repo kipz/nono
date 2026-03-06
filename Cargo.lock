@@ -1602,6 +1602,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nono-shim"
+version = "0.11.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

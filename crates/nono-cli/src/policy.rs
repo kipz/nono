@@ -123,6 +123,8 @@ pub struct ProfileDef {
     pub allow_launch_services: Option<bool>,
     #[serde(default)]
     pub interactive: bool,
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 impl ProfileDef {
@@ -154,6 +156,7 @@ impl ProfileDef {
             allow_launch_services: self.allow_launch_services,
             interactive: self.interactive,
             skipdirs: Vec::new(),
+            mediation: self.mediation.clone(),
         }
     }
 }

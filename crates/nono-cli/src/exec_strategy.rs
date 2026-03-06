@@ -57,10 +57,10 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + tokio mediation workers (2) +
+/// aws-lc-rs ECDSA pool (4). When --network-profile, mediation, and trust
+/// scanning are all active simultaneously the ceiling is 9 threads.
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
@@ -193,6 +193,9 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Additional env var names to block from the child (from mediation.env.block).
+    /// Complements the hardcoded injection-vector list in env_sanitization.rs.
+    pub extra_blocked_env: &'a [String],
 }
 
 /// Configuration for supervisor IPC in supervised execution mode.
@@ -247,8 +250,11 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
+    let extra_blocked: Vec<&str> = std::iter::once("NONO_CAP_FILE")
+        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+        .collect();
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
+        if !should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
             cmd.env(&key, &value);
         }
     }
@@ -264,6 +270,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     // exec() only returns if there's an error
     Err(NonoError::CommandExecution(err))
 }
+
 
 /// Execute a command using the Supervised strategy (fork first, sandbox only child).
 ///
@@ -341,12 +348,18 @@ pub fn execute_supervised(
     let mut open_shim: Option<OpenShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
+    let extra_blocked_supervised: Vec<&str> =
+        ["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"]
+            .iter()
+            .copied()
+            .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+            .collect();
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
             let should_skip = should_skip_env_var(
                 k,
                 &config.env_vars,
-                &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
+                &extra_blocked_supervised,
             );
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {

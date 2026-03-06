@@ -45,6 +45,8 @@ pub struct InjectedEnvVar {
 pub struct SessionHandle {
     /// Directory containing shim symlinks (must be prepended to child PATH).
     pub shim_dir: PathBuf,
+    /// Real path of the nono-shim binary (needed for sandbox file-read allow rules).
+    pub shim_binary: PathBuf,
     /// Path of the Unix socket the mediation server listens on.
     pub socket_path: PathBuf,
     /// Session temp directory (cleaned up on drop).
@@ -146,6 +148,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
 
     Ok(Some(SessionHandle {
         shim_dir,
+        shim_binary,
         socket_path,
         session_dir,
         blocked_binaries,

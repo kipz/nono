@@ -147,6 +147,7 @@ impl ProfileDef {
                 groups,
                 trust_groups: self.trust_groups.clone(),
                 allowed_commands: self.security.allowed_commands.clone(),
+                signal_mode: self.security.signal_mode,
             },
             filesystem: self.filesystem.clone(),
             network: self.network.clone(),

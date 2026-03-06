@@ -58,7 +58,9 @@ pub mod trust;
 pub mod undo;
 
 // Re-exports for convenience
-pub use capability::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NetworkMode};
+pub use capability::{
+    AccessMode, CapabilitySet, CapabilitySource, FsCapability, NetworkMode, SignalMode,
+};
 pub use diagnostic::{DenialReason, DenialRecord, DiagnosticFormatter, DiagnosticMode};
 pub use error::{NonoError, Result};
 pub use keystore::{

@@ -270,6 +270,14 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_allowed_command(cmd.as_str());
         }
 
+        // Apply signal mode from profile (None defaults to Isolated)
+        let mode = profile
+            .security
+            .signal_mode
+            .map(nono::SignalMode::from)
+            .unwrap_or_default();
+        caps = caps.set_signal_mode(mode);
+
         // Apply CLI overrides (CLI args take precedence)
         add_cli_overrides(&mut caps, args)?;
 

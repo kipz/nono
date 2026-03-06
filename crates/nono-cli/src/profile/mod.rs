@@ -551,6 +551,28 @@ pub struct HooksConfig {
 /// Controls whether and how the current working directory is automatically
 /// shared with the sandboxed process. This is profile-driven so each
 /// application can declare its own CWD requirements.
+/// Signal isolation mode as specified in a profile.
+///
+/// Maps to `nono::SignalMode` when building the `CapabilitySet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileSignalMode {
+    /// Signals restricted to the current process only
+    Isolated,
+    /// Signals allowed to any process
+    #[serde(alias = "allow_all")]
+    AllowAll,
+}
+
+impl From<ProfileSignalMode> for nono::SignalMode {
+    fn from(val: ProfileSignalMode) -> Self {
+        match val {
+            ProfileSignalMode::Isolated => nono::SignalMode::Isolated,
+            ProfileSignalMode::AllowAll => nono::SignalMode::AllowAll,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkdirAccess {
@@ -589,6 +611,11 @@ pub struct SecurityConfig {
     /// Applied before CLI `--allow-command` overrides.
     #[serde(default)]
     pub allowed_commands: Vec<String>,
+    /// Signal isolation mode. Controls whether the sandboxed process can signal
+    /// other processes. When `None`, inherits from the base profile during merge
+    /// (defaults to `Isolated` if no base sets it).
+    #[serde(default)]
+    pub signal_mode: Option<ProfileSignalMode>,
 }
 
 /// Rollback snapshot configuration in a profile
@@ -820,6 +847,7 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
                 groups: def.security.groups.clone(),
                 trust_groups: def.trust_groups.clone(),
                 allowed_commands: def.security.allowed_commands.clone(),
+                signal_mode: def.security.signal_mode,
             },
             filesystem: def.filesystem.clone(),
             network: def.network.clone(),
@@ -852,6 +880,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &base.security.allowed_commands,
                 &child.security.allowed_commands,
             ),
+            signal_mode: child.security.signal_mode.or(base.security.signal_mode),
         },
         filesystem: FilesystemConfig {
             allow: dedup_append(&base.filesystem.allow, &child.filesystem.allow),

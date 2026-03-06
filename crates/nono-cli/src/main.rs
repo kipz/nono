@@ -1593,14 +1593,24 @@ fn execute_sandboxed(
                 if let Ok(cap) = nono::FsCapability::new_dir(&session.shim_dir, nono::AccessMode::Read) {
                     caps.add_fs(cap);
                 }
+                // Allow read+exec of the nono-shim binary itself (symlink target).
+                // Without this, the sandbox cannot stat/access nono-shim through the symlink,
+                // so bash's PATH lookup skips the shim and falls back to the real binary.
+                if let Ok(cap) = nono::FsCapability::new_file(&session.shim_binary, nono::AccessMode::Read) {
+                    caps.add_fs(cap);
+                }
                 // Also allow read of the session dir (for socket path metadata)
                 if let Ok(cap) = nono::FsCapability::new_dir(&session.session_dir, nono::AccessMode::Read) {
                     caps.add_fs(cap);
                 }
-                // Seatbelt: deny exec of the real binaries (force shim usage)
+                // Seatbelt: deny exec of the real binaries (force shim usage).
+                // Canonicalize first so the deny rule matches the resolved path that
+                // Seatbelt compares against (symlinks like /opt/homebrew/bin/ddtool
+                // resolve to a different path that the literal rule must match).
                 #[cfg(target_os = "macos")]
                 for binary in &session.blocked_binaries {
-                    if let Some(path_str) = binary.to_str() {
+                    let canonical = binary.canonicalize().unwrap_or_else(|_| binary.clone());
+                    if let Some(path_str) = canonical.to_str() {
                         let rule = format!(
                             "(deny process-exec (literal \"{}\"))",
                             path_str.replace('\\', "\\\\").replace('"', "\\\"")
@@ -1648,7 +1658,7 @@ fn execute_sandboxed(
         env_vars.push((k.as_str(), v.as_str()));
     }
 
-    // Add mediation env vars: socket path and injected credentials.
+    // Add mediation env vars: socket path, injected credentials, and PATH override.
     // These strings are kept alive until `env_vars` is consumed by exec.
     let mediation_socket_path_str: String = mediation_session
         .as_ref()
@@ -1663,8 +1673,22 @@ fn execute_sandboxed(
                 .collect()
         })
         .unwrap_or_default();
+    // Prepend shim dir to PATH so shim symlinks shadow real binaries.
+    let mediation_path_str: String = mediation_session
+        .as_ref()
+        .map(|s| {
+            let shim = s.shim_dir.to_string_lossy();
+            let original = std::env::var("PATH").unwrap_or_default();
+            if original.is_empty() {
+                shim.into_owned()
+            } else {
+                format!("{}:{}", shim, original)
+            }
+        })
+        .unwrap_or_default();
     if mediation_session.is_some() {
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_path_str));
+        env_vars.push(("PATH", &mediation_path_str));
         for (k, v) in &mediation_env_inject_strs {
             env_vars.push((k.as_str(), v.as_str()));
         }

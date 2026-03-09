@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -63,10 +63,15 @@ fn run() -> i32 {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // Read all of stdin
-    let mut stdin_bytes = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
-    let stdin = String::from_utf8_lossy(&stdin_bytes).into_owned();
+    // Read stdin only when it is not a TTY (i.e. piped/redirected).
+    // If stdin is a terminal, read_to_end would block forever waiting for EOF.
+    let stdin = if std::io::stdin().is_terminal() {
+        String::new()
+    } else {
+        let mut stdin_bytes = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut stdin_bytes);
+        String::from_utf8_lossy(&stdin_bytes).into_owned()
+    };
 
     let env: HashMap<String, String> = std::env::vars().collect();
 

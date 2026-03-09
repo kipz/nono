@@ -272,6 +272,55 @@ export NONO_THEME=latte
 # theme = "frappe"
 ```
 
+### Command Mediation
+
+Intercept specific CLI commands inside the sandbox and apply policy before they execute. A minimal shim binary (`nono-shim`) is placed in the sandbox's `PATH` for each mediated command. When the agent invokes the command, the shim forwards the call over a Unix socket to the unsandboxed parent process, which applies policy and responds — the sandboxed process never touches the real binary or its credentials.
+
+**Intercept actions:**
+
+- **`respond`** — return a static response immediately, without running the real binary.
+- **`capture`** — return a nonce (phantom token) to the sandbox; the real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret.
+
+**Env var blocking:** named environment variables are stripped from the child process at session start, preventing the sandbox from reading raw credentials.
+
+**Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
+
+```json
+{
+  "mediation": {
+    "commands": {
+      "gh": {
+        "env": {
+          "block": ["GH_TOKEN", "GITHUB_TOKEN"]
+        },
+        "rules": [
+          {
+            "args": ["auth", "token"],
+            "action": "capture",
+            "capture_key": "gh_token"
+          },
+          {
+            "args": ["auth", "status"],
+            "action": "respond",
+            "response": "github.com\n  ✓ Logged in to github.com\n  ✓ Git operations for github.com configured"
+          }
+        ],
+        "sandbox": {
+          "fs_read": ["/usr/local/share/gh", "~/.config/gh"],
+          "fs_write": [],
+          "network": {
+            "block": []
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+> [!NOTE]
+> Per-command `sandbox` restrictions are part of the configuration schema and are being rolled out — documentation will be updated once fully wired up.
+
 ### Audit Trail
 
 Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.
@@ -323,6 +372,7 @@ nono is structured as a Cargo workspace:
 
 - **nono** (`crates/nono/`) -- Core library. A policy-free sandbox primitive that applies only what clients explicitly request.
 - **nono-cli** (`crates/nono-cli/`) -- CLI binary. Owns all security policy, profiles, hooks, and UX.
+- **nono-shim** (`crates/nono-shim/`) -- Minimal shim binary used by command mediation. Placed in the sandbox PATH for each mediated command; forwards invocations to the parent mediation server over a Unix socket.
 - **nono-ffi** (`bindings/c/`) -- C FFI bindings with auto-generated header.
 
 Language-specific bindings are maintained separately:

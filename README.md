@@ -279,6 +279,69 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 
 **Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
 
+```mermaid
+%%{init: {'flowchart': {'curve': 'basis'}}}%%
+flowchart TD
+    User(["👤 User"])
+
+    subgraph host["Host Process (unsandboxed)"]
+        direction TB
+        HostProc["Process Manager"]
+        Seatbelt["Seatbelt Policy"]
+        MedServer["Mediation Server"]
+        Broker["Token Broker"]
+        MediatedBinHost["Mediated Binary (host)"]
+    end
+
+    subgraph sb["Agent Sandbox"]
+        direction TB
+        Agent["Agent Process"]
+        BlockedBin["🚫 Original Binary (denied)"]
+        Shim["nono-shim (intercepts)"]
+        FreeBin["Allowed Binaries"]
+    end
+
+    subgraph sb2["Binary Sandbox (optional)"]
+        MediatedBinSB["Mediated Binary"]
+    end
+
+    User -->|"nono run"| HostProc
+    HostProc -->|"applies policy"| Seatbelt
+    HostProc -->|"starts"| MedServer
+    HostProc -->|"forks into"| Agent
+    Seatbelt -.->|"enforces"| sb
+
+    Agent -->|"execve original binary"| BlockedBin
+    Agent -->|"execve via PATH"| Shim
+    Agent -->|"execve allowed cmd"| FreeBin
+    Shim -->|"request"| MedServer
+    MedServer -->|"capture / respond"| Broker
+    MedServer -->|"passthrough"| MediatedBinHost
+    MedServer -->|"passthrough"| MediatedBinSB
+    Broker -.->|"nonce lookup"| MedServer
+    MediatedBinHost -->|"output"| MedServer
+    MediatedBinSB -->|"output"| MedServer
+    MedServer -->|"stdout + exit code"| Shim
+    Shim -->|"stdout"| Agent
+
+    style host fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+    style sb fill:#fef3c7,stroke:#f59e0b,color:#78350f
+    style sb2 fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    style User fill:#f0fdf4,stroke:#22c55e,color:#14532d
+    style Seatbelt fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+    style Broker fill:#fce7f3,stroke:#ec4899,color:#831843
+    style MedServer fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
+    style MediatedBinHost fill:#f1f5f9,stroke:#64748b,color:#1e293b
+    style MediatedBinSB fill:#f1f5f9,stroke:#64748b,color:#1e293b
+    style FreeBin fill:#f0fdf4,stroke:#22c55e,color:#14532d
+    style BlockedBin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
+    style Shim fill:#fff7ed,stroke:#ea580c,color:#431407
+    style Agent fill:#fefce8,stroke:#ca8a04,color:#422006
+    style HostProc fill:#dbeafe,stroke:#3b82f6,color:#1e3a5f
+
+    linkStyle 5 stroke:#dc2626,stroke-width:2px,stroke-dasharray:5
+```
+
 ```json
 {
   "mediation": {

@@ -391,9 +391,6 @@ flowchart TD
 }
 ```
 
-> [!NOTE]
-> Per-command `sandbox` restrictions are part of the configuration schema and are being rolled out — documentation will be updated once fully wired up.
-
 ### Audit Trail
 
 Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.

@@ -93,24 +93,290 @@ caps.allow_write("/tmp/workspace")?;
 Sandbox::apply(&caps)?;  // Irreversible -- kernel-enforced from here on
 ```
 
-Also available as [Python](https://github.com/always-further/nono-py) , [TypeScript](https://github.com/always-further/nono-ts), [Go](https://github.com/always-further/nono-go)  bindings.
+#### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" width="18" height="18" alt="Python"/> Python — [nono-py](https://github.com/always-further/nono-py)
 
-## Key Features
+```python
+from nono_py import CapabilitySet, AccessMode, apply
 
-| Feature | Description |
-|---------|-------------|
-| **Kernel sandbox** | Landlock (Linux) + Seatbelt (macOS). Irreversible, inherited by child processes. |
-| **Credential injection** | Proxy mode keeps API keys outside the sandbox entirely. Supports keystore, 1Password, Apple Passwords. |
-| **Attestation** | Sigstore-based signing and verification of instruction files (SKILLS.md, CLAUDE.md, etc.). |
-| **Network filtering** | Allowlist-based host and endpoint filtering via local proxy. Cloud metadata endpoints hard-denied. |
-| **Snapshots** | Content-addressable rollback with SHA-256 dedup and Merkle tree integrity. |
-| **Policy profiles** | Pre-built profiles for popular agents and use cases. Custom profile builder for your own needs. |
-| **Audit logs** | Verifiable logs of all agent actions, with optional remote upload and monitoring. |
-| **Cross-platform** | Support for macOS, Linux, and WSL2. Native Windows support in planning. |
-| **Multiplexing** | Run multiple agents in parallel with separate sandboxes. Attach/detach to long-running agents. |
-| **Runs anywhere** | Local CLI, CI pipelines, Containers / Kubernetes, cloud VMs, microVMs. |
+caps = CapabilitySet()
+caps.allow_path("/data/models", AccessMode.READ)
+caps.allow_path("/tmp/workspace", AccessMode.READ_WRITE)
 
-See the [full documentation](https://docs.nono.sh) for details and configuration.
+apply(caps)  # Apply CapabilitySet
+```
+
+#### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/typescript/typescript-original.svg" width="18" height="18" alt="TypeScript"/> TypeScript — [nono-ts](https://github.com/always-further/nono-ts)
+
+```typescript
+import { CapabilitySet, AccessMode, apply } from "nono-ts";
+
+const caps = new CapabilitySet();
+caps.allowPath("/data/models", AccessMode.Read);
+caps.allowPath("/tmp/workspace", AccessMode.ReadWrite);
+
+apply(caps);  // Irreversible — kernel-enforced from here on
+```
+
+---
+
+## Features
+
+### Kernel-Enforced Sandbox
+
+nono applies OS-level restrictions that cannot be bypassed or escalated from within the sandboxed process. Permissions are defined as capabilities granted before execution -- once the sandbox is applied, it is irreversible. All child processes inherit the same restrictions.
+
+| Platform | Mechanism | Minimum Kernel |
+|----------|-----------|----------------|
+| macOS | Seatbelt | 10.5+ |
+| Linux | Landlock | 5.13+ |
+
+```bash
+# Grant read to src, write to output — everything else is denied by the kernel
+nono run --read ./src --write ./output -- cargo build
+```
+
+### Credential Injection
+
+Two modes: **proxy injection** keeps credentials entirely outside the sandbox — the agent connects to `localhost` and the proxy injects real API keys into upstream requests. **Env injection** loads secrets from the OS keystore, 1Password, or Apple Passwords and injects them as environment variables before the sandbox locks.
+
+```bash
+# Proxy mode — agent never sees the API key, even in its own memory
+nono run --network-profile claude-code --proxy-credential openai -- my-agent
+
+# Env mode — simpler, but secret is in the process environment
+nono run --env-credential openai_api_key --allow-cwd -- my-agent
+
+# 1Password — map URI reference to destination env var
+nono run --env-credential-map 'op://Development/OpenAI/credential' OPENAI_API_KEY --allow-cwd -- my-agent
+
+# Apple Passwords (macOS) — map URI reference to destination env var
+nono run --env-credential-map 'apple-password://github.com/alice@example.com' GITHUB_PASSWORD --allow-cwd -- my-agent
+```
+
+### Agent SKILL Provenance and Supply Chain Security
+
+Instruction files (SKILLS.md, CLAUDE.md, AGENTS.md, AGENT.MD) and associated artifacts such as scripts are a supply chain attack vector. nono cryptographically signs and verifies them using Sigstore attestation with DSSE envelopes and in-toto / SLSA style statements. It supports keyed signing (system keystore) and keyless signing (OIDC via GitHub Actions + Fulcio + Rekor). Upon execution, nono verifies the signature, checks the signing certificate against trusted roots, and validates the statement predicates (e.g. signed within the last 30 days, signed by a trusted maintainer).
+
+<p align="center">
+  <a href="https://github.com/marketplace/actions/nono-attest">
+    <img src="https://img.shields.io/badge/GitHub_Action-nono--attest-2088FF?style=for-the-badge&logo=github-actions&logoColor=white" alt="nono-attest GitHub Action"/>
+  </a>
+</p>
+
+Sign instruction files directly within GitHub Actions workflows. Users can then verify that files originate from the expected repository and branch, signed by a trusted maintainer.
+
+### Network Filtering
+
+Allowlist-based host filtering via a local proxy. The sandbox blocks all direct outbound connections — the agent can only reach explicitly allowed hosts. Cloud metadata endpoints are hardcoded as denied.
+
+```bash
+nono run --allow-proxy api.openai.com --allow-proxy api.anthropic.com -- my-agent
+
+# Keep the claude-code profile, but allow unrestricted network for this session
+nono run --profile claude-code --allow-net -- claude
+```
+
+### Supervisor and Capability Expansion
+
+On Linux, seccomp user notification intercepts syscalls when the agent needs access outside its sandbox. The supervisor prompts the user, then injects the file descriptor directly — the agent never executes its own `open()`. Sensitive paths are never-grantable regardless of approval.
+
+```bash
+nono run --rollback --supervised --profile claude-code --allow-cwd -- claude
+```
+
+### Undo and Snapshots
+
+Content-addressable snapshots of your working directory taken before and during sandboxed execution. SHA-256 deduplication and Merkle tree commitments for integrity verification. Interactively review and restore individual files or the entire directory. Known regenerable directories (`.git`, `target`, `node_modules`, etc.) and directories with more than 10,000 files are auto-excluded from snapshots to prevent hangs on large projects.
+
+```bash
+# Zero-flag usage — auto-excludes large/regenerable directories
+nono run --rollback --allow . -- npm test
+
+# Force-include an auto-excluded directory
+nono run --rollback --rollback-include target -- cargo build
+
+# Exclude a custom directory from rollback
+nono run --rollback --rollback-exclude vendor -- go test ./...
+
+# Disable rollback entirely
+nono run --no-rollback --allow . -- npm test
+
+nono rollback list
+nono rollback restore
+```
+
+### Composable Policy Groups
+
+Security policy defined as named groups in a single JSON file. Profiles reference groups by name — compose fine-grained policies from reusable building blocks.
+
+```json
+{
+  "deny_credentials": {
+    "deny": { "access": ["~/.ssh", "~/.gnupg", "~/.aws", "~/.kube"] }
+  },
+  "node_runtime": {
+    "allow": { "read": ["~/.nvm", "~/.fnm", "~/.npm"] }
+  }
+}
+```
+
+### Destructive Command Blocking
+
+Dangerous commands (`rm`, `dd`, `chmod`, `sudo`, `scp`) are blocked before execution. Override per invocation with `--allow-command` or permanently via `allowed_commands` in a profile. Block additional commands with `add_deny_commands`.
+
+```bash
+$ nono run --allow-cwd -- rm -rf /
+nono: blocked command: rm
+
+# Override per invocation
+nono run --allow-cwd --allow-command rm -- rm ./temp-file.txt
+
+# Override via profile
+# { "security": { "allowed_commands": ["rm"] } }
+nono run --profile my-profile -- rm /tmp/old-file.txt
+
+# Block specific commands in a profile (add_deny_commands) — pairs with add_deny_access for sockets
+# { "policy": { "add_deny_access": ["/var/run/docker.sock"], "add_deny_commands": ["docker", "kubectl"] } }
+nono run --profile no-docker -- claude
+```
+
+> [!WARNING]
+> Command blocking is defense-in-depth layered on top of the kernel sandbox. Commands can bypass this via `sh -c '...'` or wrapper scripts — the sandbox filesystem restrictions are the real security boundary.
+
+### Themes
+
+nono ships with multiple color themes inspired by popular terminal palettes. The default is **Catppuccin Mocha**.
+
+| Theme | Description |
+|-------|-------------|
+| `mocha` | Catppuccin Mocha -- warm dark (default) |
+| `latte` | Catppuccin Latte -- clean light |
+| `frappe` | Catppuccin Frappe -- muted dark |
+| `macchiato` | Catppuccin Macchiato -- deep vivid dark |
+| `tokyo-night` | Tokyo Night -- cool blues and purples |
+| `minimal` | Grayscale with orange accent |
+
+```bash
+# Per invocation
+nono --theme tokyo-night run --allow-cwd -- my-agent
+
+# Via environment variable
+export NONO_THEME=latte
+
+# Via config file (~/.config/nono/config.toml)
+# [ui]
+# theme = "frappe"
+```
+
+### Command Mediation
+
+Intercept specific CLI commands inside the sandbox and apply policy before they execute. A minimal shim binary (`nono-shim`) is placed in the sandbox's `PATH` for each mediated command. When the agent invokes the command, the shim forwards the call over a Unix socket to the unsandboxed parent process, which applies policy and responds — the sandboxed process never touches the real binary or its credentials.
+
+**Intercept actions:**
+
+- **`respond`** — return a static response immediately, without running the real binary.
+- **`capture`** — return a nonce (phantom token) to the sandbox; the real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret.
+
+**Env var blocking:** named environment variables are stripped from the child process at session start, preventing the sandbox from reading raw credentials.
+
+**Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
+
+```json
+{
+  "mediation": {
+    "commands": {
+      "gh": {
+        "env": {
+          "block": ["GH_TOKEN", "GITHUB_TOKEN"]
+        },
+        "rules": [
+          {
+            "args": ["auth", "token"],
+            "action": "capture",
+            "capture_key": "gh_token"
+          },
+          {
+            "args": ["auth", "status"],
+            "action": "respond",
+            "response": "github.com\n  ✓ Logged in to github.com\n  ✓ Git operations for github.com configured"
+          }
+        ],
+        "sandbox": {
+          "fs_read": ["/usr/local/share/gh", "~/.config/gh"],
+          "fs_write": [],
+          "network": {
+            "block": []
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+> [!NOTE]
+> Per-command `sandbox` restrictions are part of the configuration schema and are being rolled out — documentation will be updated once fully wired up.
+
+### Audit Trail
+
+Every supervised session automatically records command, timing, exit code, network events, and cryptographic snapshot commitments as structured JSON. Opt out with `--no-audit`.
+
+```bash
+nono audit list
+nono audit show 20260216-193311-20751 --json
+```
+
+## Quick Start
+
+### Homebrew (macOS/Linux)
+
+```bash
+brew install nono
+```
+
+### Other Linux Install Options
+
+See the [Installation Guide](https://docs.nono.sh/cli/getting_started/installation) for prebuilt binaries and package manager instructions.
+
+### From Source
+
+See the [Development Guide](https://docs.nono.sh/cli/development/index) for building from source.
+
+## Supported Clients
+
+nono ships with built-in profiles for popular AI coding agents. Each profile defines audited, minimal permissions.
+
+| Client | Profile | Docs |
+|--------|---------|------|
+| **Claude Code** | `claude-code` | [Guide](https://docs.nono.sh/cli/clients/claude-code) |
+| **Codex** | `codex` | [Guide](https://docs.nono.sh/cli/clients/codex) |
+| **OpenCode** | `opencode` | [Guide](https://docs.nono.sh/cli/clients/opencode) |
+| **OpenClaw** | `openclaw` | [Guide](https://docs.nono.sh/cli/clients/openclaw) |
+| **Swival** | `swival` | [Guide](https://docs.nono.sh/cli/clients/swival) |
+
+Custom profiles can [extend built-in ones](https://docs.nono.sh/cli/features/profiles-groups) with `"extends": "claude-code"` (or multiple: `"extends": ["claude-code", "node-dev"]`) to inherit all settings and add overrides. nono is agent-agnostic and works with any CLI command. See the [full documentation](https://docs.nono.sh) for usage details, configuration, and integration guides.
+
+## Projects using nono
+
+| Project | Repository |
+|---------|------------|
+| **claw-wrap** | [GitHub](https://github.com/dedene/claw-wrap) |
+
+## Architecture
+
+nono is structured as a Cargo workspace:
+
+- **nono** (`crates/nono/`) -- Core library. A policy-free sandbox primitive that applies only what clients explicitly request.
+- **nono-cli** (`crates/nono-cli/`) -- CLI binary. Owns all security policy, profiles, hooks, and UX.
+- **nono-shim** (`crates/nono-shim/`) -- Minimal shim binary used by command mediation. Placed in the sandbox PATH for each mediated command; forwards invocations to the parent mediation server over a Unix socket.
+- **nono-ffi** (`bindings/c/`) -- C FFI bindings with auto-generated header.
+
+Language-specific bindings are maintained separately:
+
+| Language | Repository | Package |
+|----------|------------|---------|
+| Python | [nono-py](https://github.com/always-further/nono-py) | PyPI |
+| TypeScript | [nono-ts](https://github.com/always-further/nono-ts) | npm |
 
 ## Contributing
 

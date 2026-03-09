@@ -1548,7 +1548,9 @@ mod tests {
 
     #[test]
     fn test_expand_vars() {
-        // Save original HOME to restore after test (avoid polluting other parallel tests)
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .expect("env_test_mutex poisoned");
         let original_home = env::var("HOME").ok();
 
         let workdir = PathBuf::from("/projects/myapp");
@@ -1560,33 +1562,39 @@ mod tests {
         let expanded = expand_vars("$HOME/.config", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.config"));
 
-        // Restore original HOME
         if let Some(home) = original_home {
             env::set_var("HOME", home);
+        } else {
+            env::remove_var("HOME");
         }
     }
 
     #[test]
     fn test_resolve_user_config_dir_uses_valid_absolute_xdg() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .expect("env_test_mutex poisoned");
         let tmp = tempdir().expect("tmpdir");
         env::set_var("XDG_CONFIG_HOME", tmp.path());
         let resolved = resolve_user_config_dir().expect("resolve user config dir");
+        env::remove_var("XDG_CONFIG_HOME");
         assert_eq!(
             resolved,
             tmp.path().canonicalize().expect("canonicalize tmp")
         );
-        env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]
     fn test_resolve_user_config_dir_falls_back_on_relative_xdg() {
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .expect("env_test_mutex poisoned");
         let expected_home = home_dir().expect("home dir");
         env::set_var("XDG_CONFIG_HOME", "relative/path");
 
         let resolved = resolve_user_config_dir().expect("resolve with fallback");
-        assert_eq!(resolved, expected_home.join(".config"));
-
         env::remove_var("XDG_CONFIG_HOME");
+        assert_eq!(resolved, expected_home.join(".config"));
     }
 
     #[test]

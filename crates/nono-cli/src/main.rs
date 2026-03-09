@@ -5,12 +5,12 @@
 mod audit_commands;
 mod capability_ext;
 mod cli;
-mod mediation;
 mod config;
 mod exec_strategy;
 mod hooks;
 mod instruction_deny;
 mod learn;
+mod mediation;
 mod network_policy;
 mod output;
 mod policy;
@@ -32,6 +32,16 @@ mod trust_intercept;
 mod trust_keystore;
 mod trust_scan;
 mod update_check;
+
+/// Process-wide mutex for tests that must temporarily modify environment variables
+/// such as HOME or XDG_CONFIG_HOME. Rust runs unit tests in parallel within the
+/// same process; an unrestored env var causes flaky failures in unrelated tests.
+/// All tests that call `std::env::set_var` on HOME or similar vars must hold this lock.
+#[cfg(test)]
+pub(crate) fn env_test_mutex() -> &'static std::sync::Mutex<()> {
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 use capability_ext::CapabilitySetExt;
 use clap::Parser;
@@ -1567,17 +1577,23 @@ fn execute_sandboxed(
         match mediation::session::setup(&flags.mediation) {
             Ok(Some(session)) => {
                 // Add shim dir as readable (shims are symlinks, need read+exec)
-                if let Ok(cap) = nono::FsCapability::new_dir(&session.shim_dir, nono::AccessMode::Read) {
+                if let Ok(cap) =
+                    nono::FsCapability::new_dir(&session.shim_dir, nono::AccessMode::Read)
+                {
                     caps.add_fs(cap);
                 }
                 // Allow read+exec of the nono-shim binary itself (symlink target).
                 // Without this, the sandbox cannot stat/access nono-shim through the symlink,
                 // so bash's PATH lookup skips the shim and falls back to the real binary.
-                if let Ok(cap) = nono::FsCapability::new_file(&session.shim_binary, nono::AccessMode::Read) {
+                if let Ok(cap) =
+                    nono::FsCapability::new_file(&session.shim_binary, nono::AccessMode::Read)
+                {
                     caps.add_fs(cap);
                 }
                 // Also allow read of the session dir (for socket path metadata)
-                if let Ok(cap) = nono::FsCapability::new_dir(&session.session_dir, nono::AccessMode::Read) {
+                if let Ok(cap) =
+                    nono::FsCapability::new_dir(&session.session_dir, nono::AccessMode::Read)
+                {
                     caps.add_fs(cap);
                 }
                 // Seatbelt: deny exec of the real binaries (force shim usage).
@@ -1593,7 +1609,10 @@ fn execute_sandboxed(
                             path_str.replace('\\', "\\\\").replace('"', "\\\"")
                         );
                         if let Err(e) = caps.add_platform_rule(&rule) {
-                            warn!("mediation: failed to add seatbelt deny rule for {}: {}", path_str, e);
+                            warn!(
+                                "mediation: failed to add seatbelt deny rule for {}: {}",
+                                path_str, e
+                            );
                         }
                     }
                 }
@@ -1606,7 +1625,10 @@ fn execute_sandboxed(
                             shim_dir_str.replace('\\', "\\\\").replace('"', "\\\"")
                         );
                         if let Err(e) = caps.add_platform_rule(&rule) {
-                            warn!("mediation: failed to add seatbelt allow rule for shim dir: {}", e);
+                            warn!(
+                                "mediation: failed to add seatbelt allow rule for shim dir: {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -1635,11 +1657,15 @@ fn execute_sandboxed(
         env_vars.push((k.as_str(), v.as_str()));
     }
 
-    // Add mediation env vars: socket path and PATH override.
+    // Add mediation env vars: socket path, session token, and PATH override.
     // These strings are kept alive until `env_vars` is consumed by exec.
     let mediation_socket_path_str: String = mediation_session
         .as_ref()
         .map(|s| s.socket_path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mediation_session_token_str: String = mediation_session
+        .as_ref()
+        .map(|s| s.session_token.as_str().to_owned())
         .unwrap_or_default();
     // Prepend shim dir to PATH so shim symlinks shadow real binaries.
     let mediation_path_str: String = mediation_session
@@ -1656,6 +1682,7 @@ fn execute_sandboxed(
         .unwrap_or_default();
     if mediation_session.is_some() {
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_path_str));
+        env_vars.push(("NONO_SESSION_TOKEN", &mediation_session_token_str));
         env_vars.push(("PATH", &mediation_path_str));
     }
 
@@ -1669,15 +1696,20 @@ fn execute_sandboxed(
     // fork over because: (1) the synchronous call completed, (2) idle XPC workers
     // behave like idle tokio workers (parked on kqueue), (3) the child applies
     // sandbox then immediately calls execve which replaces the address space.
-    let threading = if !loaded_secrets.is_empty() && !flags.proxy_active && mediation_session.is_none() {
-        exec_strategy::ThreadingContext::KeyringExpected
-    } else if flags.trust_interception_active || flags.proxy_active || !loaded_secrets.is_empty() || mediation_session.is_some() {
-        // Proxy and mediation server use tokio threads parked on epoll/kqueue —
-        // safe for fork+exec because the child immediately calls execve.
-        exec_strategy::ThreadingContext::CryptoExpected
-    } else {
-        exec_strategy::ThreadingContext::Strict
-    };
+    let threading =
+        if !loaded_secrets.is_empty() && !flags.proxy_active && mediation_session.is_none() {
+            exec_strategy::ThreadingContext::KeyringExpected
+        } else if flags.trust_interception_active
+            || flags.proxy_active
+            || !loaded_secrets.is_empty()
+            || mediation_session.is_some()
+        {
+            // Proxy and mediation server use tokio threads parked on epoll/kqueue —
+            // safe for fork+exec because the child immediately calls execve.
+            exec_strategy::ThreadingContext::CryptoExpected
+        } else {
+            exec_strategy::ThreadingContext::Strict
+        };
 
     info!(
         "Executing with strategy: {:?}, threading: {:?}",

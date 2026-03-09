@@ -2003,7 +2003,9 @@ mod tests {
 
     #[test]
     fn test_expand_home() {
-        // Save original HOME to restore after test (avoid polluting other parallel tests)
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .expect("env_test_mutex poisoned");
         let original_home = std::env::var("HOME").ok();
 
         std::env::set_var("HOME", "/home/test");
@@ -2017,9 +2019,10 @@ mod tests {
             "/absolute/path"
         );
 
-        // Restore original HOME
         if let Some(home) = original_home {
             std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
         }
     }
 

@@ -518,6 +518,12 @@ mod tests {
     /// `resolve_user_config_dir()` returning `~/.config`. This test catches that.
     #[test]
     fn test_setup_profiles_loadable_by_name() {
+        // Hold the process-wide env lock for the duration of the HOME/XDG modification
+        // to prevent races with other tests that also modify HOME.
+        let _env_guard = crate::env_test_mutex()
+            .lock()
+            .expect("env_test_mutex poisoned");
+
         let original_home = env::var("HOME").ok();
         let original_xdg = env::var("XDG_CONFIG_HOME").ok();
 

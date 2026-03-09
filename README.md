@@ -285,6 +285,8 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 
 **Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
 
+**Socket security:** the mediation socket is protected by two layers. The session directory is created `0700` and the socket itself `0600`, so other local users cannot connect. Within the same user, a 256-bit random session token is injected into the sandboxed child as `NONO_SESSION_TOKEN`; every shim request must include it. Requests exceeding 1 MiB are dropped before allocation; requests with a missing or incorrect token are dropped after reading.
+
 ```mermaid
 %%{init: {'flowchart': {'curve': 'basis'}}}%%
 flowchart TD

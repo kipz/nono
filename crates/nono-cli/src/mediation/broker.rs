@@ -63,7 +63,12 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("ghp_secret".to_string()));
         assert!(nonce.starts_with("nono_"), "nonce was: {}", nonce);
-        assert_eq!(nonce.len(), 5 + 64, "expected 'nono_' + 64 hex chars, got: {}", nonce);
+        assert_eq!(
+            nonce.len(),
+            5 + 64,
+            "expected 'nono_' + 64 hex chars, got: {}",
+            nonce
+        );
     }
 
     #[test]

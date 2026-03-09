@@ -289,7 +289,7 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 **Intercept actions:**
 
 - **`respond`** — return a static response immediately, without running the real binary.
-- **`capture`** — return a nonce (phantom token) to the sandbox; the real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret.
+- **`capture`** — return a nonce (phantom token) to the sandbox; the real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret. By default runs the real binary to obtain the value; set `script` to run a shell script via `sh -c` instead.
 
 **Env var blocking:** named environment variables are stripped from the child process at session start, preventing the sandbox from reading raw credentials.
 

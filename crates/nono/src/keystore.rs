@@ -2152,7 +2152,6 @@ mod tests {
     }
 
     // =========================================================================
-<<<<<<< HEAD
     // file:// URI tests
     // =========================================================================
 
@@ -2337,7 +2336,7 @@ mod tests {
     fn test_load_secret_by_ref_literal_basic() {
         let result = load_secret_by_ref("nono", "literal:hello");
         assert!(result.is_ok(), "should succeed: {:?}", result.err());
-        assert_eq!(*result.unwrap(), "hello");
+        assert_eq!(*result.expect("literal:hello should succeed"), "hello");
     }
 
     #[test]
@@ -2345,14 +2344,17 @@ mod tests {
         // literal: with empty suffix returns empty string
         let result = load_secret_by_ref("nono", "literal:");
         assert!(result.is_ok());
-        assert_eq!(*result.unwrap(), "");
+        assert_eq!(*result.expect("literal: should succeed"), "");
     }
 
     #[test]
     fn test_load_secret_by_ref_literal_with_spaces_and_special_chars() {
         let result = load_secret_by_ref("nono", "literal:hello world/foo=bar");
         assert!(result.is_ok());
-        assert_eq!(*result.unwrap(), "hello world/foo=bar");
+        assert_eq!(
+            *result.expect("literal with spaces should succeed"),
+            "hello world/foo=bar"
+        );
     }
 
     #[test]
@@ -2361,6 +2363,9 @@ mod tests {
         // value looks like a keyring account name.
         let result = load_secret_by_ref("nono", "literal:some-account-name");
         assert!(result.is_ok(), "should not attempt keyring lookup");
-        assert_eq!(*result.unwrap(), "some-account-name");
+        assert_eq!(
+            *result.expect("literal account name should succeed"),
+            "some-account-name"
+        );
     }
 }

@@ -367,7 +367,6 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     Err(NonoError::CommandExecution(err))
 }
 
-
 /// Execute a command using the Supervised strategy (fork first, sandbox only child).
 ///
 /// Forks first and applies the sandbox only in the child. The parent remains
@@ -461,19 +460,14 @@ pub fn execute_supervised(
     let mut browser_shim: Option<BrowserShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
-    let extra_blocked_supervised: Vec<&str> =
-        ["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"]
-            .iter()
-            .copied()
-            .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
-            .collect();
+    let extra_blocked_supervised: Vec<&str> = ["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"]
+        .iter()
+        .copied()
+        .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+        .collect();
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = should_skip_env_var(
-                k,
-                &config.env_vars,
-                &extra_blocked_supervised,
-            );
+            let should_skip = should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised);
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                     env_c.push(cstr);

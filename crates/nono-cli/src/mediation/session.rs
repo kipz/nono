@@ -7,12 +7,14 @@
 //! 4. Returns a `SessionHandle` that keeps the server alive and exposes the
 //!    paths/env needed by the rest of the startup sequence.
 
-use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
 use super::broker::TokenBroker;
+use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
 use nono::{NonoError, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
+use zeroize::Zeroizing;
 
 /// The action stored in a resolved intercept rule.
 #[derive(Clone, Debug)]
@@ -54,6 +56,9 @@ pub struct SessionHandle {
     pub blocked_binaries: Vec<PathBuf>,
     /// Env vars to strip from the child environment (from `mediation.env.block`).
     pub env_block: Vec<String>,
+    /// 256-bit random session authentication token (hex). Injected into the child
+    /// as `NONO_SESSION_TOKEN`; shims must include it in every request.
+    pub session_token: Zeroizing<String>,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
@@ -62,7 +67,10 @@ impl Drop for SessionHandle {
     fn drop(&mut self) {
         // Clean up the session directory on parent exit.
         let _ = std::fs::remove_dir_all(&self.session_dir);
-        debug!("Mediation session directory removed: {}", self.session_dir.display());
+        debug!(
+            "Mediation session directory removed: {}",
+            self.session_dir.display()
+        );
     }
 }
 
@@ -93,6 +101,17 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         ))
     })?;
 
+    // Restrict session directory to owner-only so other local users cannot reach the socket.
+    std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+        |e| {
+            NonoError::SandboxInit(format!(
+                "mediation: failed to set session dir permissions {}: {}",
+                session_dir.display(),
+                e
+            ))
+        },
+    )?;
+
     // -------------------------------------------------------------------------
     // Resolve commands
     // -------------------------------------------------------------------------
@@ -104,6 +123,16 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
     }
+
+    // -------------------------------------------------------------------------
+    // Generate session authentication token
+    // -------------------------------------------------------------------------
+    let session_token = {
+        use rand::RngExt;
+        let bytes: [u8; 32] = rand::rng().random();
+        let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        Zeroizing::new(hex)
+    };
 
     // -------------------------------------------------------------------------
     // Create token broker (session-scoped)
@@ -125,8 +154,9 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
+    let token_arc: Arc<str> = Arc::from(session_token.as_str());
     runtime.spawn(async move {
-        if let Err(e) = super::server::run(sock, cmds, broker_clone).await {
+        if let Err(e) = super::server::run(sock, cmds, broker_clone, token_arc).await {
             tracing::error!("mediation server error: {}", e);
         }
     });
@@ -144,6 +174,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         session_dir,
         blocked_binaries,
         env_block: config.env.block.clone(),
+        session_token,
         _runtime: runtime,
     }))
 }
@@ -271,13 +302,15 @@ mod tests {
     #[test]
     fn test_setup_returns_none_when_inactive() {
         let config = MediationConfig::default();
-        let result = setup(&config).unwrap();
+        let result = setup(&config).expect("setup should not fail for inactive config");
         assert!(result.is_none());
     }
 
     #[test]
     fn test_session_dir_path_has_pid() {
         let path = session_dir_path();
-        assert!(path.to_string_lossy().contains(&std::process::id().to_string()));
+        assert!(path
+            .to_string_lossy()
+            .contains(&std::process::id().to_string()));
     }
 }

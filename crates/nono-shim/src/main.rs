@@ -24,6 +24,7 @@ struct ShimRequest {
     command: String,
     args: Vec<String>,
     stdin: String,
+    session_token: String,
     env: HashMap<String, String>,
 }
 
@@ -44,6 +45,14 @@ fn run() -> i32 {
         Ok(p) => p,
         Err(_) => {
             eprintln!("nono-shim: NONO_MEDIATION_SOCKET not set");
+            return 127;
+        }
+    };
+
+    let session_token = match std::env::var("NONO_SESSION_TOKEN") {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("nono-shim: NONO_SESSION_TOKEN not set");
             return 127;
         }
     };
@@ -79,6 +88,7 @@ fn run() -> i32 {
         command: command_name,
         args,
         stdin,
+        session_token,
         env,
     };
 
@@ -100,9 +110,7 @@ fn run() -> i32 {
 
     // Send length-prefixed request
     let len = request_bytes.len() as u32;
-    if stream.write_all(&len.to_be_bytes()).is_err()
-        || stream.write_all(&request_bytes).is_err()
-    {
+    if stream.write_all(&len.to_be_bytes()).is_err() || stream.write_all(&request_bytes).is_err() {
         eprintln!("nono-shim: failed to send request");
         return 127;
     }

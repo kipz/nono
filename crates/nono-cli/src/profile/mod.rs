@@ -1803,6 +1803,7 @@ mod tests {
             tmp.path().to_str().expect("tmp path"),
         )]);
         let resolved = resolve_user_config_dir().expect("resolve user config dir");
+        env::remove_var("XDG_CONFIG_HOME");
         assert_eq!(
             resolved,
             tmp.path().canonicalize().expect("canonicalize tmp")

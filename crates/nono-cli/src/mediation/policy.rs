@@ -24,6 +24,11 @@ pub struct ShimRequest {
     pub command: String,
     pub args: Vec<String>,
     pub stdin: String,
+    /// Session authentication token. Must match the token injected via
+    /// `NONO_SESSION_TOKEN`. Requests with a missing or wrong token are
+    /// silently rejected. Old shims missing this field fail deserialization
+    /// and receive a 127 error — the correct security behaviour.
+    pub session_token: String,
     /// Environment variables from the sandbox at invocation time.
     /// Used only for nonce promotion — all non-nonce vars are discarded.
     #[serde(default)]
@@ -65,7 +70,10 @@ pub async fn apply(
         warn!("mediation: unknown command '{}'", request.command);
         return ShimResponse {
             stdout: String::new(),
-            stderr: format!("nono-mediation: command '{}' not configured\n", request.command),
+            stderr: format!(
+                "nono-mediation: command '{}' not configured\n",
+                request.command
+            ),
             exit_code: 127,
         };
     };
@@ -89,7 +97,15 @@ pub async fn apply(
                         None => {
                             // No per-command sandbox during capture — the real binary needs
                             // full access to system resources (e.g. Keychain) to fetch the credential.
-                            exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker, None).await
+                            exec_passthrough(
+                                cmd,
+                                &request.args,
+                                &request.stdin,
+                                &request.env,
+                                &broker,
+                                None,
+                            )
+                            .await
                         }
                     };
                     if result.exit_code != 0 {
@@ -113,7 +129,15 @@ pub async fn apply(
         request.args,
         cmd.real_path.display()
     );
-    exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker, cmd.sandbox.clone()).await
+    exec_passthrough(
+        cmd,
+        &request.args,
+        &request.stdin,
+        &request.env,
+        &broker,
+        cmd.sandbox.clone(),
+    )
+    .await
 }
 
 /// Check if the invocation's positional args start with the given prefix.
@@ -157,7 +181,9 @@ async fn exec_script(
             .spawn()
             .map_err(NonoError::CommandExecution)?;
 
-        let output = child.wait_with_output().map_err(NonoError::CommandExecution)?;
+        let output = child
+            .wait_with_output()
+            .map_err(NonoError::CommandExecution)?;
         Ok(ShimResponse {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -299,7 +325,9 @@ async fn exec_passthrough(
             }
         }
 
-        let output = child.wait_with_output().map_err(NonoError::CommandExecution)?;
+        let output = child
+            .wait_with_output()
+            .map_err(NonoError::CommandExecution)?;
 
         Ok(ShimResponse {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -394,6 +422,7 @@ mod tests {
             command: "doesnotexist".to_string(),
             args: vec![],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         let resp = apply(req, &[], make_broker()).await;
@@ -403,7 +432,11 @@ mod tests {
     #[tokio::test]
     async fn test_intercept_respond_exact_prefix_match() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+            args_prefix: vec![
+                "auth".to_string(),
+                "github".to_string(),
+                "token".to_string(),
+            ],
             action: ResolvedAction::Respond {
                 stdout: "static_output\n".to_string(),
             },
@@ -412,8 +445,13 @@ mod tests {
 
         let req = ShimRequest {
             command: "testcmd".to_string(),
-            args: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+            args: vec![
+                "auth".to_string(),
+                "github".to_string(),
+                "token".to_string(),
+            ],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         let resp = apply(req, &[cmd], make_broker()).await;
@@ -435,6 +473,7 @@ mod tests {
             command: "testcmd".to_string(),
             args: vec!["auth".to_string(), "github".to_string()],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         let resp = apply(req, &[cmd], make_broker()).await;
@@ -456,6 +495,7 @@ mod tests {
             command: "testcmd".to_string(),
             args: vec!["status".to_string()],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         // Falls through to passthrough exec of /usr/bin/true
@@ -476,17 +516,18 @@ mod tests {
             &["a".to_string(), "b".to_string()],
             &["a".to_string()]
         ));
-        assert!(!subcommand_matches(
-            &["a".to_string()],
-            &["b".to_string()]
-        ));
+        assert!(!subcommand_matches(&["a".to_string()], &["b".to_string()]));
     }
 
     #[test]
     fn test_subcommand_matches_ignores_leading_flags() {
         // --debug before positional args should not break matching
         assert!(subcommand_matches(
-            &["auth".to_string(), "github".to_string(), "token".to_string()],
+            &[
+                "auth".to_string(),
+                "github".to_string(),
+                "token".to_string()
+            ],
             &[
                 "--debug".to_string(),
                 "auth".to_string(),
@@ -535,12 +576,17 @@ mod tests {
             // args passed to echo: "auth" "hello" → output "auth hello"
             args: vec!["auth".to_string(), "hello".to_string()],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         let broker = make_broker();
         let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
         assert_eq!(resp.exit_code, 0);
-        assert!(resp.stdout.trim().starts_with("nono_"), "stdout was: {}", resp.stdout);
+        assert!(
+            resp.stdout.trim().starts_with("nono_"),
+            "stdout was: {}",
+            resp.stdout
+        );
         // The nonce resolves to the trimmed stdout of `echo auth hello`
         let nonce = resp.stdout.trim();
         let resolved = broker.resolve(nonce).expect("nonce should be in broker");
@@ -561,6 +607,7 @@ mod tests {
             command: "testcmd".to_string(),
             args: vec!["auth".to_string()],
             stdin: String::new(),
+            session_token: String::new(),
             env: HashMap::new(),
         };
         let broker = make_broker();
@@ -586,7 +633,10 @@ mod tests {
         // We can only check that the non-nonce values weren't injected from sandbox.
         // (Parent env values may be present; we just check sandbox-specific ones.)
         assert_ne!(env.get("SOME_VAR").map(|s| s.as_str()), Some("not_a_nonce"));
-        assert_ne!(env.get("ANOTHER").map(|s| s.as_str()), Some("regular_value"));
+        assert_ne!(
+            env.get("ANOTHER").map(|s| s.as_str()),
+            Some("regular_value")
+        );
     }
 
     #[test]
@@ -598,7 +648,10 @@ mod tests {
         sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
 
         let env = build_exec_env(&sandbox_env, &broker);
-        assert_eq!(env.get("GH_TOKEN").map(|s| s.as_str()), Some("real_credential"));
+        assert_eq!(
+            env.get("GH_TOKEN").map(|s| s.as_str()),
+            Some("real_credential")
+        );
     }
 
     #[test]
@@ -614,7 +667,10 @@ mod tests {
         // PATH from sandbox must not be the injected value (parent PATH is used instead)
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil/path"));
         // LD_PRELOAD should not have been injected
-        assert_ne!(env.get("LD_PRELOAD").map(|s| s.as_str()), Some("/evil/path"));
+        assert_ne!(
+            env.get("LD_PRELOAD").map(|s| s.as_str()),
+            Some("/evil/path")
+        );
     }
 
     #[test]

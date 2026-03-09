@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-# Simulates: ddtool auth github token
-# In production this would be the real ddtool binary calling out to the auth service.
-# The real token must never appear inside the sandbox — that's the whole point of Capture.
-echo "ghp_SUPERSECRET_DEMO_TOKEN_abcdef123456"

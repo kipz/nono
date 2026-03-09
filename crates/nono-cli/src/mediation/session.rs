@@ -37,8 +37,6 @@ pub struct ResolvedCommand {
     pub real_path: PathBuf,
     pub intercepts: Vec<ResolvedIntercept>,
     /// Optional sandbox profile to apply when exec-ing the real binary.
-    // Not yet wired up to sandbox application.
-    #[allow(dead_code)]
     pub sandbox: Option<CommandSandbox>,
 }
 
@@ -156,12 +154,23 @@ fn resolve_command(
     shim_dir: &Path,
     shim_binary: &Path,
 ) -> Result<ResolvedCommand> {
-    let real_path = which::which(&entry.name).map_err(|e| {
-        NonoError::SandboxInit(format!(
-            "mediation: command '{}' not found on PATH: {}",
-            entry.name, e
-        ))
-    })?;
+    let real_path = if let Some(ref bp) = entry.binary_path {
+        let p = PathBuf::from(bp);
+        if !p.is_file() {
+            return Err(NonoError::SandboxInit(format!(
+                "mediation: binary_path for '{}' does not exist or is not a file: {}",
+                entry.name, bp
+            )));
+        }
+        p
+    } else {
+        which::which(&entry.name).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "mediation: command '{}' not found on PATH: {}",
+                entry.name, e
+            ))
+        })?
+    };
     debug!(
         "Mediation: resolved '{}' -> {}",
         entry.name,

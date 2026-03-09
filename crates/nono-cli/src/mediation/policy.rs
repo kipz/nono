@@ -87,7 +87,9 @@ pub async fn apply(
                     let result = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
                         None => {
-                            exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker).await
+                            // No per-command sandbox during capture — the real binary needs
+                            // full access to system resources (e.g. Keychain) to fetch the credential.
+                            exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker, None).await
                         }
                     };
                     if result.exit_code != 0 {
@@ -111,7 +113,7 @@ pub async fn apply(
         request.args,
         cmd.real_path.display()
     );
-    exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker).await
+    exec_passthrough(cmd, &request.args, &request.stdin, &request.env, &broker, cmd.sandbox.clone()).await
 }
 
 /// Check if the invocation's positional args start with the given prefix.
@@ -193,6 +195,7 @@ async fn exec_passthrough(
     stdin_data: &str,
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    sandbox: Option<super::CommandSandbox>,
 ) -> ShimResponse {
     let env = build_exec_env(sandbox_env, broker);
 
@@ -213,20 +216,82 @@ async fn exec_passthrough(
 
     let real_path = cmd.real_path.clone();
     let stdin_data = stdin_data.to_string();
+    let maybe_sandbox = sandbox;
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
         use std::io::Write;
+        use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
-        let mut child = Command::new(&real_path)
+        let mut cmd_builder = Command::new(&real_path);
+        cmd_builder
             .args(&args)
             .env_clear()
             .envs(&env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(NonoError::CommandExecution)?;
+            .stderr(Stdio::piped());
+
+        if let Some(sb) = maybe_sandbox {
+            let mut caps = nono::CapabilitySet::new();
+
+            // Apply platform system read paths so the binary can actually exec.
+            // Mirrors the system_read_macos / system_read_linux groups applied to the main sandbox.
+            if let Ok(policy) = crate::policy::load_embedded_policy() {
+                let platform_group = if cfg!(target_os = "macos") {
+                    "system_read_macos"
+                } else {
+                    "system_read_linux"
+                };
+                let _ = crate::policy::resolve_groups(
+                    &policy,
+                    &[platform_group.to_string()],
+                    &mut caps,
+                );
+            }
+
+            // Also allow the binary's own directory, in case it lives outside the standard
+            // system paths (e.g. ~/dd/devtools/bin/gh). Use the ORIGINAL (pre-canonicalize)
+            // parent so FsCapability emits Seatbelt rules for both the symlink path and the
+            // resolved canonical path — Seatbelt checks paths as-accessed (pre-resolution).
+            if let Some(parent) = real_path.parent() {
+                if parent.exists() {
+                    caps = caps.allow_path(parent, nono::AccessMode::Read)?;
+                }
+            }
+
+            // Add command-specific configured paths (~ is expanded to $HOME).
+            for path in &sb.fs_read {
+                let expanded = expand_home(path);
+                let p = std::path::Path::new(&expanded);
+                if p.is_file() {
+                    caps = caps.allow_file(&expanded, nono::AccessMode::Read)?;
+                } else if p.is_dir() {
+                    caps = caps.allow_path(&expanded, nono::AccessMode::Read)?;
+                }
+            }
+            for path in &sb.fs_write {
+                let expanded = expand_home(path);
+                let p = std::path::Path::new(&expanded);
+                if p.is_file() {
+                    caps = caps.allow_file(&expanded, nono::AccessMode::Write)?;
+                } else if p.is_dir() {
+                    caps = caps.allow_path(&expanded, nono::AccessMode::Write)?;
+                }
+            }
+            if sb.network.block {
+                caps = caps.block_network();
+            }
+            unsafe {
+                cmd_builder.pre_exec(move || {
+                    nono::Sandbox::apply(&caps).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
+                    })
+                });
+            }
+        }
+
+        let mut child = cmd_builder.spawn().map_err(NonoError::CommandExecution)?;
 
         if !stdin_data.is_empty() {
             if let Some(mut si) = child.stdin.take() {
@@ -257,6 +322,19 @@ async fn exec_passthrough(
             exit_code: 1,
         },
     }
+}
+
+/// Expand a leading `~` to the current user's home directory.
+fn expand_home(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    path.to_string()
 }
 
 /// Build the environment map for an exec'd child.

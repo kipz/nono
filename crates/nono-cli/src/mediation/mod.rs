@@ -43,6 +43,10 @@ impl MediationConfig {
 pub struct CommandEntry {
     /// The command name to mediate (resolved via `which` at session start).
     pub name: String,
+    /// Optional absolute path to the real binary, overriding `which` resolution.
+    /// Useful when the system `which` resolves to a wrapper that should not be exec'd.
+    #[serde(default)]
+    pub binary_path: Option<String>,
     /// Arg-prefix intercept rules. Checked in order; first match wins.
     #[serde(default)]
     pub intercept: Vec<InterceptRule>,
@@ -89,9 +93,7 @@ pub enum InterceptAction {
 /// Sandbox profile applied when exec-ing the real binary for a passthrough command.
 ///
 /// Default (when absent): no sandbox applied — existing behavior.
-/// Operators opt in per command.
-// Fields are parsed from config but application is not yet wired up.
-#[allow(dead_code)]
+/// Operators opt in per command. Applied via `pre_exec` in `exec_passthrough`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CommandSandbox {
     /// Network policy for the exec'd command. Default: allow all (no restriction).
@@ -106,7 +108,6 @@ pub struct CommandSandbox {
 }
 
 /// Simple network config for per-command sandbox profiles.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct NetworkConfig {
     /// If true, block all outbound network. Default: false (allow all).

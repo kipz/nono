@@ -223,7 +223,7 @@ async fn exec_passthrough(
     broker: &Arc<TokenBroker>,
     sandbox: Option<super::CommandSandbox>,
 ) -> ShimResponse {
-    let env = build_exec_env(sandbox_env, broker);
+    let mut env = build_exec_env(sandbox_env, broker);
 
     // Promote nonce values in args
     let args: Vec<String> = args
@@ -242,6 +242,36 @@ async fn exec_passthrough(
 
     let real_path = cmd.real_path.clone();
     let stdin_data = stdin_data.to_string();
+
+    // Start a per-command proxy if allowed_hosts is configured (and block is not set).
+    let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
+    let mut proxy_port: Option<u16> = None;
+
+    if let Some(ref sb) = sandbox {
+        if !sb.network.allowed_hosts.is_empty() && !sb.network.block {
+            let proxy_config = nono_proxy::ProxyConfig {
+                allowed_hosts: sb.network.allowed_hosts.clone(),
+                ..Default::default()
+            };
+            match nono_proxy::start(proxy_config).await {
+                Ok(handle) => {
+                    for (k, v) in handle.env_vars() {
+                        env.insert(k, v);
+                    }
+                    proxy_port = Some(handle.port);
+                    proxy_handle = Some(handle);
+                }
+                Err(e) => {
+                    return ShimResponse {
+                        stdout: String::new(),
+                        stderr: format!("nono-mediation: failed to start network proxy: {}\n", e),
+                        exit_code: 1,
+                    };
+                }
+            }
+        }
+    }
+
     let maybe_sandbox = sandbox;
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
@@ -307,6 +337,8 @@ async fn exec_passthrough(
             }
             if sb.network.block {
                 caps = caps.block_network();
+            } else if let Some(port) = proxy_port {
+                caps = caps.proxy_only(port);
             }
             unsafe {
                 cmd_builder.pre_exec(move || {
@@ -336,6 +368,10 @@ async fn exec_passthrough(
         })
     })
     .await;
+
+    if let Some(handle) = proxy_handle {
+        handle.shutdown();
+    }
 
     match result {
         Ok(Ok(resp)) => resp,
@@ -688,6 +724,96 @@ mod tests {
         assert_ne!(
             env.get("MY_TOKEN").map(|s| s.as_str()),
             Some("nono_0000000000000000000000000000000000000000000000000000000000000000")
+        );
+    }
+
+    // --- Per-command proxy tests ---
+
+    /// When `allowed_hosts` is configured, exec_passthrough injects HTTPS_PROXY
+    /// pointing to 127.0.0.1 into the environment passed to the command.
+    #[tokio::test]
+    async fn test_allowed_hosts_injects_https_proxy() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: false,
+                    allowed_hosts: vec!["github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_write: vec![],
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            // `env` prints its own environment; grep output for HTTPS_PROXY
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+
+        let broker = make_broker();
+        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        // The command ran (exit 0) and output should contain HTTPS_PROXY pointing to 127.0.0.1
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "HTTPS_PROXY not found in env output: {}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("127.0.0.1"),
+            "proxy addr not 127.0.0.1: {}",
+            resp.stdout
+        );
+    }
+
+    /// When `block: true` and `allowed_hosts` is also set, `block` takes
+    /// precedence: no proxy is started, network is blocked at OS level.
+    /// We verify this by checking the env printed by the child does NOT
+    /// contain an HTTPS_PROXY entry.
+    #[tokio::test]
+    async fn test_block_takes_precedence_over_allowed_hosts() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec!["github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_write: vec![],
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+
+        let broker = make_broker();
+        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        // Command may fail due to sandbox (network block applies via pre_exec),
+        // but crucially HTTPS_PROXY must NOT have been injected.
+        assert!(
+            !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "HTTPS_PROXY should not be set when block=true, got: {}",
+            resp.stdout
         );
     }
 }

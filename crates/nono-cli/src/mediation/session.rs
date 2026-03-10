@@ -7,6 +7,7 @@
 //! 4. Returns a `SessionHandle` that keeps the server alive and exposes the
 //!    paths/env needed by the rest of the startup sequence.
 
+use super::approval::{ApprovalGate, NativeApprovalGate};
 use super::broker::TokenBroker;
 use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
 use nono::{NonoError, Result};
@@ -29,6 +30,8 @@ pub struct ResolvedIntercept {
     pub args_prefix: Vec<String>,
     pub action: ResolvedAction,
     pub exit_code: i32,
+    /// If true, requires user authentication before the action executes.
+    pub admin: bool,
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -151,12 +154,17 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             NonoError::SandboxInit(format!("mediation: failed to start runtime: {}", e))
         })?;
 
+    let approval: Arc<dyn ApprovalGate + Send + Sync> = Arc::new(NativeApprovalGate);
+
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
     let token_arc: Arc<str> = Arc::from(session_token.as_str());
+    let approval_clone = Arc::clone(&approval);
     runtime.spawn(async move {
-        if let Err(e) = super::server::run(sock, cmds, broker_clone, token_arc).await {
+        if let Err(e) =
+            super::server::run(sock, cmds, broker_clone, token_arc, approval_clone).await
+        {
             tracing::error!("mediation server error: {}", e);
         }
     });
@@ -250,6 +258,7 @@ fn resolve_command(
                 args_prefix: rule.args_prefix.clone(),
                 action,
                 exit_code,
+                admin: rule.admin,
             }
         })
         .collect();

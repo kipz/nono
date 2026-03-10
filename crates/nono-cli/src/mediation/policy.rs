@@ -9,6 +9,7 @@
 //! 5. If not matched: execs the real binary. Nonce-bearing env vars from the sandbox are promoted
 //!    (replaced with real values); all other sandbox env vars are discarded.
 
+use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
 use nono::{NonoError, Result};
@@ -57,6 +58,8 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
 /// Apply policy to a shim request and produce a response.
 ///
 /// - If the command is unknown: returns an error response (not found).
+/// - If an intercept rule matches with `admin: true`: invokes the approval gate.
+///   If denied, returns exit 126 immediately without executing the action.
 /// - If an intercept rule matches with `Respond`: returns the pre-resolved output.
 /// - If an intercept rule matches with `Capture`: runs the binary/script, issues a nonce.
 /// - Otherwise: execs the real binary with strict env filtering.
@@ -64,6 +67,7 @@ pub async fn apply(
     request: ShimRequest,
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> ShimResponse {
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
@@ -85,6 +89,30 @@ pub async fn apply(
                 "mediation: intercepting '{}' with prefix {:?}",
                 request.command, rule.args_prefix
             );
+
+            // Admin gate: require user authentication before executing the action.
+            if rule.admin {
+                let command = request.command.clone();
+                let args = request.args.clone();
+                let approval_clone = Arc::clone(&approval);
+                let allowed =
+                    tokio::task::spawn_blocking(move || approval_clone.approve(&command, &args))
+                        .await
+                        .unwrap_or(false);
+                if !allowed {
+                    let invocation = if request.args.is_empty() {
+                        request.command.clone()
+                    } else {
+                        format!("{} {}", request.command, request.args.join(" "))
+                    };
+                    return ShimResponse {
+                        stdout: String::new(),
+                        stderr: format!("nono: '{}' was not approved\n", invocation),
+                        exit_code: 126,
+                    };
+                }
+            }
+
             return match &rule.action {
                 ResolvedAction::Respond { stdout } => ShimResponse {
                     stdout: stdout.clone(),
@@ -400,11 +428,20 @@ fn build_exec_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
     use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
         Arc::new(TokenBroker::new())
+    }
+
+    fn always_allow() -> Arc<dyn ApprovalGate + Send + Sync> {
+        Arc::new(AlwaysAllow)
+    }
+
+    fn always_deny() -> Arc<dyn ApprovalGate + Send + Sync> {
+        Arc::new(AlwaysDeny)
     }
 
     fn make_cmd(intercepts: Vec<ResolvedIntercept>) -> ResolvedCommand {
@@ -425,7 +462,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[], make_broker()).await;
+        let resp = apply(req, &[], make_broker(), always_allow()).await;
         assert_eq!(resp.exit_code, 127);
     }
 
@@ -441,6 +478,7 @@ mod tests {
                 stdout: "static_output\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -454,7 +492,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(req, &[cmd], make_broker(), always_allow()).await;
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "static_output\n");
     }
@@ -467,6 +505,7 @@ mod tests {
                 stdout: "matched\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -476,7 +515,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(req, &[cmd], make_broker(), always_allow()).await;
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "matched\n");
     }
@@ -489,6 +528,7 @@ mod tests {
                 stdout: "secret\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -499,8 +539,93 @@ mod tests {
             env: HashMap::new(),
         };
         // Falls through to passthrough exec of /usr/bin/true
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(req, &[cmd], make_broker(), always_allow()).await;
         assert_eq!(resp.exit_code, 0);
+    }
+
+    // --- Admin gate tests ---
+
+    #[tokio::test]
+    async fn test_admin_rule_allow_proceeds() {
+        // AlwaysAllow gate + admin=true rule → normal Respond action is returned.
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "Aborted by policy.\n".to_string(),
+            },
+            exit_code: 1,
+            admin: true,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "repo".to_string(),
+                "delete".to_string(),
+                "my-repo".to_string(),
+            ],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        let resp = apply(req, &[cmd], make_broker(), always_allow()).await;
+        // Approved → action fires, returns configured exit_code=1 and stdout
+        assert_eq!(resp.exit_code, 1);
+        assert_eq!(resp.stdout, "Aborted by policy.\n");
+    }
+
+    #[tokio::test]
+    async fn test_admin_rule_deny_blocks() {
+        // AlwaysDeny gate + admin=true rule → exit 126, denial stderr.
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "Aborted by policy.\n".to_string(),
+            },
+            exit_code: 1,
+            admin: true,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "repo".to_string(),
+                "delete".to_string(),
+                "my-repo".to_string(),
+            ],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        let resp = apply(req, &[cmd], make_broker(), always_deny()).await;
+        assert_eq!(resp.exit_code, 126);
+        assert!(resp.stdout.is_empty());
+        assert!(resp.stderr.contains("was not approved"));
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_rule_skips_gate() {
+        // AlwaysDeny gate + admin=false rule → gate is NOT called, action executes normally.
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["auth".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "token\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["auth".to_string()],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        // Even though the gate always denies, admin=false means it is never called.
+        let resp = apply(req, &[cmd], make_broker(), always_deny()).await;
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "token\n");
     }
 
     // --- subcommand_matches tests ---
@@ -564,6 +689,7 @@ mod tests {
             args_prefix: vec!["auth".to_string()],
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
+            admin: false,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
@@ -580,7 +706,7 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(req, &[cmd], Arc::clone(&broker), always_allow()).await;
         assert_eq!(resp.exit_code, 0);
         assert!(
             resp.stdout.trim().starts_with("nono_"),
@@ -601,6 +727,7 @@ mod tests {
                 script: Some("echo my_secret_token".to_string()),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -611,7 +738,7 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(req, &[cmd], Arc::clone(&broker), always_allow()).await;
         assert_eq!(resp.exit_code, 0);
         let nonce = resp.stdout.trim();
         assert!(nonce.starts_with("nono_"), "expected nonce, got: {}", nonce);

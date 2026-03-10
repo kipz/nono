@@ -6,22 +6,19 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-approve build-ffi build-arm64 test test-lib test-cli test-approve test-ffi check clippy fmt clean install audit help
+.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi check clippy fmt clean install audit help
 
 # Default target
 all: build
 
 # Build targets
-build: build-lib build-cli build-approve
+build: build-lib build-cli
 
 build-lib:
 	cargo build -p nono
 
 build-cli:
 	cargo build -p nono-cli
-
-build-approve:
-	cargo build -p nono-approve
 
 build-ffi:
 	cargo build -p nono-ffi
@@ -44,16 +41,13 @@ build-arm64:
 	@cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
 
 # Test targets
-test: test-lib test-cli test-approve test-ffi
+test: test-lib test-cli test-ffi
 
 test-lib:
 	cargo test -p nono
 
 test-cli:
 	cargo test -p nono-cli
-
-test-approve:
-	cargo test -p nono-approve
 
 test-ffi:
 	cargo test -p nono-ffi

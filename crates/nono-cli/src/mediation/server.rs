@@ -8,8 +8,10 @@
 //!   Request:  u32 big-endian length || JSON payload
 //!   Response: u32 big-endian length || JSON payload
 
+use super::admin::AdminModeStatus;
+use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
-use super::policy::{apply, ShimRequest, ShimResponse};
+use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
 use nix::libc;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,8 @@ pub async fn run(
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
     shim_dir: PathBuf,
+    admin_state: super::admin::AdminState,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -51,9 +55,20 @@ pub async fn run(
                 let token = Arc::clone(&session_token);
                 let sd = Arc::clone(&shim_dir);
                 let sp = Arc::clone(&socket_path);
+                let admin_rx = admin_state.subscribe();
+                let gate = Arc::clone(&approval);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(stream, &cmds, broker, token.clone(), &sd, &sp).await
+                    if let Err(e) = handle_connection(
+                        stream,
+                        &cmds,
+                        broker,
+                        token.clone(),
+                        &sd,
+                        &sp,
+                        admin_rx,
+                        gate,
+                    )
+                    .await
                     {
                         warn!("mediation: connection error: {}", e);
                     }
@@ -68,6 +83,7 @@ pub async fn run(
 }
 
 /// Handle a single shim connection: read request, apply policy, write response.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     commands: &[ResolvedCommand],
@@ -75,6 +91,8 @@ async fn handle_connection(
     session_token: Arc<str>,
     shim_dir: &std::path::Path,
     socket_path: &std::path::Path,
+    admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -116,12 +134,25 @@ async fn handle_connection(
         request.command, request.args
     );
 
+    // Check admin mode — bypass all policy if active
+    if admin_receiver.borrow().is_active() {
+        warn!(
+            "admin mode: passthrough command='{}' args={:?} session_pid={}",
+            request.command,
+            request.args,
+            std::process::id()
+        );
+        let response = admin_passthrough(&request, commands).await;
+        write_response(&mut stream, &response).await?;
+        return Ok(());
+    }
+
     let ctx = super::policy::SessionCtx {
         shim_dir,
         socket_path,
         session_token: &session_token,
     };
-    let response = apply(request, commands, broker, &ctx).await;
+    let response = apply(request, commands, broker, &ctx, approval).await;
 
     write_response(&mut stream, &response).await
 }

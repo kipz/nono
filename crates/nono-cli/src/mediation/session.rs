@@ -7,6 +7,8 @@
 //! 4. Returns a `SessionHandle` that keeps the server alive and exposes the
 //!    paths/env needed by the rest of the startup sequence.
 
+use super::admin::AdminState;
+use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
 use nono::{NonoError, Result};
@@ -29,6 +31,8 @@ pub struct ResolvedIntercept {
     pub args_prefix: Vec<String>,
     pub action: ResolvedAction,
     pub exit_code: i32,
+    /// If true, requires user authentication before the action executes.
+    pub admin: bool,
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -59,12 +63,21 @@ pub struct SessionHandle {
     /// 256-bit random session authentication token (hex). Injected into the child
     /// as `NONO_SESSION_TOKEN`; shims must include it in every request.
     pub session_token: Zeroizing<String>,
+    /// Path of the control socket (used by external admin CLI/menu bar app).
+    #[allow(dead_code)]
+    pub control_socket_path: PathBuf,
+    /// Shared admin mode state (for passing to admin_commands query).
+    pub admin_state: AdminState,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
+        // Log if admin mode was active when the session ended.
+        if self.admin_state.subscribe().borrow().is_active() {
+            tracing::warn!("admin mode was active when mediation session ended");
+        }
         // Clean up the session directory on parent exit.
         let _ = std::fs::remove_dir_all(&self.session_dir);
         debug!(
@@ -92,6 +105,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let session_dir = session_dir_path();
     let shim_dir = session_dir.join("shims");
     let socket_path = session_dir.join("mediation.sock");
+    let control_socket_path = session_dir.join("control.sock");
 
     std::fs::create_dir_all(&shim_dir).map_err(|e| {
         NonoError::SandboxInit(format!(
@@ -125,7 +139,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     }
 
     // -------------------------------------------------------------------------
-    // Generate session authentication token
+    // Generate session authentication token and control token
     // -------------------------------------------------------------------------
     let session_token = {
         use rand::RngExt;
@@ -134,10 +148,49 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         Zeroizing::new(hex)
     };
 
+    let control_token = super::control::generate_token();
+
     // -------------------------------------------------------------------------
     // Create token broker (session-scoped)
     // -------------------------------------------------------------------------
     let broker = Arc::new(TokenBroker::new());
+
+    // -------------------------------------------------------------------------
+    // Create admin state
+    // -------------------------------------------------------------------------
+    let admin_state = AdminState::new();
+
+    // -------------------------------------------------------------------------
+    // Write session.json (mode 0600) — contains control_token for admin CLI
+    // -------------------------------------------------------------------------
+    let session_json_path = session_dir.join("session.json");
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let session_info = serde_json::json!({
+        "pid": std::process::id(),
+        "control_socket": control_socket_path.to_string_lossy(),
+        "control_token": control_token,
+        "started_at": started_at,
+    });
+    let session_json_bytes = serde_json::to_vec(&session_info).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to serialize session.json: {}",
+            e
+        ))
+    })?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&session_json_path)
+            .and_then(|mut f| f.write_all(&session_json_bytes))
+            .map_err(|e| {
+                NonoError::SandboxInit(format!("mediation: failed to write session.json: {}", e))
+            })?;
+    }
 
     // -------------------------------------------------------------------------
     // Start the mediation server
@@ -151,16 +204,44 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             NonoError::SandboxInit(format!("mediation: failed to start runtime: {}", e))
         })?;
 
+    let approval_gate: Arc<dyn super::approval::ApprovalGate + Send + Sync> =
+        Arc::new(NativeApprovalGate);
+
     let sock = socket_path.clone();
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
     let token_arc: Arc<str> = Arc::from(session_token.as_str());
     let shim_dir_clone = shim_dir.clone();
+    let admin_clone = admin_state.clone();
+    let gate_clone = Arc::clone(&approval_gate);
     runtime.spawn(async move {
-        if let Err(e) =
-            super::server::run(sock, cmds, broker_clone, token_arc, shim_dir_clone).await
+        if let Err(e) = super::server::run(
+            sock,
+            cmds,
+            broker_clone,
+            token_arc,
+            shim_dir_clone,
+            admin_clone,
+            gate_clone,
+        )
+        .await
         {
             tracing::error!("mediation server error: {}", e);
+        }
+    });
+
+    // -------------------------------------------------------------------------
+    // Start the control socket server
+    // -------------------------------------------------------------------------
+    let ctrl_sock = control_socket_path.clone();
+    let ctrl_token = control_token;
+    let ctrl_admin = admin_state.clone();
+    let ctrl_sdir = session_dir.clone();
+    runtime.spawn(async move {
+        if let Err(e) =
+            super::control::run_control_server(ctrl_sock, ctrl_token, ctrl_admin, ctrl_sdir).await
+        {
+            tracing::error!("control server error: {}", e);
         }
     });
 
@@ -178,6 +259,8 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         blocked_binaries,
         env_block: config.env.block.clone(),
         session_token,
+        control_socket_path,
+        admin_state,
         _runtime: runtime,
     }))
 }
@@ -253,6 +336,7 @@ fn resolve_command(
                 args_prefix: rule.args_prefix.clone(),
                 action,
                 exit_code,
+                admin: rule.admin,
             }
         })
         .collect();
@@ -301,6 +385,7 @@ fn session_dir_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediation::admin::AdminModeStatus;
 
     #[test]
     fn test_setup_returns_none_when_inactive() {
@@ -315,5 +400,27 @@ mod tests {
         assert!(path
             .to_string_lossy()
             .contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn test_admin_state_initial_disabled() {
+        // Verify a freshly constructed AdminState starts in Disabled mode.
+        let state = AdminState::new();
+        let rx = state.subscribe();
+        assert!(
+            !rx.borrow().is_active(),
+            "admin mode should be disabled by default"
+        );
+        assert!(matches!(*rx.borrow(), AdminModeStatus::Disabled));
+    }
+
+    #[test]
+    fn test_control_socket_path_in_session_dir() {
+        // The control socket path should be derived from the session directory.
+        let session_dir = session_dir_path();
+        let expected = session_dir.join("control.sock");
+        // Re-derive using the same logic as setup()
+        let derived = session_dir_path().join("control.sock");
+        assert_eq!(expected, derived);
     }
 }

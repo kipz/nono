@@ -113,6 +113,10 @@ pub struct NetworkConfig {
     /// If true, block all outbound network. Default: false (allow all).
     #[serde(default)]
     pub block: bool,
+    /// If non-empty, start a per-command proxy restricting outbound
+    /// connections to these hosts. Mutually exclusive with `block`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Environment variable policy for the sandboxed child process.
@@ -121,4 +125,37 @@ pub struct EnvPolicy {
     /// Env var names to strip from the child environment (credential leakage prevention).
     #[serde(default)]
     pub block: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_network_config_allowed_hosts_deserializes() {
+        let json = r#"{
+            "allowed_hosts": ["github.com", "*.github.com", "api.github.com"]
+        }"#;
+        let config: NetworkConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(!config.block);
+        assert_eq!(
+            config.allowed_hosts,
+            vec!["github.com", "*.github.com", "api.github.com"]
+        );
+    }
+
+    #[test]
+    fn test_network_config_block_and_allowed_hosts_coexist() {
+        let json = r#"{"block": true, "allowed_hosts": ["github.com"]}"#;
+        let config: NetworkConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(config.block);
+        assert_eq!(config.allowed_hosts, vec!["github.com"]);
+    }
+
+    #[test]
+    fn test_network_config_default_has_empty_allowed_hosts() {
+        let config = NetworkConfig::default();
+        assert!(!config.block);
+        assert!(config.allowed_hosts.is_empty());
+    }
 }

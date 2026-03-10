@@ -155,8 +155,11 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let cmds = resolved_commands.clone();
     let broker_clone = Arc::clone(&broker);
     let token_arc: Arc<str> = Arc::from(session_token.as_str());
+    let shim_dir_clone = shim_dir.clone();
     runtime.spawn(async move {
-        if let Err(e) = super::server::run(sock, cmds, broker_clone, token_arc).await {
+        if let Err(e) =
+            super::server::run(sock, cmds, broker_clone, token_arc, shim_dir_clone).await
+        {
             tracing::error!("mediation server error: {}", e);
         }
     });

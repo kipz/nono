@@ -31,6 +31,7 @@ pub async fn run(
     commands: Vec<ResolvedCommand>,
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
+    shim_dir: PathBuf,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -39,6 +40,8 @@ pub async fn run(
     debug!("Mediation server listening on {}", socket_path.display());
 
     let commands = Arc::new(commands);
+    let shim_dir = Arc::new(shim_dir);
+    let socket_path = Arc::new(socket_path);
 
     loop {
         match listener.accept().await {
@@ -46,8 +49,12 @@ pub async fn run(
                 let cmds = Arc::clone(&commands);
                 let broker = Arc::clone(&broker);
                 let token = Arc::clone(&session_token);
+                let sd = Arc::clone(&shim_dir);
+                let sp = Arc::clone(&socket_path);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &cmds, broker, token).await {
+                    if let Err(e) =
+                        handle_connection(stream, &cmds, broker, token.clone(), &sd, &sp).await
+                    {
                         warn!("mediation: connection error: {}", e);
                     }
                 });
@@ -66,6 +73,8 @@ async fn handle_connection(
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
+    shim_dir: &std::path::Path,
+    socket_path: &std::path::Path,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -107,7 +116,12 @@ async fn handle_connection(
         request.command, request.args
     );
 
-    let response = apply(request, commands, broker).await;
+    let ctx = super::policy::SessionCtx {
+        shim_dir,
+        socket_path,
+        session_token: &session_token,
+    };
+    let response = apply(request, commands, broker, &ctx).await;
 
     write_response(&mut stream, &response).await
 }

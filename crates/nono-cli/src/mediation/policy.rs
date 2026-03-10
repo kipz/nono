@@ -43,6 +43,15 @@ pub struct ShimResponse {
     pub exit_code: i32,
 }
 
+/// Mediation session context passed to policy functions.
+///
+/// Bundles the per-session paths and token needed by `apply` and `exec_passthrough`.
+pub struct SessionCtx<'a> {
+    pub shim_dir: &'a std::path::Path,
+    pub socket_path: &'a std::path::Path,
+    pub session_token: &'a str,
+}
+
 /// Env var names that must never receive a nonce-promoted value, even if a
 /// nonce-bearing var with this name appears in the sandbox env.
 static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
@@ -64,6 +73,7 @@ pub async fn apply(
     request: ShimRequest,
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
+    ctx: &SessionCtx<'_>,
 ) -> ShimResponse {
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
@@ -104,6 +114,7 @@ pub async fn apply(
                                 &request.env,
                                 &broker,
                                 None,
+                                ctx,
                             )
                             .await
                         }
@@ -136,6 +147,7 @@ pub async fn apply(
         &request.env,
         &broker,
         cmd.sandbox.clone(),
+        ctx,
     )
     .await
 }
@@ -211,6 +223,9 @@ async fn exec_script(
 ///
 /// Env building:
 /// - Starts from the trusted parent (mediation server) environment.
+/// - Prepends `shim_dir` to PATH so subprocess invocations of mediated commands
+///   route through the mediation server instead of running directly inside the
+///   per-command sandbox (where network is restricted).
 /// - From the sandbox env, promotes only nonce-bearing vars (`nono_` prefix).
 ///   All other sandbox env vars are discarded to prevent sandbox injection.
 /// - Dangerous var names (PATH, LD_PRELOAD, etc.) are blocked even with valid nonces.
@@ -222,8 +237,35 @@ async fn exec_passthrough(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
     sandbox: Option<super::CommandSandbox>,
+    ctx: &SessionCtx<'_>,
 ) -> ShimResponse {
     let mut env = build_exec_env(sandbox_env, broker);
+
+    // Prepend shim_dir to PATH so that subprocesses of the exec'd binary
+    // (e.g. kubectl's exec credential plugin) route through mediation rather
+    // than running directly inside the per-command Seatbelt sandbox.
+    let shim_dir_str = ctx.shim_dir.to_string_lossy();
+    let parent_path = env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| "/usr/bin:/bin".to_string());
+    env.insert(
+        "PATH".to_string(),
+        format!("{}:{}", shim_dir_str, parent_path),
+    );
+
+    // Inject mediation socket path and session token so the shim binaries
+    // invoked by the exec'd command can authenticate to the mediation server.
+    // This allows exec plugins (e.g. kubectl's credential plugin) to route
+    // through mediation rather than running directly in the per-command sandbox.
+    env.insert(
+        "NONO_MEDIATION_SOCKET".to_string(),
+        ctx.socket_path.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "NONO_SESSION_TOKEN".to_string(),
+        ctx.session_token.to_string(),
+    );
 
     // Promote nonce values in args
     let args: Vec<String> = args
@@ -242,6 +284,9 @@ async fn exec_passthrough(
 
     let real_path = cmd.real_path.clone();
     let stdin_data = stdin_data.to_string();
+    // Owned shim paths for use in spawn_blocking (which requires 'static captures).
+    let shim_dir_buf = ctx.shim_dir.to_path_buf();
+    let real_shim_binary = std::fs::canonicalize(ctx.shim_dir.join(&cmd.name)).ok();
 
     // Start a per-command proxy if allowed_hosts is configured (and block is not set).
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
@@ -316,6 +361,14 @@ async fn exec_passthrough(
                 }
             }
 
+            // Allow the shim directory and the nono-shim binary so that subprocesses
+            // of the exec'd command (e.g. kubectl's exec credential plugin) can exec
+            // the shim binaries and route through the mediation server.
+            caps = caps.allow_path(&shim_dir_buf, nono::AccessMode::Read)?;
+            if let Some(ref real_shim) = real_shim_binary {
+                caps = caps.allow_file(real_shim, nono::AccessMode::Read)?;
+            }
+
             // Add command-specific configured paths (~ is expanded to $HOME).
             for path in &sb.fs_read {
                 let expanded = expand_home(path);
@@ -339,6 +392,18 @@ async fn exec_passthrough(
                 caps = caps.block_network();
             } else if let Some(port) = proxy_port {
                 caps = caps.proxy_only(port);
+                // Allow outbound connections to the mediation Unix socket so that
+                // shim binaries exec'd by this command (e.g. kubectl's credential
+                // plugin) can route through the mediation server.
+                // Requires both system-socket (AF_UNIX) and network-outbound (unix-socket).
+                for rule in [
+                    "(allow system-socket (socket-domain AF_UNIX))",
+                    "(allow network-outbound (remote unix-socket))",
+                ] {
+                    if let Err(e) = caps.add_platform_rule(rule) {
+                        warn!("mediation: failed to add mediation socket rule: {}", e);
+                    }
+                }
             }
             unsafe {
                 cmd_builder.pre_exec(move || {
@@ -412,22 +477,23 @@ fn build_exec_env(
     // Start from parent (trusted) env
     let mut env: HashMap<String, String> = std::env::vars().collect();
 
-    // From sandbox env: only promote nonce-bearing vars; discard everything else.
+    // From sandbox env: promote nonce-bearing vars and forward all other non-dangerous
+    // vars. If a var was not blocked by the profile's `env.block` list it is permitted
+    // to flow through to mediated commands. System execution vars (PATH, LD_PRELOAD,
+    // etc.) are always blocked as defense-in-depth regardless of profile configuration.
     for (key, value) in sandbox_env {
-        if !value.starts_with("nono_") {
-            continue;
-        }
         if DANGEROUS_ENV_VAR_NAMES.contains(&key.as_str()) {
-            warn!(
-                "mediation: blocked nonce injection into dangerous var {}",
-                key
-            );
+            warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
-        if let Some(real) = broker.resolve(value) {
-            env.insert(key.clone(), real.as_str().to_string());
+        if value.starts_with("nono_") {
+            if let Some(real) = broker.resolve(value) {
+                env.insert(key.clone(), real.as_str().to_string());
+            }
+            // Unknown nonce: silently discard — don't let sandbox probe broker contents.
+        } else {
+            env.insert(key.clone(), value.clone());
         }
-        // Unknown nonce: silently discard — don't let sandbox probe broker contents.
     }
 
     env
@@ -461,7 +527,17 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[], make_broker()).await;
+        let resp = apply(
+            req,
+            &[],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 127);
     }
 
@@ -490,7 +566,17 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "static_output\n");
     }
@@ -512,7 +598,17 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "matched\n");
     }
@@ -535,7 +631,17 @@ mod tests {
             env: HashMap::new(),
         };
         // Falls through to passthrough exec of /usr/bin/true
-        let resp = apply(req, &[cmd], make_broker()).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 0);
     }
 
@@ -616,7 +722,17 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 0);
         assert!(
             resp.stdout.trim().starts_with("nono_"),
@@ -647,7 +763,17 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         assert_eq!(resp.exit_code, 0);
         let nonce = resp.stdout.trim();
         assert!(nonce.starts_with("nono_"), "expected nonce, got: {}", nonce);
@@ -658,20 +784,28 @@ mod tests {
     // --- Env filtering tests ---
 
     #[test]
-    fn test_build_exec_env_discards_non_nonce_sandbox_vars() {
+    fn test_build_exec_env_forwards_context_vars_and_blocks_dangerous() {
         let broker = make_broker();
         let mut sandbox_env = HashMap::new();
-        sandbox_env.insert("SOME_VAR".to_string(), "not_a_nonce".to_string());
-        sandbox_env.insert("ANOTHER".to_string(), "regular_value".to_string());
+        // Dangerous vars must never be forwarded.
+        sandbox_env.insert("PATH".to_string(), "/evil".to_string());
+        sandbox_env.insert("LD_PRELOAD".to_string(), "/evil.so".to_string());
+        // Non-dangerous context vars (e.g. from kubectl exec plugin config) should
+        // be forwarded when not already in the parent env. Use an unlikely-to-exist key.
+        sandbox_env.insert(
+            "NONO_TEST_CONTEXT_12345".to_string(),
+            "context_value".to_string(),
+        );
 
         let env = build_exec_env(&sandbox_env, &broker);
-        // Non-nonce vars from sandbox should not appear (unless they were in parent env)
-        // We can only check that the non-nonce values weren't injected from sandbox.
-        // (Parent env values may be present; we just check sandbox-specific ones.)
-        assert_ne!(env.get("SOME_VAR").map(|s| s.as_str()), Some("not_a_nonce"));
-        assert_ne!(
-            env.get("ANOTHER").map(|s| s.as_str()),
-            Some("regular_value")
+
+        // Dangerous vars must not be injected from sandbox.
+        assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil"));
+        assert_ne!(env.get("LD_PRELOAD").map(|s| s.as_str()), Some("/evil.so"));
+        // Non-dangerous context var should be forwarded.
+        assert_eq!(
+            env.get("NONO_TEST_CONTEXT_12345").map(|s| s.as_str()),
+            Some("context_value")
         );
     }
 
@@ -760,7 +894,17 @@ mod tests {
         };
 
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         // The command ran (exit 0) and output should contain HTTPS_PROXY pointing to 127.0.0.1
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
         assert!(
@@ -807,7 +951,17 @@ mod tests {
         };
 
         let broker = make_broker();
-        let resp = apply(req, &[cmd], Arc::clone(&broker)).await;
+        let resp = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+        )
+        .await;
         // Command may fail due to sandbox (network block applies via pre_exec),
         // but crucially HTTPS_PROXY must NOT have been injected.
         assert!(

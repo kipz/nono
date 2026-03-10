@@ -9,6 +9,7 @@
 //! 5. If not matched: execs the real binary. Nonce-bearing env vars from the sandbox are promoted
 //!    (replaced with real values); all other sandbox env vars are discarded.
 
+use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
 use nono::{NonoError, Result};
@@ -74,6 +75,7 @@ pub async fn apply(
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
     ctx: &SessionCtx<'_>,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> ShimResponse {
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
@@ -95,6 +97,30 @@ pub async fn apply(
                 "mediation: intercepting '{}' with prefix {:?}",
                 request.command, rule.args_prefix
             );
+
+            // Admin gate: require user authentication before executing this rule.
+            if rule.admin {
+                let command = request.command.clone();
+                let args = request.args.clone();
+                let approval_clone = Arc::clone(&approval);
+                let allowed =
+                    tokio::task::spawn_blocking(move || approval_clone.approve(&command, &args))
+                        .await
+                        .unwrap_or(false);
+                if !allowed {
+                    let invocation = if request.args.is_empty() {
+                        request.command.clone()
+                    } else {
+                        format!("{} {}", request.command, request.args.join(" "))
+                    };
+                    return ShimResponse {
+                        stdout: String::new(),
+                        stderr: format!("nono: '{}' was not approved\n", invocation),
+                        exit_code: 126,
+                    };
+                }
+            }
+
             return match &rule.action {
                 ResolvedAction::Respond { stdout } => ShimResponse {
                     stdout: stdout.clone(),
@@ -150,6 +176,83 @@ pub async fn apply(
         ctx,
     )
     .await
+}
+
+/// Execute the real binary without any mediation — no intercept rules, no env
+/// var filtering, no nonce promotion. Used when admin mode is active.
+///
+/// This is an intentional bypass. The operator explicitly granted admin mode
+/// via biometric or password auth. All calls are logged at WARN level.
+pub async fn admin_passthrough(
+    request: &ShimRequest,
+    commands: &[ResolvedCommand],
+) -> ShimResponse {
+    let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
+        warn!("admin passthrough: unknown command '{}'", request.command);
+        return ShimResponse {
+            stdout: String::new(),
+            stderr: format!(
+                "nono-mediation: command '{}' not configured\n",
+                request.command
+            ),
+            exit_code: 127,
+        };
+    };
+
+    // Build env from parent process — no filtering, no nonce promotion.
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let args = request.args.clone();
+    let stdin_data = request.stdin.clone();
+    let real_path = cmd.real_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> nono::Result<ShimResponse> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut cmd_builder = Command::new(&real_path);
+        cmd_builder
+            .args(&args)
+            .env_clear()
+            .envs(&env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd_builder
+            .spawn()
+            .map_err(nono::NonoError::CommandExecution)?;
+
+        if !stdin_data.is_empty() {
+            if let Some(mut si) = child.stdin.take() {
+                let _ = si.write_all(stdin_data.as_bytes());
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(nono::NonoError::CommandExecution)?;
+
+        Ok(ShimResponse {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            exit_code: output.status.code().unwrap_or(1),
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => ShimResponse {
+            stdout: String::new(),
+            stderr: format!("nono-mediation: admin passthrough exec failed: {}\n", e),
+            exit_code: 1,
+        },
+        Err(e) => ShimResponse {
+            stdout: String::new(),
+            stderr: format!("nono-mediation: internal error: {}\n", e),
+            exit_code: 1,
+        },
+    }
 }
 
 /// Check if the invocation's positional args start with the given prefix.
@@ -502,11 +605,20 @@ fn build_exec_env(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
     use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
         Arc::new(TokenBroker::new())
+    }
+
+    fn always_allow() -> Arc<dyn ApprovalGate + Send + Sync> {
+        Arc::new(AlwaysAllow)
+    }
+
+    fn always_deny() -> Arc<dyn ApprovalGate + Send + Sync> {
+        Arc::new(AlwaysDeny)
     }
 
     fn make_cmd(intercepts: Vec<ResolvedIntercept>) -> ResolvedCommand {
@@ -536,6 +648,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 127);
@@ -553,6 +666,7 @@ mod tests {
                 stdout: "static_output\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -575,6 +689,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 0);
@@ -589,6 +704,7 @@ mod tests {
                 stdout: "matched\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -607,6 +723,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 0);
@@ -621,6 +738,7 @@ mod tests {
                 stdout: "secret\n".to_string(),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -640,9 +758,114 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_admin_rule_allow_proceeds() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "deleted\n".to_string(),
+            },
+            exit_code: 0,
+            admin: true,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["repo".to_string(), "delete".to_string()],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "deleted\n");
+    }
+
+    #[tokio::test]
+    async fn test_admin_rule_deny_blocks() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "deleted\n".to_string(),
+            },
+            exit_code: 0,
+            admin: true,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["repo".to_string(), "delete".to_string()],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_deny(),
+        )
+        .await;
+        assert_eq!(resp.exit_code, 126);
+        assert!(resp.stderr.contains("was not approved"));
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_rule_skips_gate() {
+        // admin=false rule with AlwaysDeny gate — gate must NOT be called, action executes.
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["status".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "ok\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["status".to_string()],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+        let resp = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_deny(),
+        )
+        .await;
+        // Gate not consulted; action executes normally.
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "ok\n");
     }
 
     // --- subcommand_matches tests ---
@@ -706,6 +929,7 @@ mod tests {
             args_prefix: vec!["auth".to_string()],
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
+            admin: false,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
@@ -731,6 +955,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 0);
@@ -753,6 +978,7 @@ mod tests {
                 script: Some("echo my_secret_token".to_string()),
             },
             exit_code: 0,
+            admin: false,
         }]);
 
         let req = ShimRequest {
@@ -772,6 +998,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         assert_eq!(resp.exit_code, 0);
@@ -903,6 +1130,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         // The command ran (exit 0) and output should contain HTTPS_PROXY pointing to 127.0.0.1
@@ -960,6 +1188,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
             },
+            always_allow(),
         )
         .await;
         // Command may fail due to sandbox (network block applies via pre_exec),

@@ -8,6 +8,7 @@
 //!   Request:  u32 big-endian length || JSON payload
 //!   Response: u32 big-endian length || JSON payload
 
+use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::policy::{apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
@@ -31,6 +32,7 @@ pub async fn run(
     commands: Vec<ResolvedCommand>,
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -46,8 +48,10 @@ pub async fn run(
                 let cmds = Arc::clone(&commands);
                 let broker = Arc::clone(&broker);
                 let token = Arc::clone(&session_token);
+                let approval = Arc::clone(&approval);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &cmds, broker, token).await {
+                    if let Err(e) = handle_connection(stream, &cmds, broker, token, approval).await
+                    {
                         warn!("mediation: connection error: {}", e);
                     }
                 });
@@ -66,6 +70,7 @@ async fn handle_connection(
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
+    approval: Arc<dyn ApprovalGate + Send + Sync>,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -107,7 +112,7 @@ async fn handle_connection(
         request.command, request.args
     );
 
-    let response = apply(request, commands, broker).await;
+    let response = apply(request, commands, broker, approval).await;
 
     write_response(&mut stream, &response).await
 }

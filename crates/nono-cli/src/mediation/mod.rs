@@ -13,6 +13,7 @@
 //! All policy (which commands to intercept, what to do, which env vars to block)
 //! lives in the profile's `mediation` section.
 
+pub mod approval;
 pub mod broker;
 pub mod policy;
 pub mod server;
@@ -62,6 +63,11 @@ pub struct InterceptRule {
     /// The leading positional args that must match (flags are ignored during matching).
     /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
     pub args_prefix: Vec<String>,
+    /// If true, the user must authenticate via a native macOS biometric/password dialog
+    /// before the action is executed. Requires `nono-approve` to be installed alongside nono.
+    /// Defaults to false.
+    #[serde(default)]
+    pub admin: bool,
     /// What to do when this rule matches.
     pub action: InterceptAction,
 }

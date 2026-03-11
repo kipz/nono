@@ -83,6 +83,7 @@ mod tests {
             .filesystem
             .allow
             .contains(&"$HOME/.codex".to_string()));
+        assert!(profile.security.groups.contains(&"codex_macos".to_string()));
         assert!(profile
             .security
             .groups

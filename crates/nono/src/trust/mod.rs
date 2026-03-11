@@ -34,6 +34,7 @@ pub mod digest;
 pub mod dsse;
 pub mod policy;
 pub mod signing;
+pub mod skill;
 pub mod types;
 
 pub use bundle::{
@@ -57,8 +58,13 @@ pub use policy::{
 };
 pub use signing::{
     export_public_key, generate_signing_key, key_id_hex, sign_bytes, sign_files,
-    sign_instruction_file, sign_policy_bytes, sign_policy_file, write_bundle, KeyPair,
-    SigningScheme, MAX_MULTI_SUBJECT_FILES,
+    sign_instruction_file, sign_policy_bytes, sign_policy_file, sign_skill, write_bundle,
+    write_skill_bundle, KeyPair, SigningScheme, MAX_MULTI_SUBJECT_FILES,
+};
+pub use skill::{
+    find_skill_directories, load_skill_manifest, verify_skill, SkillEntryPoint, SkillHook,
+    SkillManifest, SkillVerificationResult, NONO_SKILL_PREDICATE_TYPE, SKILL_BUNDLE_FILENAME,
+    SKILL_MANIFEST_FILENAME,
 };
 pub use types::{
     BlockedPublisher, Blocklist, BlocklistEntry, Enforcement, IncludePatterns, Publisher,

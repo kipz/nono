@@ -97,6 +97,7 @@ pub(super) fn handle_seccomp_notification(
     rate_limiter: &mut RateLimiter,
     denials: &mut Vec<DenialRecord>,
     mut trust_interceptor: Option<&mut TrustInterceptor>,
+    mut skill_interceptor: Option<&mut crate::skill_intercept::SkillInterceptor>,
 ) -> Result<()> {
     use nono::sandbox::{
         classify_access_from_flags, continue_notif, deny_notif, inject_fd, notif_id_valid,
@@ -365,6 +366,61 @@ pub(super) fn handle_seccomp_notification(
     } else {
         None
     };
+
+    // 7b. Skill verification for plugin directory files
+    if let Some(skill_result) = skill_interceptor
+        .as_mut()
+        .and_then(|si| si.check_path(&path))
+    {
+        match skill_result {
+            Ok(verified) => {
+                debug!(
+                    "Seccomp: skill file {} verified ({} v{}, publisher: {})",
+                    path.display(),
+                    verified.name,
+                    verified.version,
+                    verified.publisher,
+                );
+                // Verified skill file — open and inject fd for read access
+                match open_path_for_access(&path, &access, config.never_grant, None, None) {
+                    Ok(file) => {
+                        if notif_id_valid(notify_fd, notif.id)? {
+                            if let Err(e) = inject_fd(notify_fd, notif.id, file.as_raw_fd()) {
+                                debug!(
+                                    "inject_fd failed for verified skill file {}: {}",
+                                    path.display(),
+                                    e
+                                );
+                                let _ = deny_notif(notify_fd, notif.id);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Failed to open verified skill file {}: {}",
+                            path.display(),
+                            e
+                        );
+                        let _ = deny_notif(notify_fd, notif.id);
+                    }
+                }
+                return Ok(());
+            }
+            Err(reason) => {
+                debug!("Seccomp: skill file {} denied: {}", path.display(), reason);
+                record_denial(
+                    denials,
+                    DenialRecord {
+                        path: path.clone(),
+                        access,
+                        reason: DenialReason::PolicyBlocked,
+                    },
+                );
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        }
+    }
 
     // 8. Delegate to approval backend (for both instruction and non-instruction files)
     let request = nono::supervisor::CapabilityRequest {

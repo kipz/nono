@@ -4,7 +4,7 @@
 
 use crate::cli::{
     TrustArgs, TrustCommands, TrustExportKeyArgs, TrustInitArgs, TrustKeygenArgs, TrustListArgs,
-    TrustSignArgs, TrustSignPolicyArgs, TrustVerifyArgs,
+    TrustSignArgs, TrustSignPolicyArgs, TrustSignSkillArgs, TrustVerifyArgs, TrustVerifySkillArgs,
 };
 use crate::trust_keystore;
 use aws_lc_rs::rand::SystemRandom;
@@ -35,6 +35,8 @@ pub fn run_trust(args: TrustArgs) -> Result<()> {
         TrustCommands::List(list_args) => run_list(list_args),
         TrustCommands::Keygen(keygen_args) => run_keygen(keygen_args),
         TrustCommands::ExportKey(export_args) => run_export_key(export_args),
+        TrustCommands::SignSkill(args) => run_sign_skill(args),
+        TrustCommands::VerifySkill(args) => run_verify_skill(args),
     }
 }
 
@@ -1011,6 +1013,88 @@ fn run_list(args: TrustListArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// sign-skill
+// ---------------------------------------------------------------------------
+
+fn run_sign_skill(args: TrustSignSkillArgs) -> Result<()> {
+    let key_id = args.key.as_deref().unwrap_or("default");
+    let key_pair = load_signing_key(key_id)?;
+
+    let bundle_json = trust::sign_skill(&args.dir, &key_pair, key_id)?;
+    trust::write_skill_bundle(&args.dir, &bundle_json)?;
+
+    let bundle_path = args.dir.join(trust::SKILL_BUNDLE_FILENAME);
+    eprintln!(
+        "  {} {} -> {}",
+        "SIGNED".green(),
+        args.dir.display(),
+        bundle_path.display()
+    );
+    eprintln!();
+    eprintln!("{}", "Skill directory signed successfully.".green());
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify-skill
+// ---------------------------------------------------------------------------
+
+fn run_verify_skill(args: TrustVerifySkillArgs) -> Result<()> {
+    let policy = load_trust_policy(args.policy.as_deref())?;
+
+    let result = trust::verify_skill(&policy, &args.dir)?;
+
+    match &result.outcome {
+        trust::VerificationOutcome::Verified { publisher } => {
+            eprintln!(
+                "  {} {} v{} (publisher: {})",
+                "VERIFIED".green(),
+                result.name,
+                result.version,
+                publisher
+            );
+            if let Some(ref manifest) = result.manifest {
+                eprintln!("  Files: {}", manifest.files.len());
+                eprintln!("  Entry points: {}", manifest.entry_points.len());
+                eprintln!("  Hooks: {}", manifest.hooks.len());
+            }
+        }
+        outcome => {
+            let reason = match outcome {
+                trust::VerificationOutcome::Blocked { reason } => {
+                    format!("blocklisted: {reason}")
+                }
+                trust::VerificationOutcome::Unsigned => "unsigned (no bundle)".to_string(),
+                trust::VerificationOutcome::InvalidSignature { detail } => {
+                    format!("invalid: {detail}")
+                }
+                trust::VerificationOutcome::UntrustedPublisher { identity } => {
+                    format!("untrusted publisher: {identity:?}")
+                }
+                trust::VerificationOutcome::DigestMismatch { expected, actual } => {
+                    format!("digest mismatch: expected {expected}, got {actual}")
+                }
+                trust::VerificationOutcome::Verified { .. } => unreachable!(),
+            };
+            eprintln!(
+                "  {} {} v{}: {}",
+                "FAILED".red(),
+                result.name,
+                result.version,
+                reason
+            );
+            return Err(nono::NonoError::TrustVerification {
+                path: args.dir.display().to_string(),
+                reason,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Key loading from system keystore
 // ---------------------------------------------------------------------------
 
@@ -1316,26 +1400,41 @@ mod tests {
 
     #[test]
     fn load_trust_policy_returns_default_when_no_file() {
-        // CWD mutation with catch_unwind to guarantee cleanup even on panic.
-        // Isolate from real user config dir to avoid picking up invalid files.
+        // Acquire the env mutex — this test modifies HOME, XDG_CONFIG_HOME, and CWD.
+        let _lock = crate::env_test_mutex()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let dir = tempfile::tempdir().unwrap();
-        let original = std::env::current_dir().unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        let original_home = std::env::var("HOME").ok();
         let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &xdg_dir);
 
-        let result = std::panic::catch_unwind(|| {
-            std::env::set_current_dir(dir.path()).unwrap();
-            let policy = load_trust_policy(None).unwrap();
-            assert!(policy.publishers.is_empty());
-        });
+        // Override HOME so dirs::config_dir() won't find a real user-level policy.
+        std::env::set_var("HOME", dir.path());
+        std::env::set_current_dir(dir.path()).unwrap();
 
-        std::env::set_current_dir(original).unwrap();
+        let policy_result = load_trust_policy(None);
+
+        // Restore env before any assertions to avoid poisoning other tests.
+        std::env::set_current_dir(original_cwd).unwrap();
+        match original_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
         match orig_xdg {
             Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
-        result.unwrap();
+
+        let policy = policy_result.unwrap();
+        assert!(
+            policy.publishers.is_empty(),
+            "expected empty publishers when no policy file exists, got: {:?}",
+            policy.publishers,
+        );
     }
 }

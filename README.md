@@ -281,6 +281,10 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 
 **Socket security:** the mediation socket is protected by two layers. The session directory is created `0700` and the socket itself `0600`, so other local users cannot connect. Within the same user, a 256-bit random session token is injected into the sandboxed child as `NONO_SESSION_TOKEN`; every shim request must include it. Requests exceeding 1 MiB are dropped before allocation; requests with a missing or incorrect token are dropped after reading.
 
+**Per-rule admin gate:** set `"admin": true` on any intercept rule to require native macOS biometric or password authentication before the action executes. Requires `nono-approve` installed alongside nono.
+
+**YOLO mode (macOS):** the `nono-privileges` menu bar app lets you temporarily suspend all mediation for a session — authenticated via Touch ID and active for a configurable window (default 10 minutes). During this window all shim requests are forwarded as raw passthroughs. An audit log is written to the session directory.
+
 ```mermaid
 %%{init: {'flowchart': {'curve': 'basis'}}}%%
 flowchart TD
@@ -347,32 +351,35 @@ flowchart TD
 ```json
 {
   "mediation": {
-    "commands": {
-      "gh": {
-        "env": {
-          "block": ["GH_TOKEN", "GITHUB_TOKEN"]
-        },
-        "rules": [
+    "env": {
+      "block": ["GH_TOKEN", "GITHUB_TOKEN"]
+    },
+    "commands": [
+      {
+        "name": "gh",
+        "intercept": [
           {
-            "args": ["auth", "token"],
-            "action": "capture",
-            "capture_key": "gh_token"
+            "args_prefix": ["auth", "token"],
+            "action": { "type": "capture" }
           },
           {
-            "args": ["auth", "status"],
-            "action": "respond",
-            "response": "github.com\n  ✓ Logged in to github.com\n  ✓ Git operations for github.com configured"
+            "args_prefix": ["auth", "status"],
+            "action": {
+              "type": "respond",
+              "stdout": "github.com\n  ✓ Logged in to github.com\n  ✓ Git operations for github.com configured"
+            }
           }
         ],
         "sandbox": {
           "fs_read": ["/usr/local/share/gh", "~/.config/gh"],
           "fs_write": [],
           "network": {
-            "block": []
+            "block": false,
+            "allowed_hosts": []
           }
         }
       }
-    }
+    ]
   }
 }
 ```
@@ -429,6 +436,8 @@ nono is structured as a Cargo workspace:
 - **nono** (`crates/nono/`) -- Core library. A policy-free sandbox primitive that applies only what clients explicitly request.
 - **nono-cli** (`crates/nono-cli/`) -- CLI binary. Owns all security policy, profiles, hooks, and UX.
 - **nono-shim** (`crates/nono-shim/`) -- Minimal shim binary used by command mediation. Placed in the sandbox PATH for each mediated command; forwards invocations to the parent mediation server over a Unix socket.
+- **nono-approve** (`crates/nono-approve/`) -- Native macOS authentication binary. Invoked by the mediation server when an intercept rule sets `admin: true`; shows a biometric/password dialog via LocalAuthentication and returns exit code 0 (allow) or 1 (deny).
+- **nono-privileges** (`apps/nono-privileges/`) -- macOS menu bar app for YOLO mode. Authenticates via Touch ID and sends enable/disable commands to the session's control socket.
 - **nono-ffi** (`bindings/c/`) -- C FFI bindings with auto-generated header.
 
 Language-specific bindings are maintained separately:

@@ -404,6 +404,7 @@ pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
     trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     on_fork: Option<&mut dyn FnMut(u32)>,
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
@@ -1098,6 +1099,7 @@ pub fn execute_supervised(
                             proxy_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
+                            skill_interceptor,
                             pty_proxy.as_mut(),
                         )?
                     }
@@ -1109,6 +1111,7 @@ pub fn execute_supervised(
                             sup_cfg,
                             config.startup_timeout,
                             trust_interceptor,
+                            skill_interceptor,
                             pty_proxy.as_mut(),
                         )?
                     }
@@ -1658,6 +1661,7 @@ fn run_supervisor_loop(
     config: &SupervisorConfig<'_>,
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
@@ -1715,6 +1719,7 @@ fn run_supervisor_loop(
                             &mut denials,
                             &mut seen_request_ids,
                             trust_interceptor.as_mut(),
+                            skill_interceptor.as_mut(),
                         ) {
                             warn!("Error handling supervisor message: {}", e);
                         }
@@ -1837,6 +1842,7 @@ fn run_supervisor_loop(
     proxy_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<crate::skill_intercept::SkillInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
@@ -1921,6 +1927,7 @@ fn run_supervisor_loop(
                                 &mut denials,
                                 &mut seen_request_ids,
                                 trust_interceptor.as_mut(),
+                                skill_interceptor.as_mut(),
                             ) {
                                 warn!("Error handling supervisor message: {}", e);
                             }
@@ -1949,6 +1956,7 @@ fn run_supervisor_loop(
                                 &mut rate_limiter,
                                 &mut denials,
                                 trust_interceptor.as_mut(),
+                                skill_interceptor.as_mut(),
                             ) {
                                 debug!("Error handling seccomp notification: {}", e);
                             }
@@ -2064,6 +2072,7 @@ fn run_supervisor_loop(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
@@ -2072,6 +2081,7 @@ fn handle_supervisor_message(
     denials: &mut Vec<DenialRecord>,
     seen_request_ids: &mut HashSet<String>,
     mut trust_interceptor: Option<&mut crate::trust_intercept::TrustInterceptor>,
+    mut skill_interceptor: Option<&mut crate::skill_intercept::SkillInterceptor>,
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
@@ -2195,6 +2205,42 @@ fn handle_supervisor_message(
                         );
                         ApprovalDecision::Denied {
                             reason: format!("Instruction file failed trust verification: {reason}"),
+                        }
+                    }
+                }
+            } else if let Some(skill_result) = skill_interceptor
+                .as_mut()
+                .and_then(|si| si.check_path(&request.path))
+            {
+                // 2b. Skill verification for plugin directory files
+                match skill_result {
+                    Ok(verified) => {
+                        debug!(
+                            "Supervisor: skill file {} verified ({} v{}, publisher: {})",
+                            request.path.display(),
+                            verified.name,
+                            verified.version,
+                            verified.publisher,
+                        );
+                        // Verified skill file — auto-grant read access
+                        ApprovalDecision::Granted
+                    }
+                    Err(reason) => {
+                        debug!(
+                            "Supervisor: skill file {} denied: {}",
+                            request.path.display(),
+                            reason
+                        );
+                        record_denial(
+                            denials,
+                            DenialRecord {
+                                path: request.path.clone(),
+                                access: request.access,
+                                reason: DenialReason::PolicyBlocked,
+                            },
+                        );
+                        ApprovalDecision::Denied {
+                            reason: format!("Skill verification failed: {reason}"),
                         }
                     }
                 }
@@ -3221,6 +3267,7 @@ mod tests {
                     None, // no proxy seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
+                    None, // no skill interceptor
                     None, // no PTY relay — this is what we're testing
                 );
 
@@ -3228,6 +3275,7 @@ mod tests {
                 let result = run_supervisor_loop(
                     child, &mut sock, &sup_cfg, None, // no startup timeout
                     None, // no trust interceptor
+                    None, // no skill interceptor
                     None, // no PTY relay
                 );
 

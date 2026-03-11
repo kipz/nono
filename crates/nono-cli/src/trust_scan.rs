@@ -1019,6 +1019,117 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, ()> {
     nono::trust::base64::base64_decode(input).map_err(|_| ())
 }
 
+// ---------------------------------------------------------------------------
+// Skill scanning
+// ---------------------------------------------------------------------------
+
+/// Result of scanning skills under configurable root directories.
+pub struct SkillScanResult {
+    /// Skill directories that passed verification
+    pub verified: Vec<(PathBuf, String)>, // (dir, publisher)
+    /// Skill directories that failed verification
+    pub denied: Vec<(PathBuf, String)>, // (dir, reason)
+}
+
+/// Scan skill directories under the given roots and verify each one.
+///
+/// Returns lists of verified and denied skill directories. Denied directories
+/// should be excluded from sandbox permissions.
+pub fn scan_skills(roots: &[PathBuf], policy: &TrustPolicy, silent: bool) -> SkillScanResult {
+    let dirs = trust::find_skill_directories(roots).unwrap_or_default();
+
+    if dirs.is_empty() {
+        return SkillScanResult {
+            verified: Vec::new(),
+            denied: Vec::new(),
+        };
+    }
+
+    if !silent {
+        eprintln!(
+            "  Scanning {} skill director{} for trust verification...",
+            dirs.len(),
+            if dirs.len() == 1 { "y" } else { "ies" }
+        );
+    }
+
+    let mut verified = Vec::new();
+    let mut denied = Vec::new();
+
+    for dir in &dirs {
+        match trust::verify_skill(policy, dir) {
+            Ok(result) => match &result.outcome {
+                VerificationOutcome::Verified { publisher } => {
+                    if !silent {
+                        eprintln!(
+                            "    {} {} v{} (publisher: {})",
+                            "PASS".green(),
+                            result.name,
+                            result.version,
+                            publisher
+                        );
+                    }
+                    verified.push((dir.clone(), publisher.clone()));
+                }
+                outcome => {
+                    let reason = match outcome {
+                        VerificationOutcome::Blocked { reason } => {
+                            format!("blocklisted: {reason}")
+                        }
+                        VerificationOutcome::Unsigned => "unsigned".to_string(),
+                        VerificationOutcome::InvalidSignature { detail } => detail.clone(),
+                        VerificationOutcome::UntrustedPublisher { identity } => {
+                            format!("untrusted: {}", format_identity(identity))
+                        }
+                        VerificationOutcome::DigestMismatch { .. } => {
+                            "content modified since signing".to_string()
+                        }
+                        VerificationOutcome::Verified { .. } => unreachable!(),
+                    };
+                    if !silent {
+                        eprintln!(
+                            "    {} {} v{}: {}",
+                            "FAIL".red(),
+                            result.name,
+                            result.version,
+                            reason
+                        );
+                    }
+                    denied.push((dir.clone(), reason));
+                }
+            },
+            Err(e) => {
+                let reason = format!("verification error: {e}");
+                if !silent {
+                    eprintln!("    {} {}: {}", "FAIL".red(), dir.display(), reason);
+                }
+                denied.push((dir.clone(), reason));
+            }
+        }
+    }
+
+    if !silent && (!verified.is_empty() || !denied.is_empty()) {
+        if denied.is_empty() {
+            eprintln!(
+                "  {}",
+                format!("Skill scan: {} skill(s) verified.", verified.len()).green()
+            );
+        } else {
+            eprintln!(
+                "  {}",
+                format!(
+                    "Skill scan: {} verified, {} denied.",
+                    verified.len(),
+                    denied.len()
+                )
+                .yellow()
+            );
+        }
+    }
+
+    SkillScanResult { verified, denied }
+}
+
 fn format_identity(identity: &trust::SignerIdentity) -> String {
     match identity {
         trust::SignerIdentity::Keyed { key_id } => format!("{key_id} (keyed)"),

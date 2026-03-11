@@ -292,6 +292,119 @@ pub fn sign_files(
     sign_statement(&statement, key_pair)
 }
 
+/// Sign a skill directory, producing a Sigstore bundle.
+///
+/// Loads the skill manifest, computes SHA-256 digests for all listed files
+/// (plus the manifest itself), builds a multi-subject in-toto statement with
+/// the skill-specific predicate type, embeds the manifest content in the
+/// predicate, and signs via ECDSA P-256.
+///
+/// # Arguments
+///
+/// * `skill_dir` - Path to the skill directory containing `skill-manifest.json`
+/// * `key_pair` - The ECDSA P-256 signing key pair
+/// * `key_id` - Human-readable key identifier
+///
+/// # Returns
+///
+/// The Sigstore bundle as a pretty-printed JSON string.
+///
+/// # Errors
+///
+/// Returns `NonoError::TrustSigning` on any failure.
+pub fn sign_skill(skill_dir: &Path, key_pair: &KeyPair, key_id: &str) -> Result<String> {
+    use super::skill::{NONO_SKILL_PREDICATE_TYPE, SKILL_MANIFEST_FILENAME};
+
+    let manifest_path = skill_dir.join(SKILL_MANIFEST_FILENAME);
+    let manifest_content =
+        std::fs::read_to_string(&manifest_path).map_err(|e| NonoError::TrustSigning {
+            path: manifest_path.display().to_string(),
+            reason: format!("failed to read skill manifest: {e}"),
+        })?;
+
+    // Parse and validate the manifest
+    let manifest: super::skill::SkillManifest =
+        serde_json::from_str(&manifest_content).map_err(|e| NonoError::TrustSigning {
+            path: manifest_path.display().to_string(),
+            reason: format!("invalid skill manifest: {e}"),
+        })?;
+
+    if manifest.files.len() > MAX_MULTI_SUBJECT_FILES {
+        return Err(NonoError::TrustSigning {
+            path: skill_dir.display().to_string(),
+            reason: format!(
+                "too many files: {} exceeds maximum of {}",
+                manifest.files.len(),
+                MAX_MULTI_SUBJECT_FILES
+            ),
+        });
+    }
+
+    // Compute digests for all files in the manifest
+    let mut subjects: Vec<(String, String)> = Vec::with_capacity(manifest.files.len());
+    for file_rel in &manifest.files {
+        let file_path = skill_dir.join(file_rel);
+        if !file_path.exists() {
+            return Err(NonoError::TrustSigning {
+                path: file_path.display().to_string(),
+                reason: format!("file listed in manifest does not exist: {file_rel}"),
+            });
+        }
+        let digest =
+            crate::trust::digest::file_digest(&file_path).map_err(|e| NonoError::TrustSigning {
+                path: file_path.display().to_string(),
+                reason: format!("failed to compute digest: {e}"),
+            })?;
+        subjects.push((file_rel.clone(), digest));
+    }
+
+    // Build signer predicate with embedded manifest
+    let signer_predicate = serde_json::json!({
+        "version": 1,
+        "signer": {
+            "kind": "keyed",
+            "key_id": key_id
+        },
+        "manifest": serde_json::from_str::<serde_json::Value>(&manifest_content)
+            .unwrap_or(serde_json::Value::Null)
+    });
+
+    // Build statement with skill-specific predicate type
+    let subject = subjects
+        .iter()
+        .map(|(name, sha256_hex)| {
+            let mut digest = std::collections::HashMap::new();
+            digest.insert("sha256".to_string(), sha256_hex.clone());
+            dsse::InTotoSubject {
+                name: name.clone(),
+                digest,
+            }
+        })
+        .collect();
+
+    let statement = dsse::InTotoStatement {
+        statement_type: dsse::IN_TOTO_STATEMENT_TYPE.to_string(),
+        subject,
+        predicate_type: NONO_SKILL_PREDICATE_TYPE.to_string(),
+        predicate: signer_predicate,
+    };
+
+    sign_statement(&statement, key_pair)
+}
+
+/// Write a skill bundle JSON string to the conventional path within the skill directory.
+///
+/// # Errors
+///
+/// Returns `NonoError::TrustSigning` if the write fails.
+pub fn write_skill_bundle(skill_dir: &Path, bundle_json: &str) -> Result<()> {
+    let bundle_path = skill_dir.join(super::skill::SKILL_BUNDLE_FILENAME);
+    std::fs::write(&bundle_path, bundle_json).map_err(|e| NonoError::TrustSigning {
+        path: bundle_path.display().to_string(),
+        reason: format!("failed to write skill bundle: {e}"),
+    })
+}
+
 /// Sign an in-toto statement and wrap in a Sigstore bundle.
 ///
 /// Shared signing engine: serializes the statement to JSON, computes PAE,

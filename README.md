@@ -165,6 +165,30 @@ Instruction files (SKILLS.md, CLAUDE.md, AGENTS.md, AGENT.MD) and associated art
 
 Sign instruction files directly within GitHub Actions workflows. Users can then verify that files originate from the expected repository and branch, signed by a trusted maintainer.
 
+#### Marketplace Skill Verification
+
+Marketplace plugins installed to `~/.claude/plugins/` (prompt files, hook scripts, config) are verified as signed units before the agent can read or execute them. Each plugin directory contains a `skill-manifest.json` declaring all files, entry points, and hooks. The entire directory is signed as a multi-subject in-toto attestation with a skill-specific predicate type.
+
+```bash
+# Sign a plugin directory
+nono trust sign-skill ~/.claude/plugins/my-plugin
+
+# Verify against a trust policy
+nono trust verify-skill ~/.claude/plugins/my-plugin --policy trust-policy.json
+```
+
+**Pre-exec scanning:** before the agent starts, nono discovers all plugin directories and verifies each one. Verified plugins get read-only sandbox access. Unverified or tampered plugins are denied — on macOS via Seatbelt deny rules, on Linux by exclusion from the Landlock allow-list.
+
+**Runtime gating:** in supervised mode, the skill interceptor checks every file access against the verification cache. Files within verified skill directories are auto-granted read access. Files within unverified directories are auto-denied without prompting.
+
+**Security properties:**
+
+- **No TOFU** — plugins must have valid signatures from trusted publishers on first encounter
+- **Predicate isolation** — skill bundles use a distinct predicate type, preventing cross-use with instruction file bundles
+- **Directory completeness** — extra files on disk not in the manifest are rejected as tampering
+- **Digest integrity** — every file is SHA-256 checked against the signed manifest; post-signing modifications are detected
+- **Entry point containment** — manifest paths must resolve within the skill directory; symlinks pointing outside are rejected
+
 ### Network Filtering
 
 Allowlist-based host filtering via a local proxy. The sandbox blocks all direct outbound connections — the agent can only reach explicitly allowed hosts. Cloud metadata endpoints are hardcoded as denied.

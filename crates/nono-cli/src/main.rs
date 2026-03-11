@@ -41,6 +41,7 @@ mod sandbox_state;
 mod session;
 mod session_commands;
 mod setup;
+mod skill_intercept;
 mod startup_runtime;
 mod supervised_runtime;
 mod terminal_approval;
@@ -760,6 +761,35 @@ fn run_sandbox(run_args: RunArgs, silent: bool) -> Result<()> {
     };
     let _ = &scan_result; // suppress unused warning on non-macOS
 
+    // Skill verification: scan plugin directories and enforce sandbox rules.
+    // Verified skill dirs get read-only access; unverified dirs get deny rules (macOS)
+    // or are simply excluded from the allow-list (Linux).
+    let skill_roots = default_skill_roots();
+    if let Some(ref tp) = trust_policy {
+        let skill_result = trust_scan::scan_skills(&skill_roots, tp, silent);
+        for (path, _publisher) in &skill_result.verified {
+            match FsCapability::new_dir(path, AccessMode::Read) {
+                Ok(mut cap) => {
+                    cap.source = nono::CapabilitySource::System;
+                    prepared.caps.add_fs(cap);
+                }
+                Err(e) => {
+                    warn!("Skill dir capability failed for {}: {}", path.display(), e);
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        for (path, _reason) in &skill_result.denied {
+            if let Some(path_str) = path.to_str() {
+                let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+                let rule = format!("(deny file-read* (subpath \"{escaped}\"))");
+                if let Err(e) = prepared.caps.add_platform_rule(&rule) {
+                    warn!("Skill deny rule failed for {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+
     // Enable sandbox extensions for transparent capability expansion in supervised mode,
     // but only when the profile opts into capability elevation. Without elevation,
     // supervised mode runs with static capabilities (no seccomp, no PTY, no prompts).
@@ -1214,6 +1244,18 @@ impl ExecutionFlags {
 
 fn trust_interception_active(policy: Option<&nono::trust::TrustPolicy>) -> bool {
     policy.is_some_and(|policy| !policy.includes.is_empty())
+}
+
+/// Default root directories to search for marketplace skill plugins.
+fn default_skill_roots() -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        let plugins_dir = home.join(".claude").join("plugins");
+        if plugins_dir.is_dir() {
+            roots.push(plugins_dir);
+        }
+    }
+    roots
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2049,11 +2091,17 @@ fn execute_sandboxed(
                 None
             };
 
+            // Create skill interceptor for runtime verification of plugin directory files.
+            let skill_interceptor = flags.trust_policy.as_ref().map(|policy| {
+                skill_intercept::SkillInterceptor::new(policy.clone(), default_skill_roots())
+            });
+
             let started = chrono::Local::now().to_rfc3339();
             let exit_code = exec_strategy::execute_supervised(
                 &config,
                 Some(&supervisor_cfg),
                 trust_interceptor,
+                skill_interceptor,
             )?;
             let ended = chrono::Local::now().to_rfc3339();
 

@@ -1642,6 +1642,10 @@ pub enum TrustCommands {
     Keygen(TrustKeygenArgs),
     /// Export the public key for a signing key (base64 DER)
     ExportKey(TrustExportKeyArgs),
+    /// Sign a skill/plugin directory
+    SignSkill(TrustSignSkillArgs),
+    /// Verify a skill/plugin directory
+    VerifySkill(TrustVerifySkillArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -1786,6 +1790,26 @@ pub struct TrustExportKeyArgs {
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+pub struct TrustSignSkillArgs {
+    /// Path to the skill/plugin directory to sign
+    pub dir: PathBuf,
+
+    /// Key ID to use from the system keystore (default: "default")
+    #[arg(long, value_name = "KEY_ID")]
+    pub key: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+pub struct TrustVerifySkillArgs {
+    /// Path to the skill/plugin directory to verify
+    pub dir: PathBuf,
+
+    /// Trust policy file (default: auto-discover)
+    #[arg(long, value_name = "FILE")]
+    pub policy: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -2286,6 +2310,71 @@ mod tests {
                     assert!(export_args.pem);
                 }
                 _ => panic!("Expected ExportKey subcommand"),
+            },
+            _ => panic!("Expected Trust command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_sign_skill() {
+        let cli = Cli::parse_from(["nono", "trust", "sign-skill", "./my-plugin"]);
+        match cli.command {
+            Commands::Trust(args) => match args.command {
+                TrustCommands::SignSkill(skill_args) => {
+                    assert_eq!(skill_args.dir, PathBuf::from("./my-plugin"));
+                    assert!(skill_args.key.is_none());
+                }
+                _ => panic!("Expected SignSkill subcommand"),
+            },
+            _ => panic!("Expected Trust command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_sign_skill_with_key() {
+        let cli = Cli::parse_from(["nono", "trust", "sign-skill", "./plugin", "--key", "my-key"]);
+        match cli.command {
+            Commands::Trust(args) => match args.command {
+                TrustCommands::SignSkill(skill_args) => {
+                    assert_eq!(skill_args.key, Some("my-key".to_string()));
+                }
+                _ => panic!("Expected SignSkill subcommand"),
+            },
+            _ => panic!("Expected Trust command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_verify_skill() {
+        let cli = Cli::parse_from(["nono", "trust", "verify-skill", "./my-plugin"]);
+        match cli.command {
+            Commands::Trust(args) => match args.command {
+                TrustCommands::VerifySkill(skill_args) => {
+                    assert_eq!(skill_args.dir, PathBuf::from("./my-plugin"));
+                    assert!(skill_args.policy.is_none());
+                }
+                _ => panic!("Expected VerifySkill subcommand"),
+            },
+            _ => panic!("Expected Trust command"),
+        }
+    }
+
+    #[test]
+    fn test_trust_verify_skill_with_policy() {
+        let cli = Cli::parse_from([
+            "nono",
+            "trust",
+            "verify-skill",
+            "./plugin",
+            "--policy",
+            "custom.json",
+        ]);
+        match cli.command {
+            Commands::Trust(args) => match args.command {
+                TrustCommands::VerifySkill(skill_args) => {
+                    assert_eq!(skill_args.policy, Some(PathBuf::from("custom.json")));
+                }
+                _ => panic!("Expected VerifySkill subcommand"),
             },
             _ => panic!("Expected Trust command"),
         }

@@ -59,6 +59,7 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
 
     let t = theme::current();
 
+    eprintln!("  {}", theme::fg("Capabilities:", t.subtext).bold());
     rule();
 
     // Filesystem capabilities

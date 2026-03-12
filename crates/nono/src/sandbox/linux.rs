@@ -1,6 +1,6 @@
 //! Linux sandbox implementation using Landlock LSM
 
-use crate::capability::{AccessMode, CapabilitySet, NetworkMode};
+use crate::capability::{AccessMode, CapabilitySet, NetworkMode, SignalMode};
 use crate::error::{NonoError, Result};
 use crate::sandbox::SupportInfo;
 use landlock::{
@@ -279,6 +279,34 @@ fn is_device_directory(path: &Path) -> bool {
     path.starts_with("/dev") && path.is_dir()
 }
 
+/// Determine which Landlock scopes must be enabled for these capabilities.
+///
+/// Only `SignalMode::AllowSameSandbox` has an exact Landlock mapping today.
+/// `SignalMode::Isolated` cannot be represented because Landlock scopes to the
+/// sandbox domain, not to the calling process alone.
+fn requested_scopes(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<BitFlags<Scope>> {
+    match caps.signal_mode() {
+        SignalMode::AllowAll => Ok(BitFlags::EMPTY),
+        SignalMode::Isolated => {
+            if abi.has_scoping() {
+                Ok(Scope::Signal.into())
+            } else {
+                Ok(BitFlags::EMPTY)
+            }
+        }
+        SignalMode::AllowSameSandbox => {
+            if !abi.has_scoping() {
+                return Err(NonoError::SandboxInit(
+                    "SignalMode::AllowSameSandbox requires Landlock ABI V6+ \
+                     (LANDLOCK_SCOPE_SIGNAL), but this kernel does not support process scoping."
+                        .to_string(),
+                ));
+            }
+            Ok(Scope::Signal.into())
+        }
+    }
+}
+
 /// Apply Landlock sandbox with the given capabilities, auto-detecting ABI.
 ///
 /// This is a pure primitive - it applies ONLY the capabilities provided.
@@ -303,6 +331,7 @@ pub fn apply(caps: &CapabilitySet) -> Result<()> {
 pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
     let target_abi = abi.abi;
     info!("Using Landlock ABI {:?}", target_abi);
+    let scopes = requested_scopes(caps, abi)?;
 
     // Determine which access rights to handle based on ABI
     let handled_fs = AccessFs::from_all(target_abi);
@@ -348,6 +377,34 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<()> {
     } else {
         ruleset_builder
     };
+
+    let ruleset_builder = if scopes.is_empty() {
+        ruleset_builder
+    } else {
+        debug!("Handling Landlock scopes: {:?}", scopes);
+        ruleset_builder
+            .set_compatibility(CompatLevel::HardRequirement)
+            .scope(scopes)
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Signal scoping requested but unsupported by this kernel: {}",
+                    e
+                ))
+            })?
+            .set_compatibility(CompatLevel::BestEffort)
+    };
+
+    if matches!(caps.signal_mode(), SignalMode::Isolated) && abi.has_scoping() {
+        warn!(
+            "SignalMode::Isolated is approximated on Linux with same-sandbox signal scoping: \
+             Landlock can restrict signals to the same sandbox, but not to self only"
+        );
+    } else if matches!(caps.signal_mode(), SignalMode::Isolated) {
+        warn!(
+            "SignalMode::Isolated is not enforceable on this kernel: \
+             Landlock ABI V6+ is required for signal scoping"
+        );
+    }
 
     let mut ruleset = ruleset_builder
         .create()
@@ -1314,6 +1371,196 @@ mod tests {
 
         let v6 = DetectedAbi::new(ABI::V6);
         assert!(v6.has_scoping());
+    }
+
+    #[test]
+    fn test_requested_scopes_allow_all_is_empty() {
+        let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowAll);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        assert!(matches!(scopes, Ok(actual) if actual.is_empty()));
+    }
+
+    #[test]
+    fn test_requested_scopes_isolated_uses_signal_scope_on_v6() {
+        let caps = CapabilitySet::new().set_signal_mode(SignalMode::Isolated);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        assert!(matches!(scopes, Ok(actual) if actual == BitFlags::from(Scope::Signal)));
+    }
+
+    #[test]
+    fn test_requested_scopes_isolated_is_empty_without_v6() {
+        let caps = CapabilitySet::new().set_signal_mode(SignalMode::Isolated);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V5));
+        assert!(matches!(scopes, Ok(actual) if actual.is_empty()));
+    }
+
+    #[test]
+    fn test_requested_scopes_allow_same_sandbox_requires_v6() {
+        let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V5));
+        assert!(
+            matches!(scopes, Err(NonoError::SandboxInit(message)) if message.contains("Landlock ABI V6+"))
+        );
+    }
+
+    #[test]
+    fn test_requested_scopes_allow_same_sandbox_uses_signal_scope() {
+        let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
+        let scopes = requested_scopes(&caps, &DetectedAbi::new(ABI::V6));
+        assert!(matches!(scopes, Ok(actual) if actual == BitFlags::from(Scope::Signal)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_signal_scope_blocks_external_kill_on_v6() {
+        struct ChildCleanup {
+            sandbox_pid: Option<libc::pid_t>,
+            target_pid: Option<libc::pid_t>,
+        }
+
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                if let Some(pid) = self.sandbox_pid.take() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+
+                if let Some(pid) = self.target_pid.take() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+
+        let detected = match detect_abi() {
+            Ok(detected) => detected,
+            Err(_) => return,
+        };
+
+        if !detected.has_scoping() {
+            return;
+        }
+
+        let mut report_pipe = [0; 2];
+        let pipe_result = unsafe { libc::pipe(report_pipe.as_mut_ptr()) };
+        assert_eq!(pipe_result, 0, "pipe() failed");
+
+        let target_pid = unsafe { libc::fork() };
+        assert!(target_pid >= 0, "fork() for target failed");
+        let mut cleanup = ChildCleanup {
+            sandbox_pid: None,
+            target_pid: Some(target_pid),
+        };
+
+        if target_pid == 0 {
+            unsafe {
+                libc::close(report_pipe[0]);
+                libc::close(report_pipe[1]);
+                libc::signal(libc::SIGUSR1, libc::SIG_IGN);
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+
+        let sandbox_pid = unsafe { libc::fork() };
+        assert!(sandbox_pid >= 0, "fork() for sandbox failed");
+        cleanup.sandbox_pid = Some(sandbox_pid);
+
+        if sandbox_pid == 0 {
+            let mut payload = [0_u8; 2];
+            unsafe {
+                libc::close(report_pipe[0]);
+            }
+
+            let caps = CapabilitySet::new().set_signal_mode(SignalMode::AllowSameSandbox);
+            match apply_with_abi(&caps, &detected) {
+                Ok(()) => {
+                    let kill_result = unsafe { libc::kill(target_pid, libc::SIGUSR1) };
+                    let errno = std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(255);
+                    payload[0] = if kill_result == -1 { 1 } else { 0 };
+                    payload[1] = u8::try_from(errno).unwrap_or(u8::MAX);
+                }
+                Err(_) => {
+                    payload[0] = 2;
+                    payload[1] = 0;
+                }
+            }
+
+            let write_len = payload.len();
+            let wrote = unsafe {
+                libc::write(
+                    report_pipe[1],
+                    payload.as_ptr().cast::<libc::c_void>(),
+                    write_len,
+                )
+            };
+            let exit_code = if wrote == isize::try_from(write_len).unwrap_or(-1) {
+                0
+            } else {
+                3
+            };
+            unsafe {
+                libc::close(report_pipe[1]);
+                libc::_exit(exit_code);
+            }
+        }
+
+        unsafe {
+            libc::close(report_pipe[1]);
+        }
+
+        let mut sandbox_status = 0;
+        let waited_sandbox = unsafe { libc::waitpid(sandbox_pid, &mut sandbox_status, 0) };
+        assert_eq!(waited_sandbox, sandbox_pid, "waitpid() for sandbox failed");
+        assert!(
+            libc::WIFEXITED(sandbox_status),
+            "sandbox child did not exit normally"
+        );
+        cleanup.sandbox_pid = None;
+        assert_eq!(
+            libc::WEXITSTATUS(sandbox_status),
+            0,
+            "sandbox child returned failure"
+        );
+
+        let mut payload = [0_u8; 2];
+        let read_len = payload.len();
+        let read_result = unsafe {
+            libc::read(
+                report_pipe[0],
+                payload.as_mut_ptr().cast::<libc::c_void>(),
+                read_len,
+            )
+        };
+        unsafe {
+            libc::close(report_pipe[0]);
+        }
+        assert_eq!(
+            read_result,
+            isize::try_from(read_len).unwrap_or(-1),
+            "failed to read sandbox report"
+        );
+        assert_eq!(payload[0], 1, "sandboxed kill unexpectedly succeeded");
+        assert_eq!(
+            i32::from(payload[1]),
+            libc::EPERM,
+            "kill should fail with EPERM"
+        );
+
+        let target_wait = unsafe { libc::waitpid(target_pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(target_wait, 0, "external target should still be running");
+
+        unsafe {
+            libc::kill(target_pid, libc::SIGKILL);
+            libc::waitpid(target_pid, std::ptr::null_mut(), 0);
+        }
+        cleanup.target_pid = None;
     }
 
     #[test]

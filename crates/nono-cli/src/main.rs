@@ -55,7 +55,7 @@ use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use profile::WorkdirAccess;
 use std::ffi::OsString;
 use std::os::unix::io::FromRawFd;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() {
@@ -1562,6 +1562,27 @@ fn execute_sandboxed(
         }
     } else {
         None
+    };
+
+    // If the top-level command is a mediated command, re-resolve it to the shim.
+    // `resolved_program` was set before mediation setup, so it points at the real
+    // binary. The child must exec the shim so the invocation goes through the
+    // mediation server (shim → socket → passthrough to real binary).
+    let resolved_program = if let Some(ref session) = mediation_session {
+        let cmd_name = command.first().map(|s| s.as_str()).unwrap_or("");
+        let shim_path = session.shim_dir.join(cmd_name);
+        if shim_path.exists() {
+            debug!(
+                "Mediation: re-resolved top-level command '{}' to shim {}",
+                cmd_name,
+                shim_path.display()
+            );
+            shim_path
+        } else {
+            resolved_program
+        }
+    } else {
+        resolved_program
     };
 
     // Apply sandbox BEFORE fork for Direct and Monitor modes.

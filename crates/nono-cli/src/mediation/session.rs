@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 pub enum ResolvedAction {
     Respond { stdout: String },
     Capture { script: Option<String> },
+    Approve { script: Option<String> },
 }
 
 /// A resolved intercept rule ready for the mediation server.
@@ -132,7 +133,27 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let mut resolved_commands: Vec<ResolvedCommand> = Vec::new();
     let mut blocked_binaries: Vec<PathBuf> = Vec::new();
 
+    let command_names: Vec<&str> = config.commands.iter().map(|c| c.name.as_str()).collect();
+
     for entry in &config.commands {
+        // Validate allow_commands references
+        if let Some(ref sb) = entry.sandbox {
+            for allowed in &sb.allow_commands {
+                if allowed == &entry.name {
+                    return Err(NonoError::SandboxInit(format!(
+                        "mediation: command '{}' lists itself in allow_commands",
+                        entry.name
+                    )));
+                }
+                if !command_names.contains(&allowed.as_str()) {
+                    tracing::warn!(
+                        "mediation: command '{}' lists '{}' in allow_commands but '{}' is not a mediated command",
+                        entry.name, allowed, allowed
+                    );
+                }
+            }
+        }
+
         let resolved = resolve_command(entry, &shim_dir, &shim_binary)?;
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
@@ -327,6 +348,12 @@ fn resolve_command(
                 ),
                 InterceptAction::Capture { script } => (
                     ResolvedAction::Capture {
+                        script: script.clone(),
+                    },
+                    0,
+                ),
+                InterceptAction::Approve { script } => (
+                    ResolvedAction::Approve {
                         script: script.clone(),
                     },
                     0,

@@ -96,6 +96,16 @@ pub enum InterceptAction {
         #[serde(default)]
         script: Option<String>,
     },
+    /// Run the real binary and return its actual output (no nonce wrapping).
+    ///
+    /// Useful with `admin: true` to gate sensitive-but-non-secret commands
+    /// behind an approval step while still showing the real output.
+    /// If `script` is set, runs `sh -c "<script>"` instead of the real binary.
+    Approve {
+        /// Optional shell script to run instead of the real binary.
+        #[serde(default)]
+        script: Option<String>,
+    },
 }
 
 /// Sandbox profile applied when exec-ing the real binary for a passthrough command.
@@ -113,6 +123,10 @@ pub struct CommandSandbox {
     /// Filesystem paths the command may write.
     #[serde(default)]
     pub fs_write: Vec<String>,
+    /// Commands allowed to execute directly (real binary, not shim) inside this
+    /// per-command sandbox. Their output stays within the sandbox.
+    #[serde(default)]
+    pub allow_commands: Vec<String>,
 }
 
 /// Simple network config for per-command sandbox profiles.
@@ -165,5 +179,29 @@ mod tests {
         let config = NetworkConfig::default();
         assert!(!config.block);
         assert!(config.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_command_sandbox_allow_commands_deserializes() {
+        let json = r#"{
+            "allow_commands": ["ddtool", "kubectl"],
+            "network": { "block": true }
+        }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(sb.allow_commands, vec!["ddtool", "kubectl"]);
+        assert!(sb.network.block);
+    }
+
+    #[test]
+    fn test_command_sandbox_allow_commands_defaults_empty() {
+        let json = r#"{ "network": { "block": false } }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert!(sb.allow_commands.is_empty());
+    }
+
+    #[test]
+    fn test_command_sandbox_default_has_empty_allow_commands() {
+        let sb = CommandSandbox::default();
+        assert!(sb.allow_commands.is_empty());
     }
 }

@@ -14,7 +14,8 @@ use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
@@ -141,6 +142,7 @@ pub async fn apply(
                                 &broker,
                                 None,
                                 ctx,
+                                commands,
                             )
                             .await
                         }
@@ -153,6 +155,26 @@ pub async fn apply(
                         stdout: format!("{}\n", nonce),
                         stderr: String::new(),
                         exit_code: 0,
+                    }
+                }
+                ResolvedAction::Approve { script } => {
+                    // Run the real binary (or script) and return the actual output.
+                    // Typically used with admin: true to gate behind approval.
+                    match script {
+                        Some(sh) => exec_script(sh, &request.env, &broker).await,
+                        None => {
+                            exec_passthrough(
+                                cmd,
+                                &request.args,
+                                &request.stdin,
+                                &request.env,
+                                &broker,
+                                None,
+                                ctx,
+                                commands,
+                            )
+                            .await
+                        }
                     }
                 }
             };
@@ -174,6 +196,7 @@ pub async fn apply(
         &broker,
         cmd.sandbox.clone(),
         ctx,
+        commands,
     )
     .await
 }
@@ -322,6 +345,9 @@ async fn exec_script(
     }
 }
 
+/// Atomic counter for generating unique filtered shim directory names.
+static FILTERED_SHIM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Execute the real binary and collect its output.
 ///
 /// Env building:
@@ -333,6 +359,11 @@ async fn exec_script(
 ///   All other sandbox env vars are discarded to prevent sandbox injection.
 /// - Dangerous var names (PATH, LD_PRELOAD, etc.) are blocked even with valid nonces.
 /// - Arg nonces: any arg starting with `nono_` is replaced with the real value.
+///
+/// When `allow_commands` is non-empty on the sandbox, a filtered shim directory is
+/// created containing symlinks only for commands NOT in the allow list. Allowed
+/// commands run directly (real binary) inside the per-command sandbox.
+#[allow(clippy::too_many_arguments)]
 async fn exec_passthrough(
     cmd: &ResolvedCommand,
     args: &[String],
@@ -341,21 +372,60 @@ async fn exec_passthrough(
     broker: &Arc<TokenBroker>,
     sandbox: Option<super::CommandSandbox>,
     ctx: &SessionCtx<'_>,
+    all_commands: &[ResolvedCommand],
 ) -> ShimResponse {
     let mut env = build_exec_env(sandbox_env, broker);
 
-    // Prepend shim_dir to PATH so that subprocesses of the exec'd binary
-    // (e.g. kubectl's exec credential plugin) route through mediation rather
-    // than running directly inside the per-command Seatbelt sandbox.
-    let shim_dir_str = ctx.shim_dir.to_string_lossy();
+    // Build the effective shim directory and PATH.
+    // When allow_commands is set, create a filtered shim dir that excludes allowed
+    // commands so they resolve to their real binaries instead of routing through mediation.
+    let allow_commands = sandbox
+        .as_ref()
+        .map(|sb| &sb.allow_commands)
+        .filter(|ac| !ac.is_empty());
+
+    let (effective_shim_dir, _filtered_dir_guard) = if let Some(allow_cmds) = allow_commands {
+        match build_filtered_shim_dir(ctx.shim_dir, allow_cmds, all_commands) {
+            Ok((dir, guard)) => (dir, Some(guard)),
+            Err(e) => {
+                return ShimResponse {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "nono-mediation: failed to create filtered shim dir: {}\n",
+                        e
+                    ),
+                    exit_code: 1,
+                };
+            }
+        }
+    } else {
+        (ctx.shim_dir.to_path_buf(), None)
+    };
+
+    let shim_dir_str = effective_shim_dir.to_string_lossy().to_string();
     let parent_path = env
         .get("PATH")
         .cloned()
         .unwrap_or_else(|| "/usr/bin:/bin".to_string());
-    env.insert(
-        "PATH".to_string(),
-        format!("{}:{}", shim_dir_str, parent_path),
-    );
+
+    // For allowed commands, prepend their real binary directories after the shim dir
+    // so they resolve to the real binary (which won't have a shim in the filtered dir).
+    let mut path_parts = vec![shim_dir_str.clone()];
+    if let Some(allow_cmds) = allow_commands {
+        let mut seen_dirs: HashSet<String> = HashSet::new();
+        for allowed_name in allow_cmds {
+            if let Some(allowed_cmd) = all_commands.iter().find(|c| c.name == *allowed_name) {
+                if let Some(parent) = allowed_cmd.real_path.parent() {
+                    let dir_str = parent.to_string_lossy().to_string();
+                    if seen_dirs.insert(dir_str.clone()) {
+                        path_parts.push(dir_str);
+                    }
+                }
+            }
+        }
+    }
+    path_parts.push(parent_path);
+    env.insert("PATH".to_string(), path_parts.join(":"));
 
     // Inject mediation socket path and session token so the shim binaries
     // invoked by the exec'd command can authenticate to the mediation server.
@@ -388,8 +458,28 @@ async fn exec_passthrough(
     let real_path = cmd.real_path.clone();
     let stdin_data = stdin_data.to_string();
     // Owned shim paths for use in spawn_blocking (which requires 'static captures).
-    let shim_dir_buf = ctx.shim_dir.to_path_buf();
+    let shim_dir_buf = effective_shim_dir.clone();
     let real_shim_binary = std::fs::canonicalize(ctx.shim_dir.join(&cmd.name)).ok();
+
+    // Collect allowed command binary directories for sandbox read capabilities.
+    let allowed_binary_dirs: Vec<std::path::PathBuf> = sandbox
+        .as_ref()
+        .map(|sb| &sb.allow_commands)
+        .filter(|ac| !ac.is_empty())
+        .map(|allow_cmds| {
+            allow_cmds
+                .iter()
+                .filter_map(|name| {
+                    all_commands
+                        .iter()
+                        .find(|c| c.name == *name)
+                        .and_then(|c| c.real_path.parent())
+                        .filter(|p| p.exists())
+                        .map(|p| p.to_path_buf())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Start a per-command proxy if allowed_hosts is configured (and block is not set).
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
@@ -439,17 +529,18 @@ async fn exec_passthrough(
         if let Some(sb) = maybe_sandbox {
             let mut caps = nono::CapabilitySet::new();
 
-            // Apply platform system read paths so the binary can actually exec.
-            // Mirrors the system_read_macos / system_read_linux groups applied to the main sandbox.
+            // Apply platform system read+write paths so the binary can actually exec
+            // and use standard devices (e.g. /dev/null). Mirrors the system groups
+            // applied to the main sandbox.
             if let Ok(policy) = crate::policy::load_embedded_policy() {
-                let platform_group = if cfg!(target_os = "macos") {
-                    "system_read_macos"
+                let (read_group, write_group) = if cfg!(target_os = "macos") {
+                    ("system_read_macos", "system_write_macos")
                 } else {
-                    "system_read_linux"
+                    ("system_read_linux", "system_write_linux")
                 };
                 let _ = crate::policy::resolve_groups(
                     &policy,
-                    &[platform_group.to_string()],
+                    &[read_group.to_string(), write_group.to_string()],
                     &mut caps,
                 );
             }
@@ -470,6 +561,12 @@ async fn exec_passthrough(
             caps = caps.allow_path(&shim_dir_buf, nono::AccessMode::Read)?;
             if let Some(ref real_shim) = real_shim_binary {
                 caps = caps.allow_file(real_shim, nono::AccessMode::Read)?;
+            }
+
+            // Allow read access to directories of allowed commands so they can exec
+            // their real binaries directly (bypassing the shim).
+            for dir in &allowed_binary_dirs {
+                caps = caps.allow_path(dir, nono::AccessMode::Read)?;
             }
 
             // Add command-specific configured paths (~ is expanded to $HOME).
@@ -553,6 +650,100 @@ async fn exec_passthrough(
             stderr: format!("nono-mediation: internal error: {}\n", e),
             exit_code: 1,
         },
+    }
+}
+
+/// Build a filtered shim directory containing symlinks only for commands NOT
+/// in the `allow_commands` list. Returns the path and a guard that cleans up
+/// on drop. The directory is created under the session dir (derived from the
+/// shim_dir's parent) so `SessionHandle::drop` also cleans it up.
+fn build_filtered_shim_dir(
+    shim_dir: &std::path::Path,
+    allow_commands: &[String],
+    all_commands: &[ResolvedCommand],
+) -> Result<(std::path::PathBuf, FilteredShimDirGuard)> {
+    let allow_set: HashSet<&str> = allow_commands.iter().map(|s| s.as_str()).collect();
+
+    // Derive directory under the session dir for automatic cleanup.
+    let session_dir = shim_dir
+        .parent()
+        .ok_or_else(|| NonoError::SandboxInit("mediation: shim_dir has no parent".to_string()))?;
+    let counter = FILTERED_SHIM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filtered_dir = session_dir.join(format!("filtered-shims-{}", counter));
+
+    std::fs::create_dir_all(&filtered_dir).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to create filtered shim dir {}: {}",
+            filtered_dir.display(),
+            e
+        ))
+    })?;
+
+    // For each shim in the original shim_dir, symlink it into the filtered dir
+    // unless the command is in the allow list.
+    let entries = std::fs::read_dir(shim_dir).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to read shim dir {}: {}",
+            shim_dir.display(),
+            e
+        ))
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            NonoError::SandboxInit(format!("mediation: failed to read shim dir entry: {}", e))
+        })?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if allow_set.contains(name_str.as_ref()) {
+            debug!(
+                "mediation: allowing direct exec for '{}' (excluded from filtered shim dir)",
+                name_str
+            );
+            continue;
+        }
+
+        // Symlink the original shim (which itself points to nono-shim)
+        let src = entry.path();
+        let dst = filtered_dir.join(&name);
+        std::os::unix::fs::symlink(&src, &dst).map_err(|e| {
+            NonoError::SandboxInit(format!(
+                "mediation: failed to symlink {} -> {}: {}",
+                dst.display(),
+                src.display(),
+                e
+            ))
+        })?;
+    }
+
+    // Log the allowed commands and their real paths for auditability.
+    for allowed_name in allow_commands {
+        if let Some(cmd) = all_commands.iter().find(|c| c.name == *allowed_name) {
+            debug!(
+                "mediation: allow_commands '{}' -> {} (direct exec in per-command sandbox)",
+                allowed_name,
+                cmd.real_path.display()
+            );
+        }
+    }
+
+    let guard = FilteredShimDirGuard {
+        path: filtered_dir.clone(),
+    };
+    Ok((filtered_dir, guard))
+}
+
+/// RAII guard that removes the filtered shim directory on drop.
+/// The session dir cleanup also handles this, but this ensures prompt cleanup
+/// when the exec_passthrough call completes.
+struct FilteredShimDirGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for FilteredShimDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -1088,6 +1279,83 @@ mod tests {
         );
     }
 
+    // --- Filtered shim dir tests ---
+
+    #[test]
+    fn test_filtered_shim_dir_excludes_allowed_commands() {
+        // Create a temporary shim directory with some shim files
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+
+        // Create fake shim files
+        for name in &["gh", "ddtool", "kubectl"] {
+            std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
+        }
+
+        let commands = vec![
+            ResolvedCommand {
+                name: "gh".to_string(),
+                real_path: PathBuf::from("/usr/bin/gh"),
+                intercepts: vec![],
+                sandbox: None,
+            },
+            ResolvedCommand {
+                name: "ddtool".to_string(),
+                real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
+                intercepts: vec![],
+                sandbox: None,
+            },
+            ResolvedCommand {
+                name: "kubectl".to_string(),
+                real_path: PathBuf::from("/usr/local/bin/kubectl"),
+                intercepts: vec![],
+                sandbox: None,
+            },
+        ];
+
+        let allow_commands = vec!["ddtool".to_string()];
+
+        let (filtered_dir, _guard) = build_filtered_shim_dir(&shim_dir, &allow_commands, &commands)
+            .expect("build filtered shim dir");
+
+        // ddtool should NOT be in the filtered dir (it's allowed)
+        assert!(
+            !filtered_dir.join("ddtool").exists(),
+            "ddtool should be excluded from filtered shim dir"
+        );
+        // gh and kubectl should be symlinked
+        assert!(
+            filtered_dir.join("gh").exists(),
+            "gh should be in filtered shim dir"
+        );
+        assert!(
+            filtered_dir.join("kubectl").exists(),
+            "kubectl should be in filtered shim dir"
+        );
+    }
+
+    #[test]
+    fn test_filtered_shim_dir_empty_allow_commands_copies_all() {
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+
+        for name in &["gh", "ddtool"] {
+            std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
+        }
+
+        let commands = vec![];
+        // This function should not normally be called with empty allow_commands,
+        // but if it is, all shims should be present.
+        let allow_commands: Vec<String> = vec![];
+        let (filtered_dir, _guard) = build_filtered_shim_dir(&shim_dir, &allow_commands, &commands)
+            .expect("build filtered shim dir");
+
+        assert!(filtered_dir.join("gh").exists());
+        assert!(filtered_dir.join("ddtool").exists());
+    }
+
     // --- Per-command proxy tests ---
 
     /// When `allowed_hosts` is configured, exec_passthrough injects HTTPS_PROXY
@@ -1108,6 +1376,7 @@ mod tests {
                 },
                 fs_read: vec![],
                 fs_write: vec![],
+                allow_commands: vec![],
             }),
         };
 
@@ -1167,6 +1436,7 @@ mod tests {
                 },
                 fs_read: vec![],
                 fs_write: vec![],
+                allow_commands: vec![],
             }),
         };
 

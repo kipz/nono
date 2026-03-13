@@ -303,11 +303,14 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 **Intercept actions:**
 
 - **`respond`** — return a static response immediately, without running the real binary.
-- **`capture`** — return a nonce (phantom token) to the sandbox; the real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret. By default runs the real binary to obtain the value; set `script` to run a shell script via `sh -c` instead.
+- **`capture`** — run the real binary (or a `script` via `sh -c`) and return a nonce (phantom token) to the sandbox. The real value is substituted at passthrough time, so the agent can use the token in subsequent calls without ever seeing the real secret.
+- **`approve`** — run the real binary (or a `script` via `sh -c`) and return the actual output to the sandbox. Typically paired with `"admin": true` to gate sensitive-but-non-secret commands behind biometric/password approval.
 
 **Env var blocking:** named environment variables are stripped from the child process at session start, preventing the sandbox from reading raw credentials.
 
 **Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
+
+**Allowed commands (`allow_commands`):** when a mediated command (e.g. `gh`) runs inside its per-command sandbox, subprocesses normally route through shims. `allow_commands` lets specific commands (e.g. `ddtool`) execute directly as real binaries inside that sandbox. A filtered shim directory is created containing shims only for commands _not_ in the allow list. The allowed commands' binary directories are added to PATH and granted read access in the Seatbelt profile. Their output stays within the per-command sandbox — network restrictions prevent credential leakage.
 
 **Socket security:** the mediation socket is protected by two layers. The session directory is created `0700` and the socket itself `0600`, so other local users cannot connect. Within the same user, a 256-bit random session token is injected into the sandboxed child as `NONO_SESSION_TOKEN`; every shim request must include it. Requests exceeding 1 MiB are dropped before allocation; requests with a missing or incorrect token are dropped after reading.
 
@@ -339,6 +342,7 @@ flowchart TD
 
     subgraph sb2["Binary Sandbox (optional)"]
         MediatedBinSB["Mediated Binary"]
+        AllowedBin["Allowed Binary (direct)"]
     end
 
     User -->|"nono run"| HostProc
@@ -351,12 +355,14 @@ flowchart TD
     Agent -->|"execve via PATH"| Shim
     Agent -->|"execve allowed cmd"| FreeBin
     Shim -->|"request"| MedServer
-    MedServer -->|"capture / respond"| Broker
+    MedServer -->|"capture / respond / approve"| Broker
     MedServer -->|"passthrough"| MediatedBinHost
     MedServer -->|"passthrough"| MediatedBinSB
+    MediatedBinSB -->|"allow_commands"| AllowedBin
     Broker -.->|"nonce lookup"| MedServer
     MediatedBinHost -->|"output"| MedServer
     MediatedBinSB -->|"output"| MedServer
+    AllowedBin -->|"output"| MediatedBinSB
     MedServer -->|"stdout + exit code"| Shim
     Shim -->|"stdout"| Agent
 
@@ -369,6 +375,7 @@ flowchart TD
     style MedServer fill:#e0f2fe,stroke:#0284c7,color:#0c4a6e
     style MediatedBinHost fill:#f1f5f9,stroke:#64748b,color:#1e293b
     style MediatedBinSB fill:#f1f5f9,stroke:#64748b,color:#1e293b
+    style AllowedBin fill:#f0fdf4,stroke:#22c55e,color:#14532d
     style FreeBin fill:#f0fdf4,stroke:#22c55e,color:#14532d
     style BlockedBin fill:#fee2e2,stroke:#dc2626,color:#7f1d1d
     style Shim fill:#fff7ed,stroke:#ea580c,color:#431407
@@ -378,12 +385,106 @@ flowchart TD
     linkStyle 5 stroke:#dc2626,stroke-width:2px,stroke-dasharray:5
 ```
 
+#### Example: Credential Capture with Nonce Tokens
+
+The agent calls `gh auth token` — the shim intercepts it, the real binary runs in the unsandboxed parent, and the sandbox receives a nonce (`nono_abc123...`) instead of the real token. When the agent later calls `gh api user`, the nonce is promoted to the real value at passthrough time.
+
 ```json
 {
   "mediation": {
-    "env": {
-      "block": ["GH_TOKEN", "GITHUB_TOKEN"]
-    },
+    "env": { "block": ["GH_TOKEN", "GITHUB_TOKEN"] },
+    "commands": [
+      {
+        "name": "gh",
+        "intercept": [
+          {
+            "args_prefix": ["auth", "token"],
+            "action": { "type": "capture" }
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### Example: Static Responses
+
+Return a canned response without running the real binary. The agent sees a realistic output but no real operation occurs.
+
+```json
+{
+  "args_prefix": ["auth", "status"],
+  "action": {
+    "type": "respond",
+    "stdout": "github.com\n  Logged in to github.com account kipz\n"
+  }
+}
+```
+
+#### Example: Admin-Gated Approval
+
+Gate sensitive commands behind Touch ID / password via `nono-approve`. The `approve` action runs the real command and returns the actual output — unlike `capture`, no nonce wrapping occurs.
+
+```json
+{
+  "args_prefix": ["ssh-key", "list"],
+  "admin": true,
+  "action": { "type": "approve" }
+}
+```
+
+If the user denies the prompt, the shim returns exit code 126 and a "was not approved" message. If approved, the real output is returned to the sandbox.
+
+#### Example: Per-Command Sandbox with `allow_commands`
+
+Restrict `gh` to GitHub hosts only, but let it call `ddtool` directly inside its sandbox to fetch a token from the macOS Keychain. The `ddtool` binary runs as a real process (not through the shim) inside `gh`'s network-restricted sandbox — the token is used internally and never leaks to the primary sandbox.
+
+```json
+{
+  "mediation": {
+    "env": { "block": ["GH_TOKEN", "GITHUB_TOKEN"] },
+    "commands": [
+      {
+        "name": "gh",
+        "intercept": [
+          { "args_prefix": ["auth", "token"], "action": { "type": "capture" } }
+        ],
+        "sandbox": {
+          "network": {
+            "allowed_hosts": ["github.com", "*.github.com", "api.github.com"]
+          },
+          "fs_read": ["~/.config/gh", "~/Library/Keychains/login.keychain-db"],
+          "allow_commands": ["ddtool"]
+        }
+      },
+      {
+        "name": "ddtool",
+        "intercept": [
+          { "args_prefix": ["auth", "github", "token"], "action": { "type": "capture" } }
+        ]
+      }
+    ]
+  }
+}
+```
+
+How this works:
+
+1. Agent calls `gh api user` — the shim forwards it to the mediation server.
+2. The server execs the real `gh` binary inside a per-command Seatbelt sandbox (network restricted to `github.com`).
+3. The `gh` wrapper internally calls `ddtool auth github token` — because `ddtool` is in `allow_commands`, it resolves to the real binary (no shim), reads the Keychain, and returns the token.
+4. The wrapper sets `GH_TOKEN` and calls the real `gh` binary, which hits the GitHub API through the allowlisted proxy.
+5. At the top level, `ddtool auth github token` called directly by the agent still routes through the shim and returns a nonce — credentials are never exposed to the sandbox.
+
+#### Example: Full Profile
+
+Combining all capabilities — credential capture, static responses, admin-gated approval, per-command sandboxing, and allowed commands:
+
+```json
+{
+  "mediation": {
+    "env": { "block": ["GH_TOKEN", "GITHUB_TOKEN"] },
     "commands": [
       {
         "name": "gh",
@@ -396,18 +497,31 @@ flowchart TD
             "args_prefix": ["auth", "status"],
             "action": {
               "type": "respond",
-              "stdout": "github.com\n  ✓ Logged in to github.com\n  ✓ Git operations for github.com configured"
+              "stdout": "github.com\n  Logged in to github.com account kipz\n"
             }
+          },
+          {
+            "args_prefix": ["ssh-key", "list"],
+            "admin": true,
+            "action": { "type": "approve" }
           }
         ],
         "sandbox": {
-          "fs_read": ["/usr/local/share/gh", "~/.config/gh"],
-          "fs_write": [],
           "network": {
-            "block": false,
-            "allowed_hosts": []
-          }
+            "allowed_hosts": ["github.com", "*.github.com", "api.github.com"]
+          },
+          "fs_read": ["~/.config/gh", "~/Library/Keychains/login.keychain-db"],
+          "allow_commands": ["ddtool"]
         }
+      },
+      {
+        "name": "ddtool",
+        "intercept": [
+          {
+            "args_prefix": ["auth", "github", "token"],
+            "action": { "type": "capture" }
+          }
+        ]
       }
     ]
   }

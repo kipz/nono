@@ -91,31 +91,6 @@ The `workdir` section controls whether and how the current working directory is 
 
 When a profile specifies a workdir access level, nono will prompt the user to confirm CWD sharing (unless `--allow-cwd` is used to skip the prompt).
 
-### Environment Credential Injection
-
-The `env_credentials` section maps keystore account names to environment variable names. Credentials are loaded from the system keystore (macOS Keychain / Linux Secret Service) before the sandbox is applied, then injected as environment variables.
-
-```json
-{
-  "env_credentials": {
-    "openai_api_key": "OPENAI_API_KEY",
-    "database_url": "DATABASE_URL"
-  }
-}
-```
-
-```bash
-nono run --profile my-agent -- my-command
-```
-
-The legacy field name `"secrets"` is accepted as an alias for backward compatibility.
-
-See [Credential Injection](/cli/features/credential-injection) for details on storing credentials in the keystore.
-
-<Note>
-  For API keys, prefer [Credential Injection](/cli/features/credential-injection) over environment variable injection. Credential injection routes API calls through a reverse proxy that injects credentials transparently - the API key never enters the sandbox, even as an environment variable.
-</Note>
-
 ### Policy Overrides
 
 The `policy` section provides fine-grained, additive and subtractive composition on top of inherited groups and filesystem configuration. This is the primary mechanism for surgically customizing inherited profiles without redefining everything from scratch.
@@ -334,39 +309,20 @@ Profiles support these environment variables in path values:
 
 ### Creating User Profiles
 
-<Tip>
-  Use `nono profile init` to scaffold profiles with validation, JSON Schema, and editor autocomplete. See [Profile Authoring](/cli/features/profile-authoring) for the full workflow.
-</Tip>
+Use `nono profile init` to scaffold a new profile:
 
-1. Create the profiles directory:
-   ```bash
-   mkdir -p ~/.config/nono/profiles
-   ```
+```bash
+# Scaffold a profile that inherits from default with the node_runtime group
+nono profile init my-agent --extends default --groups node_runtime
 
-2. Create a JSON file:
-   ```json
-   // ~/.config/nono/profiles/my-agent.json
-   {
-     "meta": {
-       "name": "my-agent",
-       "version": "1.0.0"
-     },
-     "security": {
-       "groups": ["node_runtime"]
-     },
-     "filesystem": {
-       "allow": ["$WORKDIR"]
-     },
-     "network": {
-       "block": true
-     }
-   }
-   ```
+# Validate the generated profile
+nono policy validate ~/.config/nono/profiles/my-agent.json
 
-3. Use the profile:
-   ```bash
-   nono run --profile my-agent -- my-agent-command
-   ```
+# Use the profile
+nono run --profile my-agent -- my-agent-command
+```
+
+See [Profile Authoring](/cli/features/profile-authoring) for the full workflow, including JSON Schema integration, editor autocomplete, and the LLM authoring guide.
 
 You can also load a profile by file path:
 

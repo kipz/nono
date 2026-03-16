@@ -173,6 +173,12 @@ nono profile guide
 
 This outputs a comprehensive reference covering every profile section, field descriptions, common patterns, variable expansion, and validation workflow. It is useful when asking an LLM to help you write a profile -- pipe or paste the guide into your conversation for context.
 
+To make the guide automatically available to your coding agent, add a line to your project's instruction file (e.g., `CLAUDE.md`, `AGENT.md`, `.cursorrules`):
+
+```md
+Should you need to work with nono profiles or policy, you can retrieve context using the `nono profile guide` command
+```
+
 ## Workflow
 
 A typical profile authoring workflow:

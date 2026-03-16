@@ -141,7 +141,7 @@ impl ProfileDef {
         groups.extend(self.security.groups.clone());
 
         Ok(profile::Profile {
-            extends: None,
+            extends: None, // built-in profiles don't chain via to_profile
             meta: self.meta.clone(),
             security: profile::SecurityConfig {
                 groups,

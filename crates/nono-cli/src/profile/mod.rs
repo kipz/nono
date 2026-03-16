@@ -7,7 +7,7 @@
 mod builtin;
 
 use nono::{NonoError, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -557,12 +557,48 @@ pub struct RollbackConfig {
     pub exclude_globs: Vec<String>,
 }
 
+/// Deserialize the `extends` field from either a single string or an array of strings.
+///
+/// Accepts:
+/// - `"extends": "base"` → `Some(vec!["base"])`
+/// - `"extends": ["a", "b"]` → `Some(vec!["a", "b"])`
+/// - absent / null → `None`
+fn deserialize_extends<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ExtendsValue {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    let value: Option<ExtendsValue> = Option::deserialize(deserializer)?;
+    Ok(match value {
+        Some(ExtendsValue::Single(s)) => Some(vec![s]),
+        Some(ExtendsValue::Multiple(v)) => {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v)
+            }
+        }
+        None => None,
+    })
+}
+
 /// A complete profile definition
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Profile {
-    /// Optional base profile to inherit from (by name)
-    #[serde(default)]
-    pub extends: Option<String>,
+    /// Optional base profile(s) to inherit from (by name).
+    /// Accepts either a single string `"extends": "base"` or an array
+    /// `"extends": ["base-a", "base-b"]`. Multiple bases are merged
+    /// left-to-right before the child overrides.
+    #[serde(default, deserialize_with = "deserialize_extends")]
+    pub extends: Option<Vec<String>>,
     #[serde(default)]
     pub meta: ProfileMeta,
     #[serde(default)]
@@ -706,12 +742,19 @@ const MAX_INHERITANCE_DEPTH: usize = 10;
 
 /// Resolve the `extends` chain for a profile.
 ///
-/// If the profile declares `extends`, the base profile is loaded, its own
-/// `extends` resolved recursively, and the two are merged. The `visited` vec
+/// If the profile declares `extends` (one or more base names), each base is
+/// loaded and resolved recursively, then they are fold-merged left-to-right.
+/// The accumulated base is finally merged with the child. The `visited` vec
 /// tracks profile names already in the chain to detect circular dependencies.
+///
+/// Diamond inheritance is intentionally rejected: if bases `B` and `C` both
+/// extend `D`, then `extends: ["B", "C"]` will error because `D` appears
+/// twice in the visited set. This is the conservative choice for a security
+/// tool — merging the same profile from two paths could cause confusing
+/// permission accumulation.
 fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> Result<Profile> {
-    let base_name = match child.extends {
-        Some(ref name) => name.clone(),
+    let base_names = match child.extends {
+        Some(ref names) => names.clone(),
         None => return Ok(child),
     };
 
@@ -723,20 +766,32 @@ fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> R
         )));
     }
 
-    if visited.contains(&base_name) {
-        return Err(NonoError::ProfileInheritance(format!(
-            "circular dependency detected: {} -> {}",
-            visited.join(" -> "),
-            base_name
-        )));
+    // Resolve each base and fold-merge them left-to-right
+    let mut accumulated_base: Option<Profile> = None;
+    for base_name in &base_names {
+        if visited.contains(base_name) {
+            return Err(NonoError::ProfileInheritance(format!(
+                "circular dependency detected: {} -> {}",
+                visited.join(" -> "),
+                base_name
+            )));
+        }
+
+        visited.push(base_name.clone());
+
+        let base = load_base_profile_raw(base_name)?;
+        let resolved_base = resolve_extends(base, visited, depth + 1)?;
+
+        accumulated_base = Some(match accumulated_base {
+            Some(acc) => merge_profiles(acc, resolved_base),
+            None => resolved_base,
+        });
     }
 
-    visited.push(base_name.clone());
-
-    let base = load_base_profile_raw(&base_name)?;
-    let resolved_base = resolve_extends(base, visited, depth + 1)?;
-
-    Ok(merge_profiles(resolved_base, child))
+    match accumulated_base {
+        Some(base) => Ok(merge_profiles(base, child)),
+        None => Ok(child),
+    }
 }
 
 /// Load a base profile by name WITHOUT applying `merge_base_groups`.
@@ -762,7 +817,7 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
     let policy = crate::policy::load_embedded_policy()?;
     if let Some(def) = policy.profiles.get(name) {
         return Ok(Profile {
-            extends: None,
+            extends: None, // built-in profiles don't chain
             meta: def.meta.clone(),
             security: SecurityConfig {
                 groups: def.security.groups.clone(),
@@ -1826,7 +1881,7 @@ mod tests {
 
     fn child_profile() -> Profile {
         Profile {
-            extends: Some("base".to_string()),
+            extends: Some(vec!["base".to_string()]),
             meta: ProfileMeta {
                 name: "child".to_string(),
                 version: "2.0".to_string(),
@@ -2253,7 +2308,7 @@ mod tests {
     #[test]
     fn test_extends_missing_base_error() {
         let profile = Profile {
-            extends: Some("nonexistent-profile-xyz".to_string()),
+            extends: Some(vec!["nonexistent-profile-xyz".to_string()]),
             ..Default::default()
         };
 
@@ -2271,7 +2326,7 @@ mod tests {
     fn test_extends_circular_dependency_error() {
         // Simulate: visited already has "b", and we try to extend "b" again
         let profile = Profile {
-            extends: Some("b".to_string()),
+            extends: Some(vec!["b".to_string()]),
             ..Default::default()
         };
 
@@ -2289,7 +2344,7 @@ mod tests {
     #[test]
     fn test_extends_self_reference_error() {
         let profile = Profile {
-            extends: Some("self-ref".to_string()),
+            extends: Some(vec!["self-ref".to_string()]),
             ..Default::default()
         };
 
@@ -2307,7 +2362,7 @@ mod tests {
     #[test]
     fn test_extends_depth_limit_error() {
         let profile = Profile {
-            extends: Some("deep".to_string()),
+            extends: Some(vec!["deep".to_string()]),
             ..Default::default()
         };
 
@@ -2328,7 +2383,7 @@ mod tests {
     fn test_extends_empty_child_inherits_all() {
         let base = base_profile();
         let empty_child = Profile {
-            extends: Some("base".to_string()),
+            extends: Some(vec!["base".to_string()]),
             ..Default::default()
         };
 
@@ -2422,7 +2477,7 @@ mod tests {
 
     #[test]
     fn test_merge_profiles_extends_consumed() {
-        let child = child_profile(); // has extends = Some("base")
+        let child = child_profile(); // has extends = Some(vec!["base"])
         let merged = merge_profiles(base_profile(), child);
         assert!(
             merged.extends.is_none(),
@@ -2432,15 +2487,213 @@ mod tests {
 
     #[test]
     fn test_extends_field_deserialization() {
+        // Single string form
         let json_str = r#"{
             "extends": "claude-code",
             "meta": { "name": "ext-test" }
         }"#;
-        let profile: Profile = serde_json::from_str(json_str).expect("parse");
-        assert_eq!(profile.extends, Some("claude-code".to_string()));
+        let profile: Profile = serde_json::from_str(json_str).expect("parse single");
+        assert_eq!(profile.extends, Some(vec!["claude-code".to_string()]));
 
+        // Array form
+        let json_str = r#"{
+            "extends": ["claude-code", "opencode"],
+            "meta": { "name": "ext-multi" }
+        }"#;
+        let profile: Profile = serde_json::from_str(json_str).expect("parse array");
+        assert_eq!(
+            profile.extends,
+            Some(vec!["claude-code".to_string(), "opencode".to_string()])
+        );
+
+        // Absent field
         let json_str = r#"{ "meta": { "name": "no-ext" } }"#;
-        let profile: Profile = serde_json::from_str(json_str).expect("parse");
+        let profile: Profile = serde_json::from_str(json_str).expect("parse absent");
+        assert!(profile.extends.is_none());
+
+        // Empty array
+        let json_str = r#"{ "extends": [], "meta": { "name": "empty-ext" } }"#;
+        let profile: Profile = serde_json::from_str(json_str).expect("parse empty array");
+        assert!(
+            profile.extends.is_none(),
+            "empty array should normalize to None"
+        );
+    }
+
+    #[test]
+    fn test_extends_empty_string_in_array_rejected() {
+        // An empty string passes deserialization but is caught by load_base_profile_raw
+        let profile = Profile {
+            extends: Some(vec!["".to_string()]),
+            ..Default::default()
+        };
+
+        let result = resolve_extends(profile, &mut Vec::new(), 0);
+        assert!(result.is_err());
+        let err = result.expect_err("empty string base should error");
+        assert!(
+            err.to_string().contains("invalid base profile name"),
+            "Error should mention invalid name: {}",
+            err
+        );
+    }
+
+    // --- Multiple extends tests ---
+
+    #[test]
+    fn test_extends_multiple_bases() {
+        // Child extends ["a", "b"] — gets merged groups/filesystem from both
+        let base_a = Profile {
+            extends: None,
+            meta: ProfileMeta {
+                name: "a".to_string(),
+                ..Default::default()
+            },
+            security: SecurityConfig {
+                groups: vec!["group_a".to_string()],
+                ..Default::default()
+            },
+            filesystem: FilesystemConfig {
+                allow: vec!["/a/path".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let base_b = Profile {
+            extends: None,
+            meta: ProfileMeta {
+                name: "b".to_string(),
+                ..Default::default()
+            },
+            security: SecurityConfig {
+                groups: vec!["group_b".to_string()],
+                ..Default::default()
+            },
+            filesystem: FilesystemConfig {
+                allow: vec!["/b/path".to_string()],
+                read: vec!["/b/read".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let child = Profile {
+            extends: Some(vec!["a".to_string(), "b".to_string()]),
+            meta: ProfileMeta {
+                name: "child".to_string(),
+                ..Default::default()
+            },
+            filesystem: FilesystemConfig {
+                allow: vec!["/child/path".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Simulate what resolve_extends does: merge a + b, then merge with child
+        let merged_bases = merge_profiles(base_a, base_b);
+        let merged = merge_profiles(merged_bases, child);
+
+        assert_eq!(merged.meta.name, "child");
+        assert!(merged.filesystem.allow.contains(&"/a/path".to_string()));
+        assert!(merged.filesystem.allow.contains(&"/b/path".to_string()));
+        assert!(merged.filesystem.allow.contains(&"/child/path".to_string()));
+        assert!(merged.filesystem.read.contains(&"/b/read".to_string()));
+        assert!(merged.security.groups.contains(&"group_a".to_string()));
+        assert!(merged.security.groups.contains(&"group_b".to_string()));
+        assert!(merged.extends.is_none());
+    }
+
+    #[test]
+    fn test_extends_multiple_ordering() {
+        // Later bases override earlier for scalar fields (network_profile, workdir)
+        let base_a = Profile {
+            extends: None,
+            network: NetworkConfig {
+                network_profile: Some("net-a".to_string()),
+                ..Default::default()
+            },
+            workdir: WorkdirConfig {
+                access: WorkdirAccess::Read,
+            },
+            interactive: false,
+            ..Default::default()
+        };
+
+        let base_b = Profile {
+            extends: None,
+            network: NetworkConfig {
+                network_profile: Some("net-b".to_string()),
+                ..Default::default()
+            },
+            workdir: WorkdirConfig {
+                access: WorkdirAccess::ReadWrite,
+            },
+            interactive: true,
+            ..Default::default()
+        };
+
+        // Merge a then b: b should win for scalars
+        let merged = merge_profiles(base_a, base_b);
+        assert_eq!(
+            merged.network.network_profile,
+            Some("net-b".to_string()),
+            "later base should override network_profile"
+        );
+        assert_eq!(
+            merged.workdir.access,
+            WorkdirAccess::ReadWrite,
+            "later base should override workdir"
+        );
+        assert!(merged.interactive, "interactive should be OR'd");
+    }
+
+    #[test]
+    fn test_extends_duplicate_base_error() {
+        // extends: ["a", "a"] should trigger circular dependency detection
+        let profile = Profile {
+            extends: Some(vec!["claude-code".to_string(), "claude-code".to_string()]),
+            ..Default::default()
+        };
+
+        let result = resolve_extends(profile, &mut Vec::new(), 0);
+        assert!(result.is_err());
+        let err = result.expect_err("duplicate base should error");
+        assert!(
+            err.to_string().contains("circular"),
+            "Error should mention 'circular': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_extends_multiple_builtin_profiles() {
+        // Test extending two built-in profiles via file load
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("multi-ext.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "extends": ["claude-code", "opencode"],
+                "meta": { "name": "multi-ext-test" },
+                "filesystem": { "allow": ["/tmp/multi-ext"] }
+            }"#,
+        )
+        .expect("write profile");
+
+        let profile = load_from_file(&profile_path).expect("load multi-extended profile");
+        assert_eq!(profile.meta.name, "multi-ext-test");
+        // Should inherit paths from both bases
+        assert!(
+            profile.filesystem.allow.len() > 1,
+            "Expected inherited paths from both bases, got: {:?}",
+            profile.filesystem.allow
+        );
+        assert!(profile
+            .filesystem
+            .allow
+            .contains(&"/tmp/multi-ext".to_string()));
         assert!(profile.extends.is_none());
     }
 }

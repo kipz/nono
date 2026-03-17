@@ -50,10 +50,22 @@ fn main() {
         let hook_path = Path::new("data/hooks").join(hook_name);
         if hook_path.exists() {
             let content = fs::read_to_string(&hook_path)
-                .unwrap_or_else(|_| panic!("Failed to read hook script {}", hook_name));
-            fs::write(out_path.join(hook_name), &content)
-                .unwrap_or_else(|_| panic!("Failed to write hook script {} to OUT_DIR", hook_name));
+                .unwrap_or_else(|e| panic!("Failed to read hook script {}: {}", hook_name, e));
+            fs::write(out_path.join(hook_name), &content).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to write hook script {} to OUT_DIR: {}",
+                    hook_name, e
+                )
+            });
         }
+    }
+
+    // === Embed rules files ===
+    let rules_path = Path::new("data/rules/nono-cursor-rules.mdc");
+    if rules_path.exists() {
+        let content = fs::read_to_string(rules_path).expect("Failed to read nono-cursor-rules.mdc");
+        fs::write(out_path.join("nono-cursor-rules.mdc"), &content)
+            .expect("Failed to write nono-cursor-rules.mdc to OUT_DIR");
     }
 
     // === Embed profile JSON Schema ===

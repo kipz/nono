@@ -463,24 +463,9 @@ fn update_cursor_rules(rules_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Content for Cursor rules file
-const NONO_CURSOR_RULES_CONTENT: &str = "\
----
-description: nono sandbox environment awareness
-globs: **/*
-alwaysApply: true
----
-
-# nono Sandbox
-
-You may be running inside a nono security sandbox. When active, the `NONO_CAP_FILE` environment variable is set.
-
-If you encounter `operation not permitted`, `EPERM`, or `permission denied` errors:
-- STOP immediately. Do not try alternative paths or workarounds.
-- The sandbox is a hard OS-level security boundary that cannot be bypassed.
-- Tell the user to exit and restart with the needed path allowed:
-  `nono run --allow /path/to/needed -- cursor`
-";
+/// Content for Cursor rules file (embedded at build time)
+const NONO_CURSOR_RULES_CONTENT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/nono-cursor-rules.mdc"));
 
 /// Install all hooks from a profile's hooks configuration
 /// Returns a list of (target, result) pairs for each hook installed

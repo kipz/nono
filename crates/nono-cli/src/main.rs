@@ -1733,7 +1733,8 @@ fn execute_sandboxed(
         env_vars.push((k.as_str(), v.as_str()));
     }
 
-    // Add mediation env vars: socket path, session token, and PATH override.
+    // Add mediation env vars: socket path, session token, PATH override,
+    // audit socket, shim dir, and mediated command list.
     // These strings are kept alive until `env_vars` is consumed by exec.
     let mediation_socket_path_str: String = mediation_session
         .as_ref()
@@ -1756,10 +1757,25 @@ fn execute_sandboxed(
             }
         })
         .unwrap_or_default();
+    let mediation_shim_dir_str: String = mediation_session
+        .as_ref()
+        .map(|s| s.shim_dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mediation_audit_socket_str: String = mediation_session
+        .as_ref()
+        .map(|s| s.audit_socket_path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mediation_commands_str: String = mediation_session
+        .as_ref()
+        .map(|s| s.mediated_commands.join(","))
+        .unwrap_or_default();
     if mediation_session.is_some() {
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_path_str));
         env_vars.push(("NONO_SESSION_TOKEN", &mediation_session_token_str));
         env_vars.push(("PATH", &mediation_path_str));
+        env_vars.push(("NONO_SHIM_DIR", &mediation_shim_dir_str));
+        env_vars.push(("NONO_AUDIT_SOCKET", &mediation_audit_socket_str));
+        env_vars.push(("NONO_MEDIATED_COMMANDS", &mediation_commands_str));
     }
 
     // Determine threading context for fork safety.

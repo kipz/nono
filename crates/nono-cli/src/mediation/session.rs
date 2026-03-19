@@ -69,6 +69,10 @@ pub struct SessionHandle {
     pub control_socket_path: PathBuf,
     /// Shared admin mode state (for passing to admin_commands query).
     pub admin_state: AdminState,
+    /// Command names that use full request-response mediation (vs audit-only).
+    pub mediated_commands: Vec<String>,
+    /// Path to the audit datagram socket for fire-and-forget command logging.
+    pub audit_socket_path: PathBuf,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
@@ -107,6 +111,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let shim_dir = session_dir.join("shims");
     let socket_path = session_dir.join("mediation.sock");
     let control_socket_path = session_dir.join("control.sock");
+    let audit_socket_path = session_dir.join("audit.sock");
 
     std::fs::create_dir_all(&shim_dir).map_err(|e| {
         NonoError::SandboxInit(format!(
@@ -158,6 +163,39 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
     }
+
+    // -------------------------------------------------------------------------
+    // Universal audit shims: symlink all PATH executables not already mediated
+    // -------------------------------------------------------------------------
+    let mediated_commands: Vec<String> = resolved_commands.iter().map(|c| c.name.clone()).collect();
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let dir_path = Path::new(dir);
+            if !dir_path.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir_path) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let shim_path = shim_dir.join(&name);
+                    // Already shimmed (mediated command or earlier PATH entry)
+                    if shim_path.exists() || shim_path.symlink_metadata().is_ok() {
+                        continue;
+                    }
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                            let _ = std::os::unix::fs::symlink(&shim_binary, &shim_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    debug!(
+        "Mediation: created universal audit shims in {}",
+        shim_dir.display()
+    );
 
     // -------------------------------------------------------------------------
     // Generate session authentication token and control token
@@ -235,7 +273,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let shim_dir_clone = shim_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
-    let audit_socket_path = session_dir.join("audit.sock");
+    let audit_sock = audit_socket_path.clone();
     let session_dir_clone = session_dir.clone();
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
@@ -246,7 +284,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             shim_dir_clone,
             admin_clone,
             gate_clone,
-            audit_socket_path,
+            audit_sock,
             session_dir_clone,
         )
         .await
@@ -286,6 +324,8 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
         session_token,
         control_socket_path,
         admin_state,
+        mediated_commands,
+        audit_socket_path,
         _runtime: runtime,
     }))
 }

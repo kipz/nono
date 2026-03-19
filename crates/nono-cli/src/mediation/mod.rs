@@ -21,10 +21,10 @@ pub mod policy;
 pub mod server;
 pub mod session;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level mediation configuration from a profile's `mediation` section.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct MediationConfig {
     /// Commands to mediate (intercept or pass through).
     #[serde(default)]
@@ -42,7 +42,7 @@ impl MediationConfig {
 }
 
 /// Per-command mediation entry.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CommandEntry {
     /// The command name to mediate (resolved via `which` at session start).
     pub name: String,
@@ -60,7 +60,7 @@ pub struct CommandEntry {
 
 /// An intercept rule: if `args_prefix` matches the invocation's positional args,
 /// perform the configured action without (or with) calling the real binary.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptRule {
     /// The leading positional args that must match (flags are ignored during matching).
     /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
@@ -75,7 +75,7 @@ pub struct InterceptRule {
 }
 
 /// The action to take when an intercept rule fires.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InterceptAction {
     /// Return a static response without calling the real binary.
@@ -112,7 +112,7 @@ pub enum InterceptAction {
 ///
 /// Default (when absent): no sandbox applied — existing behavior.
 /// Operators opt in per command. Applied via `pre_exec` in `exec_passthrough`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CommandSandbox {
     /// Network policy for the exec'd command. Default: allow all (no restriction).
     #[serde(default)]
@@ -130,7 +130,7 @@ pub struct CommandSandbox {
 }
 
 /// Simple network config for per-command sandbox profiles.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NetworkConfig {
     /// If true, block all outbound network. Default: false (allow all).
     #[serde(default)]
@@ -141,8 +141,28 @@ pub struct NetworkConfig {
     pub allowed_hosts: Vec<String>,
 }
 
+/// Audit event for command logging.
+///
+/// Used by both shim-originated fire-and-forget events (audit mode) and
+/// server-side response logging (mediated mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    /// The command name (basename of argv[0]).
+    pub command: String,
+    /// Positional arguments passed to the command.
+    pub args: Vec<String>,
+    /// Unix timestamp (seconds since epoch).
+    pub ts: u64,
+    /// Process exit code. Always present.
+    pub exit_code: i32,
+    /// Which intercept action fired (respond/capture/approve/passthrough/admin_passthrough).
+    /// Only set for mediated commands; absent for audit-mode commands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_type: Option<String>,
+}
+
 /// Environment variable policy for the sandboxed child process.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EnvPolicy {
     /// Env var names to strip from the child environment (credential leakage prevention).
     #[serde(default)]

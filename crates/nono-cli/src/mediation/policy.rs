@@ -77,18 +77,21 @@ pub async fn apply(
     broker: Arc<TokenBroker>,
     ctx: &SessionCtx<'_>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
-) -> ShimResponse {
+) -> (ShimResponse, &'static str) {
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
         warn!("mediation: unknown command '{}'", request.command);
-        return ShimResponse {
-            stdout: String::new(),
-            stderr: format!(
-                "nono-mediation: command '{}' not configured\n",
-                request.command
-            ),
-            exit_code: 127,
-        };
+        return (
+            ShimResponse {
+                stdout: String::new(),
+                stderr: format!(
+                    "nono-mediation: command '{}' not configured\n",
+                    request.command
+                ),
+                exit_code: 127,
+            },
+            "unknown",
+        );
     };
 
     // Check intercept rules in order
@@ -114,20 +117,31 @@ pub async fn apply(
                     } else {
                         format!("{} {}", request.command, request.args.join(" "))
                     };
-                    return ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!("nono: '{}' was not approved\n", invocation),
-                        exit_code: 126,
+                    let action_type = match &rule.action {
+                        ResolvedAction::Respond { .. } => "respond",
+                        ResolvedAction::Capture { .. } => "capture",
+                        ResolvedAction::Approve { .. } => "approve",
                     };
+                    return (
+                        ShimResponse {
+                            stdout: String::new(),
+                            stderr: format!("nono: '{}' was not approved\n", invocation),
+                            exit_code: 126,
+                        },
+                        action_type,
+                    );
                 }
             }
 
             return match &rule.action {
-                ResolvedAction::Respond { stdout } => ShimResponse {
-                    stdout: stdout.clone(),
-                    stderr: String::new(),
-                    exit_code: rule.exit_code,
-                },
+                ResolvedAction::Respond { stdout } => (
+                    ShimResponse {
+                        stdout: stdout.clone(),
+                        stderr: String::new(),
+                        exit_code: rule.exit_code,
+                    },
+                    "respond",
+                ),
                 ResolvedAction::Capture { script } => {
                     let result = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
@@ -148,19 +162,22 @@ pub async fn apply(
                         }
                     };
                     if result.exit_code != 0 {
-                        return result;
+                        return (result, "capture");
                     }
                     let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
-                    ShimResponse {
-                        stdout: format!("{}\n", nonce),
-                        stderr: String::new(),
-                        exit_code: 0,
-                    }
+                    (
+                        ShimResponse {
+                            stdout: format!("{}\n", nonce),
+                            stderr: String::new(),
+                            exit_code: 0,
+                        },
+                        "capture",
+                    )
                 }
                 ResolvedAction::Approve { script } => {
                     // Run the real binary (or script) and return the actual output.
                     // Typically used with admin: true to gate behind approval.
-                    match script {
+                    let resp = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
                         None => {
                             exec_passthrough(
@@ -175,7 +192,8 @@ pub async fn apply(
                             )
                             .await
                         }
-                    }
+                    };
+                    (resp, "approve")
                 }
             };
         }
@@ -188,7 +206,7 @@ pub async fn apply(
         request.args,
         cmd.real_path.display()
     );
-    exec_passthrough(
+    let resp = exec_passthrough(
         cmd,
         &request.args,
         &request.stdin,
@@ -198,7 +216,8 @@ pub async fn apply(
         ctx,
         commands,
     )
-    .await
+    .await;
+    (resp, "passthrough")
 }
 
 /// Execute the real binary without any mediation — no intercept rules, no env
@@ -209,17 +228,20 @@ pub async fn apply(
 pub async fn admin_passthrough(
     request: &ShimRequest,
     commands: &[ResolvedCommand],
-) -> ShimResponse {
+) -> (ShimResponse, &'static str) {
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
         warn!("admin passthrough: unknown command '{}'", request.command);
-        return ShimResponse {
-            stdout: String::new(),
-            stderr: format!(
-                "nono-mediation: command '{}' not configured\n",
-                request.command
-            ),
-            exit_code: 127,
-        };
+        return (
+            ShimResponse {
+                stdout: String::new(),
+                stderr: format!(
+                    "nono-mediation: command '{}' not configured\n",
+                    request.command
+                ),
+                exit_code: 127,
+            },
+            "admin_passthrough",
+        );
     };
 
     // Build env from parent process — no filtering, no nonce promotion.
@@ -263,7 +285,7 @@ pub async fn admin_passthrough(
     })
     .await;
 
-    match result {
+    let resp = match result {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => ShimResponse {
             stdout: String::new(),
@@ -275,7 +297,8 @@ pub async fn admin_passthrough(
             stderr: format!("nono-mediation: internal error: {}\n", e),
             exit_code: 1,
         },
-    }
+    };
+    (resp, "admin_passthrough")
 }
 
 /// Check if the invocation's positional args start with the given prefix.
@@ -830,7 +853,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[],
             make_broker(),
@@ -871,7 +894,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -905,7 +928,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -940,7 +963,7 @@ mod tests {
             env: HashMap::new(),
         };
         // Falls through to passthrough exec of /usr/bin/true
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -973,7 +996,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -1007,7 +1030,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -1042,7 +1065,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
         };
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             make_broker(),
@@ -1137,7 +1160,7 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1180,7 +1203,7 @@ mod tests {
             env: HashMap::new(),
         };
         let broker = make_broker();
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1390,7 +1413,7 @@ mod tests {
         };
 
         let broker = make_broker();
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1449,7 +1472,7 @@ mod tests {
         };
 
         let broker = make_broker();
-        let resp = apply(
+        let (resp, _action_type) = apply(
             req,
             &[cmd],
             Arc::clone(&broker),

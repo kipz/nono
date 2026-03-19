@@ -235,6 +235,8 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let shim_dir_clone = shim_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
+    let audit_socket_path = session_dir.join("audit.sock");
+    let session_dir_clone = session_dir.clone();
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -244,6 +246,8 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             shim_dir_clone,
             admin_clone,
             gate_clone,
+            audit_socket_path,
+            session_dir_clone,
         )
         .await
         {

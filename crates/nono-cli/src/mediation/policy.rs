@@ -450,6 +450,13 @@ async fn exec_passthrough(
     path_parts.push(parent_path);
     env.insert("PATH".to_string(), path_parts.join(":"));
 
+    // Update NONO_SHIM_DIR to point to the effective shim dir (which may be a
+    // filtered shim dir when allow_commands is set). The nono-shim binary uses
+    // this to skip its own directory when resolving the real binary. Without
+    // this, shims in the filtered dir would skip the wrong directory and find
+    // themselves again, causing infinite exec recursion (EAGAIN).
+    env.insert("NONO_SHIM_DIR".to_string(), shim_dir_str.clone());
+
     // Inject mediation socket path and session token so the shim binaries
     // invoked by the exec'd command can authenticate to the mediation server.
     // This allows exec plugins (e.g. kubectl's credential plugin) to route
@@ -615,17 +622,22 @@ async fn exec_passthrough(
                 caps = caps.block_network();
             } else if let Some(port) = proxy_port {
                 caps = caps.proxy_only(port);
-                // Allow outbound connections to the mediation Unix socket so that
-                // shim binaries exec'd by this command (e.g. kubectl's credential
-                // plugin) can route through the mediation server.
-                // Requires both system-socket (AF_UNIX) and network-outbound (unix-socket).
-                for rule in [
-                    "(allow system-socket (socket-domain AF_UNIX))",
-                    "(allow network-outbound (remote unix-socket))",
-                ] {
-                    if let Err(e) = caps.add_platform_rule(rule) {
-                        warn!("mediation: failed to add mediation socket rule: {}", e);
-                    }
+            }
+
+            // Nono is responsible for ensuring sandboxed child processes can always
+            // reach the mediation server via its Unix domain socket, regardless of
+            // network mode. The shim injected into PATH needs AF_UNIX socket creation
+            // (system-socket) and the ability to connect to a unix-socket path
+            // (network-outbound). Without these, nested nono-mediated commands (e.g.
+            // `git remote -v` called from a git hook) cannot reach the mediation server
+            // even under AllowAll network mode, because (deny default) blocks
+            // system-socket() calls unless explicitly allowed.
+            for rule in [
+                "(allow system-socket (socket-domain AF_UNIX))",
+                "(allow network-outbound (remote unix-socket))",
+            ] {
+                if let Err(e) = caps.add_platform_rule(rule) {
+                    warn!("mediation: failed to add mediation socket rule: {}", e);
                 }
             }
             unsafe {
@@ -1377,6 +1389,105 @@ mod tests {
 
         assert!(filtered_dir.join("gh").exists());
         assert!(filtered_dir.join("ddtool").exists());
+    }
+
+    /// When `allow_commands` is set, `exec_passthrough` creates a filtered shim dir
+    /// and sets NONO_SHIM_DIR to that dir. This ensures nono-shim's
+    /// `resolve_real_binary` skips the correct directory and doesn't exec itself
+    /// recursively (which would cause EAGAIN).
+    #[tokio::test]
+    async fn test_allow_commands_sets_nono_shim_dir_to_filtered_dir() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+
+        // Create fake shim files (need to exist for build_filtered_shim_dir)
+        for name in &["gh", "ddtool"] {
+            let p = shim_dir.join(name);
+            std::fs::write(&p, "fake-shim").expect("write shim");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let cmd = ResolvedCommand {
+            name: "gh".to_string(),
+            // Use /usr/bin/env so the child process prints its own environment.
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig::default(),
+                fs_read: vec![],
+                fs_write: vec![],
+                allow_commands: vec!["ddtool".to_string()],
+            }),
+        };
+
+        // Provide a ddtool entry so build_filtered_shim_dir can find its real path.
+        let ddtool_cmd = ResolvedCommand {
+            name: "ddtool".to_string(),
+            real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
+            intercepts: vec![],
+            sandbox: None,
+        };
+
+        let req = ShimRequest {
+            command: "gh".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+        };
+
+        let broker = make_broker();
+        let (resp, _action_type) = apply(
+            req,
+            &[cmd, ddtool_cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: &shim_dir,
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+
+        // Extract the value of NONO_SHIM_DIR from the child's printed environment.
+        let shim_dir_line = resp
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("NONO_SHIM_DIR="))
+            .expect("NONO_SHIM_DIR not found in env output");
+        let child_shim_dir = shim_dir_line.trim_start_matches("NONO_SHIM_DIR=");
+
+        // NONO_SHIM_DIR must NOT be the original shims/ directory — it should
+        // be the filtered shim dir created by exec_passthrough.
+        assert_ne!(
+            child_shim_dir,
+            shim_dir.to_string_lossy().as_ref(),
+            "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
+        );
+
+        // NONO_SHIM_DIR must also be at the front of PATH so resolve_real_binary
+        // in the shim finds it first when skipping its own directory.
+        let path_line = resp
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("PATH="))
+            .expect("PATH not found in env output");
+        let child_path = path_line.trim_start_matches("PATH=");
+        assert!(
+            child_path.starts_with(child_shim_dir),
+            "PATH should start with NONO_SHIM_DIR ({}), got: {}",
+            child_shim_dir,
+            child_path
+        );
     }
 
     // --- Per-command proxy tests ---

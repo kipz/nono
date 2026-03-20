@@ -542,6 +542,11 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             profile.push_str("(allow network-outbound)\n");
             profile.push_str("(allow network-inbound)\n");
             profile.push_str("(allow network-bind)\n");
+            // system-socket governs the socket(2) syscall itself. Under (deny default),
+            // processes cannot create sockets of any domain without an explicit allow,
+            // even when network-outbound/inbound are permitted. ProxyOnly and Blocked
+            // modes add socket-domain-specific rules; AllowAll must allow all domains.
+            profile.push_str("(allow system-socket)\n");
         }
     }
 
@@ -993,6 +998,10 @@ mod tests {
         assert!(profile.contains("(allow network-inbound)"));
         assert!(profile.contains("(allow network-bind)"));
         assert!(!profile.contains("(deny network*)"));
+        // system-socket must be allowed so that socket(2) calls succeed.
+        // Under (deny default), processes cannot create sockets without this,
+        // even when network-outbound/inbound are permitted.
+        assert!(profile.contains("(allow system-socket)"));
     }
 
     #[test]

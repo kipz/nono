@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.22.0] - 2026-03-21
+
+### Dependencies
+
+- *(deps)* Bump rustls-webpki from 0.103.9 to 0.103.10 (#443) ([#443](https://github.com/always-further/nono/pull/443))
+
+
+### Features
+
+- *(trust)* Lazy verification of scan policies (#448) ([#448](https://github.com/always-further/nono/pull/448))
+
 ## [0.21.0] - 2026-03-21
 
 ### Bug Fixes

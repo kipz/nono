@@ -1214,7 +1214,10 @@ fn apply_pre_fork_sandbox(
         {
             let detected = Sandbox::detect_abi()?;
             info!("Direct mode: detected {}", detected);
-            Sandbox::apply_with_abi(caps, &detected)?;
+            let _fallback = Sandbox::apply_with_abi(caps, &detected)?;
+            // Direct mode cannot handle ProxyOnly fallback (no supervisor loop).
+            // If ProxyOnly was needed and Landlock couldn't handle it, apply()
+            // would have already failed with an error.
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -1472,6 +1475,21 @@ fn execute_sandboxed(
         strategy, threading
     );
 
+    // Determine whether the seccomp proxy-only fallback is needed.
+    // This must be decided before fork so both parent and child agree.
+    #[cfg(target_os = "linux")]
+    let seccomp_proxy_fallback = {
+        let needs_proxy = matches!(caps.network_mode(), nono::NetworkMode::ProxyOnly { .. });
+        if needs_proxy {
+            match Sandbox::detect_abi() {
+                Ok(detected) => !detected.has_network(),
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    };
+
     // Create execution config
     let config = exec_strategy::ExecConfig {
         command: &command,
@@ -1484,6 +1502,8 @@ fn execute_sandboxed(
         threading,
         protected_paths: &flags.protected_paths,
         capability_elevation: flags.capability_elevation,
+        #[cfg(target_os = "linux")]
+        seccomp_proxy_fallback,
     };
 
     // Execute based on strategy
@@ -1686,6 +1706,13 @@ fn execute_sandboxed(
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
                     )
                 });
+            // Extract proxy port and bind ports for seccomp fallback config
+            #[cfg(target_os = "linux")]
+            let (sup_proxy_port, sup_proxy_bind_ports) = match caps.network_mode() {
+                nono::NetworkMode::ProxyOnly { port, bind_ports } => (*port, bind_ports.clone()),
+                _ => (0, Vec::new()),
+            };
+
             let supervisor_cfg = exec_strategy::SupervisorConfig {
                 protected_roots: protected_roots.as_paths(),
                 approval_backend: &approval_backend,
@@ -1693,6 +1720,10 @@ fn execute_sandboxed(
                 open_url_origins: &flags.open_url_origins,
                 open_url_allow_localhost: flags.open_url_allow_localhost,
                 allow_launch_services_active: flags.allow_launch_services_active,
+                #[cfg(target_os = "linux")]
+                proxy_port: sup_proxy_port,
+                #[cfg(target_os = "linux")]
+                proxy_bind_ports: sup_proxy_bind_ports,
             };
 
             let trust_interceptor = if flags.trust_interception_active {

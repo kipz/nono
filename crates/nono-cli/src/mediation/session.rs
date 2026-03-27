@@ -11,6 +11,7 @@ use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig};
+use nix::libc;
 use nono::{NonoError, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,8 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     if !config.is_active() {
         return Ok(None);
     }
+
+    cleanup_orphaned_sessions();
 
     // Find nono-shim next to the running nono binary.
     let shim_binary = find_shim_binary()?;
@@ -466,6 +469,48 @@ fn find_shim_binary() -> Result<PathBuf> {
     })
 }
 
+/// Remove session directories left behind by crashed/killed nono processes.
+///
+/// Scans the temp directory for `nono-session-{pid}` entries and removes any
+/// whose PID is no longer alive. The current process's directory is skipped.
+fn cleanup_orphaned_sessions() {
+    let current_pid = std::process::id();
+
+    #[cfg(target_os = "macos")]
+    let tmp = PathBuf::from("/private/tmp");
+    #[cfg(not(target_os = "macos"))]
+    let tmp = std::env::temp_dir();
+
+    cleanup_dirs_in(&tmp, "nono-session-", current_pid);
+}
+
+/// Scan `dir` for entries matching `{prefix}{pid}` and remove those whose PID
+/// is no longer alive.
+fn cleanup_dirs_in(dir: &Path, prefix: &str, current_pid: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let Some(pid_str) = name_str.strip_prefix(prefix) else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        // kill(pid, 0) returns 0 if process is alive, -1 with ESRCH if not.
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if !alive {
+            let _ = std::fs::remove_dir_all(entry.path());
+            debug!("Removed orphaned {} dir for dead pid {}", prefix.trim_end_matches('-'), pid);
+        }
+    }
+}
+
 /// Compute the session directory path for this process.
 fn session_dir_path() -> PathBuf {
     // Use /private/tmp on macOS (canonical form of /tmp symlink) so Seatbelt
@@ -497,6 +542,25 @@ pub fn session_admin_dir_path(pid: u32) -> PathBuf {
 mod tests {
     use super::*;
     use crate::mediation::admin::AdminModeStatus;
+
+    #[test]
+    fn test_cleanup_orphaned_sessions_skips_live_pid() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let current_pid = std::process::id();
+
+        let live_dir = tmp.path().join(format!("nono-session-{}", current_pid));
+        std::fs::create_dir_all(&live_dir).expect("create live dir");
+
+        // i32::MAX as u32 stays positive when cast to pid_t; no process ever has this PID.
+        let dead_pid: u32 = i32::MAX as u32;
+        let dead_dir = tmp.path().join(format!("nono-session-{}", dead_pid));
+        std::fs::create_dir_all(&dead_dir).expect("create dead dir");
+
+        cleanup_dirs_in(tmp.path(), "nono-session-", current_pid);
+
+        assert!(live_dir.exists(), "live PID dir must not be removed");
+        assert!(!dead_dir.exists(), "dead PID dir must be removed");
+    }
 
     #[test]
     fn test_setup_returns_none_when_inactive() {

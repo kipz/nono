@@ -216,7 +216,7 @@ fn log_mediated_audit(
         session_dir,
         &AuditEvent {
             command: command.to_string(),
-            args: args.to_vec(),
+            args: scrub_args(args),
             ts,
             exit_code: response.exit_code,
             action_type: Some(action_type.to_string()),
@@ -290,7 +290,8 @@ async fn run_audit_receiver(socket: tokio::net::UnixDatagram, session_dir: Arc<P
     loop {
         match socket.recv(&mut buf).await {
             Ok(n) => {
-                if let Ok(event) = serde_json::from_slice::<AuditEvent>(&buf[..n]) {
+                if let Ok(mut event) = serde_json::from_slice::<AuditEvent>(&buf[..n]) {
+                    event.args = scrub_args(&event.args);
                     append_audit_log(&session_dir, &event);
                 } else {
                     warn!("audit socket: failed to parse event");
@@ -307,14 +308,160 @@ async fn run_audit_receiver(socket: tokio::net::UnixDatagram, session_dir: Arc<P
 /// Append a single audit event as a JSON line to `audit.jsonl`.
 fn append_audit_log(session_dir: &Path, event: &AuditEvent) {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let log_path = session_dir.join("audit.jsonl");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&log_path)
     {
         if let Ok(line) = serde_json::to_string(event) {
             let _ = writeln!(f, "{}", line);
         }
+    }
+}
+
+/// Scrub sensitive values from command-line arguments before writing to the audit log.
+pub(super) fn scrub_args(args: &[String]) -> Vec<String> {
+    const SECRET_FLAGS: &[&str] = &[
+        "--token", "--password", "--secret", "--api-key", "--api-token", "--auth", "-p",
+    ];
+
+    let mut result: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+
+        if SECRET_FLAGS.contains(&arg.as_str()) {
+            result.push(arg.clone());
+            if i + 1 < args.len() {
+                result.push("<redacted>".to_string());
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if arg == "-H" {
+            result.push(arg.clone());
+            if i + 1 < args.len() {
+                result.push(scrub_header_value(&args[i + 1]));
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        result.push(scrub_value(arg));
+        i += 1;
+    }
+    result
+}
+
+fn scrub_header_value(value: &str) -> String {
+    let lower = value.to_lowercase();
+    if let Some(colon_pos) = lower.find("authorization:") {
+        let prefix_end = colon_pos + "authorization:".len();
+        let prefix = &value[..prefix_end];
+        let after_colon = value[prefix_end..].trim_start();
+        if let Some(space_pos) = after_colon.find(' ') {
+            let scheme = &after_colon[..space_pos];
+            return format!("{} {} <redacted>", prefix, scheme);
+        }
+        if !after_colon.is_empty() {
+            return format!("{} <redacted>", prefix);
+        }
+    }
+    value.to_string()
+}
+
+fn scrub_value(value: &str) -> String {
+    let value = scrub_nono_tokens(value);
+    scrub_url_credentials(&value)
+}
+
+fn scrub_nono_tokens(s: &str) -> String {
+    const PREFIX: &str = "nono_";
+    const MIN_HEX_LEN: usize = 40;
+
+    let mut result = String::with_capacity(s.len());
+    let mut remaining = s;
+    while let Some(pos) = remaining.find(PREFIX) {
+        result.push_str(&remaining[..pos]);
+        let after = &remaining[pos + PREFIX.len()..];
+        let hex_len = after
+            .bytes()
+            .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+            .count();
+        if hex_len >= MIN_HEX_LEN {
+            result.push_str("<redacted>");
+            remaining = &remaining[pos + PREFIX.len() + hex_len..];
+        } else {
+            result.push_str(PREFIX);
+            remaining = after;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+fn scrub_url_credentials(value: &str) -> String {
+    if let Ok(mut u) = url::Url::parse(value) {
+        if u.password().is_some() {
+            let _ = u.set_password(Some("[redacted]"));
+            return u.to_string();
+        }
+    }
+    value.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scrub_args_secret_flags() {
+        let args = ["--token", "abc123", "other"].map(String::from).to_vec();
+        assert_eq!(scrub_args(&args), vec!["--token", "<redacted>", "other"]);
+    }
+
+    #[test]
+    fn test_scrub_args_authorization_header() {
+        let args = ["-H", "Authorization: Bearer ghp_ABCDEFG"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            scrub_args(&args),
+            vec!["-H", "Authorization: Bearer <redacted>"]
+        );
+    }
+
+    #[test]
+    fn test_scrub_args_url_credentials() {
+        let args = vec!["https://user:ghp_xyz@github.com/foo/bar".to_string()];
+        let scrubbed = scrub_args(&args);
+        assert!(!scrubbed[0].contains("ghp_xyz"), "raw token still present: {}", scrubbed[0]);
+        assert!(scrubbed[0].starts_with("https://user:"), "URL structure mangled: {}", scrubbed[0]);
+    }
+
+    #[test]
+    fn test_scrub_args_nono_token() {
+        let token = format!("nono_{}", "a".repeat(40));
+        assert_eq!(scrub_args(&[token]), vec!["<redacted>"]);
+    }
+
+    #[test]
+    fn test_scrub_args_passthrough() {
+        let args = ["ls", "-la", "/tmp"].map(String::from).to_vec();
+        assert_eq!(scrub_args(&args), args);
+    }
+
+    #[test]
+    fn test_scrub_args_secret_flag_at_end() {
+        let args = vec!["--token".to_string()];
+        assert_eq!(scrub_args(&args), vec!["--token"]);
     }
 }

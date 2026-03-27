@@ -10,9 +10,12 @@ struct SessionInfo: Identifiable {
     let sessionDir: String
 }
 
-/// Scans /private/tmp/nono-session-*/session.json and returns active sessions.
+/// Scans $TMPDIR/nono-admin-*/session.json and returns active sessions.
+///
+/// session.json is written to the admin dir (not the session dir) so that the
+/// control_token is never accessible to the sandboxed child process.
 func discoverSessions() -> [SessionInfo] {
-    let tmpDir = URL(fileURLWithPath: "/private/tmp")
+    let tmpDir = FileManager.default.temporaryDirectory
     let fm = FileManager.default
 
     guard let entries = try? fm.contentsOfDirectory(
@@ -23,7 +26,7 @@ func discoverSessions() -> [SessionInfo] {
     }
 
     return entries.compactMap { entry -> SessionInfo? in
-        guard entry.lastPathComponent.hasPrefix("nono-session-") else { return nil }
+        guard entry.lastPathComponent.hasPrefix("nono-admin-") else { return nil }
         let jsonURL = entry.appendingPathComponent("session.json")
         guard let data = try? Data(contentsOf: jsonURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

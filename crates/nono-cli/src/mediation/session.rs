@@ -89,6 +89,13 @@ impl Drop for SessionHandle {
             "Mediation session directory removed: {}",
             self.session_dir.display()
         );
+        // Clean up the admin directory (contains session.json with control_token).
+        let admin_dir = session_admin_dir_path(std::process::id());
+        let _ = std::fs::remove_dir_all(&admin_dir);
+        debug!(
+            "Mediation admin directory removed: {}",
+            admin_dir.display()
+        );
     }
 }
 
@@ -220,9 +227,27 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let admin_state = AdminState::new();
 
     // -------------------------------------------------------------------------
-    // Write session.json (mode 0600) — contains control_token for admin CLI
+    // Write session.json (mode 0600) to admin dir outside sandbox-accessible path.
+    // The child process can read the session dir (shims, sockets), so we keep
+    // the control_token in a separate directory that is never in the sandbox's
+    // fs_read allow list.
     // -------------------------------------------------------------------------
-    let session_json_path = session_dir.join("session.json");
+    let admin_dir = session_admin_dir_path(std::process::id());
+    std::fs::create_dir_all(&admin_dir).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to create admin dir {}: {}",
+            admin_dir.display(),
+            e
+        ))
+    })?;
+    std::fs::set_permissions(&admin_dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to set admin dir permissions {}: {}",
+            admin_dir.display(),
+            e
+        ))
+    })?;
+    let session_json_path = admin_dir.join("session.json");
     let started_at = chrono::Utc::now().to_rfc3339();
     let session_info = serde_json::json!({
         "pid": std::process::id(),
@@ -453,6 +478,21 @@ fn session_dir_path() -> PathBuf {
     tmp.join(format!("nono-session-{}", std::process::id()))
 }
 
+/// Compute the admin directory path for a given PID.
+///
+/// The admin dir lives in `$TMPDIR` (on macOS: `/var/folders/.../T/`) rather
+/// than `/private/tmp`, so it is never covered by the sandbox's `fs_read`
+/// allow list and cannot be read by the child process.
+pub fn session_admin_dir_path(pid: u32) -> PathBuf {
+    // $TMPDIR on macOS expands to a user-specific temp dir under /var/folders,
+    // which is not included in any profile's fs_read allow list.
+    // Fall back to /tmp only if $TMPDIR is unset (non-macOS or unusual env).
+    let tmp = std::env::var("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    tmp.join(format!("nono-admin-{}", pid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +533,29 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    #[test]
+    fn test_session_admin_dir_path_has_pid() {
+        let pid = std::process::id();
+        let path = session_admin_dir_path(pid);
+        assert!(path.to_string_lossy().contains(&pid.to_string()));
+        assert!(path.to_string_lossy().contains("nono-admin-"));
+    }
+
+    #[test]
+    fn test_admin_dir_differs_from_session_dir() {
+        let pid = std::process::id();
+        let session_dir = session_dir_path();
+        let admin_dir = session_admin_dir_path(pid);
+        assert_ne!(
+            session_dir, admin_dir,
+            "admin dir must not be the same as session dir"
+        );
+        // Admin dir must not be under the session dir.
+        assert!(
+            !admin_dir.starts_with(&session_dir),
+            "admin dir must not be inside session dir"
+        );
     }
 }

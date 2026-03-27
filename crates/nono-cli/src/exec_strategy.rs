@@ -528,16 +528,10 @@ pub fn execute_supervised(
                     // shim earlier in PATH, we intercept the call.
                     if let Some(fd) = child_sock_fd {
                         if let Some(shim) = create_open_shim(&nono_exe, fd) {
-                            // Prepend shim dir to PATH and also set BROWSER for any tool
-                            // that does respect it.
-                            let current_path = std::env::var("PATH").unwrap_or_default();
-                            let new_path =
-                                format!("PATH={}:{current_path}", shim.dir.path().display());
-                            if let Ok(cstr) = CString::new(new_path) {
-                                // Remove existing PATH from env_c, then add our modified one
-                                env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                                env_c.push(cstr);
-                            }
+                            // Prepend shim dir to PATH (preserving any session shim dir
+                            // already added by env_vars) and also set BROWSER for any
+                            // tool that does respect it.
+                            apply_open_shim_path(&mut env_c, shim.dir.path());
                             let browser_cmd = format!("BROWSER={}", shim.launcher.display());
                             if let Ok(cstr) = CString::new(browser_cmd) {
                                 env_c.push(cstr);
@@ -2485,6 +2479,29 @@ pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecor
     }
 }
 
+/// Prepend `open_shim_dir` to the `PATH` entry already present in `env_c`.
+///
+/// Reads the current PATH from `env_c` (which already has the mediation session
+/// shim dir prepended by main.rs via env_vars) rather than from
+/// `std::env::var("PATH")`. Using the process env would discard the session
+/// shim dir, causing `bash -c 'gh ...'` to resolve `gh` directly instead of
+/// going through its mediation shim.
+#[cfg(target_os = "macos")]
+fn apply_open_shim_path(env_c: &mut Vec<std::ffi::CString>, open_shim_dir: &std::path::Path) {
+    let current_path = env_c
+        .iter()
+        .find(|c| c.as_bytes().starts_with(b"PATH="))
+        .and_then(|c| c.to_str().ok())
+        .and_then(|s| s.strip_prefix("PATH="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let new_path = format!("PATH={}:{current_path}", open_shim_dir.display());
+    if let Ok(cstr) = std::ffi::CString::new(new_path) {
+        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+        env_c.push(cstr);
+    }
+}
+
 /// Create a temporary directory containing an `open` shim script on macOS.
 ///
 /// The shim intercepts calls to `open` (which the Node.js `open` package
@@ -3686,5 +3703,45 @@ mod tests {
         assert!(dir.exists(), "shim dir should exist before drop");
         drop(shim);
         assert!(!dir.exists(), "shim dir should be removed on drop");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_open_shim_path_preserves_session_shim_dir() {
+        use std::ffi::CString;
+
+        let fake_session_shim = "/tmp/nono-session-9999/shims";
+        let open_shim_dir = tempfile::TempDir::new().unwrap();
+        let open_shim_dir_str = open_shim_dir.path().to_str().unwrap().to_string();
+
+        // Simulate env_c after env_vars have been applied — session shim dir is
+        // already prepended to PATH (as main.rs does via mediation_path_str).
+        let mut env_c: Vec<CString> = vec![
+            CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim)).unwrap(),
+        ];
+
+        apply_open_shim_path(&mut env_c, open_shim_dir.path());
+
+        let path_entry = env_c
+            .iter()
+            .find(|c| c.as_bytes().starts_with(b"PATH="))
+            .expect("PATH should be present in env_c");
+        let path_str = path_entry.to_str().unwrap();
+
+        assert!(
+            path_str.contains(fake_session_shim),
+            "session shim dir must be preserved in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains(&open_shim_dir_str),
+            "open shim dir must be in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.starts_with(&format!("PATH={}", open_shim_dir_str)),
+            "open shim dir must come first in PATH, got: {}",
+            path_str
+        );
     }
 }

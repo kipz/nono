@@ -469,19 +469,25 @@ fn find_shim_binary() -> Result<PathBuf> {
     })
 }
 
-/// Remove session directories left behind by crashed/killed nono processes.
+/// Remove session and admin directories left behind by crashed/killed nono processes.
 ///
-/// Scans the temp directory for `nono-session-{pid}` entries and removes any
-/// whose PID is no longer alive. The current process's directory is skipped.
+/// Scans the temp directories for `nono-session-{pid}` and `nono-admin-{pid}`
+/// entries. Any entry whose PID is no longer alive (checked via `kill(pid, 0)`)
+/// is removed. The current process's directories are always skipped.
 fn cleanup_orphaned_sessions() {
     let current_pid = std::process::id();
 
     #[cfg(target_os = "macos")]
-    let tmp = PathBuf::from("/private/tmp");
+    let session_tmp = PathBuf::from("/private/tmp");
     #[cfg(not(target_os = "macos"))]
-    let tmp = std::env::temp_dir();
+    let session_tmp = std::env::temp_dir();
 
-    cleanup_dirs_in(&tmp, "nono-session-", current_pid);
+    cleanup_dirs_in(&session_tmp, "nono-session-", current_pid);
+
+    let admin_tmp = std::env::var("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    cleanup_dirs_in(&admin_tmp, "nono-admin-", current_pid);
 }
 
 /// Scan `dir` for entries matching `{prefix}{pid}` and remove those whose PID
@@ -548,10 +554,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let current_pid = std::process::id();
 
+        // Create a dir for the current (live) PID — must not be removed.
         let live_dir = tmp.path().join(format!("nono-session-{}", current_pid));
         std::fs::create_dir_all(&live_dir).expect("create live dir");
 
-        // i32::MAX as u32 stays positive when cast to pid_t; no process ever has this PID.
+        // Create a dir for a PID that is certainly dead.
+        // i32::MAX as u32 stays positive when cast back to pid_t, so kill(pid, 0)
+        // returns ESRCH — no process can ever have such a high PID.
         let dead_pid: u32 = i32::MAX as u32;
         let dead_dir = tmp.path().join(format!("nono-session-{}", dead_pid));
         std::fs::create_dir_all(&dead_dir).expect("create dead dir");
@@ -560,6 +569,30 @@ mod tests {
 
         assert!(live_dir.exists(), "live PID dir must not be removed");
         assert!(!dead_dir.exists(), "dead PID dir must be removed");
+    }
+
+    #[test]
+    fn test_session_admin_dir_path_has_pid() {
+        let pid = std::process::id();
+        let path = session_admin_dir_path(pid);
+        assert!(path.to_string_lossy().contains(&pid.to_string()));
+        assert!(path.to_string_lossy().contains("nono-admin-"));
+    }
+
+    #[test]
+    fn test_admin_dir_differs_from_session_dir() {
+        let pid = std::process::id();
+        let session_dir = session_dir_path();
+        let admin_dir = session_admin_dir_path(pid);
+        assert_ne!(
+            session_dir, admin_dir,
+            "admin dir must not be the same as session dir"
+        );
+        // Admin dir must not be under the session dir.
+        assert!(
+            !admin_dir.starts_with(&session_dir),
+            "admin dir must not be inside session dir"
+        );
     }
 
     #[test]

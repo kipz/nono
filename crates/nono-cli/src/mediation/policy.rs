@@ -1147,6 +1147,29 @@ mod tests {
         assert!(subcommand_matches(&[], &["anything".to_string()]));
     }
 
+    #[test]
+    fn test_subcommand_matches_flag_value_injection_does_not_defeat_prefix() {
+        // Inserting a flag+value pair inserts an extra positional ("kipz"),
+        // which shifts real positionals and defeats a prefix that relied on
+        // their positions. This test documents the known limitation:
+        // profiles must not rely on a value arg appearing at a specific
+        // positional index — use a catch-all prefix for the subcommand instead.
+        assert!(!subcommand_matches(
+            &[
+                "find-generic-password".to_string(),
+                "gh:github.com".to_string(),
+            ],
+            &[
+                "find-generic-password".to_string(),
+                "-a".to_string(),
+                "kipz".to_string(), // injected positional shifts "gh:github.com"
+                "-s".to_string(),
+                "gh:github.com".to_string(),
+                "-w".to_string(),
+            ]
+        ));
+    }
+
     // --- Capture tests ---
 
     #[tokio::test]

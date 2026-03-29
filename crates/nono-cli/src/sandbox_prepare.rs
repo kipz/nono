@@ -10,6 +10,8 @@ use crate::{output, policy, protected_paths, sandbox_state};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -188,13 +190,18 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         let home_path = std::path::Path::new(&home);
 
         let precreate = |path: &std::path::Path, is_dir: bool| {
-            if !path.exists() {
-                let result = if is_dir {
-                    std::fs::create_dir_all(path)
-                } else {
-                    std::fs::File::create(path).map(|_| ())
-                };
-                if let Err(e) = result {
+            let result = if is_dir {
+                std::fs::create_dir_all(path)
+            } else {
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path)
+                    .map(|_| ())
+            };
+            if let Err(e) = result {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
                     warn!("Failed to pre-create {}: {}", path.display(), e);
                 }
             }

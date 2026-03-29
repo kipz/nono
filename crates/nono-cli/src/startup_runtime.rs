@@ -20,14 +20,14 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
     let exe = std::env::current_exe().map_err(|e| {
         NonoError::SandboxInit(format!("Failed to resolve current executable: {e}"))
     })?;
-    let startup_log_path = detached_startup_log_path(&session_id);
+    let (startup_log_path, startup_log_stdio) = create_detached_startup_log(&session_id)?;
     let mut child = Command::new(exe);
     child.args(std::env::args_os().skip(1));
     child.env(DETACHED_LAUNCH_ENV, "1");
     child.env(DETACHED_SESSION_ID_ENV, &session_id);
     child.stdin(Stdio::null());
     child.stdout(Stdio::null());
-    child.stderr(startup_log_stdio(&startup_log_path));
+    child.stderr(startup_log_stdio);
 
     #[cfg(unix)]
     unsafe {
@@ -100,18 +100,20 @@ fn print_detached_launch_banner(session_id: &str, session_name: Option<&str>, si
     eprintln!("Attach with: nono attach {}", session_id);
 }
 
-fn detached_startup_log_path(session_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(".nono-detached-startup-{session_id}.log"))
-}
+fn create_detached_startup_log(session_id: &str) -> Result<(PathBuf, Stdio)> {
+    let prefix = format!(".nono-detached-startup-{session_id}-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix).suffix(".log");
 
-fn startup_log_stdio(path: &Path) -> Stdio {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
+    let file = builder.tempfile_in(std::env::temp_dir()).map_err(|e| {
+        NonoError::SandboxInit(format!("Failed to create detached startup log file: {e}"))
+    })?;
+
+    let (file, path) = file.keep().map_err(|e| {
+        NonoError::SandboxInit(format!("Failed to persist detached startup log: {e}"))
+    })?;
+
+    Ok((path, Stdio::from(file)))
 }
 
 fn read_startup_log_summary(path: &Path) -> Option<String> {

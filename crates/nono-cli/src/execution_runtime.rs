@@ -37,6 +37,18 @@ fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
     }
 }
 
+fn next_capability_state_file_path() -> std::path::PathBuf {
+    use rand::RngExt;
+
+    let mut rng = rand::rng();
+    let bytes: [u8; 8] = rng.random();
+    let suffix = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::env::temp_dir().join(format!(".nono-{suffix}.json"))
+}
+
 pub(crate) fn execution_start_dir(
     workdir: &std::path::Path,
     caps: &CapabilitySet,
@@ -246,24 +258,45 @@ fn write_capability_state_file(
     override_deny_paths: &[std::path::PathBuf],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let cap_file = std::env::temp_dir().join(format!(".nono-{}.json", std::process::id()));
     let state = sandbox_state::SandboxState::from_caps(caps, override_deny_paths);
-    if let Err(e) = state.write_to_file(&cap_file) {
-        error!(
-            "Failed to write capability state file: {}. \
-             Sandboxed processes will not be able to query their own capabilities using 'nono why --self'.",
-            e
-        );
-        if !silent {
-            eprintln!(
-                "  WARNING: Capability state file could not be written.\n  \
-                 The sandbox is active, but 'nono why --self' will not work inside this sandbox."
-            );
+
+    for _ in 0..8 {
+        let cap_file = next_capability_state_file_path();
+        match state.write_to_file(&cap_file) {
+            Ok(()) => return Some(cap_file),
+            Err(NonoError::ConfigWrite { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                continue;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to write capability state file: {}. \
+                     Sandboxed processes will not be able to query their own capabilities using 'nono why --self'.",
+                    e
+                );
+                if !silent {
+                    eprintln!(
+                        "  WARNING: Capability state file could not be written.\n  \
+                         The sandbox is active, but 'nono why --self' will not work inside this sandbox."
+                    );
+                }
+                return None;
+            }
         }
-        None
-    } else {
-        Some(cap_file)
     }
+
+    error!(
+        "Failed to allocate a unique capability state file after repeated collisions. \
+         Sandboxed processes will not be able to query their own capabilities using 'nono why --self'."
+    );
+    if !silent {
+        eprintln!(
+            "  WARNING: Capability state file could not be written.\n  \
+             The sandbox is active, but 'nono why --self' will not work inside this sandbox."
+        );
+    }
+    None
 }
 
 #[cfg(test)]

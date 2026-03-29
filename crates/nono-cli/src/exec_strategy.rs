@@ -27,6 +27,8 @@ use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
 use std::io::{self, IsTerminal, Write};
 use std::os::fd::FromRawFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::RawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
@@ -74,6 +76,65 @@ fn print_terminal_safe_stderr(message: &str) {
     } else {
         let _ = writeln!(stderr, "{}", message);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn send_fd_over_raw_socket(sock_fd: RawFd, fd_to_send: RawFd) -> std::io::Result<()> {
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: data.len(),
+    };
+    // SAFETY: `CMSG_SPACE` and `CMSG_LEN` are pure libc size calculations for
+    // one `RawFd` ancillary payload; they do not dereference pointers.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let expected_cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) } as usize;
+
+    if cmsg_space > 64 {
+        return Err(std::io::Error::other(
+            "unexpected ancillary buffer size for raw fd send",
+        ));
+    }
+
+    let mut cmsg_buf = [0u8; 64];
+    // SAFETY: `zeroed()` is valid for `msghdr`; all fields are plain integers
+    // or pointers that will be initialized before the syscall.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = cmsg_space as _;
+
+    // SAFETY: `msg` points to valid stack-owned ancillary storage sized by
+    // `cmsg_space`, so `CMSG_FIRSTHDR` may compute the first header pointer.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
+    if cmsg.is_null() {
+        return Err(std::io::Error::other(
+            "missing ancillary header for raw fd send",
+        ));
+    }
+
+    // SAFETY: `cmsg` points into `cmsg_buf`, which is large enough for one
+    // `SCM_RIGHTS` header and payload. We write exactly one `RawFd`.
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = expected_cmsg_len as _;
+        std::ptr::copy_nonoverlapping(
+            (&fd_to_send as *const RawFd).cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<RawFd>(),
+        );
+    }
+
+    // SAFETY: `sock_fd` is an inherited Unix domain socket fd, and `msg`
+    // references stack memory that remains valid for the duration of `sendmsg`.
+    let sent = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 /// Linux procfs context for resolving child-relative procfs paths in the supervisor.
@@ -231,6 +292,14 @@ fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> 
     supervisor.is_some_and(|cfg| !cfg.allow_launch_services_active)
 }
 
+#[cfg(target_os = "linux")]
+const fn linux_child_requires_dumpable(
+    capability_elevation: bool,
+    seccomp_proxy_fallback: bool,
+) -> bool {
+    capability_elevation || seccomp_proxy_fallback
+}
+
 /// Execute a command using the Direct strategy (exec, nono disappears).
 ///
 /// This is the original behavior: apply sandbox, then exec into the command.
@@ -275,8 +344,9 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 ///
 /// - Child is sandboxed with full restrictions
 /// - Parent is NOT sandboxed - requires additional hardening:
-///   - Linux: PR_SET_DUMPABLE(0) applied BEFORE fork (inherited by both processes,
-///     closes TOCTOU window). Failure is fatal.
+///   - Linux: parent is made non-dumpable immediately after fork. The child is
+///     made non-dumpable unless seccomp-driven runtime inspection needs
+///     `/proc/PID/mem` access. Failure is fatal.
 ///   - macOS: PT_DENY_ATTACH applied in parent immediately after fork (not inherited
 ///     across fork on macOS). Failure is fatal - child is killed and error returned.
 ///
@@ -507,12 +577,11 @@ pub fn execute_supervised(
         }
     }
 
-    // NOTE: In supervised mode with IPC, we do NOT set
-    // PR_SET_DUMPABLE(0) before fork. The child must remain dumpable so
-    // the parent can read /proc/CHILD/mem for seccomp-notify path extraction.
-    // In rollback-only mode (no IPC), the child is made non-dumpable after
-    // sandbox apply (see child branch below).
-    // The parent sets itself non-dumpable immediately after fork.
+    // NOTE: We do not set PR_SET_DUMPABLE(0) before fork because the parent may
+    // need to inspect the child's memory for seccomp-notify requests. Instead,
+    // the parent hardens itself immediately after fork and the child hardens
+    // itself after sandbox/filter setup whenever procfs inspection is not
+    // required.
 
     // PTY pair is prepared by the caller so sessions can be detached and
     // reattached independently of capability elevation.
@@ -654,26 +723,21 @@ pub fn execute_supervised(
                     if let Some(fd) = child_sock_fd {
                         match nono::sandbox::install_seccomp_notify() {
                             Ok(notify_fd) => {
-                                // Send the notify fd to the parent via SCM_RIGHTS
-                                // SAFETY: We own the child socket end and the notify fd
-                                // is valid. from_stream is safe with our inherited fd.
-                                let child_sock =
-                                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                                let tmp_sock = SupervisorSocket::from_stream(child_sock);
-                                if let Err(_e) = tmp_sock.send_fd(notify_fd.as_raw_fd()) {
-                                    let msg =
-                                        b"nono: failed to send seccomp notify fd to supervisor\n";
+                                if let Err(e) = send_fd_over_raw_socket(fd, notify_fd.as_raw_fd()) {
+                                    let detail = format!(
+                                        "nono: failed to send seccomp notify fd to supervisor: {}\n",
+                                        e
+                                    );
+                                    let msg = detail.as_bytes();
                                     unsafe {
                                         libc::write(
                                             libc::STDERR_FILENO,
                                             msg.as_ptr().cast::<libc::c_void>(),
                                             msg.len(),
                                         );
+                                        libc::_exit(126);
                                     }
                                 }
-                                // Leak the socket wrapper so it doesn't close the fd
-                                // (the fd is still needed for supervisor IPC)
-                                std::mem::forget(tmp_sock);
                             }
                             Err(e) => {
                                 // seccomp not available -- proceed without transparent expansion
@@ -716,10 +780,9 @@ pub fn execute_supervised(
                     if let Some(fd) = child_sock_fd {
                         match nono::sandbox::install_seccomp_proxy_filter(has_bind) {
                             Ok(proxy_notify_fd) => {
-                                let child_sock =
-                                    unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-                                let tmp_sock = SupervisorSocket::from_stream(child_sock);
-                                if let Err(e) = tmp_sock.send_fd(proxy_notify_fd.as_raw_fd()) {
+                                if let Err(e) =
+                                    send_fd_over_raw_socket(fd, proxy_notify_fd.as_raw_fd())
+                                {
                                     let detail = format!(
                                         "nono: failed to send proxy seccomp notify fd: {}\n",
                                         e
@@ -734,7 +797,6 @@ pub fn execute_supervised(
                                         libc::_exit(126);
                                     }
                                 }
-                                std::mem::forget(tmp_sock);
                             }
                             Err(e) => {
                                 let detail =
@@ -749,6 +811,29 @@ pub fn execute_supervised(
                                     libc::_exit(126);
                                 }
                             }
+                        }
+                    }
+                }
+
+                if !linux_child_requires_dumpable(
+                    config.capability_elevation,
+                    config.seccomp_proxy_fallback,
+                ) {
+                    use nix::sys::prctl;
+
+                    if let Err(e) = prctl::set_dumpable(false) {
+                        let detail = format!(
+                            "nono: failed to set PR_SET_DUMPABLE(0) in supervised child: {}\n",
+                            e
+                        );
+                        let msg = detail.as_bytes();
+                        unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                msg.as_ptr().cast::<libc::c_void>(),
+                                msg.len(),
+                            );
+                            libc::_exit(126);
                         }
                     }
                 }
@@ -837,7 +922,7 @@ pub fn execute_supervised(
 
             // On Linux, set PR_SET_DUMPABLE(0) on the parent to prevent
             // ptrace attachment. The child stays dumpable only when
-            // supervisor IPC is active (for /proc/CHILD/mem path extraction).
+            // seccomp-driven procfs inspection is active.
             #[cfg(target_os = "linux")]
             {
                 use nix::sys::prctl;
@@ -2684,6 +2769,15 @@ fn open_canonical_path_no_symlinks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
+        assert!(!linux_child_requires_dumpable(false, false));
+        assert!(linux_child_requires_dumpable(true, false));
+        assert!(linux_child_requires_dumpable(false, true));
+        assert!(linux_child_requires_dumpable(true, true));
+    }
 
     #[test]
     fn test_exec_strategy_default_is_supervised() {

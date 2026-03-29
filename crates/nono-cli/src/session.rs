@@ -496,7 +496,7 @@ fn process_matches_session(
         ProcessLiveness::NotRunning => false,
         ProcessLiveness::Running => match actual_start_epoch {
             Some(actual_start) => actual_start == expected_start_epoch,
-            None => true,
+            None => false,
         },
         ProcessLiveness::RunningNoPermission => match actual_start_epoch {
             Some(actual_start) => actual_start == expected_start_epoch,
@@ -952,8 +952,12 @@ mod tests {
     }
 
     #[test]
-    fn test_process_matches_session_keeps_accessible_process_without_start_time() {
-        assert!(process_matches_session(ProcessLiveness::Running, None, 123));
+    fn test_process_matches_session_requires_start_time_when_accessible() {
+        assert!(!process_matches_session(
+            ProcessLiveness::Running,
+            None,
+            123
+        ));
     }
 
     #[test]

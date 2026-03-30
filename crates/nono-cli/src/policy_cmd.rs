@@ -1880,71 +1880,46 @@ fn resolve_to_manifest(
     let mut grants = Vec::new();
     let mut deny = Vec::new();
 
-    // Directory grants
-    for p in &prof.filesystem.allow {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+    let fs_sources: &[(&[String], manifest::AccessMode, bool)] = &[
+        (
+            &prof.filesystem.allow,
             manifest::AccessMode::Readwrite,
             false,
-        )?);
-    }
-    for p in &prof.filesystem.read {
-        grants.push(make_fs_grant(
-            &expand(p)?,
-            manifest::AccessMode::Read,
-            false,
-        )?);
-    }
-    for p in &prof.filesystem.write {
-        grants.push(make_fs_grant(
-            &expand(p)?,
-            manifest::AccessMode::Write,
-            false,
-        )?);
-    }
-    // File grants
-    for p in &prof.filesystem.allow_file {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+        ),
+        (&prof.filesystem.read, manifest::AccessMode::Read, false),
+        (&prof.filesystem.write, manifest::AccessMode::Write, false),
+        (
+            &prof.filesystem.allow_file,
             manifest::AccessMode::Readwrite,
             true,
-        )?);
-    }
-    for p in &prof.filesystem.read_file {
-        grants.push(make_fs_grant(
-            &expand(p)?,
-            manifest::AccessMode::Read,
-            true,
-        )?);
-    }
-    for p in &prof.filesystem.write_file {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+        ),
+        (&prof.filesystem.read_file, manifest::AccessMode::Read, true),
+        (
+            &prof.filesystem.write_file,
             manifest::AccessMode::Write,
             true,
-        )?);
-    }
-    // Policy patch paths
-    for p in &prof.policy.add_allow_read {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+        ),
+        (
+            &prof.policy.add_allow_read,
             manifest::AccessMode::Read,
             false,
-        )?);
-    }
-    for p in &prof.policy.add_allow_write {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+        ),
+        (
+            &prof.policy.add_allow_write,
             manifest::AccessMode::Write,
             false,
-        )?);
-    }
-    for p in &prof.policy.add_allow_readwrite {
-        grants.push(make_fs_grant(
-            &expand(p)?,
+        ),
+        (
+            &prof.policy.add_allow_readwrite,
             manifest::AccessMode::Readwrite,
             false,
-        )?);
+        ),
+    ];
+
+    for (paths, access, is_file) in fs_sources {
+        for p in *paths {
+            grants.push(make_fs_grant(&expand(p)?, *access, *is_file)?);
+        }
     }
     // Deny paths from policy patches
     for p in &prof.policy.add_deny_access {

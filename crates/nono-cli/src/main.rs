@@ -2365,17 +2365,18 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         // For K8s/container use, manifests should contain absolute paths
         // and this expansion is a no-op.
         if let Some(ref mut fs) = manifest.filesystem {
+            let expand_path = |path_str: &str| -> Result<String> {
+                let expanded = profile::expand_vars(path_str, &workdir)?;
+                Ok(expanded.to_string_lossy().into_owned())
+            };
+
             for grant in &mut fs.grants {
-                let expanded = profile::expand_vars(grant.path.as_str(), &workdir)?;
-                grant.path = expanded
-                    .to_string_lossy()
+                grant.path = expand_path(grant.path.as_str())?
                     .parse()
                     .map_err(|e| NonoError::ConfigParse(format!("invalid path: {e}")))?;
             }
             for deny in &mut fs.deny {
-                let expanded = profile::expand_vars(deny.path.as_str(), &workdir)?;
-                deny.path = expanded
-                    .to_string_lossy()
+                deny.path = expand_path(deny.path.as_str())?
                     .parse()
                     .map_err(|e| NonoError::ConfigParse(format!("invalid path: {e}")))?;
             }

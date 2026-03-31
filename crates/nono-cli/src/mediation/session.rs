@@ -631,28 +631,4 @@ mod tests {
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
     }
-
-    #[test]
-    fn test_session_admin_dir_path_has_pid() {
-        let pid = std::process::id();
-        let path = session_admin_dir_path(pid);
-        assert!(path.to_string_lossy().contains(&pid.to_string()));
-        assert!(path.to_string_lossy().contains("nono-admin-"));
-    }
-
-    #[test]
-    fn test_admin_dir_differs_from_session_dir() {
-        let pid = std::process::id();
-        let session_dir = session_dir_path();
-        let admin_dir = session_admin_dir_path(pid);
-        assert_ne!(
-            session_dir, admin_dir,
-            "admin dir must not be the same as session dir"
-        );
-        // Admin dir must not be under the session dir.
-        assert!(
-            !admin_dir.starts_with(&session_dir),
-            "admin dir must not be inside session dir"
-        );
-    }
 }

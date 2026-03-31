@@ -117,12 +117,18 @@ pub struct CommandSandbox {
     /// Network policy for the exec'd command. Default: allow all (no restriction).
     #[serde(default)]
     pub network: NetworkConfig,
-    /// Filesystem paths the command may read.
+    /// Directories the command may read.
     #[serde(default)]
     pub fs_read: Vec<String>,
-    /// Filesystem paths the command may write.
+    /// Individual files the command may read.
+    #[serde(default)]
+    pub fs_read_file: Vec<String>,
+    /// Directories the command may write.
     #[serde(default)]
     pub fs_write: Vec<String>,
+    /// Individual files the command may write.
+    #[serde(default)]
+    pub fs_write_file: Vec<String>,
     /// Commands allowed to execute directly (real binary, not shim) inside this
     /// per-command sandbox. Their output stays within the sandbox.
     #[serde(default)]
@@ -223,5 +229,30 @@ mod tests {
     fn test_command_sandbox_default_has_empty_allow_commands() {
         let sb = CommandSandbox::default();
         assert!(sb.allow_commands.is_empty());
+    }
+
+    #[test]
+    fn test_command_sandbox_fs_file_fields_deserialize() {
+        let json = r#"{
+            "fs_read": ["~/.config/gh"],
+            "fs_read_file": ["~/.gitconfig", "~/.vault-token"],
+            "fs_write": ["~/.config/ddtool"],
+            "fs_write_file": ["~/.vault-token"]
+        }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(sb.fs_read, vec!["~/.config/gh"]);
+        assert_eq!(sb.fs_read_file, vec!["~/.gitconfig", "~/.vault-token"]);
+        assert_eq!(sb.fs_write, vec!["~/.config/ddtool"]);
+        assert_eq!(sb.fs_write_file, vec!["~/.vault-token"]);
+    }
+
+    #[test]
+    fn test_command_sandbox_fs_file_fields_default_empty() {
+        let json = r#"{ "fs_read": ["~/.ssh"] }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(sb.fs_read, vec!["~/.ssh"]);
+        assert!(sb.fs_read_file.is_empty());
+        assert!(sb.fs_write.is_empty());
+        assert!(sb.fs_write_file.is_empty());
     }
 }

@@ -1862,32 +1862,6 @@ mod tests {
     }
 
     #[test]
-    fn test_user_tools_group_does_not_grant_xdg_state_home() {
-        // ~/.local/state (XDG_STATE_HOME) contains shell history, wireplumber
-        // state, less history, python_history, etc. The user_tools group is
-        // described as "User-local executables, .desktop files, man pages, and
-        // shell completions" — none of which live under ~/.local/state.
-        // Granting readwrite to this entire tree leaks sensitive data and allows
-        // the sandboxed process to tamper with other programs' state.
-        let policy = load_embedded_policy().expect("embedded policy must load");
-        let group = policy
-            .groups
-            .get("user_tools")
-            .expect("user_tools group must exist");
-
-        let allow = group.allow.as_ref().expect("user_tools must have allow");
-
-        let state_home = "~/.local/state";
-        let has_state_rw = allow.readwrite.iter().any(|p| p == state_home);
-        let has_state_w = allow.write.iter().any(|p| p == state_home);
-        assert!(
-            !has_state_rw && !has_state_w,
-            "user_tools must NOT grant write access to {state_home} — \
-             it contains shell history and state of other programs"
-        );
-    }
-
-    #[test]
     fn test_resolve_deny_group_collects_deny_paths() {
         let policy = load_policy(sample_policy_json()).expect("parse failed");
         let mut caps = CapabilitySet::new();

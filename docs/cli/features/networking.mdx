@@ -154,6 +154,63 @@ export NONO_UPSTREAM_BYPASS=git.internal.corp,*.dev.local
 nono run --allow-cwd --network-profile enterprise -- my-agent
 ```
 
+## Endpoint Filtering
+
+When credential injection routes traffic through the reverse proxy, you can further restrict which HTTP method+path combinations are allowed on a per-service basis. This enforces least-privilege at the API level — the agent can reach an allowed domain but only use specific endpoints.
+
+### CLI Usage
+
+Use `--allow-endpoint` to restrict a credential service to specific patterns:
+
+```bash
+# Allow only chat completions through OpenAI
+nono run --allow-cwd --credential openai \
+  --allow-endpoint 'openai:POST:/v1/chat/completions' \
+  -- my-agent
+
+# Allow GitHub issue reads and comment writes, block everything else
+nono run --allow-cwd --credential github \
+  --allow-endpoint 'github:GET:/repos/*/issues/**' \
+  --allow-endpoint 'github:POST:/repos/*/issues/*/comments' \
+  -- my-agent
+```
+
+When any endpoint rules are configured for a service, requests that don't match receive `403 Forbidden` and are logged in the audit trail.
+
+### Profile Configuration
+
+Endpoint rules can also be defined on custom credentials within profiles:
+
+```json
+{
+  "network": {
+    "custom_credentials": {
+      "gitlab": {
+        "upstream": "https://gitlab.example.com",
+        "credential_key": "gitlab_token",
+        "endpoint_rules": [
+          { "method": "GET", "path": "/api/v4/projects/*/merge_requests/**" },
+          { "method": "POST", "path": "/api/v4/projects/*/merge_requests/*/notes" }
+        ]
+      }
+    }
+  }
+}
+```
+
+See [Credential Injection — Custom Credential Definitions](/cli/features/credential-injection#custom-credential-definitions) for the full `custom_credentials` schema.
+
+### Pattern Syntax
+
+Path patterns use standard glob syntax (same as `.gitignore` and nono profile `include` patterns):
+
+| Pattern | Matches |
+|---------|---------|
+| `/v1/chat/completions` | Exact path only |
+| `/repos/*/issues` | One segment wildcard (e.g., `/repos/myrepo/issues`) |
+| `/api/**` | Zero or more segments (e.g., `/api/v1/data/export`) |
+| `*` | Any method (when used as the method field) |
+
 ## Localhost IPC
 
 Use `--open-port` to allow bidirectional localhost TCP on a specific port (connect + listen). This enables IPC between sandboxed processes — for example, an MCP server in one sandbox and an AI agent in another.

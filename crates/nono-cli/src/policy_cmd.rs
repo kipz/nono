@@ -577,7 +577,7 @@ fn cmd_show(args: PolicyShowArgs) -> Result<()> {
     let has_net = net.block
         || net.resolved_network_profile().is_some()
         || !net.allow_domain.is_empty()
-        || !net.credentials.is_empty()
+        || !net.resolved_credentials().is_empty()
         || !net.open_port.is_empty()
         || !net.listen_port.is_empty()
         || net.upstream_proxy.is_some()
@@ -603,11 +603,11 @@ fn cmd_show(args: PolicyShowArgs) -> Result<()> {
                 net.allow_domain.join(", ")
             );
         }
-        if !net.credentials.is_empty() {
+        if !net.resolved_credentials().is_empty() {
             println!(
                 "    {}: {}",
                 theme::fg("credentials", t.subtext),
-                net.credentials.join(", ")
+                net.resolved_credentials().join(", ")
             );
         }
         if !net.open_port.is_empty() {
@@ -762,7 +762,7 @@ fn profile_to_json(
         "block": profile.network.block,
         "network_profile": profile.network.resolved_network_profile(),
         "allow_domain": profile.network.allow_domain,
-        "credentials": profile.network.credentials,
+        "credentials": profile.network.resolved_credentials(),
         "open_port": profile.network.open_port,
         "listen_port": profile.network.listen_port,
         "upstream_proxy": profile.network.upstream_proxy,
@@ -1013,8 +1013,8 @@ fn cmd_diff(args: PolicyDiffArgs) -> Result<()> {
         ),
         (
             "credentials",
-            &p1.network.credentials,
-            &p2.network.credentials,
+            p1.network.resolved_credentials(),
+            p2.network.resolved_credentials(),
         ),
         (
             "upstream_bypass",
@@ -1496,7 +1496,7 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "changed": p1.network.resolved_network_profile() != p2.network.resolved_network_profile(),
             },
             "allow_domain": diff_vec(&p1.network.allow_domain, &p2.network.allow_domain),
-            "credentials": diff_vec(&p1.network.credentials, &p2.network.credentials),
+            "credentials": diff_vec(p1.network.resolved_credentials(), p2.network.resolved_credentials()),
             "open_port": {
                 "profile1": p1.network.open_port,
                 "profile2": p2.network.open_port,

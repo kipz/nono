@@ -310,7 +310,14 @@ pub fn expand_proxy_allow(policy: &NetworkPolicy, entries: &[String]) -> Vec<Str
                 result.push(wildcard);
             }
         } else {
-            result.push(entry.clone());
+            // Strip optional :port suffix — the proxy host filter matches
+            // hostnames only, while allow_domain entries may include ports
+            // for Landlock TCP connect rules.
+            let host = entry
+                .rsplit_once(':')
+                .and_then(|(h, p)| p.parse::<u16>().ok().map(|_| h))
+                .unwrap_or(entry.as_str());
+            result.push(host.to_string());
         }
     }
     result

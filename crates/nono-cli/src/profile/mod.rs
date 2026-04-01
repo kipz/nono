@@ -600,8 +600,17 @@ pub struct NetworkConfig {
     pub allow_domain: Vec<String>,
     /// Credential services to enable via reverse proxy.
     /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
-    #[serde(default, rename = "credentials", alias = "proxy_credentials")]
-    pub credentials: Vec<String>,
+    ///
+    /// When `None` (absent from profile), inherits parent credentials during merge.
+    /// When `Some([])` (explicitly set to empty array), overrides parent to disable
+    /// all inherited credential routes.
+    #[serde(
+        default,
+        rename = "credentials",
+        alias = "proxy_credentials",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credentials: Option<Vec<String>>,
     /// Localhost TCP ports to allow bidirectional IPC (connect + bind).
     /// Equivalent to `--open-port` CLI flag.
     /// Canonical profile key: `open_port` (legacy `port_allow` and `allow_port`
@@ -639,11 +648,16 @@ impl NetworkConfig {
         self.network_profile.as_ref().map(String::as_str)
     }
 
+    /// Returns the resolved credentials list, defaulting to empty if unset.
+    pub fn resolved_credentials(&self) -> &[String] {
+        self.credentials.as_deref().unwrap_or(&[])
+    }
+
     /// Whether any profile setting requires proxy mode activation.
     pub fn has_proxy_flags(&self) -> bool {
         self.resolved_network_profile().is_some()
             || !self.allow_domain.is_empty()
-            || !self.credentials.is_empty()
+            || !self.resolved_credentials().is_empty()
             || self.upstream_proxy.is_some()
     }
 }
@@ -1315,7 +1329,23 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             allow_domain: dedup_append(&base.network.allow_domain, &child.network.allow_domain),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
-            credentials: dedup_append(&base.network.credentials, &child.network.credentials),
+            // Child `Some([])` overrides parent credentials to empty (disables proxy).
+            // Child `None` inherits parent credentials. Child `Some([...])` merges with parent.
+            credentials: match child.network.credentials {
+                Some(ref child_creds) => {
+                    if child_creds.is_empty() {
+                        // Explicitly empty — override parent, disable inherited credentials
+                        Some(Vec::new())
+                    } else {
+                        // Child has credentials — merge with parent
+                        Some(dedup_append(
+                            base.network.credentials.as_deref().unwrap_or(&[]),
+                            child_creds,
+                        ))
+                    }
+                }
+                None => base.network.credentials,
+            },
             custom_credentials: {
                 let mut merged = base.network.custom_credentials;
                 merged.extend(child.network.custom_credentials);
@@ -1570,6 +1600,7 @@ pub fn list_profiles() -> Vec<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::env;
@@ -2507,7 +2538,7 @@ mod tests {
                 allow_domain: vec!["base.example.com".to_string()],
                 open_port: vec![3000],
                 listen_port: vec![4000],
-                credentials: vec!["base_cred".to_string()],
+                credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
@@ -2575,7 +2606,7 @@ mod tests {
                 allow_domain: vec!["child.example.com".to_string()],
                 open_port: vec![3000, 5000],
                 listen_port: vec![4000, 6000],
-                credentials: vec![],
+                credentials: None,
                 custom_credentials: HashMap::new(),
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
@@ -3247,6 +3278,73 @@ mod tests {
             .policy
             .override_deny
             .contains(&"/child/override-deny".to_string()));
+    }
+
+    #[test]
+    fn test_merge_profiles_credentials_none_inherits_base() {
+        let base = base_profile(); // credentials: Some(["base_cred"])
+        let child = child_profile(); // credentials: None
+        let merged = merge_profiles(base, child);
+        // None child inherits base credentials
+        assert_eq!(
+            merged.network.resolved_credentials(),
+            &["base_cred".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_credentials_empty_overrides_base() {
+        let base = base_profile(); // credentials: Some(["base_cred"])
+        let mut child = child_profile();
+        child.network.credentials = Some(Vec::new()); // Explicitly empty
+        let merged = merge_profiles(base, child);
+        // Some([]) overrides base — no credentials
+        assert!(merged.network.resolved_credentials().is_empty());
+        assert_eq!(merged.network.credentials, Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_merge_profiles_credentials_some_merges_with_base() {
+        let base = base_profile(); // credentials: Some(["base_cred"])
+        let mut child = child_profile();
+        child.network.credentials = Some(vec!["child_cred".to_string()]);
+        let merged = merge_profiles(base, child);
+        // Some([...]) merges with base
+        let creds = merged.network.resolved_credentials();
+        assert!(creds.contains(&"base_cred".to_string()));
+        assert!(creds.contains(&"child_cred".to_string()));
+    }
+
+    #[test]
+    fn test_credentials_none_does_not_activate_proxy() {
+        let mut config = NetworkConfig::default();
+        assert!(!config.has_proxy_flags()); // None = no proxy
+        config.credentials = Some(Vec::new());
+        assert!(!config.has_proxy_flags()); // Some([]) = no proxy
+        config.credentials = Some(vec!["openai".to_string()]);
+        assert!(config.has_proxy_flags()); // Some(["openai"]) = proxy
+    }
+
+    #[test]
+    fn test_credentials_deserialization_absent_vs_empty() {
+        // Absent field → None (inherit)
+        let json = r#"{ "meta": { "name": "no-creds" }, "network": {} }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert!(profile.network.credentials.is_none());
+
+        // Explicit empty array → Some([]) (override to empty)
+        let json = r#"{ "meta": { "name": "empty-creds" }, "network": { "credentials": [] } }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(profile.network.credentials, Some(Vec::<String>::new()));
+
+        // With values → Some(["openai"])
+        let json =
+            r#"{ "meta": { "name": "has-creds" }, "network": { "credentials": ["openai"] } }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            profile.network.credentials,
+            Some(vec!["openai".to_string()])
+        );
     }
 
     #[test]

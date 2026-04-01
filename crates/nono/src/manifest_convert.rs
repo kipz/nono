@@ -43,7 +43,11 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
                 NetworkMode::Blocked => caps.block_network(),
                 // Proxy mode blocks direct network access at the OS level; the CLI
                 // layer sets up the reverse proxy separately and allows its port.
-                NetworkMode::Proxy => caps.set_network_mode(InternalNetworkMode::Blocked),
+                // Port 0 is a placeholder — the CLI fills in the actual proxy port.
+                NetworkMode::Proxy => caps.set_network_mode(InternalNetworkMode::ProxyOnly {
+                    port: 0,
+                    bind_ports: vec![],
+                }),
                 NetworkMode::Unrestricted => caps.set_network_mode(InternalNetworkMode::AllowAll),
             };
 

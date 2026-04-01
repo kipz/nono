@@ -1931,6 +1931,103 @@ fn resolve_to_manifest(
         });
     }
 
+    // Resolve security.groups → filesystem grants, deny paths, and blocked commands.
+    // Groups are the primary source of system read paths, deny rules, and dangerous
+    // command blocks. Without this, the exported manifest is weaker than the profile.
+    let loaded_policy = policy::load_embedded_policy()?;
+    let mut scratch_caps = nono::CapabilitySet::new();
+    let resolved_groups =
+        policy::resolve_groups(&loaded_policy, &prof.security.groups, &mut scratch_caps)?;
+
+    // Add filesystem grants from resolved groups
+    for cap in scratch_caps.fs_capabilities() {
+        let access = match cap.access {
+            nono::AccessMode::Read => manifest::AccessMode::Read,
+            nono::AccessMode::Write => manifest::AccessMode::Write,
+            nono::AccessMode::ReadWrite => manifest::AccessMode::Readwrite,
+        };
+        let path_str = cap.resolved.to_string_lossy().into_owned();
+        grants.push(make_fs_grant(&path_str, access, cap.is_file)?);
+    }
+
+    // Expand override_deny paths so we can filter them out of the deny list.
+    // The manifest is the fully-resolved output — overridden denies must not
+    // appear, otherwise the manifest re-applies restrictions the profile relaxed.
+    let override_deny_expanded: Vec<std::path::PathBuf> = prof
+        .policy
+        .override_deny
+        .iter()
+        .filter_map(|tmpl| profile::expand_vars(tmpl, workdir).ok())
+        .map(|p| {
+            if p.exists() {
+                p.canonicalize().unwrap_or(p)
+            } else {
+                p
+            }
+        })
+        .collect();
+
+    // Add deny paths from resolved groups, filtering out overridden paths.
+    for deny_path in resolved_groups
+        .deny_paths
+        .iter()
+        .filter(|dp| !override_deny_expanded.iter().any(|ovr| dp.starts_with(ovr)))
+    {
+        let path_str = deny_path.to_string_lossy().into_owned();
+        deny.push(manifest::FsDeny {
+            path: path_str
+                .parse()
+                .map_err(|e| NonoError::ConfigParse(format!("invalid deny path: {e}")))?,
+        });
+    }
+
+    // Add blocked commands from resolved groups
+    let group_blocked_commands: Vec<String> = scratch_caps.blocked_commands().to_vec();
+
+    // Add workdir access as a filesystem grant
+    let workdir_str = workdir.to_string_lossy().into_owned();
+    match prof.workdir.access {
+        WorkdirAccess::ReadWrite => {
+            grants.push(make_fs_grant(
+                &workdir_str,
+                manifest::AccessMode::Readwrite,
+                false,
+            )?);
+        }
+        WorkdirAccess::Read => {
+            grants.push(make_fs_grant(
+                &workdir_str,
+                manifest::AccessMode::Read,
+                false,
+            )?);
+        }
+        WorkdirAccess::Write => {
+            grants.push(make_fs_grant(
+                &workdir_str,
+                manifest::AccessMode::Write,
+                false,
+            )?);
+        }
+        WorkdirAccess::None => {} // no grant
+    }
+
+    // Deduplicate grants: if the same path appears from both filesystem.allow
+    // and workdir (or groups), keep the highest-access-mode entry.
+    grants.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    grants.dedup_by(|a, b| {
+        if a.path.as_str() == b.path.as_str() && a.type_ == b.type_ {
+            // Keep the broader access mode in `b` (the survivor of dedup_by)
+            b.access = wider_access(a.access, b.access);
+            true
+        } else {
+            false
+        }
+    });
+
+    // Deduplicate deny entries by path
+    deny.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    deny.dedup_by(|a, b| a.path.as_str() == b.path.as_str());
+
     let filesystem = if grants.is_empty() && deny.is_empty() {
         None
     } else {
@@ -2002,8 +2099,20 @@ fn resolve_to_manifest(
 
     let process = Some(manifest::Process {
         allowed_commands: prof.security.allowed_commands.clone(),
-        blocked_commands: prof.policy.add_deny_commands.clone(),
-        exec_strategy: manifest::ExecStrategy::Monitor,
+        blocked_commands: {
+            let mut cmds = group_blocked_commands;
+            cmds.extend(prof.policy.add_deny_commands.clone());
+            cmds.sort();
+            cmds.dedup();
+            cmds
+        },
+        exec_strategy: if !prof.rollback.exclude_patterns.is_empty()
+            || !prof.rollback.exclude_globs.is_empty()
+        {
+            manifest::ExecStrategy::Supervised
+        } else {
+            manifest::ExecStrategy::Monitor
+        },
         signal_mode,
         process_info_mode,
         ipc_mode,
@@ -2068,6 +2177,14 @@ fn resolve_to_manifest(
                 path_replacement: cred.path_replacement.clone(),
                 query_param_name: cred.query_param_name.clone(),
             }),
+            env_var: cred
+                .env_var
+                .as_ref()
+                .map(|v| {
+                    v.parse()
+                        .map_err(|e| NonoError::ConfigParse(format!("invalid env_var: {e}")))
+                })
+                .transpose()?,
             endpoint_rules,
         });
     }
@@ -2085,6 +2202,20 @@ fn resolve_to_manifest(
         rollback,
         credentials,
     })
+}
+
+/// Return the broader of two access modes (Read + Write → Readwrite).
+fn wider_access(
+    a: nono::manifest::AccessMode,
+    b: nono::manifest::AccessMode,
+) -> nono::manifest::AccessMode {
+    use nono::manifest::AccessMode::{Read, Readwrite, Write};
+    match (a, b) {
+        (Readwrite, _) | (_, Readwrite) => Readwrite,
+        (Read, Write) | (Write, Read) => Readwrite,
+        (Read, Read) => Read,
+        (Write, Write) => Write,
+    }
 }
 
 /// Helper to construct an `FsGrant` from an expanded path string.

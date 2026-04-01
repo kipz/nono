@@ -49,10 +49,46 @@ impl CapabilityManifest {
     /// Validate semantic constraints that the JSON Schema cannot express.
     ///
     /// Checks for:
+    /// - `rollback.enabled` requires `exec_strategy: "supervised"`
+    /// - URI manager credential sources require `env_var`
     /// - `url_path` inject mode requires `path_pattern`
     /// - `query_param` inject mode requires `query_param_name`
     pub fn validate(&self) -> crate::Result<()> {
+        // rollback.enabled requires exec_strategy: "supervised"
+        if let Some(ref rb) = self.rollback {
+            if rb.enabled {
+                let exec_strategy = self
+                    .process
+                    .as_ref()
+                    .map_or(ExecStrategy::Monitor, |p| p.exec_strategy);
+                if exec_strategy != ExecStrategy::Supervised {
+                    return Err(crate::NonoError::ConfigParse(
+                        "rollback.enabled: true requires exec_strategy: \"supervised\" \
+                         (rollback needs a parent process for snapshots)"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         for cred in &self.credentials {
+            // URI manager sources (op://, apple-password://, file://) need an
+            // explicit env_var because uppercasing the URI produces a nonsensical
+            // environment variable name.
+            let source = cred.source.as_str();
+            if (crate::keystore::is_op_uri(source)
+                || crate::keystore::is_apple_password_uri(source)
+                || crate::keystore::is_file_uri(source))
+                && cred.env_var.is_none()
+            {
+                return Err(crate::NonoError::ConfigParse(format!(
+                    "credential '{}': env_var is required when source is a URI manager \
+                     reference (op://, apple-password://, or file://); \
+                     set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
+                    cred.name.as_str()
+                )));
+            }
+
             if let Some(ref inject) = cred.inject {
                 match inject.mode {
                     InjectMode::UrlPath => {

@@ -89,3 +89,4 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 jsonschema = "0.45"
+proptest = "1"

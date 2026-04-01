@@ -221,6 +221,11 @@
           "$ref": "#/$defs/CredentialInject",
           "description": "How the credential is injected into outbound requests. Defaults to Bearer token in Authorization header."
         },
+        "env_var": {
+          "type": "string",
+          "description": "SDK API key environment variable name for phantom token injection (e.g., 'OPENAI_API_KEY'). Required when source is a URI manager reference (op://, apple-password://, file://) because those URIs cannot be meaningfully uppercased into an environment variable name. When absent for keystore-backed credentials, derived from credential_key.to_uppercase().",
+          "minLength": 1
+        },
         "endpoint_rules": {
           "type": "array",
           "items": { "$ref": "#/$defs/EndpointRule" },

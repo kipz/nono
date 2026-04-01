@@ -2346,10 +2346,10 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
     // specification. We skip profile loading, group resolution, CWD
     // auto-inclusion, and deny overlap validation.
     //
-    // NOTE: credentials declared in the manifest are NOT yet wired to the
-    // reverse proxy — that requires proxy startup logic from the profile
-    // path. For now, --config only handles filesystem, network mode/ports,
-    // and process isolation. Credential proxy support is future work.
+    // Network proxy fields (allow_domains, credentials, listen_ports) are
+    // wired to PreparedSandbox so the built-in reverse proxy activates
+    // when mode is "proxy". For external proxy scenarios, the manifest
+    // blocks direct network and the operator provides proxy infrastructure.
     if let Some(ref config_path) = args.config {
         let json = std::fs::read_to_string(config_path).map_err(|e| {
             NonoError::ConfigParse(format!(
@@ -2382,7 +2382,23 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
             }
         }
 
-        let caps = CapabilitySet::try_from(&manifest)?;
+        let mut caps = CapabilitySet::try_from(&manifest)?;
+        caps.deduplicate();
+
+        // Validate deny/grant overlaps on Linux (Landlock cannot enforce
+        // deny-within-allow). This catches misconfigured manifests early
+        // rather than silently dropping the deny.
+        let manifest_deny_paths: Vec<std::path::PathBuf> = manifest
+            .filesystem
+            .as_ref()
+            .map(|fs| {
+                fs.deny
+                    .iter()
+                    .map(|d| std::path::PathBuf::from(d.path.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        policy::validate_deny_overlaps(&manifest_deny_paths, &caps)?;
 
         // Protected roots validation still applies — a manifest should not
         // grant access to security-critical system paths without warning.
@@ -2408,19 +2424,83 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         }
         info!("{}", Sandbox::support_info().details);
 
+        // Wire proxy fields from manifest so the proxy machinery activates.
+        let manifest_allow_domain = manifest
+            .network
+            .as_ref()
+            .map_or_else(Vec::new, |n| n.allow_domains.clone());
+
+        let manifest_listen_ports: Vec<u16> = manifest
+            .network
+            .as_ref()
+            .and_then(|n| n.ports.as_ref())
+            .map_or_else(Vec::new, |p| {
+                p.bind
+                    .iter()
+                    .filter_map(|v| u16::try_from(v.get()).ok())
+                    .collect()
+            });
+
+        // Convert manifest credentials → profile CustomCredentialDef for the proxy
+        let mut manifest_custom_credentials = std::collections::HashMap::new();
+        for cred in &manifest.credentials {
+            let inject_mode =
+                cred.inject
+                    .as_ref()
+                    .map_or(crate::profile::InjectMode::Header, |inj| match inj.mode {
+                        nono::manifest::InjectMode::Header => crate::profile::InjectMode::Header,
+                        nono::manifest::InjectMode::UrlPath => crate::profile::InjectMode::UrlPath,
+                        nono::manifest::InjectMode::QueryParam => {
+                            crate::profile::InjectMode::QueryParam
+                        }
+                        nono::manifest::InjectMode::BasicAuth => {
+                            crate::profile::InjectMode::BasicAuth
+                        }
+                    });
+
+            let inject = cred.inject.as_ref();
+            let custom_def = crate::profile::CustomCredentialDef {
+                upstream: cred.upstream.to_string(),
+                credential_key: cred.source.to_string(),
+                inject_mode,
+                inject_header: inject
+                    .map(|i| i.header.clone())
+                    .unwrap_or_else(|| "Authorization".to_string()),
+                credential_format: inject
+                    .map(|i| i.format.clone())
+                    .unwrap_or_else(|| "Bearer {}".to_string()),
+                path_pattern: inject.and_then(|i| i.path_pattern.clone()),
+                path_replacement: inject.and_then(|i| i.path_replacement.clone()),
+                query_param_name: inject.and_then(|i| i.query_param_name.clone()),
+                env_var: cred.env_var.as_ref().map(|v| v.to_string()),
+                endpoint_rules: cred
+                    .endpoint_rules
+                    .iter()
+                    .map(|r| nono_proxy::config::EndpointRule {
+                        method: r.method.to_string(),
+                        path: r.path.to_string(),
+                    })
+                    .collect(),
+            };
+            manifest_custom_credentials.insert(cred.name.to_string(), custom_def);
+        }
+
         return Ok(PreparedSandbox {
             caps,
             secrets: Vec::new(),
             rollback_exclude_patterns,
             rollback_exclude_globs,
             skip_dirs: Vec::new(),
+            // No network_profile name — the manifest is fully resolved, so
+            // there is no named profile to look up.  The proxy is activated
+            // by the ProxyOnly network mode and/or non-empty allow_domain.
             network_profile: None,
-            allow_domain: Vec::new(),
+            allow_domain: manifest_allow_domain,
             credentials: Vec::new(),
-            custom_credentials: std::collections::HashMap::new(),
+            custom_credentials: manifest_custom_credentials,
             upstream_proxy: None,
             upstream_bypass: Vec::new(),
-            listen_ports: Vec::new(),
+            listen_ports: manifest_listen_ports,
             capability_elevation: false,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::default(),

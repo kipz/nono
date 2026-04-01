@@ -1068,10 +1068,26 @@ pub fn list_policy_profiles() -> Result<Vec<String>> {
 
 /// Load the embedded policy and return the parsed Policy struct.
 ///
-/// Convenience wrapper that loads from the compile-time embedded JSON.
+/// The policy JSON is embedded at compile time and never changes at runtime,
+/// so we parse it once and cache the result. This avoids re-parsing ~23 KB of
+/// JSON on every call (up to ~18 call sites per CLI invocation).
 pub fn load_embedded_policy() -> Result<Policy> {
+    static CACHED: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+
+    // The embedded JSON is baked in at build time — parse failure here means
+    // a build-system bug, not a runtime condition.  We cache the successful
+    // parse and clone on each call (cheap: Policy is a handful of HashMaps
+    // whose keys and values are small strings).
+    if let Some(policy) = CACHED.get() {
+        return Ok(policy.clone());
+    }
+
     let json = crate::config::embedded::embedded_policy_json();
-    load_policy(json)
+    let policy = load_policy(json)?;
+    // Another thread may have raced us; that's fine — OnceLock keeps the
+    // first value and our `policy` is simply dropped.
+    let _ = CACHED.set(policy.clone());
+    Ok(policy)
 }
 
 // ============================================================================

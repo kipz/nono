@@ -18,15 +18,29 @@ fn combined_output(output: &std::process::Output) -> String {
 
 #[test]
 fn env_nono_allow_comma_separated() {
+    // Create real temporary directories so the paths exist and appear in
+    // the dry-run capability banner.  Non-existent paths are silently
+    // skipped (with a WARN log), which is not visible in all environments
+    // (e.g. NixOS builds with RUST_LOG unset).  See #563.
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path_a = dir.path().join("a");
+    let path_b = dir.path().join("b");
+    std::fs::create_dir(&path_a).expect("create dir a");
+    std::fs::create_dir(&path_b).expect("create dir b");
+
+    let allow_val = format!("{},{}", path_a.display(), path_b.display());
+
     let output = nono_bin()
-        .env("NONO_ALLOW", "/tmp/a,/tmp/b")
+        .env("NONO_ALLOW", &allow_val)
         .args(["run", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
 
     let text = combined_output(&output);
+    let a_str = path_a.display().to_string();
+    let b_str = path_b.display().to_string();
     assert!(
-        text.contains("/tmp/a") && text.contains("/tmp/b"),
+        text.contains(a_str.as_str()) && text.contains(b_str.as_str()),
         "expected both paths in dry-run output, got:\n{text}"
     );
 }

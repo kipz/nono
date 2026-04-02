@@ -316,12 +316,14 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         // When credential_key is a URI manager reference, env_var is required because the URI
         // cannot be meaningfully uppercased into an env var name (e.g.,
         // "op://vault/item/field" -> "OP://VAULT/ITEM/FIELD" is nonsensical).
-        if (nono::keystore::is_op_uri(key) || nono::keystore::is_apple_password_uri(key))
+        if (nono::keystore::is_op_uri(key)
+            || nono::keystore::is_apple_password_uri(key)
+            || nono::keystore::is_file_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op:// or apple-password://); \
+                 manager reference (op://, apple-password://, or file://); \
                  set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
@@ -4935,7 +4937,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_accepted() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/api-token".to_string(),
+            credential_key: Some("file:///run/secrets/api-token".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -4959,7 +4962,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_requires_env_var() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/api-token".to_string(),
+            credential_key: Some("file:///run/secrets/api-token".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -4986,7 +4990,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_invalid_rejected() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file://relative/path".to_string(),
+            credential_key: Some("file://relative/path".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -5013,7 +5018,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_traversal_rejected() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/../../../etc/shadow".to_string(),
+            credential_key: Some("file:///run/secrets/../../../etc/shadow".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -5096,7 +5102,10 @@ mod tests {
             .custom_credentials
             .get("my_service")
             .expect("my_service credential should exist");
-        assert_eq!(cred.credential_key, "file:///run/secrets/api-token");
+        assert_eq!(
+            cred.credential_key,
+            Some("file:///run/secrets/api-token".to_string())
+        );
         assert_eq!(cred.env_var, Some("MY_API_KEY".to_string()));
     }
 }

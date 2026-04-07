@@ -100,7 +100,7 @@ pub async fn apply(
     // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
     if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT") {
         if let Some(parent_name) = broker.resolve(ctx_nonce) {
-            if let Some(parent_cmd) = commands.iter().find(|c| c.name == &**parent_name) {
+            if let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name) {
                 if let Some(ref sb) = parent_cmd.sandbox {
                     if sb.allow_commands.contains(&request.command) {
                         debug!(
@@ -519,10 +519,7 @@ async fn exec_passthrough(
     // (credentials flow between trusted sub-processes, not to the agent).
     // The nonce is unforgeable — only the server can issue valid nonces.
     let sandbox_context_nonce = broker.issue(Zeroizing::new(cmd.name.clone()));
-    env.insert(
-        "NONO_SANDBOX_CONTEXT".to_string(),
-        sandbox_context_nonce,
-    );
+    env.insert("NONO_SANDBOX_CONTEXT".to_string(), sandbox_context_nonce);
 
     // Promote nonce values in args
     let args: Vec<String> = args
@@ -790,8 +787,7 @@ fn build_filtered_shim_dir(
             // commands that have no mediation and should resolve to real binaries directly.
             let has_mediation = all_commands
                 .iter()
-                .find(|c| c.name == name_str)
-                .map_or(false, |c| !c.intercepts.is_empty() || c.sandbox.is_some());
+                .any(|c| c.name == name_str && (!c.intercepts.is_empty() || c.sandbox.is_some()));
             if has_mediation {
                 debug!(
                     "mediation: keeping shim for '{}' in filtered dir (has own mediation rules)",

@@ -325,7 +325,13 @@ fn append_audit_log(session_dir: &Path, event: &AuditEvent) {
 /// Scrub sensitive values from command-line arguments before writing to the audit log.
 pub(super) fn scrub_args(args: &[String]) -> Vec<String> {
     const SECRET_FLAGS: &[&str] = &[
-        "--token", "--password", "--secret", "--api-key", "--api-token", "--auth", "-p",
+        "--token",
+        "--password",
+        "--secret",
+        "--api-key",
+        "--api-token",
+        "--auth",
+        "-p",
     ];
 
     let mut result: Vec<String> = Vec::with_capacity(args.len());
@@ -392,10 +398,7 @@ fn scrub_nono_tokens(s: &str) -> String {
     while let Some(pos) = remaining.find(PREFIX) {
         result.push_str(&remaining[..pos]);
         let after = &remaining[pos + PREFIX.len()..];
-        let hex_len = after
-            .bytes()
-            .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
-            .count();
+        let hex_len = after.bytes().take_while(|b| b.is_ascii_hexdigit()).count();
         if hex_len >= MIN_HEX_LEN {
             result.push_str("<redacted>");
             remaining = &remaining[pos + PREFIX.len() + hex_len..];
@@ -443,8 +446,16 @@ mod tests {
     fn test_scrub_args_url_credentials() {
         let args = vec!["https://user:ghp_xyz@github.com/foo/bar".to_string()];
         let scrubbed = scrub_args(&args);
-        assert!(!scrubbed[0].contains("ghp_xyz"), "raw token still present: {}", scrubbed[0]);
-        assert!(scrubbed[0].starts_with("https://user:"), "URL structure mangled: {}", scrubbed[0]);
+        assert!(
+            !scrubbed[0].contains("ghp_xyz"),
+            "raw token still present: {}",
+            scrubbed[0]
+        );
+        assert!(
+            scrubbed[0].starts_with("https://user:"),
+            "URL structure mangled: {}",
+            scrubbed[0]
+        );
     }
 
     #[test]

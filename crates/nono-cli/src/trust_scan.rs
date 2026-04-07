@@ -1024,6 +1024,7 @@ fn base64_decode(input: &str) -> std::result::Result<Vec<u8>, ()> {
 // ---------------------------------------------------------------------------
 
 /// Result of scanning skills under configurable root directories.
+#[allow(dead_code)]
 pub struct SkillScanResult {
     /// Skill directories that passed verification
     pub verified: Vec<(PathBuf, String)>, // (dir, publisher)
@@ -1035,6 +1036,7 @@ pub struct SkillScanResult {
 ///
 /// Returns lists of verified and denied skill directories. Denied directories
 /// should be excluded from sandbox permissions.
+#[allow(dead_code)]
 pub fn scan_skills(roots: &[PathBuf], policy: &TrustPolicy, silent: bool) -> SkillScanResult {
     let dirs = trust::find_skill_directories(roots).unwrap_or_default();
 
@@ -1384,9 +1386,9 @@ mod tests {
         // Redirect HOME so dirs::config_dir() returns a path with no user policy,
         // preventing the real user policy from polluting this test.
         // Hold the process-wide env lock for the duration of the HOME modification.
-        let _env_guard = crate::env_test_mutex()
+        let _env_guard = crate::test_env::ENV_LOCK
             .lock()
-            .expect("env_test_mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let old_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", dir.path());
         let policy = load_scan_policy(dir.path(), true, &[]);

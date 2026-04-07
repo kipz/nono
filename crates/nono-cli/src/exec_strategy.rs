@@ -3711,14 +3711,20 @@ mod tests {
         use std::ffi::CString;
 
         let fake_session_shim = "/tmp/nono-session-9999/shims";
-        let open_shim_dir = tempfile::TempDir::new().unwrap();
-        let open_shim_dir_str = open_shim_dir.path().to_str().unwrap().to_string();
+        let open_shim_dir = tempfile::TempDir::new().expect("create temp dir");
+        let open_shim_dir_str = open_shim_dir
+            .path()
+            .to_str()
+            .expect("temp dir path is valid UTF-8")
+            .to_string();
 
         // Simulate env_c after env_vars have been applied — session shim dir is
         // already prepended to PATH (as main.rs does via mediation_path_str).
-        let mut env_c: Vec<CString> = vec![
-            CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim)).unwrap(),
-        ];
+        let mut env_c: Vec<CString> =
+            vec![
+                CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim))
+                    .expect("valid CString"),
+            ];
 
         apply_open_shim_path(&mut env_c, open_shim_dir.path());
 
@@ -3726,7 +3732,7 @@ mod tests {
             .iter()
             .find(|c| c.as_bytes().starts_with(b"PATH="))
             .expect("PATH should be present in env_c");
-        let path_str = path_entry.to_str().unwrap();
+        let path_str = path_entry.to_str().expect("PATH is valid UTF-8");
 
         assert!(
             path_str.contains(fake_session_shim),

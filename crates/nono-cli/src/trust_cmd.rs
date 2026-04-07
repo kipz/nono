@@ -1524,7 +1524,7 @@ mod tests {
     #[test]
     fn load_trust_policy_returns_default_when_no_file() {
         // Acquire the env mutex — this test modifies HOME, XDG_CONFIG_HOME, and CWD.
-        let _lock = crate::env_test_mutex()
+        let _lock = crate::test_env::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 

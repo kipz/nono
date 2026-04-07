@@ -154,11 +154,11 @@ pub fn load_secrets(
 ///
 /// Dispatch order:
 /// 1. `file:///path` — reads from a local file (before sandbox activation)
-/// 1b. `literal:VALUE` — returns the string after the prefix as-is (no keystore lookup)
-/// 2. `env://VAR` — reads from the process environment
-/// 3. `op://vault/item/field` — delegates to the 1Password CLI
-/// 4. `apple-password://server/account` — delegates to macOS `security`
-/// 5. Everything else — loads from the system keyring
+/// 2. `literal:VALUE` — returns the string after the prefix as-is (no keystore lookup)
+/// 3. `env://VAR` — reads from the process environment
+/// 4. `op://vault/item/field` — delegates to the 1Password CLI
+/// 5. `apple-password://server/account` — delegates to macOS `security`
+/// 6. Everything else — loads from the system keyring
 ///
 /// # Arguments
 /// * `service` - Keyring service name (only used for keyring backend)
@@ -176,7 +176,9 @@ pub fn load_secret_by_ref(service: &str, credential_ref: &str) -> Result<Zeroizi
     if credential_ref.starts_with(FILE_URI_PREFIX) {
         load_from_file(credential_ref)
     } else if credential_ref.starts_with(LITERAL_URI_PREFIX) {
-        let value = credential_ref.strip_prefix(LITERAL_URI_PREFIX).unwrap_or("");
+        let value = credential_ref
+            .strip_prefix(LITERAL_URI_PREFIX)
+            .unwrap_or("");
         Ok(Zeroizing::new(value.to_string()))
     } else if credential_ref.starts_with(ENV_URI_PREFIX) {
         load_from_env(credential_ref)

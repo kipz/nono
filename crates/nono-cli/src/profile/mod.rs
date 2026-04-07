@@ -1028,6 +1028,8 @@ struct ProfileDeserialize {
     interactive: bool,
     #[serde(default)]
     skipdirs: Vec<String>,
+    #[serde(default)]
+    mediation: crate::mediation::MediationConfig,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1047,6 +1049,7 @@ impl From<ProfileDeserialize> for Profile {
             allow_launch_services: raw.allow_launch_services,
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
+            mediation: raw.mediation,
         }
     }
 }

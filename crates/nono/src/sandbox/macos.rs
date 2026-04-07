@@ -955,12 +955,12 @@ mod tests {
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
         // Modern keychain daemon (macOS 13 Ventura+)
-        assert!(profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))"));
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
         // macOS 26+ (Tahoe): security daemon renamed to secd
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -980,11 +980,11 @@ mod tests {
 
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(!profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))"));
+        assert!(
+            !profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
         assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(!profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        assert!(!profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]
@@ -1005,11 +1005,11 @@ mod tests {
 
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.SecurityServer\"))"));
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.securityd\"))"));
-        assert!(profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))"));
+        assert!(
+            profile.contains("(deny mach-lookup (global-name \"com.apple.security.keychaind\"))")
+        );
         assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.secd\"))"));
-        assert!(profile
-            .contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
+        assert!(profile.contains("(deny mach-lookup (global-name \"com.apple.security.agent\"))"));
     }
 
     #[test]

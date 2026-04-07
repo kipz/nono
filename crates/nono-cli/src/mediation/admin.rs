@@ -83,14 +83,13 @@ pub fn write_admin_audit(session_dir: &std::path::Path, event: &serde_json::Valu
         }
     };
 
-    let mut file = match {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-    } {
+    use std::os::unix::fs::OpenOptionsExt;
+    let open_result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&path);
+    let mut file = match open_result {
         Ok(f) => f,
         Err(e) => {
             warn!("admin audit: failed to open {}: {}", path.display(), e);

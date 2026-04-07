@@ -93,10 +93,7 @@ impl Drop for SessionHandle {
         // Clean up the admin directory (contains session.json with control_token).
         let admin_dir = session_admin_dir_path(std::process::id());
         let _ = std::fs::remove_dir_all(&admin_dir);
-        debug!(
-            "Mediation admin directory removed: {}",
-            admin_dir.display()
-        );
+        debug!("Mediation admin directory removed: {}", admin_dir.display());
     }
 }
 
@@ -512,7 +509,11 @@ fn cleanup_dirs_in(dir: &Path, prefix: &str, current_pid: u32) {
         let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
         if !alive {
             let _ = std::fs::remove_dir_all(entry.path());
-            debug!("Removed orphaned {} dir for dead pid {}", prefix.trim_end_matches('-'), pid);
+            debug!(
+                "Removed orphaned {} dir for dead pid {}",
+                prefix.trim_end_matches('-'),
+                pid
+            );
         }
     }
 }

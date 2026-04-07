@@ -2130,9 +2130,9 @@ mod tests {
 
     #[test]
     fn test_expand_home() {
-        let _env_guard = crate::env_test_mutex()
+        let _env_guard = crate::test_env::ENV_LOCK
             .lock()
-            .expect("env_test_mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         let original_home = std::env::var("HOME").ok();
 
         std::env::set_var("HOME", "/home/test");

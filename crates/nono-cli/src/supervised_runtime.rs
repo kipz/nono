@@ -199,6 +199,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             config,
             Some(&supervisor_cfg),
             trust_interceptor,
+            None, // no skill interceptor
             Some(&mut on_fork),
             pty_pair,
             Some(&short_session_id),

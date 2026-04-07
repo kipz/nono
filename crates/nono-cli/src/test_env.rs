@@ -14,7 +14,9 @@ pub struct EnvVarGuard {
     original: Vec<(&'static str, Option<String>)>,
 }
 
+#[allow(clippy::disallowed_methods)] // This IS the safe wrapper around env var mutation.
 impl EnvVarGuard {
+    /// Set multiple env vars, capturing originals for restore on drop.
     #[must_use]
     pub fn set_all(vars: &[(&'static str, &str)]) -> Self {
         let original = vars
@@ -28,8 +30,16 @@ impl EnvVarGuard {
 
         Self { original }
     }
+
+    /// Remove an env var mid-test (e.g. to test fallback behaviour).
+    ///
+    /// The original value captured at construction is still restored on drop.
+    pub fn remove(&self, key: &str) {
+        std::env::remove_var(key);
+    }
 }
 
+#[allow(clippy::disallowed_methods)] // Restoring env vars is the other half of the safe wrapper.
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         for (key, value) in self.original.iter().rev() {

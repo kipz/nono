@@ -1422,17 +1422,17 @@ mod tests {
     #[cfg(feature = "test-trust-overrides")]
     #[test]
     fn user_trust_policy_path_prefers_test_override() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let dir = tempfile::tempdir().unwrap();
         let override_path = dir.path().join("trust-policy.json");
-        let original = std::env::var(TEST_USER_POLICY_PATH_ENV).ok();
-
-        std::env::set_var(TEST_USER_POLICY_PATH_ENV, &override_path);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[(
+            TEST_USER_POLICY_PATH_ENV,
+            override_path.to_str().unwrap(),
+        )]);
         let resolved = user_trust_policy_path();
-
-        match original {
-            Some(value) => std::env::set_var(TEST_USER_POLICY_PATH_ENV, value),
-            None => std::env::remove_var(TEST_USER_POLICY_PATH_ENV),
-        }
 
         assert_eq!(resolved, Some(override_path));
     }

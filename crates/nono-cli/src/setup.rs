@@ -532,7 +532,7 @@ mod tests {
             ("HOME", tmp.path().to_str().expect("tmp path")),
             ("XDG_CONFIG_HOME", "__placeholder__"),
         ]);
-        std::env::remove_var("XDG_CONFIG_HOME");
+        _env.remove("XDG_CONFIG_HOME");
 
         // Run the actual setup code that writes example profiles.
         let runner = SetupRunner {

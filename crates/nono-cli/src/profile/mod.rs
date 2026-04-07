@@ -1681,7 +1681,6 @@ pub fn list_profiles() -> Vec<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::env;
     use tempfile::tempdir;
 
     #[test]
@@ -1733,7 +1732,7 @@ mod tests {
         assert_eq!(expanded, PathBuf::from("/custom/state/history"));
 
         // Fallback when env var is unset
-        env::remove_var("XDG_STATE_HOME");
+        _env.remove("XDG_STATE_HOME");
         let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.local/state/history"));
     }
@@ -1754,7 +1753,7 @@ mod tests {
         assert_eq!(expanded, PathBuf::from("/custom/cache/pip"));
 
         // Fallback when env var is unset
-        env::remove_var("XDG_CACHE_HOME");
+        _env.remove("XDG_CACHE_HOME");
         let expanded = expand_vars("$XDG_CACHE_HOME/pip", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.cache/pip"));
     }
@@ -1773,7 +1772,7 @@ mod tests {
 
         // When unset, $XDG_RUNTIME_DIR has no default per the spec — the
         // variable should be left unexpanded so the path won't resolve.
-        env::remove_var("XDG_RUNTIME_DIR");
+        _env.remove("XDG_RUNTIME_DIR");
         let expanded = expand_vars("$XDG_RUNTIME_DIR/pulse", &workdir).expect("valid env");
         assert_eq!(
             expanded,

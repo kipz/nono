@@ -299,7 +299,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
     let audit_sock = audit_socket_path.clone();
-    let session_dir_clone = session_dir.clone();
+    let audit_log_dir = crate::session::ensure_sessions_dir()?;
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -310,7 +310,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             admin_clone,
             gate_clone,
             audit_sock,
-            session_dir_clone,
+            audit_log_dir,
         )
         .await
         {

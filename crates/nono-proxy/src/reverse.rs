@@ -19,6 +19,7 @@ use crate::config::InjectMode;
 use crate::credential::{CredentialStore, LoadedCredential};
 use crate::error::{ProxyError, Result};
 use crate::filter::ProxyFilter;
+use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -40,7 +41,9 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// a configured route, injects credentials, and forwards to the upstream.
 /// Shared context passed from the server to the reverse proxy handler.
 pub struct ReverseProxyCtx<'a> {
-    /// Credential store for service lookups
+    /// Route store for upstream URL, L7 filtering, and per-route TLS
+    pub route_store: &'a RouteStore,
+    /// Credential store for service lookups (optional injection)
     pub credential_store: &'a CredentialStore,
     /// Session token for authentication
     pub session_token: &'a Zeroizing<String>,
@@ -79,9 +82,9 @@ pub async fn handle_reverse_proxy(
     // Extract service prefix from path (e.g., "/openai/v1/chat" -> ("openai", "/v1/chat"))
     let (service, upstream_path) = parse_service_prefix(&path)?;
 
-    // Look up credential for service
-    let cred = ctx
-        .credential_store
+    // Look up route for service (required — provides upstream URL and L7 filtering)
+    let route = ctx
+        .route_store
         .get(&service)
         .ok_or_else(|| ProxyError::UnknownService {
             prefix: service.clone(),
@@ -89,7 +92,8 @@ pub async fn handle_reverse_proxy(
 
     // L7 endpoint filtering: check method+path against rules before any
     // credential operations. Denied endpoints get 403 immediately.
-    if !cred.endpoint_rules.is_allowed(&method, &upstream_path) {
+    // This check runs regardless of whether a credential is configured.
+    if !route.endpoint_rules.is_allowed(&method, &upstream_path) {
         let reason = format!(
             "endpoint denied: {} {} on service '{}'",
             method, upstream_path, service
@@ -106,44 +110,52 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
-    // Validate phantom token based on injection mode.
-    // For header/basic_auth modes: validate from Authorization/x-api-key header
-    // For url_path mode: validate from URL path pattern
-    // For query_param mode: validate from query parameter
-    if let Err(e) = validate_phantom_token_for_mode(
-        &cred.inject_mode,
-        remaining_header,
-        &upstream_path,
-        &cred.header_name,
-        cred.path_pattern.as_deref(),
-        cred.query_param_name.as_deref(),
-        ctx.session_token,
-    ) {
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::Reverse,
-            &service,
-            0,
-            &e.to_string(),
-        );
-        send_error(stream, 401, "Unauthorized").await?;
-        return Ok(());
+    // Look up credential for service (optional — not all routes inject credentials)
+    let cred = ctx.credential_store.get(&service);
+
+    // Validate phantom token and transform path if credential injection is active.
+    if let Some(cred) = cred {
+        if let Err(e) = validate_phantom_token_for_mode(
+            &cred.inject_mode,
+            remaining_header,
+            &upstream_path,
+            &cred.header_name,
+            cred.path_pattern.as_deref(),
+            cred.query_param_name.as_deref(),
+            ctx.session_token,
+        ) {
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                &service,
+                0,
+                &e.to_string(),
+            );
+            send_error(stream, 401, "Unauthorized").await?;
+            return Ok(());
+        }
     }
 
-    // Transform the path based on injection mode (url_path and query_param modes)
-    let transformed_path = transform_path_for_mode(
-        &cred.inject_mode,
-        &upstream_path,
-        cred.path_pattern.as_deref(),
-        cred.path_replacement.as_deref(),
-        cred.query_param_name.as_deref(),
-        &cred.raw_credential,
-    )?;
+    // Transform the path based on injection mode (url_path and query_param modes).
+    // When no credential is configured, the path is forwarded unchanged.
+    let transformed_path = if let Some(cred) = cred {
+        transform_path_for_mode(
+            &cred.inject_mode,
+            &upstream_path,
+            cred.path_pattern.as_deref(),
+            cred.path_replacement.as_deref(),
+            cred.query_param_name.as_deref(),
+            &cred.raw_credential,
+        )?
+    } else {
+        upstream_path.clone()
+    };
 
-    // Parse upstream URL with potentially transformed path
+    // Parse upstream URL with potentially transformed path.
+    // Upstream URL comes from the route, not the credential.
     let upstream_url = format!(
         "{}{}",
-        cred.upstream.trim_end_matches('/'),
+        route.upstream.trim_end_matches('/'),
         transformed_path
     );
     debug!("Forwarding to upstream: {} {}", method, upstream_url);
@@ -166,8 +178,12 @@ pub async fn handle_reverse_proxy(
         return Ok(());
     }
 
-    // Collect remaining request headers (excluding X-Nono-Token and Host)
-    let filtered_headers = filter_headers(remaining_header, &cred.header_name);
+    // Collect remaining request headers (excluding X-Nono-Token and Host).
+    // When a credential is present, also strip the credential header.
+    let cred_header_name = cred
+        .map(|c| c.header_name.as_str())
+        .unwrap_or("Authorization");
+    let filtered_headers = filter_headers(remaining_header, cred_header_name);
     let content_length = extract_content_length(remaining_header);
 
     // Read request body if present, with size limit.
@@ -195,7 +211,7 @@ pub async fn handle_reverse_proxy(
     // Connect to upstream over TLS using pre-resolved addresses.
     // Use the per-route TLS connector (with custom CA) if configured,
     // otherwise fall back to the shared default connector.
-    let connector = cred.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
+    let connector = route.tls_connector.as_ref().unwrap_or(ctx.tls_connector);
     let upstream_result = connect_upstream_tls(
         &upstream_host,
         upstream_port,
@@ -227,17 +243,20 @@ pub async fn handle_reverse_proxy(
         method, upstream_path_full, version, upstream_host
     ));
 
-    // Inject credential based on mode
-    inject_credential_for_mode(cred, &mut request);
+    // Inject credential based on mode (only if credential is configured)
+    if let Some(cred) = cred {
+        inject_credential_for_mode(cred, &mut request);
+    }
 
     // Forward filtered headers (excluding auth headers that we're replacing)
-    let auth_header_lower = cred.header_name.to_lowercase();
+    let auth_header_lower = cred_header_name.to_lowercase();
     for (name, value) in &filtered_headers {
         // Skip the auth header if we're using header/basic_auth mode
         // (we already injected our own)
-        if matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-            && name.to_lowercase() == auth_header_lower
-        {
+        if cred.is_some_and(|c| {
+            matches!(c.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+                && name.to_lowercase() == auth_header_lower
+        }) {
             continue;
         }
         request.push_str(&format!("{}: {}\r\n", name, value));

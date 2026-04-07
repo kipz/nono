@@ -15,6 +15,7 @@ use crate::error::{ProxyError, Result};
 use crate::external;
 use crate::filter::ProxyFilter;
 use crate::reverse;
+use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -161,6 +162,9 @@ impl ProxyHandle {
 struct ProxyState {
     filter: ProxyFilter,
     session_token: Zeroizing<String>,
+    /// Route-level configuration (upstream, L7 filtering, custom TLS CA) for all routes.
+    route_store: RouteStore,
+    /// Credential-specific configuration (inject mode, headers, secrets) for routes with credentials.
     credential_store: CredentialStore,
     config: ProxyConfig,
     /// Shared TLS connector for upstream connections (reverse proxy mode).
@@ -203,7 +207,15 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
 
     info!("Proxy server listening on {}", local_addr);
 
-    // Load credentials for reverse proxy routes
+    // Load route-level configuration (upstream, L7 filtering, custom TLS CA)
+    // for ALL routes, regardless of credential presence.
+    let route_store = if config.routes.is_empty() {
+        RouteStore::empty()
+    } else {
+        RouteStore::load(&config.routes)?
+    };
+
+    // Load credentials for reverse proxy routes (only routes with credential_key)
     let credential_store = if config.routes.is_empty() {
         CredentialStore::empty()
     } else {
@@ -243,10 +255,10 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let audit_log = audit::new_audit_log();
 
-    // Compute NO_PROXY hosts: allowed_hosts minus credential upstreams.
-    // Non-credential hosts bypass the proxy (direct connection, still
-    // Landlock-enforced). Credential upstreams must go through the proxy
-    // for L7 path filtering and credential injection.
+    // Compute NO_PROXY hosts: allowed_hosts minus route upstreams.
+    // Non-route hosts bypass the proxy (direct connection, still
+    // Landlock-enforced). Route upstreams must go through the proxy
+    // for L7 path filtering and/or credential injection.
     //
     // On macOS this MUST be empty: Seatbelt's ProxyOnly mode generates
     // `(deny network*) (allow network-outbound (remote tcp "localhost:PORT"))`
@@ -256,7 +268,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
     let no_proxy_hosts: Vec<String> = if cfg!(target_os = "macos") {
         Vec::new()
     } else {
-        let credential_hosts = credential_store.credential_upstream_hosts();
+        let route_hosts = route_store.route_upstream_hosts();
         config
             .allowed_hosts
             .iter()
@@ -276,7 +288,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
                         format!("{}:443", h)
                     }
                 };
-                !credential_hosts.contains(&normalised)
+                !route_hosts.contains(&normalised)
             })
             .cloned()
             .collect()
@@ -289,6 +301,7 @@ pub async fn start(config: ProxyConfig) -> Result<ProxyHandle> {
     let state = Arc::new(ProxyState {
         filter,
         session_token: session_token.clone(),
+        route_store,
         credential_store,
         config,
         tls_connector,
@@ -405,11 +418,11 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
 
     // Dispatch by method
     if first_line.starts_with("CONNECT ") {
-        // Block CONNECT tunnels to credential upstreams. These must go
+        // Block CONNECT tunnels to route upstreams. These must go
         // through the reverse proxy path so L7 path filtering and
         // credential injection are enforced. A CONNECT tunnel would
         // bypass both (raw TLS pipe, proxy never sees HTTP method/path).
-        if !state.credential_store.is_empty() {
+        if !state.route_store.is_empty() {
             if let Some(authority) = first_line.split_whitespace().nth(1) {
                 // Normalise authority to host:port. Handle IPv6 brackets:
                 // "[::1]:443" already has port, "[::1]" needs default, "host:443" has port.
@@ -425,13 +438,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                 } else {
                     format!("{}:443", authority.to_lowercase())
                 };
-                if state.credential_store.is_credential_upstream(&host_port) {
+                if state.route_store.is_route_upstream(&host_port) {
                     let (host, port) = host_port
                         .rsplit_once(':')
                         .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(443)))
                         .unwrap_or((&host_port, 443));
                     warn!(
-                        "Blocked CONNECT to credential upstream {} — use reverse proxy path instead",
+                        "Blocked CONNECT to route upstream {} — use reverse proxy path instead",
                         authority
                     );
                     audit::log_denied(
@@ -439,7 +452,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                         audit::ProxyMode::Connect,
                         host,
                         port,
-                        "credential upstream: CONNECT bypasses L7 filtering",
+                        "route upstream: CONNECT bypasses L7 filtering",
                     );
                     let response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
                     stream.write_all(response.as_bytes()).await?;
@@ -512,9 +525,10 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             )
             .await
         }
-    } else if !state.credential_store.is_empty() {
-        // Non-CONNECT request with credential routes -> reverse proxy
+    } else if !state.route_store.is_empty() {
+        // Non-CONNECT request with routes configured -> reverse proxy
         let ctx = reverse::ReverseProxyCtx {
+            route_store: &state.route_store,
             credential_store: &state.credential_store,
             session_token: &state.session_token,
             filter: &state.filter,
@@ -523,7 +537,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
-        // No credential routes configured, reject non-CONNECT requests
+        // No routes configured, reject non-CONNECT requests
         let response = "HTTP/1.1 400 Bad Request\r\n\r\n";
         stream.write_all(response.as_bytes()).await?;
         Ok(())

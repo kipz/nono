@@ -1381,19 +1381,9 @@ mod tests {
 
         // Redirect HOME so dirs::config_dir() returns a path with no user policy,
         // preventing the real user policy from polluting this test.
-        // Hold the process-wide env lock for the duration of the HOME modification.
-        let _env_guard = crate::test_env::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", dir.path());
+        let _env_home =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", dir.path().to_str().unwrap())]);
         let policy = load_scan_policy(dir.path(), true, &[]);
-        if let Some(ref h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-        drop(_env_guard);
         let policy = policy.expect("load_scan_policy should succeed with trust_override=true");
         assert_eq!(policy.enforcement, Enforcement::Warn);
     }

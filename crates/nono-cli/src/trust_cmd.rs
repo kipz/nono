@@ -1533,13 +1533,10 @@ mod tests {
         let original = std::env::current_dir().unwrap();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "XDG_CONFIG_HOME",
-            xdg_dir.to_str().unwrap(),
-        )]);
-
-        // Override HOME so dirs::config_dir() won't find a real user-level policy.
-        std::env::set_var("HOME", dir.path());
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", xdg_dir.to_str().unwrap()),
+            ("HOME", dir.path().to_str().unwrap()),
+        ]);
 
         let result = std::panic::catch_unwind(|| {
             std::env::set_current_dir(dir.path()).unwrap();

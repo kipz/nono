@@ -818,6 +818,10 @@ fn profile_to_json(
         val["allow_launch_services"] = serde_json::json!(als);
     }
 
+    if let Some(ag) = profile.allow_gpu {
+        val["allow_gpu"] = serde_json::json!(ag);
+    }
+
     val
 }
 
@@ -1197,6 +1201,13 @@ fn cmd_diff(args: PolicyDiffArgs) -> Result<()> {
         t,
     );
 
+    any_diff |= diff_scalar_option(
+        "allow_gpu",
+        &p1.allow_gpu.map(|v| format!("{v}")),
+        &p2.allow_gpu.map(|v| format!("{v}")),
+        t,
+    );
+
     // Env credentials
     let ec1: BTreeSet<(&String, &String)> = p1.env_credentials.mappings.iter().collect();
     let ec2: BTreeSet<(&String, &String)> = p2.env_credentials.mappings.iter().collect();
@@ -1546,6 +1557,11 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile1": p1.allow_launch_services,
             "profile2": p2.allow_launch_services,
             "changed": p1.allow_launch_services != p2.allow_launch_services,
+        },
+        "allow_gpu": {
+            "profile1": p1.allow_gpu,
+            "profile2": p2.allow_gpu,
+            "changed": p1.allow_gpu != p2.allow_gpu,
         },
     })
 }

@@ -171,10 +171,15 @@ pub(crate) fn maybe_enable_macos_gpu(
 
     if !profile_allowed {
         return Err(NonoError::ConfigParse(
-            "--allow-gpu requires a profile that opts into allow_gpu".to_string(),
+            "--allow-gpu requires the selected profile to opt into allow_gpu".to_string(),
         ));
     }
 
+    // These IOKit classes cover Metal on Apple Silicon only. IOAccelerator
+    // exists on Apple Silicon but Seatbelt matches on the leaf class, not
+    // the base, so it is not needed here. Intel Macs require
+    // IntelAccelerator, IOAccelerator, and AMDRadeonX* classes which are
+    // not yet supported.
     caps.add_platform_rule(
         "(allow iokit-open \
             (iokit-connection \"IOGPU\") \
@@ -378,7 +383,11 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         open_url_allow_localhost,
     )?;
 
-    let allow_gpu_active = maybe_enable_macos_gpu(&mut caps, args.allow_gpu, profile_allow_gpu)?;
+    let allow_gpu_active = maybe_enable_macos_gpu(
+        &mut caps,
+        args.allow_gpu,
+        loaded_profile.is_none() || profile_allow_gpu,
+    )?;
 
     let cwd_access = if let Some(ref access) = profile_workdir_access {
         match access {

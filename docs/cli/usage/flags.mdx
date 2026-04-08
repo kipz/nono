@@ -649,13 +649,11 @@ nono run --profile claude-code --allow-launch-services -- claude
 Allow GPU access on Apple Silicon Macs through IOKit. This enables GPU device creation, command queues, buffer allocation, and shader compilation for workloads like ML inference.
 
 ```bash
-# gpu-profile.json: { "allow_gpu": true, "filesystem": { "read": ["."] } }
-# Note: "." exposes the current working directory as read-only to the sandbox
-nono run --profile ./gpu-profile.json --allow-gpu -- llama-cli -m ./model.gguf -p "hello"
+nono run --allow-gpu -- llama-cli -m ./model.gguf -p "hello"
 ```
 
 <Note>
-  `--allow-gpu` is only supported on macOS. It requires the selected profile to opt into `allow_gpu`; otherwise nono fails closed with an error.
+  `--allow-gpu` is only supported on macOS. When used with a profile, the profile must opt into allow_gpu; otherwise nono fails closed with an error.
 </Note>
 
 ### Execution Mode Flags

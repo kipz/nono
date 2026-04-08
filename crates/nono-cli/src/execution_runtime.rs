@@ -1,9 +1,10 @@
 use crate::launch_runtime::{select_threading_context, LaunchPlan};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
-use crate::{config, exec_strategy, output, sandbox_state};
+use crate::{config, exec_strategy, output, sandbox_state, session};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -163,8 +164,28 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
+    // Build session audit context before mediation setup.
+    // session_id and session_name must be consistent between the mediation audit
+    // log and the session record written by supervised_runtime.
+    let mediation_session_id = std::env::var(crate::DETACHED_SESSION_ID_ENV)
+        .ok()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(session::generate_session_id);
+    let mediation_session_name = flags
+        .session
+        .session_name
+        .clone()
+        .unwrap_or_else(session::generate_random_name);
+    let sandboxed_pid_latch: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
+    let audit_info = crate::mediation::SessionAuditInfo {
+        session_id: mediation_session_id.clone(),
+        session_name: Some(mediation_session_name.clone()),
+        nono_pid: std::process::id(),
+        sandboxed_pid: Arc::clone(&sandboxed_pid_latch),
+    };
+
     // Set up command mediation (shim dir, server, env blocking) before sandbox.
-    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
+    let mediation_handle = crate::mediation::session::setup(&flags.mediation, audit_info)?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;
@@ -331,6 +352,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 proxy,
                 proxy_handle: proxy_handle.as_ref(),
                 silent: flags.silent,
+                pre_session_id: Some(mediation_session_id),
+                pre_session_name: Some(mediation_session_name),
+                mediation_sandboxed_pid_latch: mediation_handle
+                    .as_ref()
+                    .map(|_| Arc::clone(&sandboxed_pid_latch)),
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

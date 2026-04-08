@@ -3445,10 +3445,8 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", "/tmp/foo"),
-        ]);
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "/tmp/foo")]);
 
         let workdir = PathBuf::from("/projects/myapp");
         let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
@@ -3463,10 +3461,7 @@ mod tests {
         };
         // Pre-register FOO so EnvVarGuard will restore whatever ambient value
         // exists, then remove it for the scope of the test.
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", ""),
-        ]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "")]);
         _env.remove("FOO");
 
         let workdir = PathBuf::from("/projects/myapp");
@@ -3484,10 +3479,7 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", "/a"),
-        ]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "/a")]);
 
         let workdir = PathBuf::from("/projects/myapp");
         let expanded = expand_vars("${FOO}/bar", &workdir).expect("valid env");
@@ -3542,10 +3534,8 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("USER", "jcarnegie"),
-        ]);
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("USER", "jcarnegie")]);
 
         let workdir = PathBuf::from("/projects/myapp");
 

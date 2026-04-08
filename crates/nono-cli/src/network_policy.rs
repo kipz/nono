@@ -523,8 +523,13 @@ mod tests {
     fn test_resolve_credentials_filtered() {
         let json = embedded_network_policy_json();
         let policy = load_network_policy(json).unwrap();
-        let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &HashMap::new(), test_workdir()).unwrap();
+        let routes = resolve_credentials(
+            &policy,
+            &["openai".to_string()],
+            &HashMap::new(),
+            test_workdir(),
+        )
+        .unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].prefix, "openai");
     }
@@ -574,7 +579,9 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["telegram".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["telegram".to_string()], &custom, test_workdir())
+                .unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].prefix, "telegram");
         assert_eq!(routes[0].upstream, "https://api.telegram.org");
@@ -614,7 +621,8 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].upstream, "https://my-proxy.example.com/openai");
         assert_eq!(routes[0].credential_key, Some("my_openai_key".to_string()));
@@ -697,7 +705,8 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].upstream, "http://localhost:8080/api");
     }
@@ -783,7 +792,8 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
     }
 
@@ -816,7 +826,8 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["local".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
     }
 
@@ -849,7 +860,8 @@ mod tests {
             },
         );
 
-        let routes = resolve_credentials(&policy, &["test".to_string()], &custom, test_workdir()).unwrap();
+        let routes =
+            resolve_credentials(&policy, &["test".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].inject_header, "X-Custom-Auth");
         assert_eq!(routes[0].credential_format.as_deref(), Some("Token {}"));
@@ -887,8 +899,8 @@ mod tests {
             },
         );
 
-        let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).expect("should resolve");
+        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir())
+            .expect("should resolve");
         assert_eq!(routes.len(), 1);
         assert_eq!(
             routes[0].env_var,
@@ -963,8 +975,8 @@ mod tests {
         let policy = load_network_policy(json).expect("policy should load");
 
         let custom = HashMap::new();
-        let routes =
-            resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir()).expect("should resolve");
+        let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir())
+            .expect("should resolve");
         assert_eq!(routes.len(), 1);
         assert_eq!(
             routes[0].env_var, None,
@@ -978,8 +990,8 @@ mod tests {
         let policy = load_network_policy(json).expect("policy should load");
 
         let custom = HashMap::new();
-        let routes =
-            resolve_credentials(&policy, &["github".to_string()], &custom, test_workdir()).expect("should resolve");
+        let routes = resolve_credentials(&policy, &["github".to_string()], &custom, test_workdir())
+            .expect("should resolve");
         assert_eq!(routes.len(), 1);
 
         let github = &routes[0];
@@ -1171,8 +1183,7 @@ mod tests {
         );
 
         let routes =
-            resolve_credentials(&policy, &["my_api".to_string()], &custom, test_workdir())
-                .unwrap();
+            resolve_credentials(&policy, &["my_api".to_string()], &custom, test_workdir()).unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].prefix, "my_api");
         assert_eq!(routes[0].upstream, "https://api.example.com");

@@ -1269,7 +1269,12 @@ mod tests {
         )
         .unwrap();
 
-        let policy = load_scan_policy(dir.path(), true, &[]).unwrap();
+        // Redirect HOME so dirs::config_dir() returns a path with no user policy,
+        // preventing the real user policy from polluting this test.
+        let _env_home =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", dir.path().to_str().unwrap())]);
+        let policy = load_scan_policy(dir.path(), true, &[]);
+        let policy = policy.expect("load_scan_policy should succeed with trust_override=true");
         assert_eq!(policy.enforcement, Enforcement::Warn);
     }
 

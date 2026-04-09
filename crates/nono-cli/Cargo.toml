@@ -58,7 +58,9 @@ keyring = "3"
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.6"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+subtle = "2"
+hex = "0.4"
 
 ureq = "3"
 semver = "1"

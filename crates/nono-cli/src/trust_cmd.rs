@@ -1774,15 +1774,19 @@ mod tests {
         let original = std::env::current_dir().unwrap();
         let xdg_dir = dir.path().join("xdg");
         std::fs::create_dir_all(&xdg_dir).unwrap();
-        let _env = crate::test_env::EnvVarGuard::set_all(&[(
-            "XDG_CONFIG_HOME",
-            xdg_dir.to_str().unwrap(),
-        )]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("XDG_CONFIG_HOME", xdg_dir.to_str().unwrap()),
+            ("HOME", dir.path().to_str().unwrap()),
+        ]);
 
         let result = std::panic::catch_unwind(|| {
             std::env::set_current_dir(dir.path()).unwrap();
             let policy = load_trust_policy(None).unwrap();
-            assert!(policy.publishers.is_empty());
+            assert!(
+                policy.publishers.is_empty(),
+                "expected empty publishers when no policy file exists, got: {:?}",
+                policy.publishers,
+            );
         });
 
         std::env::set_current_dir(original).unwrap();

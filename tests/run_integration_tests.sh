@@ -152,6 +152,7 @@ SUITES=(
     "test_setup.sh:Setup"
     "test_learn.sh:Learn Mode"
     "test_override_deny.sh:Override Deny"
+    "test_mediation_audit.sh:Mediation Audit"
 )
 
 TOTAL_SUITES=${#SUITES[@]}

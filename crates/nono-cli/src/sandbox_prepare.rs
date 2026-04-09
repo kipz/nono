@@ -468,6 +468,7 @@ pub(crate) struct PreparedSandbox {
     /// True when the profile or CLI requested HTTP/2 to upstream servers
     /// (`network.allow_http2` or `--allow-http2`).
     pub(crate) allow_http2_requested: bool,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1303,6 +1304,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 set_vars: None,
                 profile_network_block: false,
                 allow_http2_requested: args.allow_http2,
+                mediation: crate::mediation::MediationConfig::default(),
             },
             &[],
             args,
@@ -1624,6 +1626,11 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .unwrap_or(false);
     let allow_http2_requested = args.allow_http2 || profile_allow_http2;
 
+    let profile_mediation = loaded_profile
+        .as_ref()
+        .map(|p| p.mediation.clone())
+        .unwrap_or_default();
+
     let profile_secrets = loaded_profile
         .as_ref()
         .map(|profile| profile.env_credentials.mappings.clone())
@@ -1682,6 +1689,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             set_vars: profile_set_vars,
             profile_network_block,
             allow_http2_requested,
+            mediation: profile_mediation,
         },
         &blocked_grants,
         args,
@@ -2270,6 +2278,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            mediation: crate::mediation::MediationConfig::default(),
         }
     }
 

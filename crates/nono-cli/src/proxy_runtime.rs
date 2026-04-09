@@ -3088,6 +3088,7 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
+            mediation: crate::mediation::MediationConfig::default(),
         };
 
         let args = crate::cli::SandboxArgs::default();

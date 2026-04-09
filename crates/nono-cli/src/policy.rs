@@ -149,6 +149,8 @@ pub struct ProfileDef {
     pub command_args: Vec<String>,
     #[serde(default)]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    #[serde(default)]
+    pub mediation: crate::mediation::MediationConfig,
 }
 
 impl ProfileDef {
@@ -187,6 +189,7 @@ impl ProfileDef {
             binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
+            mediation: self.mediation.clone(),
         }
     }
 }

@@ -244,6 +244,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -294,6 +295,7 @@ impl ExecutionFlags {
             set_vars: prepared.set_vars.clone(),
             startup_timeout_secs: None,
             command_policies: prepared.command_policies.clone(),
+            mediation: prepared.mediation.clone(),
         })
     }
 }

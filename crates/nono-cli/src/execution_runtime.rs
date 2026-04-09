@@ -292,6 +292,48 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let tool_sandbox_trust_bundle_paths = active_proxy.tool_sandbox_trust_bundle_paths;
     let proxy_handle = active_proxy.handle;
 
+    // Set up command mediation (shim dir, server, env blocking) before sandbox.
+    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
+
+    // If mediation is active, add shim directory and binary to sandbox rules.
+    let mediation_path_str;
+    let mediation_socket_str;
+    let mediation_token_str;
+    let mut mediation_env_block: Vec<String> = Vec::new();
+    if let Some(ref handle) = mediation_handle {
+        // Prepend shim dir to PATH so the agent calls our shims instead of real binaries.
+        mediation_path_str = handle.shim_dir.display().to_string();
+        mediation_socket_str = handle.socket_path.display().to_string();
+        mediation_token_str = handle.session_token.to_string();
+        mediation_env_block = handle.env_block.clone();
+
+        // Allow sandbox to read the shim binary and session directory.
+        caps.add_fs(
+            nono::FsCapability::new_dir(&handle.shim_dir, nono::AccessMode::Read)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation shim dir: {e}")))?,
+        );
+        caps.add_fs(
+            nono::FsCapability::new_file(&handle.shim_binary, nono::AccessMode::Read)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation shim binary: {e}")))?,
+        );
+        // Allow sandbox to access the session directory (contains the mediation
+        // and audit sockets, created asynchronously by the server).
+        caps.add_fs(
+            nono::FsCapability::new_dir(&handle.session_dir, nono::AccessMode::ReadWrite)
+                .map_err(|e| nono::NonoError::SandboxInit(format!("mediation session dir: {e}")))?,
+        );
+
+        info!(
+            "Mediation session active: {} commands mediated, shim_dir={}",
+            handle.mediated_commands.len(),
+            handle.shim_dir.display()
+        );
+    } else {
+        mediation_path_str = String::new();
+        mediation_socket_str = String::new();
+        mediation_token_str = String::new();
+    }
+
     let requested_workdir =
         flags
             .workdir
@@ -479,6 +521,27 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         env_vars.push((key.as_str(), value.as_str()));
     }
 
+    // Inject mediation env vars: session token, socket path, and prepend shim dir to PATH.
+    let mediation_path_value;
+    let mediation_commands_str;
+    let mediation_audit_socket_str;
+    if let Some(ref handle) = mediation_handle {
+        env_vars.push(("NONO_SESSION_TOKEN", &mediation_token_str));
+        env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_str));
+        env_vars.push(("NONO_SHIM_DIR", &mediation_path_str));
+        // Tell shims which commands use full mediation vs audit-only passthrough.
+        mediation_commands_str = handle.mediated_commands.join(",");
+        env_vars.push(("NONO_MEDIATED_COMMANDS", &mediation_commands_str));
+        // Audit socket for fire-and-forget command logging.
+        mediation_audit_socket_str = handle.audit_socket_path.display().to_string();
+        env_vars.push(("NONO_AUDIT_SOCKET", &mediation_audit_socket_str));
+        // Prepend the mediation shim directory to PATH so the agent resolves
+        // mediated commands to our shims instead of the real binaries.
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        mediation_path_value = format!("{}:{current_path}", mediation_path_str);
+        env_vars.push(("PATH", &mediation_path_value));
+    }
+
     // Hook env vars have lowest priority: prepend so secrets and proxy override.
     for (key, value) in hook_env_vars_owned.iter().rev() {
         env_vars.insert(0, (key.as_str(), value.as_str()));
@@ -612,6 +675,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         set_vars: flags.set_vars.unwrap_or_default(),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         tool_sandbox_runtime: tool_sandbox_runtime.as_ref(),
+        extra_blocked_env: &mediation_env_block,
     };
 
     match strategy {

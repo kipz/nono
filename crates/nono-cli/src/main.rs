@@ -32,6 +32,8 @@ mod learn_runtime;
 mod legacy_cleanup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
+#[allow(dead_code)]
+mod mediation;
 mod migration;
 mod network_policy;
 mod open_url_runtime;
@@ -289,6 +291,7 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             network_block_requested: false,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -342,6 +345,7 @@ mod tests {
             denied_env_vars: None,
             set_vars: None,
             network_block_requested: false,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

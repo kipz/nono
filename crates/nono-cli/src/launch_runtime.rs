@@ -118,6 +118,7 @@ pub(crate) struct ExecutionFlags {
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
     pub(crate) startup_timeout_secs: Option<u64>,
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 impl ExecutionFlags {
@@ -150,6 +151,7 @@ impl ExecutionFlags {
             denied_env_vars: None,
             set_vars: None,
             startup_timeout_secs: None,
+            mediation: crate::mediation::MediationConfig::default(),
         })
     }
 }
@@ -288,6 +290,7 @@ pub(crate) fn prepare_run_launch_plan(
             denied_env_vars: prepared.denied_env_vars,
             set_vars: prepared.set_vars,
             startup_timeout_secs,
+            mediation: prepared.mediation,
         },
     })
 }

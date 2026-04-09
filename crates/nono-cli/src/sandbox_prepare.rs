@@ -447,6 +447,8 @@ pub(crate) struct PreparedSandbox {
     /// through because a CLI proxy flag (e.g. `--credential`) may later
     /// override `caps` to `ProxyOnly`, losing the original intent.
     pub(crate) network_block_requested: bool,
+    #[allow(dead_code)]
+    pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1078,6 +1080,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 denied_env_vars: None,
                 set_vars: None,
                 network_block_requested: args.block_net,
+                mediation: crate::mediation::MediationConfig::default(),
             },
             args,
             silent,
@@ -1356,6 +1359,11 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .unwrap_or(false);
     let network_block_requested = args.block_net || profile_network_block;
 
+    let profile_mediation = loaded_profile
+        .as_ref()
+        .map(|p| p.mediation.clone())
+        .unwrap_or_default();
+
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();
@@ -1391,6 +1399,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             denied_env_vars: profile_denied_env_vars,
             set_vars: profile_set_vars,
             network_block_requested,
+            mediation: profile_mediation,
         },
         args,
         silent,

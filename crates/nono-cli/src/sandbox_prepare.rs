@@ -175,20 +175,21 @@ pub(crate) fn maybe_enable_macos_gpu(
         ));
     }
 
-    // These IOKit classes cover Metal on Apple Silicon only. IOAccelerator
-    // exists on Apple Silicon but Seatbelt matches on the leaf class, not
-    // the base, so it is not needed here. Intel Macs require
-    // IntelAccelerator, IOAccelerator, and AMDRadeonX* classes which are
+    // Minimal IOKit surface for Metal compute on Apple Silicon. Verified that
+    // `AGXDeviceUserClient` and `IOSurfaceRootUserClient` are sufficient for
+    // the full pipeline and offscreen rendering. `AGXSharedUserClient` is only
+    // needed for cross process GPU resource sharing (such as WebKit's GPU
+    // process). Adding `iokit-connection "IOGPU"` would cover more user
+    // clients such as `IOGPUSurfaceMTL` and `IOGPUGLDrawableUserClient` which
+    // are needed for display output and OpenGL. Intel Macs require
+    // `IntelAccelerator`, `IOAccelerator`, and `AMDRadeonX*` classes which are
     // not yet supported.
     caps.add_platform_rule(
         "(allow iokit-open \
-            (iokit-connection \"IOGPU\") \
             (iokit-user-client-class \
                 \"AGXDeviceUserClient\" \
-                \"AGXSharedUserClient\" \
                 \"IOSurfaceRootUserClient\"))",
     )?;
-    caps.add_platform_rule("(allow iokit-get-properties)")?;
     warn!("--allow-gpu enabled: allowing access to GPU");
     Ok(true)
 }

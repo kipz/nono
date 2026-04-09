@@ -461,14 +461,16 @@ mod tests {
 
         assert!(enabled);
         assert!(
-            caps.platform_rules().iter().any(|r| r.contains("IOGPU")),
-            "IOGPU platform rule should be present"
+            caps.platform_rules()
+                .iter()
+                .any(|r| r.contains("AGXDeviceUserClient")),
+            "AGXDeviceUserClient platform rule should be present"
         );
         assert!(
             caps.platform_rules()
                 .iter()
-                .any(|r| r.contains("iokit-get-properties")),
-            "iokit-get-properties rule should be present"
+                .any(|r| r.contains("IOSurfaceRootUserClient")),
+            "IOSurfaceRootUserClient platform rule should be present"
         );
     }
 

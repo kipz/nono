@@ -62,10 +62,10 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
 /// Maximum threads allowed when crypto library thread pool is active.
-/// Main thread (1) + tokio proxy workers (2) + aws-lc-rs ECDSA pool (4).
-/// When --network-profile is used with trust scanning, both the proxy runtime
-/// and crypto verification threads may be active simultaneously.
-const MAX_CRYPTO_THREADS: usize = 7;
+/// Main thread (1) + tokio proxy workers (2) + tokio mediation workers (2) +
+/// aws-lc-rs ECDSA pool (4). When --network-profile, mediation, and trust
+/// scanning are all active simultaneously the ceiling is 9 threads.
+const MAX_CRYPTO_THREADS: usize = 12;
 /// Hard cap on retained denial records to prevent memory exhaustion.
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
@@ -242,6 +242,9 @@ pub struct ExecConfig<'a> {
     /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
     /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// Additional env var names to block from the child (from mediation.env.block).
+    /// Complements the hardcoded injection-vector list in env_sanitization.rs.
+    pub extra_blocked_env: &'a [String],
 }
 
 #[derive(Clone, Copy)]
@@ -336,17 +339,17 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
     cmd.current_dir(config.current_dir);
 
+    let extra_blocked: Vec<&str> = [
+        "NONO_CAP_FILE",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ]
+    .into_iter()
+    .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+    .collect();
     for (key, value) in std::env::vars() {
-        if should_skip_env_var(
-            &key,
-            &config.env_vars,
-            &[
-                "NONO_CAP_FILE",
-                DETACHED_LAUNCH_ENV,
-                DETACHED_SESSION_ID_ENV,
-                DETACHED_CWD_PROMPT_RESPONSE_ENV,
-            ],
-        ) {
+        if should_skip_env_var(&key, &config.env_vars, &extra_blocked) {
             continue;
         }
         if let Some(ref denied) = config.denied_env_vars
@@ -469,19 +472,19 @@ pub fn execute_supervised(
     let mut browser_shim: Option<BrowserShim> = None;
 
     // Copy current environment, filtering dangerous and overridden vars
+    let extra_blocked_supervised: Vec<&str> = [
+        "NONO_CAP_FILE",
+        "NONO_SUPERVISOR_PATH",
+        DETACHED_LAUNCH_ENV,
+        DETACHED_SESSION_ID_ENV,
+        DETACHED_CWD_PROMPT_RESPONSE_ENV,
+    ]
+    .into_iter()
+    .chain(config.extra_blocked_env.iter().map(|s| s.as_str()))
+    .collect();
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            if should_skip_env_var(
-                k,
-                &config.env_vars,
-                &[
-                    "NONO_CAP_FILE",
-                    "NONO_SUPERVISOR_PATH",
-                    DETACHED_LAUNCH_ENV,
-                    DETACHED_SESSION_ID_ENV,
-                    DETACHED_CWD_PROMPT_RESPONSE_ENV,
-                ],
-            ) {
+            if should_skip_env_var(k, &config.env_vars, &extra_blocked_supervised) {
                 continue;
             }
             if let Some(ref denied) = config.denied_env_vars
@@ -559,12 +562,7 @@ pub fn execute_supervised(
                     if should_install_macos_open_shim(supervisor)
                         && let Some(shim) = create_open_shim(&nono_exe, &socket_path)
                     {
-                        let current_path = std::env::var("PATH").unwrap_or_default();
-                        let new_path = format!("PATH={}:{current_path}", shim.dir.path().display());
-                        if let Ok(cstr) = CString::new(new_path) {
-                            env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
-                            env_c.push(cstr);
-                        }
+                        apply_open_shim_path(&mut env_c, shim.dir.path());
                         let browser_cmd = format!("BROWSER={}", shim.launcher.display());
                         if let Ok(cstr) = CString::new(browser_cmd) {
                             env_c.push(cstr);
@@ -2473,6 +2471,7 @@ fn drain_pending_network_notifications(
 /// 3. If granted, open the path and send the fd via `SCM_RIGHTS`
 /// 4. Send the decision response
 /// 5. Record denials for diagnostic footer
+#[allow(clippy::too_many_arguments)]
 fn handle_supervisor_message(
     sock: &mut SupervisorSocket,
     msg: SupervisorMessage,
@@ -2974,6 +2973,29 @@ fn clear_close_on_exec(fd: i32) -> Result<()> {
 pub(super) fn record_denial(denials: &mut Vec<DenialRecord>, record: DenialRecord) {
     if denials.len() < MAX_DENIAL_RECORDS {
         denials.push(record);
+    }
+}
+
+/// Prepend `open_shim_dir` to the `PATH` entry already present in `env_c`.
+///
+/// Reads the current PATH from `env_c` (which already has the mediation session
+/// shim dir prepended by main.rs via env_vars) rather than from
+/// `std::env::var("PATH")`. Using the process env would discard the session
+/// shim dir, causing `bash -c 'gh ...'` to resolve `gh` directly instead of
+/// going through its mediation shim.
+#[cfg(target_os = "macos")]
+fn apply_open_shim_path(env_c: &mut Vec<std::ffi::CString>, open_shim_dir: &std::path::Path) {
+    let current_path = env_c
+        .iter()
+        .find(|c| c.as_bytes().starts_with(b"PATH="))
+        .and_then(|c| c.to_str().ok())
+        .and_then(|s| s.strip_prefix("PATH="))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    let new_path = format!("PATH={}:{current_path}", open_shim_dir.display());
+    if let Ok(cstr) = std::ffi::CString::new(new_path) {
+        env_c.retain(|c| !c.as_bytes().starts_with(b"PATH="));
+        env_c.push(cstr);
     }
 }
 
@@ -4600,5 +4622,49 @@ mod tests {
 
         let result = validate_url("data:text/html,<script>alert(1)</script>", &config);
         assert!(result.is_err(), "data: URLs must be rejected");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_open_shim_path_preserves_session_shim_dir() {
+        use std::ffi::CString;
+
+        let fake_session_shim = "/tmp/nono-session-9999/shims";
+        let open_shim_dir = tempfile::TempDir::new().expect("create temp dir");
+        let open_shim_dir_str = open_shim_dir
+            .path()
+            .to_str()
+            .expect("temp dir path is valid UTF-8")
+            .to_string();
+
+        let mut env_c: Vec<CString> =
+            vec![
+                CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim))
+                    .expect("valid CString"),
+            ];
+
+        apply_open_shim_path(&mut env_c, open_shim_dir.path());
+
+        let path_entry = env_c
+            .iter()
+            .find(|c| c.as_bytes().starts_with(b"PATH="))
+            .expect("PATH should be present in env_c");
+        let path_str = path_entry.to_str().expect("PATH is valid UTF-8");
+
+        assert!(
+            path_str.contains(fake_session_shim),
+            "session shim dir must be preserved in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.contains(&open_shim_dir_str),
+            "open shim dir must be in PATH, got: {}",
+            path_str
+        );
+        assert!(
+            path_str.starts_with(&format!("PATH={}", open_shim_dir_str)),
+            "open shim dir must come first in PATH, got: {}",
+            path_str
+        );
     }
 }

@@ -63,7 +63,9 @@ keyring = { version = "3", optional = true }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.8.0"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+subtle = "2"
+hex = "0.4"
 
 ureq = { version = "3", features = ["platform-verifier"] }
 semver = "1"

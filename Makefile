@@ -6,19 +6,26 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi build-arm64 test test-lib test-cli test-ffi check clippy fmt clean install audit help
+# Local code-signing certificate name (created once with: make setup-signing-cert)
+SIGN_CERT ?= nono-dev
+
+.PHONY: all build build-lib build-cli build-approve build-ffi build-arm64 test test-lib test-cli test-approve test-ffi check clippy fmt clean install audit sign setup-signing-cert help
 
 # Default target
 all: build
 
 # Build targets
-build: build-lib build-cli
+build: build-lib build-cli build-approve
 
 build-lib:
 	cargo build -p nono
 
 build-cli:
 	cargo build -p nono-cli
+	@$(MAKE) sign --no-print-directory 2>/dev/null || true
+
+build-approve:
+	cargo build -p nono-approve
 
 build-ffi:
 	cargo build -p nono-ffi
@@ -41,13 +48,16 @@ build-arm64:
 	@cross build --release --target aarch64-unknown-linux-gnu -p nono-cli
 
 # Test targets
-test: test-lib test-cli test-ffi
+test: test-lib test-cli test-approve test-ffi
 
 test-lib:
 	cargo test -p nono
 
 test-cli:
 	cargo test -p nono-cli
+
+test-approve:
+	cargo test -p nono-approve
 
 test-ffi:
 	cargo test -p nono-ffi
@@ -101,6 +111,26 @@ doc:
 
 doc-lib:
 	cargo doc -p nono --no-deps --open
+
+# Code signing — signs debug binaries so macOS Keychain "Always Allow" persists across rebuilds.
+# Requires a local certificate created once with: make setup-signing-cert
+sign:
+	@if security find-certificate -c "$(SIGN_CERT)" ~/Library/Keychains/login.keychain-db >/dev/null 2>&1; then \
+		codesign -f -s "$(SIGN_CERT)" target/debug/nono target/debug/nono-shim 2>/dev/null && \
+		echo "Signed debug binaries with '$(SIGN_CERT)'"; \
+	fi
+
+# One-time setup: create a local self-signed code-signing certificate.
+# After running this, 'make build' will automatically sign the binaries.
+setup-signing-cert:
+	@echo "Creating local code-signing certificate '$(SIGN_CERT)'..."
+	@TMPD=$$(mktemp -d) && \
+	printf '[req]\ndefault_bits=2048\nprompt=no\ndefault_md=sha256\ndistinguished_name=dn\nx509_extensions=v3\n[dn]\nCN=$(SIGN_CERT)\n[v3]\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\nbasicConstraints=CA:FALSE\n' > $$TMPD/cert.conf && \
+	openssl req -x509 -newkey rsa:2048 -days 3650 -nodes -keyout $$TMPD/key.pem -out $$TMPD/cert.pem -config $$TMPD/cert.conf 2>/dev/null && \
+	openssl pkcs12 -export -in $$TMPD/cert.pem -inkey $$TMPD/key.pem -out $$TMPD/cert.p12 -passout pass:nono -legacy -macalg SHA1 2>/dev/null && \
+	security import $$TMPD/cert.p12 -k ~/Library/Keychains/login.keychain-db -P nono -T /usr/bin/codesign -A && \
+	rm -rf $$TMPD && \
+	echo "Done. Run 'make build' to sign binaries automatically."
 
 # Security audit
 audit:

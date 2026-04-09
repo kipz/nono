@@ -32,6 +32,8 @@ mod learn_runtime;
 mod legacy_cleanup;
 #[cfg(target_os = "macos")]
 mod macos_trust;
+#[allow(dead_code)]
+mod mediation;
 mod migration;
 mod network_policy;
 mod open_url_runtime;
@@ -287,6 +289,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -338,6 +341,7 @@ mod tests {
             suppressed_system_service_operations: Vec::new(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            mediation: mediation::MediationConfig::default(),
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

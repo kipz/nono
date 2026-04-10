@@ -419,6 +419,27 @@
           },
           "description": "L7 endpoint rules for method+path filtering. When non-empty, only requests matching at least one rule are allowed (default-deny). When empty or absent, all endpoints are permitted.",
           "default": []
+        },
+        "tls_ca": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded CA certificate file for upstream TLS. When set, the proxy trusts this CA in addition to system roots. Required for upstreams with self-signed or private CA certificates (e.g. a Kubernetes API server). Supports tilde (~) expansion."
+        },
+        "tls_client_cert": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to a PEM-encoded client certificate for upstream mutual TLS (mTLS). When set together with tls_client_key, the proxy presents this certificate during the TLS handshake. Required for upstreams that enforce client-certificate authentication."
+        },
+        "tls_client_key": {
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Path to the PEM-encoded private key corresponding to tls_client_cert. Must be set together with tls_client_cert."
         }
       }
     },

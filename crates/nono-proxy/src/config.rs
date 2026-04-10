@@ -143,6 +143,22 @@ pub struct RouteConfig {
     /// Kubernetes API servers).
     #[serde(default)]
     pub tls_ca: Option<String>,
+
+    /// Optional path to a PEM-encoded client certificate for upstream mTLS.
+    ///
+    /// When set together with `tls_client_key`, the proxy presents this
+    /// certificate to the upstream during TLS handshake. Required for
+    /// upstreams that enforce mutual TLS (e.g., Kubernetes API servers
+    /// configured with client-certificate authentication).
+    #[serde(default)]
+    pub tls_client_cert: Option<String>,
+
+    /// Optional path to a PEM-encoded private key for upstream mTLS.
+    ///
+    /// Must be set together with `tls_client_cert`. The key must correspond
+    /// to the certificate in `tls_client_cert`.
+    #[serde(default)]
+    pub tls_client_key: Option<String>,
 }
 
 /// An HTTP method+path access rule for reverse proxy endpoint filtering.

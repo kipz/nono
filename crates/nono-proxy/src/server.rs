@@ -602,6 +602,8 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -643,6 +645,8 @@ mod tests {
                 env_var: None, // No explicit env_var — should fall back to uppercase
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -693,6 +697,8 @@ mod tests {
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -749,6 +755,8 @@ mod tests {
                     env_var: None,
                     endpoint_rules: vec![],
                     tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -763,6 +771,8 @@ mod tests {
                     env_var: Some("GITHUB_TOKEN".to_string()),
                     endpoint_rules: vec![],
                     tls_ca: None,
+                    tls_client_cert: None,
+                    tls_client_key: None,
                 },
             ],
             ..Default::default()
@@ -821,6 +831,8 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };
@@ -851,6 +863,8 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             }],
             ..Default::default()
         };

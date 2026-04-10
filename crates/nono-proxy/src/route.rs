@@ -83,15 +83,23 @@ impl RouteStore {
             let endpoint_rules = CompiledEndpointRules::compile(&route.endpoint_rules)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
-            let tls_connector = match route.tls_ca {
-                Some(ref ca_path) => {
-                    debug!(
-                        "Building TLS connector with custom CA for route '{}': {}",
-                        normalized_prefix, ca_path
-                    );
-                    Some(build_tls_connector_with_ca(ca_path)?)
-                }
-                None => None,
+            let tls_connector = if route.tls_ca.is_some()
+                || route.tls_client_cert.is_some()
+                || route.tls_client_key.is_some()
+            {
+                debug!(
+                    "Building TLS connector for route '{}' (ca={}, client_cert={})",
+                    normalized_prefix,
+                    route.tls_ca.is_some(),
+                    route.tls_client_cert.is_some(),
+                );
+                Some(build_tls_connector(
+                    route.tls_ca.as_deref(),
+                    route.tls_client_cert.as_deref(),
+                    route.tls_client_key.as_deref(),
+                )?)
+            } else {
+                None
             };
 
             let upstream_host_port = extract_host_port(&route.upstream);
@@ -177,71 +185,164 @@ fn extract_host_port(url: &str) -> Option<String> {
     Some(format!("{}:{}", host.to_lowercase(), port))
 }
 
-/// Build a `TlsConnector` that trusts the system roots plus a custom CA certificate.
+/// Read a PEM file, producing a clear `ProxyError::Config` for common failure modes.
 ///
-/// The CA file must be PEM-encoded and contain at least one certificate.
-/// Returns an error if the file cannot be read, contains no valid certificates,
-/// or the TLS configuration fails.
-fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnector> {
-    let ca_path = std::path::Path::new(ca_path);
-
-    let ca_pem = Zeroizing::new(std::fs::read(ca_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ProxyError::Config(format!(
-                "CA certificate file not found: '{}'",
-                ca_path.display()
-            ))
-        } else {
-            ProxyError::Config(format!(
-                "failed to read CA certificate '{}': {}",
-                ca_path.display(),
+/// Distinguishes:
+/// - file not found  → "… not found: '…'"
+/// - permission denied → "… permission denied: '…'" (nono process lacks read access)
+/// - other I/O errors  → "failed to read … '…': {os error}"
+fn read_pem_file(path: &std::path::Path, label: &str) -> Result<Zeroizing<Vec<u8>>> {
+    std::fs::read(path)
+        .map(Zeroizing::new)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                ProxyError::Config(format!("{} file not found: '{}'", label, path.display()))
+            }
+            std::io::ErrorKind::PermissionDenied => ProxyError::Config(format!(
+                "{} permission denied: '{}' (check that nono can read this file)",
+                label,
+                path.display()
+            )),
+            _ => ProxyError::Config(format!(
+                "failed to read {} '{}': {}",
+                label,
+                path.display(),
                 e
-            ))
-        }
-    })?);
+            )),
+        })
+}
 
+/// Build a `TlsConnector` with optional custom CA and optional client certificate.
+///
+/// - `ca_path`: PEM-encoded CA certificate file to trust in addition to system roots.
+///   Required for upstreams with self-signed or private CA certificates.
+/// - `client_cert_path`: PEM-encoded client certificate for mTLS. Must be paired with `client_key_path`.
+/// - `client_key_path`: PEM-encoded private key matching `client_cert_path`.
+///
+/// At least one of the three parameters must be `Some`. Returns an error if any
+/// file cannot be read, contains invalid PEM, or the TLS configuration fails.
+fn build_tls_connector(
+    ca_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<tokio_rustls::TlsConnector> {
     let mut root_store = rustls::RootCertStore::empty();
-
-    // Add system roots first
+    // Always include system roots
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    // Parse and add custom CA certificates from PEM file
-    let certs: Vec<_> = rustls_pemfile::certs(&mut ca_pem.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            ProxyError::Config(format!(
-                "failed to parse CA certificate '{}': {}",
-                ca_path.display(),
-                e
-            ))
-        })?;
+    // Add custom CA if provided
+    if let Some(ca_path) = ca_path {
+        let ca_path = std::path::Path::new(ca_path);
+        let ca_pem = read_pem_file(ca_path, "CA certificate")?;
 
-    if certs.is_empty() {
-        return Err(ProxyError::Config(format!(
-            "CA certificate file '{}' contains no valid PEM certificates",
-            ca_path.display()
-        )));
+        let certs: Vec<_> = rustls_pemfile::certs(&mut ca_pem.as_slice())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                ProxyError::Config(format!(
+                    "failed to parse CA certificate '{}': {}",
+                    ca_path.display(),
+                    e
+                ))
+            })?;
+
+        if certs.is_empty() {
+            return Err(ProxyError::Config(format!(
+                "CA certificate file '{}' contains no valid PEM certificates",
+                ca_path.display()
+            )));
+        }
+
+        for cert in certs {
+            root_store.add(cert).map_err(|e| {
+                ProxyError::Config(format!(
+                    "invalid CA certificate in '{}': {}",
+                    ca_path.display(),
+                    e
+                ))
+            })?;
+        }
     }
 
-    for cert in certs {
-        root_store.add(cert).map_err(|e| {
-            ProxyError::Config(format!(
-                "invalid CA certificate in '{}': {}",
-                ca_path.display(),
-                e
-            ))
-        })?;
-    }
-
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_safe_default_protocol_versions()
     .map_err(|e| ProxyError::Config(format!("TLS config error: {}", e)))?
-    .with_root_certificates(root_store)
-    .with_no_client_auth();
+    .with_root_certificates(root_store);
+
+    // Add client certificate for mTLS if provided
+    let tls_config = match (client_cert_path, client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert_path = std::path::Path::new(cert_path);
+            let key_path = std::path::Path::new(key_path);
+
+            let cert_pem = read_pem_file(cert_path, "client certificate")?;
+            let key_pem = read_pem_file(key_path, "client key")?;
+
+            let cert_chain: Vec<rustls::pki_types::CertificateDer> =
+                rustls_pemfile::certs(&mut cert_pem.as_slice())
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        ProxyError::Config(format!(
+                            "failed to parse client certificate '{}': {}",
+                            cert_path.display(),
+                            e
+                        ))
+                    })?;
+
+            if cert_chain.is_empty() {
+                return Err(ProxyError::Config(format!(
+                    "client certificate file '{}' contains no valid PEM certificates",
+                    cert_path.display()
+                )));
+            }
+
+            let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+                .map_err(|e| {
+                    ProxyError::Config(format!(
+                        "failed to parse client key '{}': {}",
+                        key_path.display(),
+                        e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ProxyError::Config(format!(
+                        "client key file '{}' contains no valid PEM private key",
+                        key_path.display()
+                    ))
+                })?;
+
+            builder
+                .with_client_auth_cert(cert_chain, private_key)
+                .map_err(|e| {
+                    ProxyError::Config(format!(
+                        "invalid client certificate/key pair ('{}', '{}'): {}",
+                        cert_path.display(),
+                        key_path.display(),
+                        e
+                    ))
+                })?
+        }
+        (Some(_), None) => {
+            return Err(ProxyError::Config(
+                "tls_client_cert is set but tls_client_key is missing".to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(ProxyError::Config(
+                "tls_client_key is set but tls_client_cert is missing".to_string(),
+            ));
+        }
+        (None, None) => builder.with_no_client_auth(),
+    };
 
     Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+}
+
+/// Compatibility shim: build a connector with only a custom CA (no client cert).
+#[cfg(test)]
+fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnector> {
+    build_tls_connector(Some(ca_path), None, None)
 }
 
 #[cfg(test)]
@@ -283,6 +384,8 @@ mod tests {
                 },
             ],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -314,6 +417,8 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -336,6 +441,8 @@ mod tests {
             env_var: None,
             endpoint_rules: vec![],
             tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -359,6 +466,8 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -373,6 +482,8 @@ mod tests {
                 env_var: None,
                 endpoint_rules: vec![],
                 tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
             },
         ];
 
@@ -494,6 +605,209 @@ AAAAAAAICAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
             err.contains("no valid PEM certificates"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    // --- mTLS (client certificate) tests ---
+
+    /// Self-signed client cert + key for testing. Generated with:
+    /// openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    ///   -keyout client.key -nodes -days 3650 -subj '/CN=nono-test-client' -out client.crt
+    const TEST_CLIENT_CERT_PEM: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBijCCATGgAwIBAgIUEoEb+0z+4CTRCzN98MqeTEXgdO8wCgYIKoZIzj0EAwIw
+GzEZMBcGA1UEAwwQbm9uby10ZXN0LWNsaWVudDAeFw0yNjA0MTAwMDIwNTdaFw0z
+NjA0MDcwMDIwNTdaMBsxGTAXBgNVBAMMEG5vbm8tdGVzdC1jbGllbnQwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAASt6g2Zt0STlgF+wZ64JzdDRlpPeNr1h56ZLEEq
+HfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQo1MwUTAdBgNVHQ4E
+FgQUTiHidg8uqgrJ1qlaVvR+XSebAlEwHwYDVR0jBBgwFoAUTiHidg8uqgrJ1qla
+VvR+XSebAlEwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiA9PwBU
+f832cQkGS9cyYaU7Ij5U8Rcy/g4J7Ckf2nKX3gIgG0aarAFcIzAi5VpxbCwEScnr
+m0lHTyp6E7ut7llwMBY=
+-----END CERTIFICATE-----";
+
+    const TEST_CLIENT_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgskOkyJkTwlMZkm/L
+eEleLY6bARaHFnqauYJqxNoJWvihRANCAASt6g2Zt0STlgF+wZ64JzdDRlpPeNr1
+h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
+-----END PRIVATE KEY-----";
+
+    #[test]
+    fn test_build_tls_connector_cert_without_key_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
+
+        let result = build_tls_connector(None, Some(cert_path.to_str().unwrap()), None);
+        let err = result
+            .err()
+            .expect("should fail with half-pair")
+            .to_string();
+        assert!(
+            err.contains("tls_client_cert is set but tls_client_key is missing"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_tls_connector_key_without_cert_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
+
+        let result = build_tls_connector(None, None, Some(key_path.to_str().unwrap()));
+        let err = result
+            .err()
+            .expect("should fail with half-pair")
+            .to_string();
+        assert!(
+            err.contains("tls_client_key is set but tls_client_cert is missing"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_tls_connector_missing_client_cert_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
+
+        let result = build_tls_connector(
+            None,
+            Some("/nonexistent/client.crt"),
+            Some(key_path.to_str().unwrap()),
+        );
+        let err = result.err().expect("should fail").to_string();
+        assert!(
+            err.contains("client certificate file not found"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_tls_connector_missing_client_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
+
+        let result = build_tls_connector(
+            None,
+            Some(cert_path.to_str().unwrap()),
+            Some("/nonexistent/client.key"),
+        );
+        let err = result.err().expect("should fail").to_string();
+        assert!(
+            err.contains("client key file not found"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_build_tls_connector_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
+        // Remove all permissions so the file exists but can't be read
+        std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Skip if running as root (root bypasses permission checks)
+        if std::fs::read(&cert_path).is_ok() {
+            return;
+        }
+
+        let result = build_tls_connector(
+            None,
+            Some(cert_path.to_str().unwrap()),
+            Some("/nonexistent/key"),
+        );
+        let err = result.err().expect("should fail").to_string();
+        assert!(
+            err.contains("permission denied"),
+            "expected permission denied error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_tls_connector_empty_client_cert_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, "not a certificate\n").unwrap();
+        std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
+
+        let result = build_tls_connector(
+            None,
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+        );
+        let err = result.err().expect("should fail").to_string();
+        assert!(
+            err.contains("no valid PEM certificates"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_tls_connector_empty_client_key_pem() {
+        // Verifies that an invalid key file produces an appropriate config error.
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
+        std::fs::write(&key_path, "not a key\n").unwrap();
+
+        let result = build_tls_connector(
+            None,
+            Some(cert_path.to_str().unwrap()),
+            Some(key_path.to_str().unwrap()),
+        );
+        let err = result
+            .err()
+            .expect("should fail with invalid PEM")
+            .to_string();
+        assert!(err.contains("client key"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_route_store_loads_mtls_route() {
+        // Verify RouteStore.load() builds a TLS connector when tls_client_cert/key are set.
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("client.crt");
+        let key_path = dir.path().join("client.key");
+        std::fs::write(&cert_path, TEST_CLIENT_CERT_PEM).unwrap();
+        std::fs::write(&key_path, TEST_CLIENT_KEY_PEM).unwrap();
+
+        let routes = vec![RouteConfig {
+            prefix: "k8s".to_string(),
+            upstream: "https://192.168.64.1:6443".to_string(),
+            credential_key: None,
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
+            tls_client_key: Some(key_path.to_str().unwrap().to_string()),
+        }];
+
+        let store = RouteStore::load(&routes).expect("should load mTLS route");
+        let route = store.get("k8s").unwrap();
+        assert!(
+            route.tls_connector.is_some(),
+            "connector must be built when tls_client_cert/key are set"
         );
     }
 }

@@ -157,6 +157,7 @@ impl ProfileDef {
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
             allow_gpu: self.allow_gpu,
+            allow_parent_of_protected: None,
             interactive: self.interactive,
             skipdirs: Vec::new(),
             mediation: self.mediation.clone(),

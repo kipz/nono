@@ -42,6 +42,7 @@ impl ProtectedRoots {
 pub fn validate_caps_against_protected_roots(
     caps: &CapabilitySet,
     protected_roots: &[PathBuf],
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     for cap in caps.fs_capabilities() {
         validate_requested_path_against_protected_roots(
@@ -49,6 +50,7 @@ pub fn validate_caps_against_protected_roots(
             cap.is_file,
             &cap.source.to_string(),
             protected_roots,
+            allow_parent_of_protected,
         )?;
     }
 
@@ -70,6 +72,7 @@ pub fn validate_requested_path_against_protected_roots(
     is_file: bool,
     source: &str,
     protected_roots: &[PathBuf],
+    allow_parent_of_protected: bool,
 ) -> Result<()> {
     let requested_path = resolve_path(path);
     let resolved_roots: Vec<PathBuf> = protected_roots.iter().map(|p| resolve_path(p)).collect();
@@ -88,9 +91,9 @@ pub fn validate_requested_path_against_protected_roots(
             )));
         }
 
-        // parent_of_protected: on macOS, Seatbelt deny rules protect the root;
+        // parent_of_protected: on macOS with opt-in, Seatbelt deny rules protect the root;
         // on Linux, Landlock cannot express deny-within-allow so we must reject.
-        if parent_of_protected && !cfg!(target_os = "macos") {
+        if parent_of_protected && !(cfg!(target_os = "macos") && allow_parent_of_protected) {
             return Err(NonoError::SandboxInit(format!(
                 "Refusing to grant '{}' (source: {}) because it overlaps protected nono state root '{}'.",
                 requested_path.display(),
@@ -108,6 +111,13 @@ pub fn validate_requested_path_against_protected_roots(
 /// On macOS, only `inside_protected` is flagged because Seatbelt deny rules
 /// protect the root from parent grants. On Linux, both `inside_protected` and
 /// `parent_of_protected` are flagged.
+///
+/// Unlike [`validate_requested_path_against_protected_roots`], this function
+/// does **not** take an `allow_parent_of_protected` flag. It is called by the
+/// supervisor at runtime, after Seatbelt deny rules have already been emitted,
+/// so the unconditional macOS relaxation is safe here. The pre-flight
+/// validation (which does respect the opt-in flag) has already rejected the
+/// grant if the profile did not opt in.
 #[must_use]
 pub fn overlapping_protected_root(
     path: &Path,
@@ -140,7 +150,7 @@ pub fn overlapping_protected_root(
 ///
 /// On non-macOS, this is a no-op — Landlock does not support deny-within-allow,
 /// so the pre-flight validation rejects parent grants instead.
-pub fn emit_protected_root_deny_rules(
+pub(crate) fn emit_protected_root_deny_rules(
     protected_roots: &[PathBuf],
     caps: &mut CapabilitySet,
 ) -> Result<()> {
@@ -219,7 +229,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn parent_directory_capability_platform_conditional() {
+    fn parent_directory_capability_blocked_without_opt_in() {
         let tmp = TempDir::new().expect("tmpdir");
         let parent = tmp.path().to_path_buf();
         let protected = parent.join(".nono");
@@ -228,19 +238,52 @@ mod tests {
         let cap = FsCapability::new_dir(&parent, AccessMode::ReadWrite).expect("dir cap");
         caps.add_fs(cap);
 
-        if cfg!(target_os = "macos") {
-            // macOS: parent grant is allowed (Seatbelt deny rules protect the root)
-            validate_caps_against_protected_roots(&caps, &[protected]).expect("allowed on macOS");
-        } else {
-            // Linux: parent grant is rejected (Landlock cannot deny-within-allow)
-            let err =
-                validate_caps_against_protected_roots(&caps, &[protected]).expect_err("blocked");
-            assert!(
-                err.to_string()
-                    .contains("overlaps protected nono state root"),
-                "unexpected error: {err}",
-            );
-        }
+        // Without opt-in, parent grant is always rejected
+        let err =
+            validate_caps_against_protected_roots(&caps, &[protected], false).expect_err("blocked");
+        assert!(
+            err.to_string()
+                .contains("overlaps protected nono state root"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parent_directory_capability_allowed_with_opt_in_on_macos() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let parent = tmp.path().to_path_buf();
+        let protected = parent.join(".nono");
+
+        let mut caps = CapabilitySet::new();
+        let cap = FsCapability::new_dir(&parent, AccessMode::ReadWrite).expect("dir cap");
+        caps.add_fs(cap);
+
+        // With opt-in on macOS, parent grant is allowed (Seatbelt deny rules protect the root)
+        validate_caps_against_protected_roots(&caps, &[protected], true)
+            .expect("allowed on macOS with opt-in");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn parent_directory_capability_blocked_even_with_opt_in_on_linux() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let parent = tmp.path().to_path_buf();
+        let protected = parent.join(".nono");
+
+        let mut caps = CapabilitySet::new();
+        let cap = FsCapability::new_dir(&parent, AccessMode::ReadWrite).expect("dir cap");
+        caps.add_fs(cap);
+
+        // On Linux, parent grant is always rejected even with opt-in
+        // (Landlock cannot express deny-within-allow)
+        let err = validate_caps_against_protected_roots(&caps, &[protected], true)
+            .expect_err("blocked on Linux even with opt-in");
+        assert!(
+            err.to_string()
+                .contains("overlaps protected nono state root"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]
@@ -257,6 +300,7 @@ mod tests {
             true,
             "test",
             std::slice::from_ref(&protected),
+            false,
         )
         .expect_err("blocked");
         assert!(
@@ -273,6 +317,7 @@ mod tests {
             false,
             "test",
             std::slice::from_ref(&protected),
+            false,
         )
         .expect_err("blocked");
         assert!(
@@ -293,7 +338,7 @@ mod tests {
         let cap = FsCapability::new_dir(&child, AccessMode::ReadWrite).expect("dir cap");
         caps.add_fs(cap);
 
-        validate_caps_against_protected_roots(&caps, &[protected]).expect_err("blocked");
+        validate_caps_against_protected_roots(&caps, &[protected], false).expect_err("blocked");
     }
 
     #[test]
@@ -307,7 +352,7 @@ mod tests {
         let cap = FsCapability::new_dir(&workspace, AccessMode::ReadWrite).expect("dir cap");
         caps.add_fs(cap);
 
-        validate_caps_against_protected_roots(&caps, &[protected]).expect("allowed");
+        validate_caps_against_protected_roots(&caps, &[protected], false).expect("allowed");
     }
 
     #[test]
@@ -317,9 +362,14 @@ mod tests {
         std::fs::create_dir_all(&protected).expect("mkdir");
         let child = protected.join("rollbacks").join("future-session");
 
-        let err =
-            validate_requested_path_against_protected_roots(&child, false, "CLI", &[protected])
-                .expect_err("blocked");
+        let err = validate_requested_path_against_protected_roots(
+            &child,
+            false,
+            "CLI",
+            &[protected],
+            false,
+        )
+        .expect_err("blocked");
         assert!(
             err.to_string()
                 .contains("overlaps protected nono state root"),
@@ -341,21 +391,28 @@ mod tests {
         assert_eq!(overlap, Some(expected));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn overlapping_protected_root_parent_platform_conditional() {
+    fn overlapping_protected_root_parent_not_flagged_on_macos() {
         let tmp = TempDir::new().expect("tmpdir");
         let parent = tmp.path().to_path_buf();
         let protected = parent.join(".nono");
 
         let overlap = overlapping_protected_root(&parent, false, std::slice::from_ref(&protected));
+        // macOS: parent-of-protected is not flagged (Seatbelt deny rules handle it)
+        assert_eq!(overlap, None, "parent should not be flagged on macOS");
+    }
 
-        if cfg!(target_os = "macos") {
-            // macOS: parent-of-protected is not flagged (Seatbelt deny rules handle it)
-            assert_eq!(overlap, None, "parent should not be flagged on macOS");
-        } else {
-            // Linux: parent-of-protected is flagged
-            assert!(overlap.is_some(), "parent should be flagged on Linux");
-        }
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn overlapping_protected_root_parent_flagged_on_linux() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let parent = tmp.path().to_path_buf();
+        let protected = parent.join(".nono");
+
+        let overlap = overlapping_protected_root(&parent, false, std::slice::from_ref(&protected));
+        // Linux: parent-of-protected is flagged
+        assert!(overlap.is_some(), "parent should be flagged on Linux");
     }
 
     #[cfg(target_os = "macos")]

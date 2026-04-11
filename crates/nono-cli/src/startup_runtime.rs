@@ -1,5 +1,9 @@
 use crate::cli::{Commands, RunArgs};
-use crate::{output, session, update_check, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
+use crate::sandbox_prepare::resolve_detached_cwd_prompt_response;
+use crate::{
+    output, session, update_check, DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV,
+    DETACHED_SESSION_ID_ENV,
+};
 #[cfg(unix)]
 use nix::libc;
 use nono::{NonoError, Result};
@@ -16,6 +20,7 @@ pub(crate) fn allows_pre_exec_update_check(command: &Commands) -> bool {
 }
 
 pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
+    let cwd_prompt_response = resolve_detached_cwd_prompt_response(&args.sandbox, silent)?;
     let session_id = session::generate_session_id();
     let exe = std::env::current_exe().map_err(|e| {
         NonoError::SandboxInit(format!("Failed to resolve current executable: {e}"))
@@ -25,6 +30,9 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
     child.args(std::env::args_os().skip(1));
     child.env(DETACHED_LAUNCH_ENV, "1");
     child.env(DETACHED_SESSION_ID_ENV, &session_id);
+    if let Some(response) = cwd_prompt_response {
+        child.env(DETACHED_CWD_PROMPT_RESPONSE_ENV, response.as_env_value());
+    }
     child.stdin(Stdio::null());
     child.stdout(Stdio::null());
     child.stderr(startup_log_stdio);

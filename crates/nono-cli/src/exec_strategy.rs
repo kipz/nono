@@ -14,6 +14,7 @@ mod env_sanitization;
 #[cfg(target_os = "linux")]
 mod supervisor_linux;
 
+use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV, DETACHED_SESSION_ID_ENV};
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -344,7 +345,16 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.current_dir(config.current_dir);
 
     for (key, value) in std::env::vars() {
-        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
+        if !should_skip_env_var(
+            &key,
+            &config.env_vars,
+            &[
+                "NONO_CAP_FILE",
+                DETACHED_LAUNCH_ENV,
+                DETACHED_SESSION_ID_ENV,
+                DETACHED_CWD_PROMPT_RESPONSE_ENV,
+            ],
+        ) {
             cmd.env(&key, &value);
         }
     }
@@ -459,7 +469,13 @@ pub fn execute_supervised(
             let should_skip = should_skip_env_var(
                 k,
                 &config.env_vars,
-                &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
+                &[
+                    "NONO_CAP_FILE",
+                    "NONO_SUPERVISOR_FD",
+                    DETACHED_LAUNCH_ENV,
+                    DETACHED_SESSION_ID_ENV,
+                    DETACHED_CWD_PROMPT_RESPONSE_ENV,
+                ],
             );
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {

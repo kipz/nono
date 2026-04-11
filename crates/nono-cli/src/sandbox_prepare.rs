@@ -6,14 +6,14 @@ use crate::credential_runtime::load_env_credentials;
 use crate::profile;
 use crate::profile::WorkdirAccess;
 use crate::profile_runtime::prepare_profile;
-use crate::DETACHED_LAUNCH_ENV;
 use crate::{output, policy, protected_paths, sandbox_state};
+use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
@@ -53,6 +53,35 @@ fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
     missing
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DetachedCwdPromptResponse {
+    Allow,
+    Deny,
+}
+
+impl DetachedCwdPromptResponse {
+    pub(crate) const fn as_env_value(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCwdAccessRequest {
+    cwd_canonical: PathBuf,
+    access: AccessMode,
+}
+
 /// Result of sandbox preparation.
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
@@ -74,6 +103,99 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) override_deny_paths: Vec<PathBuf>,
+}
+
+fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
+    args.workdir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn cwd_access_requirement(profile_workdir_access: Option<&WorkdirAccess>) -> Option<AccessMode> {
+    if let Some(access) = profile_workdir_access {
+        match access {
+            WorkdirAccess::Read => Some(AccessMode::Read),
+            WorkdirAccess::Write => Some(AccessMode::Write),
+            WorkdirAccess::ReadWrite => Some(AccessMode::ReadWrite),
+            WorkdirAccess::None => None,
+        }
+    } else {
+        Some(AccessMode::Read)
+    }
+}
+
+fn pending_cwd_access_request(
+    caps: &CapabilitySet,
+    workdir: &Path,
+    profile_workdir_access: Option<&WorkdirAccess>,
+) -> Result<Option<PendingCwdAccessRequest>> {
+    let Some(access) = cwd_access_requirement(profile_workdir_access) else {
+        return Ok(None);
+    };
+
+    let cwd_canonical = workdir
+        .canonicalize()
+        .map_err(|e| NonoError::PathCanonicalization {
+            path: workdir.to_path_buf(),
+            source: e,
+        })?;
+
+    if caps.path_covered_with_access(&cwd_canonical, access) {
+        Ok(None)
+    } else {
+        Ok(Some(PendingCwdAccessRequest {
+            cwd_canonical,
+            access,
+        }))
+    }
+}
+
+fn detached_cwd_prompt_response() -> Option<DetachedCwdPromptResponse> {
+    std::env::var(DETACHED_CWD_PROMPT_RESPONSE_ENV)
+        .ok()
+        .as_deref()
+        .and_then(DetachedCwdPromptResponse::from_env_value)
+}
+
+pub(crate) fn resolve_detached_cwd_prompt_response(
+    args: &SandboxArgs,
+    silent: bool,
+) -> Result<Option<DetachedCwdPromptResponse>> {
+    if silent || args.allow_cwd || args.config.is_some() {
+        return Ok(None);
+    }
+
+    let workdir = resolved_workdir(args);
+    let loaded_profile = if let Some(ref profile_name) = args.profile {
+        Some(profile::load_profile(profile_name)?)
+    } else {
+        None
+    };
+
+    let (caps, _) = if let Some(ref profile) = loaded_profile {
+        CapabilitySet::from_profile(profile, &workdir, args)?
+    } else {
+        CapabilitySet::from_args(args)?
+    };
+
+    let Some(request) = pending_cwd_access_request(
+        &caps,
+        &workdir,
+        loaded_profile
+            .as_ref()
+            .map(|profile| &profile.workdir.access),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let confirmed = output::prompt_cwd_sharing(&request.cwd_canonical, &request.access)?;
+    Ok(Some(if confirmed {
+        DetachedCwdPromptResponse::Allow
+    } else {
+        DetachedCwdPromptResponse::Deny
+    }))
 }
 
 fn finalize_prepared_sandbox(
@@ -236,19 +358,19 @@ pub(crate) fn print_allow_launch_services_warning(silent: bool) {
     eprintln!("  Prefer using it from a trusted directory, not inside an untrusted project.");
 }
 
-fn missing_cwd_prompt_must_fail(silent: bool, detached_launch: bool) -> bool {
-    silent || detached_launch
+fn missing_cwd_prompt_must_fail(
+    silent: bool,
+    detached_launch: bool,
+    detached_prompt_response: Option<DetachedCwdPromptResponse>,
+) -> bool {
+    silent || (detached_launch && detached_prompt_response.is_none())
 }
 
 pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> {
     sandbox_state::cleanup_stale_state_files();
     let detached_launch = std::env::var_os(DETACHED_LAUNCH_ENV).is_some();
-
-    let workdir = args
-        .workdir
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let detached_prompt_response = detached_cwd_prompt_response();
+    let workdir = resolved_workdir(args);
 
     if let Some(ref config_path) = args.config {
         let json = std::fs::read_to_string(config_path).map_err(|e| {
@@ -396,44 +518,43 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         loaded_profile.is_none() || profile_allow_gpu,
     )?;
 
-    let cwd_access = if let Some(ref access) = profile_workdir_access {
-        match access {
-            WorkdirAccess::Read => Some(AccessMode::Read),
-            WorkdirAccess::Write => Some(AccessMode::Write),
-            WorkdirAccess::ReadWrite => Some(AccessMode::ReadWrite),
-            WorkdirAccess::None => None,
-        }
-    } else {
-        Some(AccessMode::Read)
-    };
-
-    if let Some(access) = cwd_access {
-        let cwd_canonical =
-            workdir
-                .canonicalize()
-                .map_err(|e| NonoError::PathCanonicalization {
-                    path: workdir.clone(),
-                    source: e,
-                })?;
-
-        if !caps.path_covered_with_access(&cwd_canonical, access) {
-            if args.allow_cwd {
-                info!("Auto-including CWD with {} access (--allow-cwd)", access);
-                let cap = FsCapability::new_dir(cwd_canonical.clone(), access)?;
-                caps.add_fs(cap);
-            } else if missing_cwd_prompt_must_fail(silent, detached_launch) {
-                return Err(NonoError::CwdPromptRequired);
+    if let Some(request) =
+        pending_cwd_access_request(&caps, &workdir, profile_workdir_access.as_ref())?
+    {
+        if args.allow_cwd
+            || matches!(
+                detached_prompt_response,
+                Some(DetachedCwdPromptResponse::Allow)
+            )
+        {
+            let reason = if args.allow_cwd {
+                "(--allow-cwd)"
             } else {
-                let confirmed = output::prompt_cwd_sharing(&cwd_canonical, &access)?;
-                if confirmed {
-                    let cap = FsCapability::new_dir(cwd_canonical.clone(), access)?;
-                    caps.add_fs(cap);
-                } else {
-                    info!("User declined CWD sharing. Continuing without automatic CWD access.");
-                }
+                "(detached launch preflight)"
+            };
+            info!(
+                "Auto-including CWD with {} access {}",
+                request.access, reason
+            );
+            let cap = FsCapability::new_dir(request.cwd_canonical.clone(), request.access)?;
+            caps.add_fs(cap);
+        } else if matches!(
+            detached_prompt_response,
+            Some(DetachedCwdPromptResponse::Deny)
+        ) {
+            info!("Detached launch declined CWD sharing. Continuing without automatic CWD access.");
+        } else if missing_cwd_prompt_must_fail(silent, detached_launch, detached_prompt_response) {
+            return Err(NonoError::CwdPromptRequired);
+        } else {
+            let confirmed = output::prompt_cwd_sharing(&request.cwd_canonical, &request.access)?;
+            if confirmed {
+                let cap = FsCapability::new_dir(request.cwd_canonical.clone(), request.access)?;
+                caps.add_fs(cap);
+            } else {
+                info!("User declined CWD sharing. Continuing without automatic CWD access.");
             }
-            caps.deduplicate();
         }
+        caps.deduplicate();
     }
 
     let active_groups = if let Some(profile) = loaded_profile
@@ -529,16 +650,74 @@ mod tests {
 
     #[test]
     fn missing_cwd_prompt_fails_in_silent_mode() {
-        assert!(missing_cwd_prompt_must_fail(true, false));
+        assert!(missing_cwd_prompt_must_fail(true, false, None));
     }
 
     #[test]
-    fn missing_cwd_prompt_fails_for_detached_launches() {
-        assert!(missing_cwd_prompt_must_fail(false, true));
+    fn missing_cwd_prompt_fails_for_unresolved_detached_launches() {
+        assert!(missing_cwd_prompt_must_fail(false, true, None));
+    }
+
+    #[test]
+    fn missing_cwd_prompt_does_not_fail_after_detached_preflight_decision() {
+        assert!(!missing_cwd_prompt_must_fail(
+            false,
+            true,
+            Some(DetachedCwdPromptResponse::Deny)
+        ));
+        assert!(!missing_cwd_prompt_must_fail(
+            false,
+            true,
+            Some(DetachedCwdPromptResponse::Allow)
+        ));
     }
 
     #[test]
     fn missing_cwd_prompt_can_interactively_prompt_when_attached() {
-        assert!(!missing_cwd_prompt_must_fail(false, false));
+        assert!(!missing_cwd_prompt_must_fail(false, false, None));
+    }
+
+    #[test]
+    fn pending_cwd_access_request_uses_default_read_access() {
+        let dir = tempdir().expect("tmpdir");
+        let caps = CapabilitySet::new();
+        let request = pending_cwd_access_request(&caps, dir.path(), None)
+            .expect("request should evaluate")
+            .expect("request should be required");
+
+        assert_eq!(
+            request.cwd_canonical,
+            dir.path().canonicalize().expect("canonical")
+        );
+        assert_eq!(request.access, AccessMode::Read);
+    }
+
+    #[test]
+    fn pending_cwd_access_request_is_skipped_when_caps_cover_workdir() {
+        let dir = tempdir().expect("tmpdir");
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(
+            FsCapability::new_dir(dir.path(), AccessMode::ReadWrite).expect("dir capability"),
+        );
+
+        assert!(pending_cwd_access_request(&caps, dir.path(), None)
+            .expect("request should evaluate")
+            .is_none());
+    }
+
+    #[test]
+    fn detached_cwd_prompt_response_env_values_round_trip() {
+        assert_eq!(
+            DetachedCwdPromptResponse::from_env_value(
+                DetachedCwdPromptResponse::Allow.as_env_value()
+            ),
+            Some(DetachedCwdPromptResponse::Allow)
+        );
+        assert_eq!(
+            DetachedCwdPromptResponse::from_env_value(
+                DetachedCwdPromptResponse::Deny.as_env_value()
+            ),
+            Some(DetachedCwdPromptResponse::Deny)
+        );
     }
 }

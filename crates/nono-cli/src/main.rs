@@ -65,6 +65,7 @@ use nono::Result;
 use tracing::error;
 
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
+const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
 const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 
 pub(crate) use launch_runtime::rollback_base_exclusions;

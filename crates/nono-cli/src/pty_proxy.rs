@@ -335,10 +335,9 @@ impl PtyProxy {
 
     /// Shut down the attach listener so no new connections can be accepted.
     ///
-    /// Removes the socket file and replaces the listener with a closed fd.
-    /// This prevents the kernel from accepting connections into the backlog
-    /// after the supervisor loop has exited but before the `PtyProxy` is
-    /// dropped — the window that causes "Broken pipe" errors on attach.
+    /// Removes the socket file. This prevents the kernel from accepting new
+    /// connections after the supervisor loop has exited but before the
+    /// `PtyProxy` is dropped — the window that causes "Broken pipe" errors on attach.
     pub fn shutdown_attach_listener(&mut self) {
         let _ = std::fs::remove_file(&self.attach_path);
     }
@@ -1499,7 +1498,12 @@ pub fn connect_to_session(session_id: &str) -> Result<UnixStream> {
     }
 
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
-        if is_socket_disconnect(&e) {
+        if is_socket_disconnect(&e)
+            || matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        {
             return NonoError::SessionGone;
         }
         NonoError::ConfigParse(format!(
@@ -1520,7 +1524,12 @@ pub fn request_session_detach(session_id: &str) -> Result<()> {
     }
 
     let mut stream = UnixStream::connect(&sock_path).map_err(|e| {
-        if is_socket_disconnect(&e) {
+        if is_socket_disconnect(&e)
+            || matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            )
+        {
             return NonoError::SessionGone;
         }
         NonoError::ConfigParse(format!(

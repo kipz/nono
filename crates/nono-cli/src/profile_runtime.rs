@@ -98,7 +98,8 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
             tracing::warn!(
                 "Pack '{}' declared by profile but not installed. \
                  Install it with: nono pull {}",
-                pack_ref, pack_ref
+                pack_ref,
+                pack_ref
             );
             continue;
         }
@@ -121,7 +122,10 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
                     ))
                 })?;
                 let digest = Sha256::digest(&bytes);
-                let hash = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                let hash = digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>();
                 if hash != locked_artifact.sha256 {
                     return Err(nono::NonoError::PackageInstall(format!(
                         "pack '{}' artifact '{}' has been tampered with.\n\

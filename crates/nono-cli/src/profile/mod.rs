@@ -1382,14 +1382,12 @@ fn is_registry_ref(s: &str) -> bool {
 /// pull it first (Docker-style auto-pull with Sigstore verification).
 fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
     let package_ref = crate::package::parse_package_ref(name_or_path)?;
-    let install_dir = crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+    let install_dir =
+        crate::package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
 
     // Check if pack is already installed
     if !install_dir.join("package.json").exists() {
-        eprintln!(
-            "Profile '{}' not found locally.",
-            package_ref.key()
-        );
+        eprintln!("Profile '{}' not found locally.", package_ref.key());
 
         // Auto-pull from registry
         crate::package_cmd::run_pull(crate::cli::PullArgs {
@@ -1437,10 +1435,7 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
                 .join("profiles")
                 .join(format!("{install_name}.json"));
             if profile_path.exists() {
-                tracing::info!(
-                    "Loading registry profile from: {}",
-                    profile_path.display()
-                );
+                tracing::info!("Loading registry profile from: {}", profile_path.display());
                 return finalize_profile(load_from_file(&profile_path)?);
             }
         }

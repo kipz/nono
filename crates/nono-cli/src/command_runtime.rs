@@ -6,8 +6,8 @@ use crate::launch_runtime::{
     select_exec_strategy, ExecutionFlags, LaunchPlan, SessionLaunchOptions,
 };
 use crate::output;
-use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::profile;
+use crate::proxy_runtime::prepare_proxy_launch_options;
 use crate::sandbox_prepare::{
     prepare_sandbox, print_allow_gpu_warning, print_allow_launch_services_warning,
     should_auto_enable_claude_launch_services, validate_external_proxy_bypass,

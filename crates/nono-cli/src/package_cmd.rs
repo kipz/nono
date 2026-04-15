@@ -692,7 +692,7 @@ fn install_manifest_artifact(
         let dest_name = artifact
             .install_as
             .as_deref()
-            .map(|n| {
+            .map(|n| -> Result<String> {
                 validate_safe_name(n, "install_as")?;
                 // For profiles, install_as is already just the name
                 Ok(if artifact.artifact_type == ArtifactType::Profile {
@@ -907,26 +907,6 @@ fn enforce_namespace_assertion(
     }
 }
 
-fn enforce_signer_consistency(
-    package_ref: &PackageRef,
-    expected_signer: &mut Option<SignerIdentity>,
-    signer_identity: &SignerIdentity,
-) -> Result<()> {
-    match expected_signer {
-        Some(existing) if !same_signer(existing, signer_identity) => {
-            Err(NonoError::PackageVerification {
-                package: package_ref.key(),
-                reason: "artifacts in the package were signed by different identities".to_string(),
-            })
-        }
-        Some(_) => Ok(()),
-        None => {
-            *expected_signer = Some(signer_identity.clone());
-            Ok(())
-        }
-    }
-}
-
 fn enforce_signer_pinning(
     existing: Option<&LockedPackage>,
     signer_identity: &str,
@@ -952,28 +932,6 @@ fn enforce_signer_pinning(
 
     Ok(())
 }
-
-fn same_signer(left: &SignerIdentity, right: &SignerIdentity) -> bool {
-    match (left, right) {
-        (
-            SignerIdentity::Keyless {
-                repository: l_repo,
-                workflow: l_workflow,
-                git_ref: l_ref,
-                ..
-            },
-            SignerIdentity::Keyless {
-                repository: r_repo,
-                workflow: r_workflow,
-                git_ref: r_ref,
-                ..
-            },
-        ) => l_repo == r_repo && l_workflow == r_workflow && l_ref == r_ref,
-        (SignerIdentity::Keyed { key_id: l }, SignerIdentity::Keyed { key_id: r }) => l == r,
-        _ => false,
-    }
-}
-
 fn signer_identity_uri(identity: &SignerIdentity) -> Result<String> {
     match identity {
         SignerIdentity::Keyless {

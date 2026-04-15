@@ -166,7 +166,9 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             }
         }
 
-        let resolved = resolve_command(entry, &shim_dir, &shim_binary)?;
+        let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary)? else {
+            continue;
+        };
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
     }
@@ -356,11 +358,15 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
 }
 
 /// Resolve a command entry: find the real binary, create the shim symlink.
+///
+/// Returns `Ok(None)` when the command is not found on PATH and no explicit
+/// `binary_path` was given. This lets callers silently skip entries for tools
+/// that are not installed on this device.
 fn resolve_command(
     entry: &CommandEntry,
     shim_dir: &Path,
     shim_binary: &Path,
-) -> Result<ResolvedCommand> {
+) -> Result<Option<ResolvedCommand>> {
     let real_path = if let Some(ref bp) = entry.binary_path {
         let p = PathBuf::from(bp);
         if !p.is_file() {
@@ -371,12 +377,16 @@ fn resolve_command(
         }
         p
     } else {
-        which::which(&entry.name).map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "mediation: command '{}' not found on PATH: {}",
-                entry.name, e
-            ))
-        })?
+        match which::which(&entry.name) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    "mediation: command '{}' not found on PATH, skipping",
+                    entry.name
+                );
+                return Ok(None);
+            }
+        }
     };
     debug!(
         "Mediation: resolved '{}' -> {}",
@@ -437,12 +447,12 @@ fn resolve_command(
         })
         .collect();
 
-    Ok(ResolvedCommand {
+    Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
         real_path,
         intercepts,
         sandbox: entry.sandbox.clone(),
-    })
+    }))
 }
 
 /// Find the nono-shim binary.

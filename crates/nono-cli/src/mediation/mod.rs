@@ -145,6 +145,23 @@ pub struct NetworkConfig {
     /// connections to these hosts. Mutually exclusive with `block`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Hosts that may be connected to directly via SSH (port 22), bypassing
+    /// the HTTP proxy used for `allowed_hosts`.
+    ///
+    /// On macOS, Seatbelt cannot filter outbound connections by external
+    /// hostname or by non-localhost port. Any non-empty list adds a blanket
+    /// `(allow network-outbound)` rule that overrides the `(deny network*)`
+    /// from ProxyOnly mode. The per-command proxy still injects `HTTPS_PROXY`
+    /// so HTTP clients remain host-filtered; only direct-TCP clients (SSH)
+    /// bypass Seatbelt-level host filtering.
+    ///
+    /// On Linux, any non-empty list allows TCP connect on port 22 to all
+    /// hosts via Landlock (hostname filtering is unsupported). No error is
+    /// raised.
+    ///
+    /// On other platforms this field is ignored.
+    #[serde(default)]
+    pub allowed_ssh_hosts: Vec<String>,
 }
 
 /// Audit event for command logging.
@@ -205,6 +222,27 @@ mod tests {
         let config = NetworkConfig::default();
         assert!(!config.block);
         assert!(config.allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn test_network_config_allowed_ssh_hosts_deserializes() {
+        let json = r#"{
+            "allowed_hosts": ["github.com", "*.github.com"],
+            "allowed_ssh_hosts": ["github.com", "*.github.com", "gitlab.com"]
+        }"#;
+        let config: NetworkConfig = serde_json::from_str(json).expect("deserialize");
+        assert!(!config.block);
+        assert_eq!(config.allowed_hosts, vec!["github.com", "*.github.com"]);
+        assert_eq!(
+            config.allowed_ssh_hosts,
+            vec!["github.com", "*.github.com", "gitlab.com"]
+        );
+    }
+
+    #[test]
+    fn test_network_config_default_has_empty_allowed_ssh_hosts() {
+        let config = NetworkConfig::default();
+        assert!(config.allowed_ssh_hosts.is_empty());
     }
 
     #[test]

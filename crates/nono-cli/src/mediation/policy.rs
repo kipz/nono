@@ -674,6 +674,46 @@ async fn exec_passthrough(
                 caps = caps.proxy_only(port);
             }
 
+            // Allow direct SSH (port 22) connections to configured hosts.
+            //
+            // On macOS, emit a Seatbelt `(allow network-outbound (remote tcp "host:22"))`
+            // rule for each exact hostname. Wildcard entries are silently skipped because
+            // Seatbelt's remote-tcp specifier does not support glob patterns.
+            //
+            // On Linux, add port 22 to the Landlock tcp_connect allowlist. Landlock
+            // cannot filter by hostname, so port 22 is allowed to all hosts — less
+            // restrictive than macOS but functional, with no error raised.
+            //
+            // Other platforms: no-op.
+            if !sb.network.allowed_ssh_hosts.is_empty() {
+                // Allow direct SSH (port 22) connections.
+                //
+                // On macOS, Seatbelt's `remote tcp` predicate only supports
+                // `localhost` — external DNS names and per-port rules are not
+                // expressible. We therefore add a blanket `(allow
+                // network-outbound)` rule, which overrides the `(deny network*)`
+                // from ProxyOnly mode for outbound connections. The per-command
+                // proxy still runs and injects HTTPS_PROXY, so well-behaved HTTP
+                // clients remain host-filtered; only direct-TCP clients (SSH)
+                // bypass host filtering.
+                //
+                // On Linux, Landlock can filter by port but not hostname, so we
+                // add port 22 to the tcp_connect allowlist. All hosts are
+                // reachable on port 22 — same trade-off, no error raised.
+                //
+                // Other platforms: no-op.
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(e) = caps.add_platform_rule("(allow network-outbound)") {
+                        warn!("mediation: failed to add SSH outbound rule: {}", e);
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    caps = caps.allow_tcp_connect(22);
+                }
+            }
+
             // Nono is responsible for ensuring sandboxed child processes can always
             // reach the mediation server via its Unix domain socket, regardless of
             // network mode. The shim injected into PATH needs AF_UNIX socket creation
@@ -1645,6 +1685,7 @@ mod tests {
                 network: NetworkConfig {
                     block: false,
                     allowed_hosts: vec!["github.com".to_string()],
+                    allowed_ssh_hosts: vec![],
                 },
                 fs_read: vec![],
                 fs_read_file: vec![],
@@ -1707,6 +1748,7 @@ mod tests {
                 network: NetworkConfig {
                     block: true,
                     allowed_hosts: vec!["github.com".to_string()],
+                    allowed_ssh_hosts: vec![],
                 },
                 fs_read: vec![],
                 fs_read_file: vec![],

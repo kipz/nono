@@ -149,11 +149,13 @@ pub struct NetworkConfig {
     /// the HTTP proxy used for `allowed_hosts`.
     ///
     /// On macOS, Seatbelt cannot filter outbound connections by external
-    /// hostname or by non-localhost port. Any non-empty list adds a blanket
-    /// `(allow network-outbound)` rule that overrides the `(deny network*)`
-    /// from ProxyOnly mode. The per-command proxy still injects `HTTPS_PROXY`
-    /// so HTTP clients remain host-filtered; only direct-TCP clients (SSH)
-    /// bypass Seatbelt-level host filtering.
+    /// hostname or by non-localhost port. Any non-empty list adds blanket
+    /// `(allow network-outbound)`, `(allow network-bind)`, and
+    /// `(allow network-inbound)` rules that override the `(deny network*)`
+    /// from ProxyOnly mode. `network-bind` is required for SSH ControlMaster,
+    /// which binds a Unix socket at the ControlPath. The per-command proxy
+    /// still injects `HTTPS_PROXY` so HTTP clients remain host-filtered;
+    /// only direct-TCP clients (SSH) bypass Seatbelt-level host filtering.
     ///
     /// On Linux, any non-empty list allows TCP connect on port 22 to all
     /// hosts via Landlock (hostname filtering is unsupported). No error is

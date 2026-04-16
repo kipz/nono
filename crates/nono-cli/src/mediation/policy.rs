@@ -704,8 +704,17 @@ async fn exec_passthrough(
                 // Other platforms: no-op.
                 #[cfg(target_os = "macos")]
                 {
-                    if let Err(e) = caps.add_platform_rule("(allow network-outbound)") {
-                        warn!("mediation: failed to add SSH outbound rule: {}", e);
+                    for rule in [
+                        "(allow network-outbound)",
+                        // SSH ControlMaster binds a Unix socket at the ControlPath
+                        // (e.g. /tmp/ssh_mux_*). Without network-bind the bind(2)
+                        // syscall returns EPERM and the SSH connection fails.
+                        "(allow network-bind)",
+                        "(allow network-inbound)",
+                    ] {
+                        if let Err(e) = caps.add_platform_rule(rule) {
+                            warn!("mediation: failed to add SSH rule '{}': {}", rule, e);
+                        }
                     }
                 }
                 #[cfg(target_os = "linux")]

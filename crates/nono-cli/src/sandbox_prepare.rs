@@ -23,6 +23,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
 
+/// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
+fn is_claude_code_profile(profile_name: &str) -> bool {
+    if profile_name == "claude-code" {
+        return true;
+    }
+    let bases = match profile::load_profile_extends(profile_name) {
+        Some(bases) => bases,
+        None => return false,
+    };
+    bases.iter().any(|base| is_claude_code_profile(base))
+}
+
 fn collect_missing_cli_requested_paths(args: &SandboxArgs) -> Vec<String> {
     let mut missing = Vec::new();
 
@@ -302,7 +314,7 @@ pub(crate) fn should_auto_enable_claude_launch_services(
     cmd_args: &[std::ffi::OsString],
 ) -> bool {
     if args.allow_launch_services
-        || args.profile.as_deref() != Some("claude-code")
+        || !args.profile.as_deref().is_some_and(is_claude_code_profile)
         || !command_is_claude(program)
         || claude_session_has_non_browser_auth(cmd_args)
     {
@@ -1012,7 +1024,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     }
 
     #[cfg(unix)]
-    if args.profile.as_deref() == Some("claude-code") {
+    if args.profile.as_deref().is_some_and(is_claude_code_profile) {
         let home = config::validated_home()?;
         let home_path = std::path::Path::new(&home);
 
@@ -1034,48 +1046,16 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             }
         };
 
-        precreate(&home_path.join(".claude.json.lock"), false);
-        precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
-
-        // Claude Code writes ~/.claude.json atomically via temp files named
-        // ~/.claude.json.tmp.<pid>.<timestamp>.  Landlock/Seatbelt cannot
-        // grant permission for these dynamically-named files in ~/, so token
-        // refreshes silently fail and the user is logged out.
-        //
-        // Fix: redirect ~/.claude.json to ~/.claude/claude.json via a
-        // symlink.  Claude Code resolves symlinks before computing the temp
-        // file path, so temp files land in ~/.claude/ (already readwrite)
-        // instead of ~/ (not writable inside the sandbox).
-        let claude_json = home_path.join(".claude.json");
-        let claude_dir = home_path.join(".claude");
-        let redirect_target = claude_dir.join("claude.json");
-
-        if let Err(e) = std::fs::create_dir_all(&claude_dir) {
-            warn!("Failed to create ~/.claude: {}", e);
-        } else if !claude_json.is_symlink() {
-            if claude_json.exists() {
-                // Regular file present — move it into ~/.claude/ then symlink.
-                if let Err(e) = std::fs::rename(&claude_json, &redirect_target) {
-                    warn!(
-                        "Failed to move ~/.claude.json to ~/.claude/claude.json: {}",
-                        e
-                    );
-                } else if let Err(e) =
-                    std::os::unix::fs::symlink(".claude/claude.json", &claude_json)
-                {
-                    warn!("Failed to create ~/.claude.json symlink: {}", e);
-                }
-            } else {
-                // File doesn't exist yet — pre-create the target so the
-                // sandbox can attach a path rule to it, then symlink.
-                precreate(&redirect_target, false);
-                if let Err(e) = std::os::unix::fs::symlink(".claude/claude.json", &claude_json) {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        warn!("Failed to create ~/.claude.json symlink: {}", e);
-                    }
-                }
-            }
+        // Set CLAUDE_CONFIG_DIR so Claude Code writes config and lock files
+        // inside ~/.claude/ (which the sandbox already grants readwrite).
+        // This replaces the old symlink-based redirect for ~/.claude.json
+        // and also ensures token refresh temp files land in a writable dir.
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            #[allow(clippy::disallowed_methods)] // Single-threaded before fork.
+            std::env::set_var("CLAUDE_CONFIG_DIR", home_path.join(".claude"));
         }
+
+        precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
     }
 
     let (mut caps, needs_unlink_overrides) = if let Some(ref profile) = loaded_profile {

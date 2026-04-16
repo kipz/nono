@@ -12,6 +12,7 @@
 
 use crate::config::{CompiledEndpointRules, RouteConfig};
 use crate::error::{ProxyError, Result};
+use rustls::pki_types::pem::PemObject;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::debug;
@@ -235,7 +236,7 @@ fn build_tls_connector(
         let ca_path = std::path::Path::new(ca_path);
         let ca_pem = read_pem_file(ca_path, "CA certificate")?;
 
-        let certs: Vec<_> = rustls_pemfile::certs(&mut ca_pem.as_slice())
+        let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(ca_pem.as_ref())
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|e| {
                 ProxyError::Config(format!(
@@ -280,7 +281,7 @@ fn build_tls_connector(
             let key_pem = read_pem_file(key_path, "client key")?;
 
             let cert_chain: Vec<rustls::pki_types::CertificateDer> =
-                rustls_pemfile::certs(&mut cert_pem.as_slice())
+                rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_ref())
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|e| {
                         ProxyError::Config(format!(
@@ -297,19 +298,17 @@ fn build_tls_connector(
                 )));
             }
 
-            let private_key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-                .map_err(|e| {
-                    ProxyError::Config(format!(
+            let private_key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_ref())
+                .map_err(|e| match e {
+                    rustls::pki_types::pem::Error::NoItemsFound => ProxyError::Config(format!(
+                        "client key file '{}' contains no valid PEM private key",
+                        key_path.display()
+                    )),
+                    _ => ProxyError::Config(format!(
                         "failed to parse client key '{}': {}",
                         key_path.display(),
                         e
-                    ))
-                })?
-                .ok_or_else(|| {
-                    ProxyError::Config(format!(
-                        "client key file '{}' contains no valid PEM private key",
-                        key_path.display()
-                    ))
+                    )),
                 })?;
 
             builder

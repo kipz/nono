@@ -212,6 +212,12 @@ pub async fn apply(
                 ResolvedAction::Approve { script } => {
                     // Run the real binary (or script) and return the actual output.
                     // Typically used with admin: true to gate behind approval.
+                    //
+                    // No per-command sandbox is applied (None). The real binary
+                    // needs unrestricted access to system resources (e.g. macOS
+                    // Keychain via mach-lookup to securityd) that a Seatbelt
+                    // sandbox would block. Protection comes from the profile
+                    // author's deliberate choice of which commands get `approve`.
                     let resp = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
                         None => {
@@ -668,6 +674,21 @@ async fn exec_passthrough(
                 let expanded = expand_home(path);
                 caps = add_sandbox_file(caps, &expanded, nono::AccessMode::Write, &cmd_name)?;
             }
+            // macOS Keychain access: grant read to keychain DB files so the
+            // Seatbelt profile skips its mach-lookup denies for security daemons.
+            // This allows the command to retrieve credentials from the system
+            // keychain without exposing them to the agent (the token flows through
+            // the command's internal auth, not stdout).
+            #[cfg(target_os = "macos")]
+            if sb.keychain_access {
+                if let Ok(home) = std::env::var("HOME") {
+                    let login = format!("{}/Library/Keychains/login.keychain-db", home);
+                    let metadata = format!("{}/Library/Keychains/metadata.keychain-db", home);
+                    caps = add_sandbox_file(caps, &login, nono::AccessMode::Read, &cmd_name)?;
+                    caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
+                }
+            }
+
             if sb.network.block {
                 caps = caps.block_network();
             } else if let Some(port) = proxy_port {
@@ -1561,6 +1582,7 @@ mod tests {
                 fs_write: vec![],
                 fs_write_file: vec![],
                 allow_commands: vec!["ddtool".to_string()],
+                keychain_access: false,
             }),
         };
 
@@ -1651,6 +1673,7 @@ mod tests {
                 fs_write: vec![],
                 fs_write_file: vec![],
                 allow_commands: vec![],
+                keychain_access: false,
             }),
         };
 
@@ -1713,6 +1736,7 @@ mod tests {
                 fs_write: vec![],
                 fs_write_file: vec![],
                 allow_commands: vec![],
+                keychain_access: false,
             }),
         };
 
@@ -1742,6 +1766,247 @@ mod tests {
         assert!(
             !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
             "HTTPS_PROXY should not be set when block=true, got: {}",
+            resp.stdout
+        );
+    }
+
+    /// Approve action does NOT apply the per-command sandbox. The real binary
+    /// needs unrestricted access to system resources (e.g. macOS Keychain via
+    /// mach-lookup to securityd). Protection comes from the profile author's
+    /// deliberate choice of which commands get `approve`.
+    ///
+    /// We verify by checking that HTTPS_PROXY is NOT injected even when the
+    /// command has `allowed_hosts` configured, proving the sandbox was skipped.
+    #[tokio::test]
+    async fn test_approve_does_not_apply_per_command_sandbox() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec![],
+                action: ResolvedAction::Approve { script: None },
+                exit_code: 0,
+                admin: false,
+            }],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: false,
+                    allowed_hosts: vec!["api.github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "approve");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        // HTTPS_PROXY must NOT be present — approve runs without per-command sandbox.
+        assert!(
+            !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "Approve action should NOT apply per-command sandbox, but HTTPS_PROXY found: {}",
+            resp.stdout
+        );
+    }
+
+    // --- keychain_access tests ---
+
+    /// Passthrough with `keychain_access: true` and `allowed_hosts` runs
+    /// successfully and still applies network restrictions (HTTPS_PROXY).
+    /// Proves keychain_access doesn't break the sandbox or disable network filtering.
+    #[tokio::test]
+    async fn test_passthrough_keychain_access_with_allowed_hosts() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: false,
+                    allowed_hosts: vec!["api.github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: true,
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "keychain_access should not disable network restrictions, HTTPS_PROXY missing: {}",
+            resp.stdout
+        );
+    }
+
+    /// Passthrough with `keychain_access: false` (default) and `allowed_hosts`
+    /// preserves existing behavior: runs successfully with network restrictions.
+    #[tokio::test]
+    async fn test_passthrough_keychain_access_false_default() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: false,
+                    allowed_hosts: vec!["api.github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(
+            resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "Default keychain_access=false should still apply network restrictions: {}",
+            resp.stdout
+        );
+    }
+
+    /// `keychain_access: true` with `network.block: true` — block takes
+    /// precedence, no proxy started, HTTPS_PROXY not injected.
+    /// Proves keychain_access doesn't interfere with network block mode.
+    #[tokio::test]
+    async fn test_keychain_access_does_not_disable_network_block() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec!["github.com".to_string()],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: true,
+            }),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            stdin: String::new(),
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+        };
+
+        let broker = make_broker();
+        let (resp, _action_type) = apply(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert!(
+            !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
+            "keychain_access should not override network block, but HTTPS_PROXY found: {}",
             resp.stdout
         );
     }

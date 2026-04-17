@@ -100,6 +100,10 @@ pub enum InterceptAction {
     ///
     /// Useful with `admin: true` to gate sensitive-but-non-secret commands
     /// behind an approval step while still showing the real output.
+    /// No per-command sandbox is applied — the binary needs unrestricted
+    /// access to system resources (e.g. macOS Keychain via securityd).
+    /// Protection comes from the profile author's choice of which commands
+    /// and subcommands receive `approve` actions.
     /// If `script` is set, runs `sh -c "<script>"` instead of the real binary.
     Approve {
         /// Optional shell script to run instead of the real binary.
@@ -133,6 +137,19 @@ pub struct CommandSandbox {
     /// per-command sandbox. Their output stays within the sandbox.
     #[serde(default)]
     pub allow_commands: Vec<String>,
+    /// If true, grant read access to macOS Keychain database files
+    /// (`login.keychain-db`, `metadata.keychain-db`). This causes the Seatbelt
+    /// profile to skip its default mach-lookup denies for security daemons
+    /// (SecurityServer, securityd, keychaind, secd), allowing the command to
+    /// retrieve credentials from the system keychain.
+    ///
+    /// Use this for commands that authenticate via macOS Keychain (e.g. `gh`,
+    /// which stores its GitHub token there). The token flows through the command
+    /// internally — it does not appear in stdout visible to the agent.
+    ///
+    /// Default: false. macOS only; ignored on other platforms.
+    #[serde(default)]
+    pub keychain_access: bool,
 }
 
 /// Simple network config for per-command sandbox profiles.
@@ -254,5 +271,28 @@ mod tests {
         assert!(sb.fs_read_file.is_empty());
         assert!(sb.fs_write.is_empty());
         assert!(sb.fs_write_file.is_empty());
+    }
+
+    #[test]
+    fn test_command_sandbox_keychain_access_deserializes() {
+        let json = r#"{
+            "keychain_access": true,
+            "network": { "allowed_hosts": ["github.com"] }
+        }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert!(sb.keychain_access);
+    }
+
+    #[test]
+    fn test_command_sandbox_keychain_access_defaults_false() {
+        let json = r#"{ "network": { "block": false } }"#;
+        let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
+        assert!(!sb.keychain_access);
+    }
+
+    #[test]
+    fn test_command_sandbox_default_has_keychain_access_false() {
+        let sb = CommandSandbox::default();
+        assert!(!sb.keychain_access);
     }
 }

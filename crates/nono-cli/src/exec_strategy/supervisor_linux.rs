@@ -532,15 +532,130 @@ pub(super) fn handle_seccomp_notification(
     Ok(())
 }
 
+/// Decision produced by [`decide_network_notification`].
+///
+/// Split out as an explicit type so the (testable) policy logic is decoupled
+/// from the (untestable) seccomp-notify response plumbing. Callers translate
+/// `Allow` to `continue_notif(…)` and `Deny` to `respond_notif_errno(…, EACCES)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NetworkDecision {
+    /// Let the kernel proceed with the already-copied sockaddr
+    /// (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`).
+    Allow,
+    /// Fail the syscall with `EACCES`.
+    Deny,
+}
+
+/// Pure policy function: given a trapped syscall and the sockaddr the child
+/// passed in, decide whether the supervisor should allow or deny it.
+///
+/// Factored out of [`handle_network_notification`] so it can be unit-tested
+/// without a live seccomp-notify fd.
+///
+/// Policy:
+///
+/// 1. **Pathname `AF_UNIX` is allowed** (issue #685). Filesystem-backed Unix
+///    sockets like `/tmp/test.sock` are IPC bound to a real path, so
+///    Landlock's filesystem rules decide access: a bind/connect succeeds
+///    only if the path is inside an allowed grant, and fails otherwise.
+///    This restores parity with Landlock V4+, where `LANDLOCK_ACCESS_NET_*`
+///    only scopes TCP and pathname `AF_UNIX` is governed by fs rules.
+///
+///    **Abstract and unnamed `AF_UNIX` are denied.** The abstract namespace
+///    (`sun_path[0] == '\0'`) lives outside the filesystem, so Landlock has
+///    no way to mediate it — a blanket allow would open a covert IPC
+///    channel that bypasses the sandbox. Unnamed sockets (addrlen == 2)
+///    have no path to check and no use case that motivated this fix.
+///    Future work (#696) may add an explicit allowlist for abstract paths.
+///
+/// 2. For `AF_INET`/`AF_INET6`:
+///    - `connect()` is allowed only to `127.0.0.1:proxy_port` (the nono proxy).
+///    - `bind()` is allowed only on ports in `proxy_bind_ports`.
+///    - Everything else is denied.
+pub(super) fn decide_network_notification(
+    syscall: i32,
+    sockaddr: &nono::sandbox::SockaddrInfo,
+    config: &SupervisorConfig<'_>,
+) -> NetworkDecision {
+    use nono::sandbox::{UnixSocketKind, SYS_BIND, SYS_CONNECT};
+
+    // AF_UNIX: allow only filesystem-backed (pathname) sockets — Landlock's
+    // filesystem rules will then decide whether the specific path is
+    // reachable. Abstract/unnamed sockets bypass fs rules, so deny them.
+    if sockaddr.family == libc::AF_UNIX as u16 {
+        match sockaddr.unix_kind {
+            Some(UnixSocketKind::Pathname) => {
+                debug!(
+                    "Proxy seccomp: allowing AF_UNIX pathname syscall (nr={}); \
+                     governed by Landlock fs rules",
+                    syscall
+                );
+                return NetworkDecision::Allow;
+            }
+            Some(UnixSocketKind::Abstract) => {
+                debug!(
+                    "Proxy seccomp: denying AF_UNIX abstract-namespace syscall (nr={}); \
+                     not mediated by Landlock fs rules",
+                    syscall
+                );
+                return NetworkDecision::Deny;
+            }
+            Some(UnixSocketKind::Unnamed) | None => {
+                debug!(
+                    "Proxy seccomp: denying AF_UNIX unnamed/unclassified syscall (nr={})",
+                    syscall
+                );
+                return NetworkDecision::Deny;
+            }
+        }
+    }
+
+    match syscall {
+        SYS_CONNECT => {
+            // Allow connect only to loopback + proxy port
+            if sockaddr.is_loopback && sockaddr.port == config.proxy_port {
+                debug!(
+                    "Proxy seccomp: allowing connect to loopback:{}",
+                    sockaddr.port
+                );
+                NetworkDecision::Allow
+            } else {
+                debug!(
+                    "Proxy seccomp: denying connect to family={} port={} loopback={}",
+                    sockaddr.family, sockaddr.port, sockaddr.is_loopback
+                );
+                NetworkDecision::Deny
+            }
+        }
+        SYS_BIND => {
+            // Allow bind only on configured bind ports
+            if config.proxy_bind_ports.contains(&sockaddr.port) {
+                debug!("Proxy seccomp: allowing bind on port {}", sockaddr.port);
+                NetworkDecision::Allow
+            } else {
+                debug!(
+                    "Proxy seccomp: denying bind on port {} (allowed: {:?})",
+                    sockaddr.port, config.proxy_bind_ports
+                );
+                NetworkDecision::Deny
+            }
+        }
+        other => {
+            warn!(
+                "Unexpected syscall {} in proxy seccomp handler, denying",
+                other
+            );
+            NetworkDecision::Deny
+        }
+    }
+}
+
 /// Handle a seccomp notification for connect() or bind() syscalls.
 ///
 /// This is the proxy-only fallback for kernels without Landlock AccessNet.
 /// The BPF filter routes connect/bind to USER_NOTIF; this function reads
-/// the sockaddr from the child's memory and allows or denies based on
-/// the configured proxy port and bind ports.
-///
-/// For connect: allow only loopback + proxy port. Deny everything else.
-/// For bind: allow only ports in the bind_ports list. Deny everything else.
+/// the sockaddr from the child's memory and delegates the allow/deny
+/// decision to [`decide_network_notification`].
 ///
 /// Uses SECCOMP_USER_NOTIF_FLAG_CONTINUE on approval (safe for connect/bind
 /// because the kernel has already copied sockaddr into kernel memory).
@@ -551,7 +666,7 @@ pub(super) fn handle_network_notification(
 ) -> nono::error::Result<()> {
     use nono::sandbox::{
         continue_notif, deny_notif, notif_id_valid, read_notif_sockaddr, recv_notif,
-        respond_notif_errno, SYS_BIND, SYS_CONNECT,
+        respond_notif_errno,
     };
 
     let notif = recv_notif(notify_fd)?;
@@ -579,58 +694,20 @@ pub(super) fn handle_network_notification(
         return Ok(());
     }
 
-    let allowed = match notif.data.nr {
-        SYS_CONNECT => {
-            // Allow connect only to loopback + proxy port
-            let port_match = sockaddr.port == config.proxy_port;
-            if sockaddr.is_loopback && port_match {
-                debug!(
-                    "Proxy seccomp: allowing connect to loopback:{}",
-                    sockaddr.port
-                );
-                true
-            } else {
-                debug!(
-                    "Proxy seccomp: denying connect to family={} port={} loopback={}",
-                    sockaddr.family, sockaddr.port, sockaddr.is_loopback
-                );
-                false
+    match decide_network_notification(notif.data.nr, &sockaddr, config) {
+        NetworkDecision::Allow => {
+            // SECCOMP_USER_NOTIF_FLAG_CONTINUE: let the kernel proceed with its
+            // already-copied sockaddr. Safe for connect/bind (move_addr_to_kernel).
+            if let Err(e) = continue_notif(notify_fd, notif.id) {
+                debug!("continue_notif failed for network notification: {}", e);
+                // Must respond to avoid leaving the child blocked. Propagate if
+                // deny also fails — the notification is orphaned.
+                return deny_notif(notify_fd, notif.id);
             }
         }
-        SYS_BIND => {
-            // Allow bind only on configured bind ports
-            let port_allowed = config.proxy_bind_ports.contains(&sockaddr.port);
-            if port_allowed {
-                debug!("Proxy seccomp: allowing bind on port {}", sockaddr.port);
-                true
-            } else {
-                debug!(
-                    "Proxy seccomp: denying bind on port {} (allowed: {:?})",
-                    sockaddr.port, config.proxy_bind_ports
-                );
-                false
-            }
+        NetworkDecision::Deny => {
+            respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
         }
-        other => {
-            warn!(
-                "Unexpected syscall {} in proxy seccomp handler, denying",
-                other
-            );
-            false
-        }
-    };
-
-    if allowed {
-        // SECCOMP_USER_NOTIF_FLAG_CONTINUE: let the kernel proceed with its
-        // already-copied sockaddr. Safe for connect/bind (move_addr_to_kernel).
-        if let Err(e) = continue_notif(notify_fd, notif.id) {
-            debug!("continue_notif failed for network notification: {}", e);
-            // Must respond to avoid leaving the child blocked. Propagate if
-            // deny also fails — the notification is orphaned.
-            return deny_notif(notify_fd, notif.id);
-        }
-    } else {
-        respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
     }
 
     Ok(())
@@ -860,5 +937,188 @@ mod tests {
             ),
             InitialCapabilityMatch::Insufficient(_)
         ));
+    }
+
+    // --- decide_network_notification tests (issue #685) ---------------------
+    //
+    // These exercise the proxy-only seccomp fallback path that runs on
+    // Landlock < V4 kernels. The key invariant: `AF_UNIX` must be allowed
+    // through so Landlock's filesystem rules decide access, matching V4+
+    // behavior where `LANDLOCK_ACCESS_NET_*` only scopes TCP.
+
+    mod network_decision {
+        use super::super::{decide_network_notification, NetworkDecision, SupervisorConfig};
+        use nix::libc;
+        use nono::sandbox::{SockaddrInfo, UnixSocketKind, SYS_BIND, SYS_CONNECT};
+        use nono::supervisor::{ApprovalDecision, CapabilityRequest};
+        use nono::ApprovalBackend;
+
+        struct DenyAllBackend;
+        impl ApprovalBackend for DenyAllBackend {
+            fn request_capability(
+                &self,
+                _req: &CapabilityRequest,
+            ) -> nono::Result<ApprovalDecision> {
+                Ok(ApprovalDecision::Denied {
+                    reason: "test".to_string(),
+                })
+            }
+            fn backend_name(&self) -> &str {
+                "deny-all-test"
+            }
+        }
+
+        fn make_config<'a>(
+            backend: &'a DenyAllBackend,
+            proxy_port: u16,
+            proxy_bind_ports: Vec<u16>,
+        ) -> SupervisorConfig<'a> {
+            SupervisorConfig {
+                protected_roots: &[],
+                approval_backend: backend,
+                session_id: "test-net-decision",
+                attach_initial_client: false,
+                detach_sequence: None,
+                open_url_origins: &[],
+                open_url_allow_localhost: false,
+                allow_launch_services_active: false,
+                proxy_port,
+                proxy_bind_ports,
+            }
+        }
+
+        fn unix_pathname() -> SockaddrInfo {
+            // Matches what read_notif_sockaddr() produces for a
+            // filesystem-backed AF_UNIX socket (e.g. /tmp/test.sock).
+            SockaddrInfo {
+                family: libc::AF_UNIX as u16,
+                port: 0,
+                is_loopback: true,
+                unix_kind: Some(UnixSocketKind::Pathname),
+            }
+        }
+
+        fn unix_abstract() -> SockaddrInfo {
+            SockaddrInfo {
+                family: libc::AF_UNIX as u16,
+                port: 0,
+                is_loopback: true,
+                unix_kind: Some(UnixSocketKind::Abstract),
+            }
+        }
+
+        fn unix_unnamed() -> SockaddrInfo {
+            SockaddrInfo {
+                family: libc::AF_UNIX as u16,
+                port: 0,
+                is_loopback: true,
+                unix_kind: Some(UnixSocketKind::Unnamed),
+            }
+        }
+
+        fn inet_loopback(port: u16) -> SockaddrInfo {
+            SockaddrInfo {
+                family: libc::AF_INET as u16,
+                port,
+                is_loopback: true,
+                unix_kind: None,
+            }
+        }
+
+        fn inet_external(port: u16) -> SockaddrInfo {
+            SockaddrInfo {
+                family: libc::AF_INET as u16,
+                port,
+                is_loopback: false,
+                unix_kind: None,
+            }
+        }
+
+        /// Regression test for #685: pathname `bind(AF_UNIX, "/tmp/…")` was
+        /// being denied because `SockaddrInfo.port` is 0 for unix sockets
+        /// and port 0 is never in `proxy_bind_ports`. It must now allow so
+        /// Landlock's filesystem rules decide whether the path is reachable.
+        #[test]
+        fn af_unix_pathname_bind_is_allowed() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, Vec::new());
+            assert_eq!(
+                decide_network_notification(SYS_BIND, &unix_pathname(), &config),
+                NetworkDecision::Allow,
+                "pathname AF_UNIX bind must be allowed so Landlock fs rules govern access"
+            );
+        }
+
+        /// Regression test for #685: pathname `connect(AF_UNIX, "/tmp/…")`
+        /// was the failure mode for `tsx`'s IPC pipe and other runtimes.
+        #[test]
+        fn af_unix_pathname_connect_is_allowed() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 8080, Vec::new());
+            assert_eq!(
+                decide_network_notification(SYS_CONNECT, &unix_pathname(), &config),
+                NetworkDecision::Allow,
+                "pathname AF_UNIX connect must be allowed independent of proxy_port"
+            );
+        }
+
+        /// Scope-limit test: abstract-namespace AF_UNIX (`sun_path[0] == 0`)
+        /// is *not* governed by Landlock filesystem rules, so a blanket
+        /// allow would open a covert IPC channel that bypasses the sandbox.
+        /// #685 is explicitly about filesystem-path sockets; abstract stays
+        /// denied pending #696 (explicit allowlist).
+        #[test]
+        fn af_unix_abstract_is_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, Vec::new());
+            assert_eq!(
+                decide_network_notification(SYS_BIND, &unix_abstract(), &config),
+                NetworkDecision::Deny,
+                "abstract AF_UNIX must be denied — Landlock fs rules do not reach it"
+            );
+            assert_eq!(
+                decide_network_notification(SYS_CONNECT, &unix_abstract(), &config),
+                NetworkDecision::Deny,
+            );
+        }
+
+        /// Unnamed AF_UNIX (`addrlen == 2`) has no path to check, so fail
+        /// closed — consistent with abstract handling and outside #685's
+        /// scope.
+        #[test]
+        fn af_unix_unnamed_is_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, Vec::new());
+            assert_eq!(
+                decide_network_notification(SYS_BIND, &unix_unnamed(), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        /// Security-critical: the `AF_UNIX → Allow` short-circuit must not
+        /// leak into AF_INET. A child connecting to an external host on
+        /// `proxy_port` must still be denied — otherwise the proxy could be
+        /// bypassed.
+        #[test]
+        fn af_inet_connect_to_external_host_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 8080, Vec::new());
+            assert_eq!(
+                decide_network_notification(SYS_CONNECT, &inet_external(8080), &config),
+                NetworkDecision::Deny
+            );
+        }
+
+        /// Proves the refactor didn't collapse AF_INET bind to unconditional
+        /// Allow. A port not in `proxy_bind_ports` must still fail.
+        #[test]
+        fn af_inet_bind_on_disallowed_port_denied() {
+            let backend = DenyAllBackend;
+            let config = make_config(&backend, 0, vec![3000]);
+            assert_eq!(
+                decide_network_notification(SYS_BIND, &inet_loopback(4000), &config),
+                NetworkDecision::Deny
+            );
+        }
     }
 }

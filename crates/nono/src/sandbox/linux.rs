@@ -1522,6 +1522,49 @@ pub fn deny_notif(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
 // port on localhost, blocking all other network activity.
 // ==========================================================================
 
+/// Kind of AF_UNIX socket, determined from `sun_path` and `addrlen`.
+///
+/// See `unix(7)`. This distinction matters for policy because only
+/// [`UnixSocketKind::Pathname`] sockets are governed by filesystem rules.
+/// Abstract and unnamed sockets live in a separate namespace that Landlock's
+/// filesystem rules cannot reach, so the supervisor must decide them
+/// explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixSocketKind {
+    /// Filesystem-backed: `sun_path` is a null-terminated filesystem path
+    /// (e.g. `/tmp/test.sock`). Access is governed by filesystem permissions
+    /// and — in our case — by Landlock's filesystem rules.
+    Pathname,
+    /// Linux abstract namespace: `sun_path[0] == '\0'` and bytes `[1..]` form
+    /// the abstract name. Not backed by any filesystem, so Landlock's
+    /// filesystem rules do not apply.
+    Abstract,
+    /// Unnamed socket: `addrlen` is `offsetof(sockaddr_un, sun_path)` (i.e.
+    /// 2 — `sa_family` only). Produced by `socketpair(2)` and autobinding
+    /// `bind(fd, NULL, 2)`.
+    Unnamed,
+}
+
+/// Classify an AF_UNIX sockaddr buffer.
+///
+/// `sun_path_first_byte` should be `buf[2]` for `addrlen >= 3`, or `None` if
+/// the sockaddr is only 2 bytes (unnamed). Pure function so it is unit-tested
+/// without the `/proc/PID/mem` plumbing.
+#[must_use]
+pub fn classify_af_unix(addrlen: u64, sun_path_first_byte: Option<u8>) -> UnixSocketKind {
+    // offsetof(sockaddr_un, sun_path) == 2 on Linux.
+    if addrlen <= 2 {
+        return UnixSocketKind::Unnamed;
+    }
+    match sun_path_first_byte {
+        Some(0) => UnixSocketKind::Abstract,
+        Some(_) => UnixSocketKind::Pathname,
+        // addrlen > 2 but we couldn't read sun_path[0] — treat as unnamed
+        // (fail-closed: callers that deny non-pathname will deny this too).
+        None => UnixSocketKind::Unnamed,
+    }
+}
+
 /// Parsed sockaddr from a seccomp notification.
 ///
 /// Extracted from `/proc/PID/mem` at the pointer in the connect/bind args.
@@ -1533,6 +1576,9 @@ pub struct SockaddrInfo {
     pub port: u16,
     /// Whether the address is a loopback address (127.0.0.1 or ::1)
     pub is_loopback: bool,
+    /// For `AF_UNIX`: kind of socket (pathname / abstract / unnamed). `None`
+    /// for non-UNIX address families.
+    pub unix_kind: Option<UnixSocketKind>,
 }
 
 /// Seccomp network fallback mode determined during sandbox apply.
@@ -1585,22 +1631,31 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
 
 /// Build a BPF filter for proxy-only network mode.
 ///
-/// Routes connect() to `SECCOMP_RET_USER_NOTIF` so the supervisor can
-/// inspect the sockaddr and allow only localhost:proxy_port.
+/// Routes `connect()` and `bind()` to `SECCOMP_RET_USER_NOTIF` so the
+/// supervisor can inspect the sockaddr and make a per-family decision:
 ///
-/// When `has_bind_ports` is true, bind() is also routed to `USER_NOTIF`.
-/// Otherwise, bind() is denied with EACCES.
+/// - `AF_INET`/`AF_INET6`: allow connect to `localhost:proxy_port`;
+///   allow bind on ports in the configured bind-ports list; deny others.
+/// - pathname `AF_UNIX` (#685): allow both connect and bind. Landlock's
+///   filesystem rules are the upstream gate on which paths are reachable.
+/// - abstract/unnamed `AF_UNIX`: deny (see `decide_network_notification`).
 ///
-/// socket() is allowed only for AF_UNIX, AF_INET, AF_INET6.
-/// socketpair() is allowed only for AF_UNIX.
-/// io_uring_setup() is denied.
+/// `has_bind_ports` is retained for API compatibility but no longer
+/// influences filter routing — a previous version routed bind directly to
+/// ERRNO when no TCP bind ports were configured, which unconditionally
+/// failed AF_UNIX bind (regression on Landlock V2 kernels where this
+/// fallback fires). The supervisor is the sole arbiter now.
+///
+/// `socket()` is allowed only for `AF_UNIX`, `AF_INET`, `AF_INET6`.
+/// `socketpair()` is allowed only for `AF_UNIX`.
+/// `io_uring_setup()` is denied.
 ///
 /// Instruction layout (19 instructions, jt = jump offset from next insn):
 /// ```text
 ///  0: ld  [nr]
 ///  1: jeq SYS_SOCKET     jt=+6  (-> 8: load socket family)
 ///  2: jeq SYS_CONNECT    jt=+13 (-> 16: notify)
-///  3: jeq SYS_BIND       jt=+13 (-> 17: bind_action)
+///  3: jeq SYS_BIND       jt=+13 (-> 17: notify)
 ///  4: jeq SYS_SOCKETPAIR jt=+8  (-> 13: load socketpair family)
 ///  5: jeq SYS_IO_URING   jt=+1  (-> 7: errno)
 ///  6: ret ALLOW
@@ -1614,17 +1669,22 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
 /// 14: jeq AF_UNIX  jt=+3 (-> 18: allow)
 /// 15: ret ERRNO(EACCES)         ; bad socketpair family
 /// 16: ret USER_NOTIF            ; connect
-/// 17: ret bind_action           ; bind (USER_NOTIF or ERRNO)
+/// 17: ret USER_NOTIF            ; bind
 /// 18: ret ALLOW                 ; allowed socket/socketpair
 /// ```
-fn build_seccomp_proxy_filter(has_bind_ports: bool) -> Vec<SockFilterInsn> {
+fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
 
-    let bind_action = if has_bind_ports {
-        SECCOMP_RET_USER_NOTIF
-    } else {
-        errno_ret
-    };
+    // bind() always routes to USER_NOTIF so the supervisor can make the
+    // per-family decision (deny AF_INET to non-allowed TCP ports; allow
+    // pathname AF_UNIX per issue #685). The previous variant took a
+    // has_bind_ports short-circuit to ERRNO when no TCP bind ports were
+    // configured, which unconditionally failed AF_UNIX bind — a real
+    // regression that only manifested on Landlock V2 kernels (where this
+    // seccomp fallback fires). The has_bind_ports parameter is retained
+    // for API compatibility but no longer gates filter routing; the
+    // supervisor's `decide_network_notification` is the sole arbiter.
+    let bind_action = SECCOMP_RET_USER_NOTIF;
 
     // Target instruction index table (jt/jf are offsets from next insn):
     //  0: ld [nr]
@@ -1932,6 +1992,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 family,
                 port,
                 is_loopback,
+                unix_kind: None,
             })
         }
         libc::AF_INET6 => {
@@ -1955,17 +2016,25 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 family,
                 port,
                 is_loopback: is_loopback || is_v4_mapped_loopback,
+                unix_kind: None,
             })
         }
-        libc::AF_UNIX => Ok(SockaddrInfo {
-            family,
-            port: 0,
-            is_loopback: true, // Unix sockets are always local
-        }),
+        libc::AF_UNIX => {
+            // sun_path starts at offset 2. buf has `n` bytes total; we need
+            // addrlen to distinguish unnamed from path-bearing sockets.
+            let sun_path_first_byte = if n >= 3 { Some(buf[2]) } else { None };
+            Ok(SockaddrInfo {
+                family,
+                port: 0,
+                is_loopback: true, // Unix sockets are always local
+                unix_kind: Some(classify_af_unix(addrlen, sun_path_first_byte)),
+            })
+        }
         _ => Ok(SockaddrInfo {
             family,
             port: 0,
             is_loopback: false,
+            unix_kind: None,
         }),
     }
 }
@@ -2687,20 +2756,31 @@ mod tests {
         assert_eq!(filter[16].code, BPF_RET | BPF_K);
         assert_eq!(filter[16].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 17 should be USER_NOTIF (bind with has_bind_ports=true)
+        // Instruction 17 should be USER_NOTIF (bind; supervisor decides).
         assert_eq!(filter[17].code, BPF_RET | BPF_K);
         assert_eq!(filter[17].k, SECCOMP_RET_USER_NOTIF);
     }
 
+    /// Regression test for the Landlock V2 + `has_bind_ports=false`
+    /// scenario (issue #685): even with no TCP bind ports configured,
+    /// bind() must route to USER_NOTIF so the supervisor can allow
+    /// pathname AF_UNIX bind. Previously the filter short-circuited to
+    /// ERRNO in this branch, unconditionally failing AF_UNIX bind.
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
         let filter = build_seccomp_proxy_filter(false);
         assert_eq!(filter.len(), 19);
 
-        // Instruction 17 should be ERRNO (bind with has_bind_ports=false)
+        // Instruction 17 (bind) must ALSO route to USER_NOTIF — the
+        // supervisor is the sole gate. This is the fix: previously this
+        // emitted ERRNO, which skipped the supervisor entirely.
         assert_eq!(filter[17].code, BPF_RET | BPF_K);
-        let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
-        assert_eq!(filter[17].k, errno_ret);
+        assert_eq!(
+            filter[17].k,
+            SECCOMP_RET_USER_NOTIF,
+            "bind must route to USER_NOTIF regardless of has_bind_ports so \
+             the supervisor can permit AF_UNIX pathname bind (#685)"
+        );
     }
 
     #[test]
@@ -2709,6 +2789,7 @@ mod tests {
             family: libc::AF_INET as u16,
             port: 8080,
             is_loopback: true,
+            unix_kind: None,
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 8080);
@@ -2720,6 +2801,7 @@ mod tests {
             family: libc::AF_INET6 as u16,
             port: 443,
             is_loopback: true,
+            unix_kind: None,
         };
         assert!(info.is_loopback);
     }
@@ -2730,6 +2812,7 @@ mod tests {
             family: libc::AF_INET as u16,
             port: 80,
             is_loopback: false,
+            unix_kind: None,
         };
         assert!(!info.is_loopback);
     }
@@ -2740,9 +2823,53 @@ mod tests {
             family: libc::AF_UNIX as u16,
             port: 0,
             is_loopback: true,
+            unix_kind: Some(UnixSocketKind::Pathname),
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 0);
+    }
+
+    // --- classify_af_unix tests (issue #685) --------------------------------
+
+    #[test]
+    fn test_classify_af_unix_pathname() {
+        // `/tmp/test.sock` — first byte is '/'
+        assert_eq!(
+            classify_af_unix(14, Some(b'/')),
+            UnixSocketKind::Pathname,
+            "non-null first byte => pathname"
+        );
+    }
+
+    #[test]
+    fn test_classify_af_unix_abstract() {
+        // \0foo — first byte is null (Linux abstract namespace)
+        assert_eq!(
+            classify_af_unix(6, Some(0)),
+            UnixSocketKind::Abstract,
+            "null first byte => abstract namespace"
+        );
+    }
+
+    #[test]
+    fn test_classify_af_unix_unnamed() {
+        // addrlen == 2: only sa_family, no sun_path
+        assert_eq!(
+            classify_af_unix(2, None),
+            UnixSocketKind::Unnamed,
+            "addrlen <= 2 => unnamed"
+        );
+    }
+
+    #[test]
+    fn test_classify_af_unix_fails_closed_on_short_read() {
+        // Defensive: if we couldn't read sun_path[0] despite addrlen > 2
+        // (unexpected), treat as unnamed so policy fails closed.
+        assert_eq!(
+            classify_af_unix(10, None),
+            UnixSocketKind::Unnamed,
+            "missing sun_path byte => fail-closed to unnamed"
+        );
     }
 
     /// Integration test: seccomp proxy filter blocks connect to non-proxy ports
@@ -2929,6 +3056,157 @@ mod tests {
         );
     }
 
+    /// End-to-end regression test for issue #685: a pathname `AF_UNIX`
+    /// `bind(2)` must succeed under the proxy-only seccomp filter even
+    /// when `has_bind_ports=false`. Previously the filter short-circuited
+    /// bind() to `EACCES` in that configuration, unconditionally failing
+    /// AF_UNIX bind regardless of what the supervisor would have decided.
+    ///
+    /// Structure mirrors `test_seccomp_proxy_filter_allows_proxy_port_blocks_others`:
+    /// fork, install filter in the child, run a minimal supervisor-mimic
+    /// handler in a child thread, try the bind, report result over a pipe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_seccomp_proxy_filter_allows_af_unix_bind_without_bind_ports() {
+        use std::io::Read;
+
+        // Unique per-test socket path under /tmp so parallel tests don't
+        // collide.
+        let sock_path = format!(
+            "/tmp/nono-integ-af-unix-bind-{}.sock",
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&sock_path);
+
+        let mut report_pipe = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(report_pipe.as_mut_ptr()) }, 0, "pipe()");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork() failed");
+
+        if pid == 0 {
+            // CHILD
+            unsafe { libc::close(report_pipe[0]) };
+
+            // Install filter with `has_bind_ports=false` — this is the
+            // exact configuration the #685 bug manifested under.
+            let notify_fd = match install_seccomp_proxy_filter(false) {
+                Ok(fd) => fd,
+                Err(_) => {
+                    // Seccomp unavailable — skip via sentinel.
+                    let sentinel: [u8; 2] = [2, 2];
+                    unsafe {
+                        libc::write(
+                            report_pipe[1],
+                            sentinel.as_ptr().cast(),
+                            sentinel.len(),
+                        );
+                        libc::close(report_pipe[1]);
+                        libc::_exit(0);
+                    }
+                }
+            };
+
+            let notify_raw = {
+                use std::os::fd::AsRawFd;
+                notify_fd.as_raw_fd()
+            };
+
+            // Minimal supervisor mimic: for each bind notification, allow
+            // pathname AF_UNIX, deny everything else. Matches the policy
+            // baked into `decide_network_notification` at PR A commit 1.
+            let handler = std::thread::spawn(move || {
+                for _ in 0..1 {
+                    let notif = match recv_notif(notify_raw) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let info = match read_notif_sockaddr(
+                        notif.pid,
+                        notif.data.args[1],
+                        notif.data.args[2],
+                    ) {
+                        Ok(i) => i,
+                        Err(_) => {
+                            let _ = deny_notif(notify_raw, notif.id);
+                            continue;
+                        }
+                    };
+                    let is_pathname_unix = info.family == libc::AF_UNIX as u16
+                        && matches!(info.unix_kind, Some(UnixSocketKind::Pathname));
+                    if is_pathname_unix {
+                        let _ = continue_notif(notify_raw, notif.id);
+                    } else {
+                        let _ = respond_notif_errno(notify_raw, notif.id, libc::EACCES);
+                    }
+                }
+            });
+
+            // Attempt bind(AF_UNIX) at the pathname socket.
+            let sock = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            addr.sun_family = libc::AF_UNIX as u16;
+            let bytes = sock_path.as_bytes();
+            assert!(bytes.len() < addr.sun_path.len(), "test path too long");
+            for (i, &b) in bytes.iter().enumerate() {
+                addr.sun_path[i] = b as libc::c_char;
+            }
+            let addrlen = (std::mem::size_of::<u16>() + bytes.len() + 1) as libc::socklen_t;
+
+            let rc = unsafe {
+                libc::bind(
+                    sock,
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    addrlen,
+                )
+            };
+            let errno = if rc < 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                0
+            };
+            unsafe { libc::close(sock) };
+
+            let _ = handler.join();
+            // Clean up the socket file the child just created.
+            let _ = std::fs::remove_file(&sock_path);
+
+            let payload: [u8; 2] = [
+                if rc < 0 { 1 } else { 0 },
+                errno.unsigned_abs().min(255) as u8,
+            ];
+            unsafe {
+                libc::write(report_pipe[1], payload.as_ptr().cast(), payload.len());
+                libc::close(report_pipe[1]);
+                libc::_exit(0);
+            }
+        }
+
+        // PARENT
+        unsafe { libc::close(report_pipe[1]) };
+
+        // Wait for child.
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        use std::os::fd::FromRawFd;
+        let mut pipe_read = unsafe { std::fs::File::from_raw_fd(report_pipe[0]) };
+        let mut buf = [0u8; 2];
+        let n = pipe_read.read(&mut buf).expect("read from pipe");
+
+        if n == 2 && buf[0] == 2 && buf[1] == 2 {
+            // Skip sentinel: seccomp not available.
+            return;
+        }
+        assert_eq!(n, 2, "expected 2 bytes from child, got {n}");
+        assert_eq!(
+            buf[0], 0,
+            "AF_UNIX bind must succeed under proxy filter with \
+             has_bind_ports=false (errno={})",
+            buf[1]
+        );
+    }
+
     /// Integration test: ProxyOnly + Landlock V4+ does NOT install seccomp
     /// proxy filter (Landlock handles networking natively).
     ///
@@ -3022,11 +3300,14 @@ mod tests {
         );
     }
 
-    /// Integration test: seccomp proxy filter blocks bind() when no bind_ports.
-    ///
-    /// Forks a child that installs the proxy filter with has_bind_ports=false,
-    /// then attempts to bind a socket. The bind should fail with EACCES directly
-    /// from the BPF filter (no notification, no handler needed).
+    /// Integration test: under the proxy filter with `has_bind_ports=false`,
+    /// an `AF_INET` `bind(2)` must still be denied — but now the denial
+    /// comes from the supervisor (via `USER_NOTIF`), not from the BPF
+    /// filter directly. Issue #685 required the filter to route bind to
+    /// USER_NOTIF regardless of `has_bind_ports` so pathname `AF_UNIX`
+    /// bind can be allowed (see `test_seccomp_proxy_filter_allows_af_unix_bind_without_bind_ports`);
+    /// this test pins the complementary invariant that `AF_INET` bind is
+    /// still rejected when the supervisor's policy says so.
     #[cfg(target_os = "linux")]
     #[test]
     fn test_seccomp_proxy_filter_blocks_bind_without_bind_ports() {
@@ -3040,40 +3321,13 @@ mod tests {
         if pid == 0 {
             unsafe { libc::close(report_pipe[0]) };
 
-            // Install proxy filter with bind disabled (returns ERRNO, not USER_NOTIF)
-            // No notification handler needed — BPF returns EACCES directly.
-            match install_seccomp_proxy_filter(false) {
-                Ok(_notify_fd) => {
-                    // Attempt bind on an ephemeral port
-                    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-
-                    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-                    addr.sin_family = libc::AF_INET as u16;
-                    addr.sin_port = 0; // ephemeral
-                    addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
-
-                    let bind_result = unsafe {
-                        libc::bind(
-                            sock,
-                            (&addr as *const libc::sockaddr_in).cast(),
-                            std::mem::size_of::<libc::sockaddr_in>() as u32,
-                        )
-                    };
-                    let errno = if bind_result < 0 {
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) as u8
-                    } else {
-                        0
-                    };
-
-                    unsafe {
-                        libc::close(sock);
-                        libc::write(report_pipe[1], &errno as *const u8 as _, 1);
-                        libc::close(report_pipe[1]);
-                        libc::_exit(0);
-                    }
-                }
+            // Install proxy filter with has_bind_ports=false. As of the
+            // #685 fix, bind() now routes to USER_NOTIF — so a handler
+            // IS required even for the "block all bind" policy.
+            let notify_fd = match install_seccomp_proxy_filter(false) {
+                Ok(fd) => fd,
                 Err(_) => {
-                    // Seccomp not available — skip
+                    // Seccomp not available — skip.
                     let skip: u8 = 255;
                     unsafe {
                         libc::write(report_pipe[1], &skip as *const u8 as _, 1);
@@ -3081,6 +3335,50 @@ mod tests {
                         libc::_exit(0);
                     }
                 }
+            };
+            let notify_raw = {
+                use std::os::fd::AsRawFd;
+                notify_fd.as_raw_fd()
+            };
+
+            // Supervisor mimic: deny every bind notification with EACCES.
+            // Models the "no bind ports configured → deny AF_INET bind"
+            // policy that `decide_network_notification` implements in
+            // the real supervisor when `config.proxy_bind_ports` is empty.
+            let handler = std::thread::spawn(move || {
+                for _ in 0..1 {
+                    let notif = match recv_notif(notify_raw) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let _ = respond_notif_errno(notify_raw, notif.id, libc::EACCES);
+                }
+            });
+
+            let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            addr.sin_family = libc::AF_INET as u16;
+            addr.sin_port = 0;
+            addr.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            let bind_result = unsafe {
+                libc::bind(
+                    sock,
+                    (&addr as *const libc::sockaddr_in).cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as u32,
+                )
+            };
+            let errno = if bind_result < 0 {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1) as u8
+            } else {
+                0
+            };
+            unsafe { libc::close(sock) };
+            let _ = handler.join();
+
+            unsafe {
+                libc::write(report_pipe[1], &errno as *const u8 as _, 1);
+                libc::close(report_pipe[1]);
+                libc::_exit(0);
             }
         }
 
@@ -3106,7 +3404,8 @@ mod tests {
         assert_eq!(
             buf[0],
             libc::EACCES as u8,
-            "bind() should fail with EACCES when has_bind_ports=false, got errno={}",
+            "AF_INET bind() must still receive EACCES (from supervisor, not filter) \
+             when has_bind_ports=false, got errno={}",
             buf[0]
         );
     }

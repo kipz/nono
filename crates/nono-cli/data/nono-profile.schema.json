@@ -104,7 +104,7 @@
     "unsafe_macos_seatbelt_rules": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules applied verbatim to the sandbox policy. Each entry must be a valid S-expression, e.g. \"(allow iokit-open)\". Rules are validated at load time and rejected if malformed. Ignored on Linux. Surfaced prominently in 'nono policy profile' output. If a rule pattern becomes common, prefer promoting it to a typed first-class capability instead."
+      "description": "macOS-only. Expert escape hatch: raw Seatbelt S-expression rules applied verbatim to the sandbox policy. Each entry must be a valid S-expression, e.g. \"(allow iokit-open)\". Rules are validated at load time and rejected if malformed. Ignored on Linux. Surfaced prominently in 'nono profile show' output. If a rule pattern becomes common, prefer promoting it to a typed first-class capability instead."
     }
   },
   "$defs": {

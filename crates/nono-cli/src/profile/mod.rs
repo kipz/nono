@@ -1244,7 +1244,7 @@ pub struct Profile {
     /// Expert escape hatch for capability gaps. Each entry must be a valid Seatbelt
     /// S-expression such as `(allow iokit-open)`. Rules are validated at load time
     /// and rejected if malformed. Ignored on Linux. Prominently surfaced in
-    /// `nono policy profile` output when present so it is obvious a profile uses
+    /// `nono profile show` output when present so it is obvious a profile uses
     /// raw platform rules.
     ///
     /// This field is intentionally named `unsafe_*` — it bypasses nono's capability

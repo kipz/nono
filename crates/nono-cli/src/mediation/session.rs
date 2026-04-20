@@ -166,7 +166,7 @@ pub fn setup(config: &MediationConfig, workdir: PathBuf) -> Result<Option<Sessio
             }
         }
 
-        let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary)? else {
+        let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary, &workdir)? else {
             continue;
         };
         blocked_binaries.push(resolved.real_path.clone());
@@ -367,13 +367,17 @@ fn resolve_command(
     entry: &CommandEntry,
     shim_dir: &Path,
     shim_binary: &Path,
+    workdir: &Path,
 ) -> Result<Option<ResolvedCommand>> {
     let real_path = if let Some(ref bp) = entry.binary_path {
-        let p = PathBuf::from(bp);
+        // Expand `$VAR` / `~` tokens so profiles can point at user-specific
+        // binaries (e.g. `$HOME/.local/bin/tool`) without hard-coding paths.
+        let p = crate::profile::expand_vars(bp, workdir)?;
         if !p.is_file() {
             return Err(NonoError::SandboxInit(format!(
                 "mediation: binary_path for '{}' does not exist or is not a file: {}",
-                entry.name, bp
+                entry.name,
+                p.display()
             )));
         }
         p
@@ -414,11 +418,20 @@ fn resolve_command(
         ))
     })?;
 
-    // Convert intercept rules
-    let intercepts = entry
+    // Convert intercept rules, expanding env-var tokens in `args_prefix`
+    // entries at profile-load time so matchers like
+    // `["find-generic-password", "$USER", "Claude Code-credentials"]`
+    // resolve to the current console user instead of requiring profile
+    // authors to pre-substitute placeholders at install time.
+    let intercepts: Vec<ResolvedIntercept> = entry
         .intercept
         .iter()
         .map(|rule| {
+            let args_prefix = rule
+                .args_prefix
+                .iter()
+                .map(|arg| crate::profile::expand_str(arg, workdir))
+                .collect::<Result<Vec<String>>>()?;
             let (action, exit_code) = match &rule.action {
                 InterceptAction::Respond { stdout, exit_code } => (
                     ResolvedAction::Respond {
@@ -439,14 +452,14 @@ fn resolve_command(
                     0,
                 ),
             };
-            ResolvedIntercept {
-                args_prefix: rule.args_prefix.clone(),
+            Ok(ResolvedIntercept {
+                args_prefix,
                 action,
                 exit_code,
                 admin: rule.admin,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
@@ -633,6 +646,69 @@ mod tests {
             "admin mode should be disabled by default"
         );
         assert!(matches!(*rx.borrow(), AdminModeStatus::Disabled));
+    }
+
+    #[test]
+    fn test_resolve_command_expands_env_vars_in_args_prefix_and_binary_path() {
+        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule};
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+
+        // Create a real binary file so `is_file()` succeeds after expansion.
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let binary_env_var = "NONO_TEST_RESOLVE_CMD_BINARY";
+
+        // Create shim dir and a fake shim target next to it so symlink creation
+        // succeeds without needing to spin up the real nono-shim binary.
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            (binary_env_var, fake_binary.to_str().expect("utf8")),
+            ("NONO_TEST_RESOLVE_CMD_USER", "test-user"),
+        ]);
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(format!("${}", binary_env_var)),
+            intercept: vec![InterceptRule {
+                args_prefix: vec![
+                    "find-generic-password".to_string(),
+                    "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
+                    "Claude Code-credentials".to_string(),
+                ],
+                admin: false,
+                action: InterceptAction::Respond {
+                    stdout: String::new(),
+                    exit_code: 0,
+                },
+            }],
+            sandbox: None,
+        };
+
+        let workdir = tmp.path();
+        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
+            .expect("resolve")
+            .expect("command resolved");
+
+        assert_eq!(resolved.real_path, fake_binary);
+        let args = &resolved.intercepts[0].args_prefix;
+        assert_eq!(
+            args,
+            &vec![
+                "find-generic-password".to_string(),
+                "test-user".to_string(),
+                "Claude Code-credentials".to_string(),
+            ],
+            "env-var tokens in args_prefix must be expanded at profile-load time"
+        );
     }
 
     #[test]

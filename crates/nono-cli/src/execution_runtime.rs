@@ -205,7 +205,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
     }
 
-    let active_proxy = start_proxy_runtime(proxy, &mut caps)?;
+    let active_proxy = start_proxy_runtime(proxy, &mut caps, &flags.workdir)?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 

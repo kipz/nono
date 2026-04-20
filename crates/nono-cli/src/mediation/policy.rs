@@ -52,6 +52,11 @@ pub struct SessionCtx<'a> {
     pub shim_dir: &'a std::path::Path,
     pub socket_path: &'a std::path::Path,
     pub session_token: &'a str,
+    /// Working directory of the nono session (the parent launch cwd or
+    /// `--workdir`). Threaded into `expand_vars` so `$WORKDIR` in mediated
+    /// sandbox paths resolves consistently across the main and per-command
+    /// sandboxes.
+    pub workdir: &'a std::path::Path,
 }
 
 /// Env var names that must never receive a nonce-promoted value, even if a
@@ -548,6 +553,9 @@ async fn exec_passthrough(
     // Owned shim paths for use in spawn_blocking (which requires 'static captures).
     let shim_dir_buf = effective_shim_dir.clone();
     let real_shim_binary = std::fs::canonicalize(ctx.shim_dir.join(&cmd.name)).ok();
+    // Own the session workdir for use inside spawn_blocking (profile::expand_vars
+    // borrows it).
+    let workdir_buf = ctx.workdir.to_path_buf();
 
     // Collect allowed command binary directories for sandbox read capabilities.
     let allowed_binary_dirs: Vec<std::path::PathBuf> = sandbox
@@ -657,21 +665,24 @@ async fn exec_passthrough(
                 caps = caps.allow_path(dir, nono::AccessMode::Read)?;
             }
 
-            // Add command-specific configured paths (~ is expanded to $HOME).
+            // Add command-specific configured paths. `~` and `$VAR` tokens
+            // (including $WORKDIR, $HOME, XDG dirs, and any env var set at
+            // launch time such as $GIT_ROOT) are resolved via `expand_vars`
+            // so they behave identically to top-level sandbox paths.
             for path in &sb.fs_read {
-                let expanded = expand_home(path);
+                let expanded = expand_sandbox_path(path, &workdir_buf, &cmd_name);
                 caps = add_sandbox_dir(caps, &expanded, nono::AccessMode::Read, &cmd_name)?;
             }
             for path in &sb.fs_read_file {
-                let expanded = expand_home(path);
+                let expanded = expand_sandbox_path(path, &workdir_buf, &cmd_name);
                 caps = add_sandbox_file(caps, &expanded, nono::AccessMode::Read, &cmd_name)?;
             }
             for path in &sb.fs_write {
-                let expanded = expand_home(path);
+                let expanded = expand_sandbox_path(path, &workdir_buf, &cmd_name);
                 caps = add_sandbox_dir(caps, &expanded, nono::AccessMode::Write, &cmd_name)?;
             }
             for path in &sb.fs_write_file {
-                let expanded = expand_home(path);
+                let expanded = expand_sandbox_path(path, &workdir_buf, &cmd_name);
                 caps = add_sandbox_file(caps, &expanded, nono::AccessMode::Write, &cmd_name)?;
             }
             // macOS Keychain access: grant read to keychain DB files so the
@@ -866,17 +877,25 @@ impl Drop for FilteredShimDirGuard {
     }
 }
 
-/// Expand a leading `~` to the current user's home directory.
-fn expand_home(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{}/{}", home, rest);
+/// Expand `~` and `$VAR` / `${VAR}` tokens in a per-command sandbox path.
+///
+/// Delegates to `crate::profile::expand_vars`, which matches the main-sandbox
+/// expansion (supports `$WORKDIR`, `$HOME`, XDG vars, `$TMPDIR`, `$UID`, and
+/// generic env vars). On failure (e.g. invalid `$HOME`), falls back to the
+/// raw path — `add_sandbox_*` will then log "does not exist, skipping" which
+/// is the same outcome as an unset variable. This preserves robustness: a
+/// misconfigured env var in one entry never aborts the whole session.
+fn expand_sandbox_path(path: &str, workdir: &std::path::Path, cmd_name: &str) -> String {
+    match crate::profile::expand_vars(path, workdir) {
+        Ok(buf) => buf.to_string_lossy().into_owned(),
+        Err(e) => {
+            warn!(
+                "mediation: command '{}' failed to expand sandbox path '{}': {}",
+                cmd_name, path, e
+            );
+            path.to_string()
         }
     }
-    path.to_string()
 }
 
 /// Add a directory capability to the sandbox.
@@ -1007,6 +1026,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1048,6 +1068,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1082,6 +1103,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1117,6 +1139,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1150,6 +1173,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1184,6 +1208,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_deny(),
         )
@@ -1219,6 +1244,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_deny(),
         )
@@ -1337,6 +1363,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1380,6 +1407,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1611,6 +1639,7 @@ mod tests {
                 shim_dir: &shim_dir,
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1695,6 +1724,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1757,6 +1787,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1822,6 +1853,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1882,6 +1914,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1938,6 +1971,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )
@@ -1995,6 +2029,7 @@ mod tests {
                 shim_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
             },
             always_allow(),
         )

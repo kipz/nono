@@ -157,12 +157,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
     }
 
-    let active_proxy = start_proxy_runtime(proxy, &mut caps)?;
+    let active_proxy = start_proxy_runtime(proxy, &mut caps, &flags.workdir)?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
     // Set up command mediation (shim dir, server, env blocking) before sandbox.
-    let mediation_handle = crate::mediation::session::setup(&flags.mediation)?;
+    // The workdir is threaded through so per-command sandbox paths that
+    // reference `$WORKDIR` / `$VAR` resolve against the same directory the
+    // main sandbox uses.
+    let mediation_handle =
+        crate::mediation::session::setup(&flags.mediation, flags.workdir.clone())?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;

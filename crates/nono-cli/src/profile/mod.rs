@@ -2020,7 +2020,19 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
         && !name.ends_with('-')
 }
 
-/// Expand environment variables in a path string
+/// Expand environment variables in a path string.
+///
+/// Convenience wrapper around [`expand_str`] that returns `PathBuf`. See
+/// [`expand_str`] for the list of supported variables and their precedence.
+pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
+    expand_str(path, workdir).map(PathBuf::from)
+}
+
+/// Expand environment variables in an arbitrary profile string.
+///
+/// Same semantics as [`expand_vars`] but returns a `String`, so it can be used
+/// for non-path profile fields (e.g. `args_prefix` in command mediation rules)
+/// without forcing the value through `PathBuf` round-tripping.
 ///
 /// Supported variables (explicit, with defaults / validated sources):
 /// - $WORKDIR: Working directory (--workdir or cwd)
@@ -2036,18 +2048,18 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// After the explicit pass, any remaining `$VAR` / `${VAR}` tokens whose name
 /// matches `[A-Z_][A-Z0-9_]*` are looked up in the process environment. If set,
 /// they are substituted; if unset, they are left literal (same fallback as
-/// `$XDG_RUNTIME_DIR`), so the resulting path simply fails to resolve and the
-/// caller's `add_sandbox_*` helper logs a "does not exist, skipping" warning.
-/// The generic pass is linear — substituted content is not rescanned, so
-/// `$A=$B` cycles cannot loop. Lower-case tokens like `$foo` are never
-/// expanded, matching shell convention for environment variables.
+/// `$XDG_RUNTIME_DIR`), so downstream consumers observe the raw token. The
+/// generic pass is linear — substituted content is not rescanned, so `$A=$B`
+/// cycles cannot loop. Lower-case tokens like `$foo` are never expanded,
+/// matching shell convention for environment variables.
 ///
-/// If $HOME cannot be determined and the path uses $HOME or XDG variables,
-/// the unexpanded variable is left in place (which will cause the path to not exist).
-pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
+/// If $HOME cannot be determined and the input uses $HOME or XDG variables,
+/// the unexpanded variable is left in place.
+pub fn expand_str(input: &str, workdir: &Path) -> Result<String> {
     use crate::config;
 
     let home = config::validated_home()?;
+    let path = input;
 
     // Expand ~/... to $HOME/... before other substitutions
     let path = if let Some(rest) = path.strip_prefix("~/") {
@@ -2132,7 +2144,7 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
     // "does not exist" warning.
     expanded = expand_remaining_env_vars(&expanded);
 
-    Ok(PathBuf::from(expanded))
+    Ok(expanded)
 }
 
 /// Expand any remaining `$VAR` / `${VAR}` tokens in `input` from the process
@@ -2427,6 +2439,36 @@ mod tests {
             PathBuf::from("/home/user/x"),
             "explicit $HOME pass must run before generic env pass"
         );
+    }
+
+    #[test]
+    fn test_expand_str_returns_string_with_embedded_tokens() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("USER", "jcarnegie"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+
+        // expand_str handles non-path strings (e.g. args_prefix entries) so
+        // things like `security find-generic-password $USER ...` work.
+        let expanded = expand_str("$USER", &workdir).expect("valid env");
+        assert_eq!(expanded, "jcarnegie");
+
+        let expanded = expand_str("${USER}-creds", &workdir).expect("valid env");
+        assert_eq!(expanded, "jcarnegie-creds");
+
+        // Unknown vars stay literal.
+        let expanded = expand_str("$DEFINITELY_UNSET_XYZ", &workdir).expect("valid env");
+        assert_eq!(expanded, "$DEFINITELY_UNSET_XYZ");
+
+        // Explicit-pass variables still resolve.
+        let expanded = expand_str("$HOME/cfg", &workdir).expect("valid env");
+        assert_eq!(expanded, "/home/user/cfg");
     }
 
     #[test]

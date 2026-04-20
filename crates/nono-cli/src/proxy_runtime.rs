@@ -159,6 +159,7 @@ pub(crate) fn merge_dedup_ports(a: &[u16], b: &[u16]) -> Vec<u16> {
 
 pub(crate) fn build_proxy_config_from_flags(
     proxy: &ProxyLaunchOptions,
+    workdir: &std::path::Path,
 ) -> Result<nono_proxy::config::ProxyConfig> {
     let net_policy_json = crate::config::embedded::embedded_network_policy_json();
     let net_policy = network_policy::load_network_policy(net_policy_json)?;
@@ -185,6 +186,7 @@ pub(crate) fn build_proxy_config_from_flags(
         &net_policy,
         &all_credentials,
         &proxy.custom_credentials,
+        workdir,
     )?;
 
     let (mut plain_hosts, endpoint_routes) =
@@ -222,6 +224,7 @@ pub(crate) fn build_proxy_config_from_flags(
 pub(crate) fn start_proxy_runtime(
     proxy: &ProxyLaunchOptions,
     caps: &mut CapabilitySet,
+    workdir: &std::path::Path,
 ) -> Result<ActiveProxyRuntime> {
     if !proxy.active {
         return Ok(ActiveProxyRuntime {
@@ -230,7 +233,7 @@ pub(crate) fn start_proxy_runtime(
         });
     }
 
-    let mut proxy_config = build_proxy_config_from_flags(proxy)?;
+    let mut proxy_config = build_proxy_config_from_flags(proxy, workdir)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
 
     // Wire up TLS interception: pick a session-scoped directory for the

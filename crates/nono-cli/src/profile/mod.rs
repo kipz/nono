@@ -2022,9 +2022,9 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 
 /// Expand environment variables in a path string
 ///
-/// Supported variables:
+/// Supported variables (explicit, with defaults / validated sources):
 /// - $WORKDIR: Working directory (--workdir or cwd)
-/// - $HOME: User's home directory
+/// - $HOME: User's home directory (from `config::validated_home`, not raw `$HOME` env)
 /// - $XDG_CONFIG_HOME: XDG config directory
 /// - $XDG_DATA_HOME: XDG data directory
 /// - $XDG_STATE_HOME: XDG state directory
@@ -2032,6 +2032,15 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// - $XDG_RUNTIME_DIR: XDG runtime directory (no default; left unexpanded when unset)
 /// - $TMPDIR: System temporary directory
 /// - $UID: Current user ID
+///
+/// After the explicit pass, any remaining `$VAR` / `${VAR}` tokens whose name
+/// matches `[A-Z_][A-Z0-9_]*` are looked up in the process environment. If set,
+/// they are substituted; if unset, they are left literal (same fallback as
+/// `$XDG_RUNTIME_DIR`), so the resulting path simply fails to resolve and the
+/// caller's `add_sandbox_*` helper logs a "does not exist, skipping" warning.
+/// The generic pass is linear — substituted content is not rescanned, so
+/// `$A=$B` cycles cannot loop. Lower-case tokens like `$foo` are never
+/// expanded, matching shell convention for environment variables.
 ///
 /// If $HOME cannot be determined and the path uses $HOME or XDG variables,
 /// the unexpanded variable is left in place (which will cause the path to not exist).
@@ -2116,7 +2125,81 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
         expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
     }
 
+    // Final pass: expand any remaining $VAR / ${VAR} tokens from the process
+    // environment. Runs once, linearly — substituted content is not rescanned
+    // (`$A=$B`-style cycles cannot loop). Unset variables are left literal so
+    // the resulting path fails to resolve and the caller skips it with a
+    // "does not exist" warning.
+    expanded = expand_remaining_env_vars(&expanded);
+
     Ok(PathBuf::from(expanded))
+}
+
+/// Expand any remaining `$VAR` / `${VAR}` tokens in `input` from the process
+/// environment. Only uppercase+underscore+digit identifiers are recognised —
+/// lowercase tokens (e.g. `$foo`) are left literal to avoid false positives.
+/// Unset variables are left literal. Single linear pass.
+fn expand_remaining_env_vars(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        // Handle `${VAR}`
+        if i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            if let Some(close) = bytes[i + 2..].iter().position(|&b| b == b'}') {
+                let name = &input[i + 2..i + 2 + close];
+                if is_valid_env_var_name(name) {
+                    match std::env::var(name) {
+                        Ok(val) => out.push_str(&val),
+                        Err(_) => out.push_str(&input[i..i + 3 + close]),
+                    }
+                    i += 3 + close;
+                    continue;
+                }
+            }
+            // Malformed or invalid name — emit the `$` literally and continue.
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        // Handle `$VAR` — first char must be [A-Z_], remainder [A-Z0-9_].
+        let name_start = i + 1;
+        let first = bytes.get(name_start).copied();
+        if !matches!(first, Some(c) if c == b'_' || c.is_ascii_uppercase()) {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        let mut end = name_start + 1;
+        while end < bytes.len()
+            && (bytes[end] == b'_'
+                || bytes[end].is_ascii_uppercase()
+                || bytes[end].is_ascii_digit())
+        {
+            end += 1;
+        }
+        let name = &input[name_start..end];
+        match std::env::var(name) {
+            Ok(val) => out.push_str(&val),
+            Err(_) => out.push_str(&input[i..end]),
+        }
+        i = end;
+    }
+    out
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.bytes();
+    match chars.next() {
+        Some(c) if c == b'_' || c.is_ascii_uppercase() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == b'_' || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
 /// List available profiles (built-in + user)
@@ -2246,6 +2329,103 @@ mod tests {
             expanded,
             PathBuf::from("$XDG_RUNTIME_DIR/pulse"),
             "unset XDG_RUNTIME_DIR should leave variable unexpanded"
+        );
+    }
+
+    #[test]
+    fn test_expand_vars_generic_env_set() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", "/tmp/foo"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/tmp/foo/bar"));
+    }
+
+    #[test]
+    fn test_expand_vars_generic_env_unset() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Pre-register FOO so EnvVarGuard will restore whatever ambient value
+        // exists, then remove it for the scope of the test.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", ""),
+        ]);
+        _env.remove("FOO");
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("$FOO/bar"),
+            "unset $FOO should be left literal"
+        );
+    }
+
+    #[test]
+    fn test_expand_vars_generic_braces() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("FOO", "/a"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("${FOO}/bar", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/a/bar"));
+    }
+
+    #[test]
+    fn test_expand_vars_generic_lowercase_not_expanded() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Ambient lower-case `foo` env var is set — $foo must remain literal.
+        // Set it directly (EnvVarGuard pattern matches on key, and we want to
+        // prove the recogniser rejects lower-case rather than the lookup
+        // failing).
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("foo", "/should-not-appear"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$foo/bar", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("$foo/bar"),
+            "lower-case $foo must not be expanded even when env var is set"
+        );
+    }
+
+    #[test]
+    fn test_expand_vars_known_vars_precedence() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Set HOME to a specific value — validated_home() reads this.
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user")]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$HOME/x", &workdir).expect("valid env");
+        assert_eq!(
+            expanded,
+            PathBuf::from("/home/user/x"),
+            "explicit $HOME pass must run before generic env pass"
         );
     }
 

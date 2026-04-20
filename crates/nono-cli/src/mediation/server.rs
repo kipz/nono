@@ -41,6 +41,7 @@ pub async fn run(
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_socket_path: PathBuf,
     audit_log_dir: PathBuf,
+    workdir: PathBuf,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -75,6 +76,7 @@ pub async fn run(
     let commands = Arc::new(commands);
     let shim_dir = Arc::new(shim_dir);
     let socket_path = Arc::new(socket_path);
+    let workdir = Arc::new(workdir);
 
     loop {
         match listener.accept().await {
@@ -84,6 +86,7 @@ pub async fn run(
                 let token = Arc::clone(&session_token);
                 let sd = Arc::clone(&shim_dir);
                 let sp = Arc::clone(&socket_path);
+                let wd = Arc::clone(&workdir);
                 let sess_dir = Arc::clone(&audit_log_dir);
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
@@ -98,6 +101,7 @@ pub async fn run(
                         admin_rx,
                         gate,
                         &sess_dir,
+                        &wd,
                     )
                     .await
                     {
@@ -125,6 +129,7 @@ async fn handle_connection(
     admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_log_dir: &Path,
+    workdir: &std::path::Path,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -192,6 +197,7 @@ async fn handle_connection(
         shim_dir,
         socket_path,
         session_token: &session_token,
+        workdir,
     };
     let (response, action_type) = apply(request, commands, broker, &ctx, approval).await;
 

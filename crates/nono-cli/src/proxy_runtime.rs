@@ -2170,6 +2170,7 @@ pub(crate) fn parse_allow_endpoint_arg(
 
 pub(crate) fn build_proxy_config_from_flags(
     proxy: &ProxyLaunchOptions,
+    workdir: &std::path::Path,
 ) -> Result<nono_proxy::config::ProxyConfig> {
     let net_policy_json = crate::config::embedded::embedded_network_policy_json();
     let net_policy = network_policy::load_network_policy(net_policy_json)?;
@@ -2205,8 +2206,12 @@ pub(crate) fn build_proxy_config_from_flags(
         .map(|c| &c.custom_credentials)
         .unwrap_or(&empty_custom_credentials);
 
-    let mut routes =
-        network_policy::resolve_credentials(&net_policy, &all_credentials, custom_credentials)?;
+    let mut routes = network_policy::resolve_credentials(
+        &net_policy,
+        &all_credentials,
+        custom_credentials,
+        workdir,
+    )?;
 
     // Apply --allow-endpoint overrides to credential routes.
     // Runs before domain-endpoint routes are merged so the prefix lookup
@@ -2511,6 +2516,7 @@ pub(crate) fn start_proxy_runtime(
         crate::tool_sandbox::token_broker::SharedBroker,
     >,
     #[cfg(not(any(target_os = "linux", target_os = "macos")))] _shared_broker: Option<()>,
+    workdir: &std::path::Path,
 ) -> Result<ActiveProxyRuntime> {
     let NetworkIntent::ProxyFiltered(proxy) = intent else {
         return Ok(ActiveProxyRuntime {
@@ -2530,7 +2536,7 @@ pub(crate) fn start_proxy_runtime(
     }
 
     let _source_env_guard = ScopedEnvVars::set(&proxy.proxy_source_env_vars);
-    let mut proxy_config = build_proxy_config_from_flags(proxy)?;
+    let mut proxy_config = build_proxy_config_from_flags(proxy, workdir)?;
     proxy_config.direct_connect_ports = caps.tcp_connect_ports().to_vec();
 
     apply_tls_intercept_config(&mut proxy_config, proxy)?;

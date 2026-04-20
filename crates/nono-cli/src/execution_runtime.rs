@@ -286,6 +286,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         Some(shared_broker.clone()),
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         None,
+        &flags.workdir,
     )?;
     let proxy_env_vars = active_proxy.env_vars;
     let tool_sandbox_proxy_credential_env_vars = active_proxy.tool_sandbox_credential_env_vars;

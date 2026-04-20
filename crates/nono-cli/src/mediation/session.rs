@@ -104,7 +104,7 @@ impl Drop for SessionHandle {
 /// # Errors
 /// Returns an error if a command cannot be resolved, or the session directory /
 /// symlinks cannot be created.
-pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
+pub fn setup(config: &MediationConfig, workdir: PathBuf) -> Result<Option<SessionHandle>> {
     if !config.is_active() {
         return Ok(None);
     }
@@ -313,6 +313,7 @@ pub fn setup(config: &MediationConfig) -> Result<Option<SessionHandle>> {
             gate_clone,
             audit_sock,
             audit_log_dir,
+            workdir,
         )
         .await
         {
@@ -609,7 +610,8 @@ mod tests {
     #[test]
     fn test_setup_returns_none_when_inactive() {
         let config = MediationConfig::default();
-        let result = setup(&config).expect("setup should not fail for inactive config");
+        let result = setup(&config, PathBuf::from("/tmp"))
+            .expect("setup should not fail for inactive config");
         assert!(result.is_none());
     }
 

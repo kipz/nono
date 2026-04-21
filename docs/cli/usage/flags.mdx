@@ -288,6 +288,8 @@ Available profiles: `minimal`, `developer`, `claude-code`, `codex`, `opencode`, 
 
 Add a domain to the proxy allowlist. Can be specified multiple times. Activates proxy mode if not already active.
 
+This flag only permits HTTP(S) traffic routed through nono's proxy. It does not grant direct raw TCP access to the destination port.
+
 ```bash
 # Allow specific domains
 nono run --allow-cwd --allow-domain api.openai.com --allow-domain api.anthropic.com -- my-agent

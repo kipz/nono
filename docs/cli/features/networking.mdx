@@ -25,6 +25,8 @@ In a profile, set `network.block` to `true`:
 
 The proxy starts whenever any domain-filtering flag is present: `--network-profile`, `--allow-domain`, `--credential`, or `--upstream-proxy` (from CLI args or profile config). It restricts outbound traffic to a set of allowed domains.
 
+`--allow-domain` is an HTTP(S) proxy allowlist, not a generic raw TCP `host:port` allow. When domain filtering is active, direct outbound connections are blocked and traffic must go through the proxy.
+
 ```bash
 # Allow specific domains
 nono run --allow-cwd --allow-domain api.openai.com --allow-domain api.anthropic.com -- my-agent

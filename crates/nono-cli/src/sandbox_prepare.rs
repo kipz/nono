@@ -9,7 +9,7 @@ use crate::output;
 use crate::profile;
 use crate::profile::WorkdirAccess;
 use crate::profile_runtime::{prepare_profile, prepare_profile_for_preflight};
-use crate::{output, policy, protected_paths, sandbox_state};
+use crate::{policy, protected_paths, sandbox_state};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
@@ -972,9 +972,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             .map(|network| network.allow_domains.clone())
             .unwrap_or_default();
         if !silent {
-            for warning in
-                network_policy::collect_allow_domain_port_warnings(&allow_domain, "manifest allow_domain")
-            {
+            for warning in network_policy::collect_allow_domain_port_warnings(
+                &allow_domain,
+                "manifest allow_domain",
+            ) {
                 output::print_warning(&warning);
             }
         }
@@ -1042,9 +1043,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         command_blocking_deprecation::print_warnings(&profile_warnings, silent);
     }
     if !silent {
-        for warning in
-            network_policy::collect_allow_domain_port_warnings(&profile_allow_domain, "profile allow_domain")
-        {
+        for warning in network_policy::collect_allow_domain_port_warnings(
+            &profile_allow_domain,
+            "profile allow_domain",
+        ) {
             output::print_warning(&warning);
         }
         for warning in

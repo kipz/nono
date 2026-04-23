@@ -554,7 +554,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 attestation_session_dir(&session_dir, audit_state),
                 &meta,
                 signer,
-                None,
+                meta.mediation_integrity.as_ref(),
             )?);
         }
         manager.save_session_metadata(&meta)?;
@@ -605,7 +605,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                     &audit_state.session_dir,
                     &meta,
                     signer,
-                    None,
+                    meta.mediation_integrity.as_ref(),
                 )?);
             }
             nono::undo::SnapshotManager::write_session_metadata(&audit_state.session_dir, &meta)?;

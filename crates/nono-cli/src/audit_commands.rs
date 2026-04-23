@@ -394,7 +394,7 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
         &session.dir,
         &session.metadata,
         args.public_key_file.as_deref(),
-        None,
+        session.metadata.mediation_integrity.as_ref(),
     )?;
 
     if args.json {

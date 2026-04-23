@@ -1,8 +1,9 @@
 use crate::trust_cmd;
 use nono::trust;
-use nono::undo::{AuditAttestationSummary, ContentHash, SessionMetadata};
+use nono::undo::{AuditAttestationSummary, AuditIntegritySummary, ContentHash, SessionMetadata};
 use nono::{NonoError, Result};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -11,6 +12,14 @@ pub(crate) const AUDIT_ATTESTATION_BUNDLE_FILENAME: &str = "audit-attestation.bu
 pub(crate) const AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA: &str =
     "https://nono.sh/attestation/audit-session/alpha";
 const KEYSTORE_URI_PREFIX: &str = "keystore://";
+
+/// Subject name for the mediation-log subject in multi-subject bundles.
+///
+/// Upstream audit-events streams use `audit-session:{id}`. Mediation streams
+/// use this prefix instead so a single bundle can attest to multiple
+/// side-by-side audit files without name collisions.
+const MEDIATION_SUBJECT_NAME_PREFIX: &str = "mediation-log:";
+const AUDIT_SUBJECT_NAME_PREFIX: &str = "audit-session:";
 
 pub(crate) struct AuditSigner {
     key_pair: trust::KeyPair,
@@ -39,6 +48,11 @@ pub(crate) struct AuditAttestationVerificationResult {
     pub(crate) merkle_root_matches: bool,
     pub(crate) session_id_matches: bool,
     pub(crate) expected_public_key_matches: Option<bool>,
+    /// Whether a mediation-log subject was verified. `None` when no
+    /// mediation integrity summary was supplied; `Some(true/false)`
+    /// when one was and verification succeeded / failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mediation_merkle_root_matches: Option<bool>,
     pub(crate) verification_error: Option<String>,
 }
 
@@ -50,6 +64,12 @@ struct AuditAttestationPredicate<'a> {
     ended: &'a Option<String>,
     command: &'a [String],
     audit_log: AuditLogPredicate<'a>,
+    /// Optional second audit stream covered by the same bundle.
+    /// Absent when the session only has a single (capability-level)
+    /// audit stream; present when a parallel per-command stream exists
+    /// and the attestation should cover both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mediation_log: Option<AuditLogPredicate<'a>>,
     signer: AuditSignerPredicate<'a>,
 }
 
@@ -59,6 +79,17 @@ struct AuditLogPredicate<'a> {
     event_count: u64,
     chain_head: &'a ContentHash,
     merkle_root: &'a ContentHash,
+}
+
+impl<'a> AuditLogPredicate<'a> {
+    fn from_summary(summary: &'a AuditIntegritySummary) -> Self {
+        Self {
+            hash_algorithm: &summary.hash_algorithm,
+            event_count: summary.event_count,
+            chain_head: &summary.chain_head,
+            merkle_root: &summary.merkle_root,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -97,6 +128,7 @@ pub(crate) fn write_audit_attestation(
     session_dir: &Path,
     metadata: &SessionMetadata,
     signer: &AuditSigner,
+    mediation_integrity: Option<&AuditIntegritySummary>,
 ) -> Result<AuditAttestationSummary> {
     let integrity = metadata
         .audit_integrity
@@ -112,12 +144,8 @@ pub(crate) fn write_audit_attestation(
         started: &metadata.started,
         ended: &metadata.ended,
         command: &metadata.command,
-        audit_log: AuditLogPredicate {
-            hash_algorithm: &integrity.hash_algorithm,
-            event_count: integrity.event_count,
-            chain_head: &integrity.chain_head,
-            merkle_root: &integrity.merkle_root,
-        },
+        audit_log: AuditLogPredicate::from_summary(integrity),
+        mediation_log: mediation_integrity.map(AuditLogPredicate::from_summary),
         signer: AuditSignerPredicate {
             kind: "keyed",
             key_id: &signer.key_id,
@@ -128,11 +156,11 @@ pub(crate) fn write_audit_attestation(
         reason: format!("failed to serialize audit attestation predicate: {e}"),
     })?;
 
-    let statement = trust::new_statement(
-        &format!("audit-session:{}", metadata.session_id),
-        &integrity.merkle_root.to_string(),
+    let statement = build_audit_statement(
+        &metadata.session_id,
+        &integrity.merkle_root,
+        mediation_integrity.map(|m| &m.merkle_root),
         predicate,
-        AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA,
     );
     let bundle_json = trust::sign_statement_bundle(&statement, &signer.key_pair)?;
     let bundle_path = session_dir.join(AUDIT_ATTESTATION_BUNDLE_FILENAME);
@@ -149,10 +177,59 @@ pub(crate) fn write_audit_attestation(
     })
 }
 
+/// Build an in-toto statement for the audit attestation bundle.
+///
+/// When `mediation_root` is `None`, the statement has a single `audit-session`
+/// subject and is byte-identical to the form produced by `trust::new_statement`.
+/// When `mediation_root` is `Some`, a second `mediation-log` subject is added.
+fn build_audit_statement(
+    session_id: &str,
+    audit_root: &ContentHash,
+    mediation_root: Option<&ContentHash>,
+    predicate: serde_json::Value,
+) -> trust::InTotoStatement {
+    if mediation_root.is_none() {
+        return trust::new_statement(
+            &format!("{AUDIT_SUBJECT_NAME_PREFIX}{session_id}"),
+            &audit_root.to_string(),
+            predicate,
+            AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA,
+        );
+    }
+
+    let mut subjects = Vec::with_capacity(2);
+    subjects.push(new_subject(
+        &format!("{AUDIT_SUBJECT_NAME_PREFIX}{session_id}"),
+        &audit_root.to_string(),
+    ));
+    if let Some(mediation) = mediation_root {
+        subjects.push(new_subject(
+            &format!("{MEDIATION_SUBJECT_NAME_PREFIX}{session_id}"),
+            &mediation.to_string(),
+        ));
+    }
+    trust::InTotoStatement {
+        statement_type: trust::IN_TOTO_STATEMENT_TYPE.to_string(),
+        subject: subjects,
+        predicate_type: AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA.to_string(),
+        predicate,
+    }
+}
+
+fn new_subject(name: &str, sha256_digest: &str) -> trust::InTotoSubject {
+    let mut digest = HashMap::new();
+    digest.insert("sha256".to_string(), sha256_digest.to_string());
+    trust::InTotoSubject {
+        name: name.to_string(),
+        digest,
+    }
+}
+
 pub(crate) fn verify_audit_attestation(
     session_dir: &Path,
     metadata: &SessionMetadata,
     expected_public_key_file: Option<&Path>,
+    mediation_integrity: Option<&AuditIntegritySummary>,
 ) -> Result<AuditAttestationVerificationResult> {
     let Some(summary) = metadata.audit_attestation.as_ref() else {
         return Ok(AuditAttestationVerificationResult {
@@ -164,6 +241,7 @@ pub(crate) fn verify_audit_attestation(
             merkle_root_matches: false,
             session_id_matches: false,
             expected_public_key_matches: expected_public_key_file.map(|_| false),
+            mediation_merkle_root_matches: mediation_integrity.map(|_| false),
             verification_error: expected_public_key_file.map(|public_key_file| {
                 format!(
                     "session has no audit attestation to verify against provided public key {}",
@@ -177,6 +255,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             "session has audit attestation metadata but no audit integrity summary".to_string(),
         ));
     };
@@ -187,6 +266,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 err.to_string(),
             ))
         }
@@ -197,6 +277,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 err.to_string(),
             ))
         }
@@ -205,6 +286,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             format!(
                 "wrong bundle type: expected {}, got {}",
                 AUDIT_ATTESTATION_PREDICATE_TYPE_ALPHA, predicate_type
@@ -218,6 +300,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 err.to_string(),
             ))
         }
@@ -228,6 +311,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 "audit attestation must be keyed".to_string(),
             ))
         }
@@ -238,6 +322,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 format!("invalid attested public key encoding: {err}"),
             ))
         }
@@ -247,6 +332,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             format!(
                 "audit attestation metadata key mismatch: expected {}, got {}",
                 summary.key_id, recomputed_key_id
@@ -257,6 +343,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             format!(
                 "audit attestation signer key mismatch: expected {}, got {}",
                 summary.key_id, signer_key_id
@@ -269,6 +356,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 Some(false),
+                mediation_integrity.map(|_| false),
                 "provided public key does not match the attested signer key".to_string(),
             ));
         }
@@ -277,6 +365,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             err.to_string(),
         ));
     }
@@ -287,6 +376,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 err.to_string(),
             ))
         }
@@ -295,6 +385,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             "audit attestation Merkle root does not match session integrity summary".to_string(),
         ));
     }
@@ -305,6 +396,7 @@ pub(crate) fn verify_audit_attestation(
             return Ok(attestation_failure(
                 summary,
                 expected_public_key_file.map(|_| true),
+                mediation_integrity.map(|_| false),
                 err.to_string(),
             ))
         }
@@ -317,6 +409,7 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             "audit attestation predicate missing session_id".to_string(),
         ));
     };
@@ -324,12 +417,35 @@ pub(crate) fn verify_audit_attestation(
         return Ok(attestation_failure(
             summary,
             expected_public_key_file.map(|_| true),
+            mediation_integrity.map(|_| false),
             format!(
                 "audit attestation session_id mismatch: expected {}, got {}",
                 metadata.session_id, statement_session_id
             ),
         ));
     }
+
+    // Optional second subject: mediation-log. Only verified when the caller
+    // supplies a mediation integrity summary. The check pulls the sha256
+    // digest from subject[1] and compares to the supplied Merkle root.
+    let mediation_merkle_root_matches = match mediation_integrity {
+        None => None,
+        Some(mediation) => {
+            let expected_name = format!("{MEDIATION_SUBJECT_NAME_PREFIX}{}", metadata.session_id);
+            let expected_root = mediation.merkle_root.to_string();
+            match verify_mediation_subject(&statement, &expected_name, &expected_root) {
+                Ok(()) => Some(true),
+                Err(err) => {
+                    return Ok(attestation_failure(
+                        summary,
+                        expected_public_key_file.map(|_| true),
+                        Some(false),
+                        err,
+                    ));
+                }
+            }
+        }
+    };
 
     Ok(AuditAttestationVerificationResult {
         present: true,
@@ -340,13 +456,38 @@ pub(crate) fn verify_audit_attestation(
         merkle_root_matches: true,
         session_id_matches: true,
         expected_public_key_matches: expected_public_key_file.map(|_| true),
+        mediation_merkle_root_matches,
         verification_error: None,
     })
+}
+
+/// Look up subject[1] (or any subject whose name matches) and verify its
+/// sha256 digest matches `expected_root`.
+fn verify_mediation_subject(
+    statement: &trust::InTotoStatement,
+    expected_name: &str,
+    expected_root: &str,
+) -> std::result::Result<(), String> {
+    let subject = statement
+        .subject
+        .iter()
+        .find(|s| s.name == expected_name)
+        .ok_or_else(|| format!("audit attestation missing mediation subject '{expected_name}'"))?;
+    let digest = subject.digest.get("sha256").ok_or_else(|| {
+        format!("audit attestation mediation subject '{expected_name}' has no sha256 digest")
+    })?;
+    if digest != expected_root {
+        return Err(format!(
+            "audit attestation mediation Merkle root mismatch: expected {expected_root}, got {digest}"
+        ));
+    }
+    Ok(())
 }
 
 fn attestation_failure(
     summary: &AuditAttestationSummary,
     expected_public_key_matches: Option<bool>,
+    mediation_merkle_root_matches: Option<bool>,
     verification_error: String,
 ) -> AuditAttestationVerificationResult {
     AuditAttestationVerificationResult {
@@ -358,6 +499,7 @@ fn attestation_failure(
         merkle_root_matches: false,
         session_id_matches: false,
         expected_public_key_matches,
+        mediation_merkle_root_matches,
         verification_error: Some(verification_error),
     }
 }
@@ -468,10 +610,10 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
         };
         let mut metadata = sample_metadata();
-        let summary = write_audit_attestation(dir.path(), &metadata, &signer).unwrap();
+        let summary = write_audit_attestation(dir.path(), &metadata, &signer, None).unwrap();
         metadata.audit_attestation = Some(summary);
 
-        let verified = verify_audit_attestation(dir.path(), &metadata, None).unwrap();
+        let verified = verify_audit_attestation(dir.path(), &metadata, None, None).unwrap();
         assert!(verified.present);
         assert!(verified.key_id_matches);
         assert!(verified.signature_verified);
@@ -495,6 +637,86 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
         assert!(signer.is_some());
     }
 
+    fn sample_mediation_integrity() -> AuditIntegritySummary {
+        AuditIntegritySummary {
+            hash_algorithm: "sha256".to_string(),
+            event_count: 3,
+            chain_head: ContentHash::from_bytes([0x33; 32]),
+            merkle_root: ContentHash::from_bytes([0x44; 32]),
+        }
+    }
+
+    #[test]
+    fn audit_attestation_with_mediation_subject_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let public_key = trust::export_public_key(&key_pair).unwrap();
+        let signer = AuditSigner {
+            key_pair,
+            key_id,
+            public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
+        };
+        let mut metadata = sample_metadata();
+        let mediation = sample_mediation_integrity();
+
+        let summary =
+            write_audit_attestation(dir.path(), &metadata, &signer, Some(&mediation)).unwrap();
+        metadata.audit_attestation = Some(summary);
+
+        let verified =
+            verify_audit_attestation(dir.path(), &metadata, None, Some(&mediation)).unwrap();
+        assert!(verified.signature_verified);
+        assert_eq!(verified.mediation_merkle_root_matches, Some(true));
+        assert!(verified.verification_error.is_none());
+    }
+
+    #[test]
+    fn audit_attestation_mediation_mismatch_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let public_key = trust::export_public_key(&key_pair).unwrap();
+        let signer = AuditSigner {
+            key_pair,
+            key_id,
+            public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
+        };
+        let mut metadata = sample_metadata();
+        let mediation = sample_mediation_integrity();
+        let summary =
+            write_audit_attestation(dir.path(), &metadata, &signer, Some(&mediation)).unwrap();
+        metadata.audit_attestation = Some(summary);
+
+        let mut tampered = mediation.clone();
+        tampered.merkle_root = ContentHash::from_bytes([0x55; 32]);
+        let verified =
+            verify_audit_attestation(dir.path(), &metadata, None, Some(&tampered)).unwrap();
+        assert_eq!(verified.mediation_merkle_root_matches, Some(false));
+        assert!(verified.verification_error.is_some());
+    }
+
+    #[test]
+    fn audit_attestation_without_mediation_is_byte_compatible_with_alpha() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_pair = trust::generate_signing_key().unwrap();
+        let key_id = trust::key_id_hex(&key_pair).unwrap();
+        let public_key = trust::export_public_key(&key_pair).unwrap();
+        let signer = AuditSigner {
+            key_pair,
+            key_id,
+            public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
+        };
+        let metadata = sample_metadata();
+
+        write_audit_attestation(dir.path(), &metadata, &signer, None).unwrap();
+        let bundle_path = dir.path().join(AUDIT_ATTESTATION_BUNDLE_FILENAME);
+        let bundle_json = fs::read_to_string(&bundle_path).unwrap();
+        // Bundle must NOT contain mediation-log field when no mediation integrity passed.
+        assert!(!bundle_json.contains("mediation_log"));
+        assert!(!bundle_json.contains("mediation-log:"));
+    }
+
     #[test]
     fn audit_attestation_mismatch_is_reported_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
@@ -507,11 +729,11 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             public_key_b64: trust::base64::base64_encode(public_key.as_bytes()),
         };
         let mut metadata = sample_metadata();
-        let summary = write_audit_attestation(dir.path(), &metadata, &signer).unwrap();
+        let summary = write_audit_attestation(dir.path(), &metadata, &signer, None).unwrap();
         metadata.audit_attestation = Some(summary);
         metadata.session_id = "tampered-session".to_string();
 
-        let verified = verify_audit_attestation(dir.path(), &metadata, None).unwrap();
+        let verified = verify_audit_attestation(dir.path(), &metadata, None, None).unwrap();
         assert!(verified.present);
         assert!(!verified.signature_verified);
         assert!(verified.verification_error.is_some());

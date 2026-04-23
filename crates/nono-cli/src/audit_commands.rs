@@ -3,7 +3,9 @@
 //! Handles `nono audit list|show` for viewing the audit trail of sandboxed sessions.
 
 use crate::audit_attestation::verify_audit_attestation;
-use crate::audit_integrity::{verify_audit_log, AuditEventPayload, AUDIT_EVENTS_CONFIG};
+use crate::audit_integrity::{
+    verify_audit_log, AuditEventPayload, AUDIT_EVENTS_CONFIG, MEDIATION_EVENTS_CONFIG,
+};
 use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
     discover_sessions, format_bytes, is_legacy_audit_only_session, is_primary_audit_session,
@@ -12,6 +14,7 @@ use crate::audit_session::{
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
 };
+use crate::mediation::AuditEvent as MediationAuditEvent;
 use crate::theme;
 use colored::Colorize;
 use nono::undo::SnapshotManager;
@@ -389,6 +392,18 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
         session.metadata.audit_integrity.as_ref(),
         &AUDIT_EVENTS_CONFIG,
     )?;
+    // Mediation stream is optional — only verify when integrity metadata is
+    // present. Sessions without command mediation don't produce audit.jsonl
+    // and metadata.mediation_integrity stays None; skip cleanly.
+    let mediation = if session.metadata.mediation_integrity.is_some() {
+        Some(verify_audit_log::<MediationAuditEvent>(
+            &session.dir,
+            session.metadata.mediation_integrity.as_ref(),
+            &MEDIATION_EVENTS_CONFIG,
+        )?)
+    } else {
+        None
+    };
     let ledger = verify_session_in_ledger(&session.metadata)?;
     let attestation = verify_audit_attestation(
         &session.dir,
@@ -400,6 +415,7 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
     if args.json {
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "session": result,
+            "mediation": mediation,
             "ledger": ledger,
             "attestation": attestation,
         }))
@@ -413,9 +429,17 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
             && attestation.key_id_matches
             && attestation.merkle_root_matches
             && attestation.session_id_matches
-            && attestation.expected_public_key_matches.unwrap_or(true));
+            && attestation.expected_public_key_matches.unwrap_or(true)
+            && attestation.mediation_merkle_root_matches.unwrap_or(true));
+    // Mediation stream adds to `verified` only when the caller's session has
+    // one — absent means "no mediation was active", which is a valid state.
+    let mediation_ok = mediation
+        .as_ref()
+        .map(|m| m.records_verified && m.event_count_matches)
+        .unwrap_or(true);
     let verified = result.records_verified
         && result.event_count_matches
+        && mediation_ok
         && ledger.session_found
         && ledger.session_digest_matches
         && ledger.ledger_chain_verified
@@ -462,6 +486,27 @@ fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
                 .unwrap_or_else(|| "-".to_string()),
             result
                 .stored_merkle_root
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    if let Some(ref m) = mediation {
+        let m_status = if m.records_verified && m.event_count_matches {
+            "verified".green().bold().to_string()
+        } else {
+            "mismatch".red().bold().to_string()
+        };
+        eprintln!("  Mediation: {m_status}");
+        eprintln!("    Events: {}", m.event_count);
+        eprintln!(
+            "    Chain:  {}",
+            m.computed_chain_head
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        eprintln!(
+            "    Root:   {}",
+            m.computed_merkle_root
                 .map(|h| h.to_string())
                 .unwrap_or_else(|| "-".to_string())
         );

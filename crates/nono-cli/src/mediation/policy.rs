@@ -636,7 +636,7 @@ async fn exec_passthrough(
                 let (read_group, write_group) = if cfg!(target_os = "macos") {
                     ("system_read_macos", "system_write_macos")
                 } else {
-                    ("system_read_linux", "system_write_linux")
+                    ("system_read_linux_core", "system_write_linux")
                 };
                 let _ = crate::policy::resolve_groups(
                     &policy,
@@ -728,7 +728,7 @@ async fn exec_passthrough(
             }
             unsafe {
                 cmd_builder.pre_exec(move || {
-                    nono::Sandbox::apply(&caps).map_err(|e| {
+                    nono::Sandbox::apply(&caps).map(|_| ()).map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
                     })
                 });

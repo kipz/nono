@@ -1232,34 +1232,46 @@ fn build_policy_explanations(
     caps: &nono::CapabilitySet,
 ) -> Vec<nono::diagnostic::PolicyExplanation> {
     use nono::diagnostic::PolicyExplanation;
-    use std::collections::BTreeSet;
+    use nono::AccessMode;
+    use std::collections::BTreeMap;
+
+    // Merge access modes per path so a path denied for both Read and Write
+    // produces a single ReadWrite query. Querying each (path, mode) pair
+    // independently would let the first insert win and drop the other mode,
+    // yielding an incomplete "Fix:" suggestion.
+    let mut paths: BTreeMap<std::path::PathBuf, AccessMode> = BTreeMap::new();
+
+    let merge = |existing: AccessMode, incoming: AccessMode| -> AccessMode {
+        if existing == incoming {
+            existing
+        } else {
+            AccessMode::ReadWrite
+        }
+    };
+
+    for denial in denials {
+        paths
+            .entry(denial.path.clone())
+            .and_modify(|a| *a = merge(*a, denial.access))
+            .or_insert(denial.access);
+    }
+
+    for violation in sandbox_violations {
+        let Some(access) = nono::diagnostic::seatbelt_operation_to_access(&violation.operation)
+        else {
+            continue;
+        };
+        let Some(target) = violation.target.as_ref() else {
+            continue;
+        };
+        paths
+            .entry(std::path::PathBuf::from(target))
+            .and_modify(|a| *a = merge(*a, access))
+            .or_insert(access);
+    }
 
     let mut explanations = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    // Collect paths from both denial sources
-    let denial_paths: Vec<(&std::path::Path, nono::AccessMode)> = denials
-        .iter()
-        .map(|d| (d.path.as_path(), d.access))
-        .collect();
-
-    let violation_paths: Vec<(std::path::PathBuf, nono::AccessMode)> = sandbox_violations
-        .iter()
-        .filter_map(|v| {
-            let access = nono::diagnostic::seatbelt_operation_to_access(&v.operation)?;
-            let target = v.target.as_ref()?;
-            Some((std::path::PathBuf::from(target), access))
-        })
-        .collect();
-
-    for (path, access) in denial_paths
-        .iter()
-        .map(|(p, a)| (std::path::PathBuf::from(p), *a))
-        .chain(violation_paths)
-    {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
+    for (path, access) in paths {
         match crate::query_ext::query_path(&path, access, caps, &[]) {
             Ok(crate::query_ext::QueryResult::Denied {
                 reason,

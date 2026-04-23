@@ -87,44 +87,10 @@ pub(crate) fn offer_save_run_profile(
         return Ok(());
     }
 
-    if let Some(suggested_name) = suggested_profile_name(compared_profile) {
-        prompt_print(
-            "Save denied paths as user profile? Enter a name (suggested: {}, or press Enter to skip): ",
-            &[suggested_name.as_str()],
-        );
-    } else {
-        prompt_print(
-            "Save denied paths as user profile? Enter a name (or press Enter to skip): ",
-            &[],
-        );
-    }
-
-    let input = read_input_line()?;
-    let profile_name = input.trim();
-
-    if profile_name.is_empty() {
+    let suggested = suggested_profile_name(compared_profile);
+    let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
         return Ok(());
-    }
-
-    if !profile::is_valid_profile_name(profile_name) {
-        prompt_println(&format!(
-            "{}",
-            "Invalid profile name. Use only letters, numbers, and hyphens.".red()
-        ));
-        return Ok(());
-    }
-
-    if would_shadow_builtin(profile_name) {
-        prompt_println(&format!(
-            "{}",
-            format!(
-                "Cannot save '{}' as a user profile because it would shadow the built-in profile of the same name. Choose a different name.",
-                profile_name
-            )
-            .red()
-        ));
-        return Ok(());
-    }
+    };
 
     if has_overrides
         && !confirm_typed_word(
@@ -136,11 +102,66 @@ pub(crate) fn offer_save_run_profile(
     }
 
     let prepared =
-        prepare_profile_save_from_patch(&patch, &cmd_name, profile_name, compared_profile)?;
+        prepare_profile_save_from_patch(&patch, &cmd_name, &profile_name, compared_profile)?;
     write_profile(&prepared)?;
     print_profile_save(&prepared, command);
 
     Ok(())
+}
+
+/// Prompt for a new profile name, re-prompting on invalid or shadowed names
+/// until the user enters a valid name or presses Enter to skip.
+///
+/// Returns `Ok(None)` when the user skips.
+fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
+    let mut first = true;
+    loop {
+        if first {
+            if let Some(suggested_name) = suggested {
+                prompt_print(
+                    "Save denied paths as user profile? Enter a name (suggested: {}, or press Enter to skip): ",
+                    &[suggested_name],
+                );
+            } else {
+                prompt_print(
+                    "Save denied paths as user profile? Enter a name (or press Enter to skip): ",
+                    &[],
+                );
+            }
+            first = false;
+        } else {
+            prompt_print("Enter a name (or press Enter to skip): ", &[]);
+        }
+
+        let input = read_input_line()?;
+        let candidate = input.trim();
+
+        if candidate.is_empty() {
+            return Ok(None);
+        }
+
+        if !profile::is_valid_profile_name(candidate) {
+            prompt_println(&format!(
+                "{}",
+                "Invalid profile name. Use only letters, numbers, and hyphens.".red()
+            ));
+            continue;
+        }
+
+        if would_shadow_builtin(candidate) {
+            prompt_println(&format!(
+                "{}",
+                format!(
+                    "Cannot save '{}' as a user profile because it would shadow the built-in profile of the same name. Choose a different name.",
+                    candidate
+                )
+                .red()
+            ));
+            continue;
+        }
+
+        return Ok(Some(candidate.to_string()));
+    }
 }
 
 pub(crate) fn command_name(command: &[String]) -> Result<String> {
@@ -212,14 +233,62 @@ pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
 
     let profile_json = serde_json::to_string_pretty(&prepared.profile)
         .map_err(|e| NonoError::LearnError(format!("Failed to serialize profile: {}", e)))?;
-    std::fs::write(&prepared.profile_path, format!("{profile_json}\n")).map_err(|e| {
+    atomic_write(
+        &prepared.profile_path,
+        format!("{profile_json}\n").as_bytes(),
+    )
+}
+
+/// Write `contents` to `path` atomically: write to a sibling temp file, fsync,
+/// then rename. On crash or disk-full mid-write, the original file at `path`
+/// is left intact rather than truncated.
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path.parent().ok_or_else(|| {
         NonoError::LearnError(format!(
-            "Failed to write profile to {}: {}",
-            prepared.profile_path.display(),
-            e
+            "Failed to determine parent directory of {}",
+            path.display()
         ))
     })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| NonoError::LearnError(format!("Invalid profile path {}", path.display())))?;
 
+    // Use a sibling temp file so the final rename is same-filesystem and
+    // therefore atomic on POSIX.
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(file_name);
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp_path = dir.join(&tmp_name);
+
+    let write_err = |stage: &str, e: std::io::Error| {
+        NonoError::LearnError(format!(
+            "Failed to {} profile {}: {}",
+            stage,
+            path.display(),
+            e
+        ))
+    };
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp_path)
+        .map_err(|e| write_err("open temp file for", e))?;
+    if let Err(e) = file.write_all(contents) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(write_err("write", e));
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(write_err("sync", e));
+    }
+    drop(file);
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(write_err("rename into place", e));
+    }
     Ok(())
 }
 
@@ -337,33 +406,67 @@ fn open_tty_writer() -> Option<std::fs::File> {
 fn prompt_read_line() -> Result<String> {
     let mut input = String::new();
     let tty = open_tty_prompt_device()?;
-    let saved_termios = force_prompt_terminal_mode(&tty);
+    // Guard restores termios on any exit path (normal, error, panic unwind).
+    // Previously the restore ran only after `read_line` succeeded, so a panic
+    // during reading could leave the terminal in no-echo/canonical-disabled
+    // state.
+    let _guard = PromptTerminalGuard::new(&tty);
     let mut reader = std::io::BufReader::new(tty);
-    let read_result = reader
+    reader
         .read_line(&mut input)
-        .map_err(|e| NonoError::LearnError(format!("Failed to read input: {}", e)));
-    if let Some(saved) = saved_termios {
-        let _ = nix::sys::termios::tcsetattr(
-            reader.get_ref(),
-            nix::sys::termios::SetArg::TCSANOW,
-            &saved,
-        );
-    }
-    read_result?;
+        .map_err(|e| NonoError::LearnError(format!("Failed to read input: {}", e)))?;
     Ok(input)
 }
 
-fn force_prompt_terminal_mode(tty: &std::fs::File) -> Option<nix::sys::termios::Termios> {
-    let Ok(original) = nix::sys::termios::tcgetattr(tty) else {
-        return None;
-    };
-    let mut termios = original.clone();
-    configure_prompt_termios(&mut termios);
-    if nix::sys::termios::tcsetattr(tty, nix::sys::termios::SetArg::TCSANOW, &termios).is_err() {
-        return None;
+/// RAII guard that switches the tty into prompt-friendly termios and restores
+/// the saved settings when dropped.
+///
+/// Owns a duplicated fd (via `try_clone`) so the caller can still move the
+/// original `File` into a `BufReader` while the guard retains a handle for
+/// the termios restore in `Drop`.
+struct PromptTerminalGuard {
+    tty: Option<std::fs::File>,
+    saved: Option<nix::sys::termios::Termios>,
+}
+
+impl PromptTerminalGuard {
+    fn new(tty: &std::fs::File) -> Self {
+        let Ok(owned) = tty.try_clone() else {
+            return Self {
+                tty: None,
+                saved: None,
+            };
+        };
+        let Ok(original) = nix::sys::termios::tcgetattr(&owned) else {
+            return Self {
+                tty: Some(owned),
+                saved: None,
+            };
+        };
+        let mut termios = original.clone();
+        configure_prompt_termios(&mut termios);
+        if nix::sys::termios::tcsetattr(&owned, nix::sys::termios::SetArg::TCSANOW, &termios)
+            .is_err()
+        {
+            return Self {
+                tty: Some(owned),
+                saved: None,
+            };
+        }
+        let _ = nix::sys::termios::tcflush(&owned, nix::sys::termios::FlushArg::TCIFLUSH);
+        Self {
+            tty: Some(owned),
+            saved: Some(original),
+        }
     }
-    let _ = nix::sys::termios::tcflush(tty, nix::sys::termios::FlushArg::TCIFLUSH);
-    Some(original)
+}
+
+impl Drop for PromptTerminalGuard {
+    fn drop(&mut self) {
+        if let (Some(tty), Some(saved)) = (self.tty.as_ref(), self.saved.as_ref()) {
+            let _ = nix::sys::termios::tcsetattr(tty, nix::sys::termios::SetArg::TCSANOW, saved);
+        }
+    }
 }
 
 pub(crate) fn configure_prompt_termios(termios: &mut nix::sys::termios::Termios) {
@@ -792,5 +895,28 @@ mod tests {
         .expect("write");
 
         assert!(!would_shadow_builtin("claude-code"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_without_truncating_on_failure() {
+        let dir = TempDir::new().expect("temp dir");
+        let target = dir.path().join("profile.json");
+        std::fs::write(&target, b"original\n").expect("seed");
+
+        atomic_write(&target, b"updated\n").expect("atomic write");
+
+        let contents = std::fs::read(&target).expect("read");
+        assert_eq!(contents, b"updated\n");
+
+        // No stray temp siblings left behind on success.
+        let leftover = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".profile.json.tmp.")
+            });
+        assert!(!leftover, "temp file should be renamed into place");
     }
 }

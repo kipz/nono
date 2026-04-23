@@ -13,13 +13,19 @@ use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
-use super::AuditEvent;
+use super::{AuditEvent, SessionAuditInfo};
+use crate::audit_integrity::AuditRecorder;
 use nix::libc;
+use nono::NonoError;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, error, warn};
+
+/// Shared type alias for the mediation recorder. See session.rs
+/// `SessionHandle.audit_recorder` for the locking contract.
+type SharedRecorder = Arc<Mutex<AuditRecorder<AuditEvent>>>;
 
 /// Maximum request size: 1 MiB. Prevents a rogue same-user process from causing
 /// a large allocation before the session token check can reject it.
@@ -40,8 +46,10 @@ pub async fn run(
     admin_state: super::admin::AdminState,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_socket_path: PathBuf,
-    audit_log_dir: PathBuf,
+    _audit_log_dir: PathBuf,
     workdir: PathBuf,
+    audit_info: Arc<SessionAuditInfo>,
+    audit_recorder: SharedRecorder,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -49,16 +57,14 @@ pub async fn run(
     let listener = bind_socket_owner_only(&socket_path)?;
     debug!("Mediation server listening on {}", socket_path.display());
 
-    // Wrap audit_log_dir so both the audit receiver and connection handler can share it.
-    let audit_log_dir = Arc::new(audit_log_dir);
-
     // Bind audit datagram socket for fire-and-forget command logging
     let _ = std::fs::remove_file(&audit_socket_path);
     match bind_dgram_owner_only(&audit_socket_path) {
         Ok(audit_socket) => {
-            let audit_log_dir_arc = Arc::clone(&audit_log_dir);
+            let recorder = Arc::clone(&audit_recorder);
+            let audit_info_arc = Arc::clone(&audit_info);
             tokio::spawn(async move {
-                run_audit_receiver(audit_socket, audit_log_dir_arc).await;
+                run_audit_receiver(audit_socket, recorder, audit_info_arc).await;
             });
             debug!(
                 "Audit datagram socket listening on {}",
@@ -87,21 +93,14 @@ pub async fn run(
                 let sd = Arc::clone(&shim_dir);
                 let sp = Arc::clone(&socket_path);
                 let wd = Arc::clone(&workdir);
-                let sess_dir = Arc::clone(&audit_log_dir);
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
+                let stamp = Arc::clone(&audit_info);
+                let recorder = Arc::clone(&audit_recorder);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
-                        stream,
-                        &cmds,
-                        broker,
-                        token.clone(),
-                        &sd,
-                        &sp,
-                        admin_rx,
-                        gate,
-                        &sess_dir,
-                        &wd,
+                        stream, &cmds, broker, token, &sd, &sp, admin_rx, gate, &wd, &stamp,
+                        recorder,
                     )
                     .await
                     {
@@ -128,8 +127,9 @@ async fn handle_connection(
     socket_path: &std::path::Path,
     admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
-    audit_log_dir: &Path,
     workdir: &std::path::Path,
+    audit_info: &SessionAuditInfo,
+    audit_recorder: SharedRecorder,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -179,20 +179,28 @@ async fn handle_connection(
             request.args,
             std::process::id()
         );
+        let command_pid = request.pid;
         let (response, action_type) = admin_passthrough(&request, commands).await;
         write_response(&mut stream, &response).await?;
+        // Audit AFTER the response is on the wire. The lock discipline
+        // rule: do not take `audit_recorder.lock()` until we are done
+        // calling into TokenBroker / policy / the stream — prevents
+        // lock-order inversion and keeps the critical section tight.
         log_mediated_audit(
-            audit_log_dir,
+            &audit_recorder,
             &request.command,
             &request.args,
             &response,
             action_type,
+            Some(command_pid),
+            audit_info,
         );
         return Ok(());
     }
 
     let command_name = request.command.clone();
     let args = request.args.clone();
+    let command_pid = request.pid;
     let ctx = super::policy::SessionCtx {
         shim_dir,
         socket_path,
@@ -202,32 +210,75 @@ async fn handle_connection(
     let (response, action_type) = apply(request, commands, broker, &ctx, approval).await;
 
     write_response(&mut stream, &response).await?;
-    log_mediated_audit(audit_log_dir, &command_name, &args, &response, action_type);
+    // Audit AFTER the response is on the wire. The lock discipline
+    // rule: do not take `audit_recorder.lock()` until we are done
+    // calling into TokenBroker / policy / the stream — prevents
+    // lock-order inversion and keeps the critical section tight.
+    log_mediated_audit(
+        &audit_recorder,
+        &command_name,
+        &args,
+        &response,
+        action_type,
+        Some(command_pid),
+        audit_info,
+    );
     Ok(())
 }
 
 /// Log an audit event for a mediated command response.
+///
+/// Critical section: `lock()` → `append_event()` → drop guard. No `.await`,
+/// no reentrancy into the server/policy/broker. If the mutex is poisoned
+/// (some earlier writer panicked), the event is dropped with a warning —
+/// further writes would be unsafe because the recorder's in-memory chain
+/// state is potentially inconsistent with the file on disk.
 fn log_mediated_audit(
-    audit_log_dir: &Path,
+    audit_recorder: &Mutex<AuditRecorder<AuditEvent>>,
     command: &str,
     args: &[String],
     response: &ShimResponse,
     action_type: &str,
+    command_pid: Option<u32>,
+    audit_info: &SessionAuditInfo,
 ) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    append_audit_log(
-        audit_log_dir,
-        &AuditEvent {
-            command: command.to_string(),
-            args: scrub_args(args),
-            ts,
-            exit_code: response.exit_code,
-            action_type: Some(action_type.to_string()),
-        },
-    );
+    let event = AuditEvent {
+        command: command.to_string(),
+        args: scrub_args(args),
+        ts,
+        exit_code: response.exit_code,
+        action_type: Some(action_type.to_string()),
+        session_id: audit_info.session_id.clone(),
+        session_name: audit_info.session_name.clone(),
+        nono_pid: audit_info.nono_pid,
+        sandboxed_pid: audit_info.sandboxed_pid.get().copied(),
+        command_pid,
+    };
+    append_to_recorder(audit_recorder, event);
+}
+
+/// Acquire the recorder lock, append one event, release. Common helper
+/// between the mediation stream path and the datagram receiver path so
+/// both paths share identical locking discipline.
+fn append_to_recorder(audit_recorder: &Mutex<AuditRecorder<AuditEvent>>, event: AuditEvent) {
+    match audit_recorder.lock() {
+        Ok(mut guard) => {
+            if let Err(err) = guard.append_event(event) {
+                warn!("mediation audit: failed to append event: {}", err);
+            }
+        }
+        Err(_) => {
+            // Poisoned mutex: a prior writer panicked mid-append. Further
+            // writes are unsafe because recorder state may be inconsistent
+            // with the on-disk chain. Drop the event with a warning.
+            let _ = NonoError::Snapshot("Mediation audit recorder lock poisoned".to_string());
+            warn!("mediation audit: recorder lock poisoned, dropping event");
+        }
+    }
 }
 
 /// Write a length-prefixed JSON response.
@@ -290,15 +341,32 @@ fn bind_dgram_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixDatagra
     tokio::net::UnixDatagram::from_std(std_sock)
 }
 
-/// Receive audit events from shims and append them to `audit.jsonl`.
-async fn run_audit_receiver(socket: tokio::net::UnixDatagram, audit_log_dir: Arc<PathBuf>) {
+/// Receive audit events from shims and append them to `audit.jsonl`
+/// through the shared recorder.
+///
+/// Shim-originated events do not carry session context (the shim has no
+/// access to it). The server stamps each received event with the session
+/// fields before handing it to the recorder.
+///
+/// Locking discipline: the `.recv().await` above MUST complete before
+/// taking the recorder lock. We never hold the recorder lock across an
+/// `.await`.
+async fn run_audit_receiver(
+    socket: tokio::net::UnixDatagram,
+    audit_recorder: SharedRecorder,
+    audit_info: Arc<SessionAuditInfo>,
+) {
     let mut buf = vec![0u8; 8192];
     loop {
         match socket.recv(&mut buf).await {
             Ok(n) => {
                 if let Ok(mut event) = serde_json::from_slice::<AuditEvent>(&buf[..n]) {
                     event.args = scrub_args(&event.args);
-                    append_audit_log(&audit_log_dir, &event);
+                    event.session_id = audit_info.session_id.clone();
+                    event.session_name = audit_info.session_name.clone();
+                    event.nono_pid = audit_info.nono_pid;
+                    event.sandboxed_pid = audit_info.sandboxed_pid.get().copied();
+                    append_to_recorder(&audit_recorder, event);
                 } else {
                     warn!("audit socket: failed to parse event");
                 }
@@ -307,23 +375,6 @@ async fn run_audit_receiver(socket: tokio::net::UnixDatagram, audit_log_dir: Arc
                 warn!("audit socket recv error: {}", e);
                 break;
             }
-        }
-    }
-}
-
-/// Append a single audit event as a JSON line to `audit.jsonl`.
-fn append_audit_log(audit_log_dir: &Path, event: &AuditEvent) {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let log_path = audit_log_dir.join("audit.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-    {
-        if let Ok(line) = serde_json::to_string(event) {
-            let _ = writeln!(f, "{}", line);
         }
     }
 }

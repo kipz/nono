@@ -16,10 +16,14 @@ There are three trust domains:
 | Domain | Trust Level | Role |
 |--------|-------------|------|
 | Kernel | Fully trusted | Enforces Landlock rules, delivers seccomp notifications, blocks unauthorized syscalls |
-| Supervisor (parent) | Trusted | Receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
+| Supervisor (parent) | Trusted | Records audit events, receives trapped syscalls, consults approval backend, opens files, injects file descriptors |
 | Sandboxed child | Untrusted | Runs the agent command under full kernel enforcement |
 
 The supervisor is trusted but constrained. It can only grant access to files it can open itself (standard Unix permissions apply), and protected nono state roots are checked before any approval backend is consulted.
+
+In supervised mode, audit recording also lives in this trust boundary. The sandboxed child does not write its own audit log. Instead, the trusted parent records session metadata, supervisor-observed events, session-local integrity data, the global audit ledger entry for that session, and any optional audit attestation signature.
+
+In plain terms: the child can generate events by doing things, but it does not control the audit writer. The trusted parent is the component that records the session, commits the event log into the integrity structure, and optionally signs the completed session. That is why the child cannot directly tamper with its own recorded audit trail.
 
 When proxy mode is active, a fourth domain exists:
 
@@ -60,6 +64,8 @@ In supervised mode, the supervisor is already part of the trusted computing base
 - owns the seccomp-notify fd
 - mediates approvals
 - may run rollback snapshots
+- records audit events and session metadata
+- may compute audit-log integrity metadata
 - may run the network proxy
 - manages the session registry and PTY
 
@@ -165,6 +171,33 @@ Transparent capability expansion on macOS would require intercepting `open()` ca
 
 macOS supervised mode provides rollback snapshots and diagnostic output, but does not attempt capability expansion. Seatbelt (`sandbox_init()`) provides the kernel enforcement layer on macOS, with the same irreversibility guarantees as Landlock on Linux.
 
+### macOS Claude Code keychain scope
+
+The built-in `claude-code` profile on macOS grants read-write access to the **user** keychain root:
+
+- `~/Library/Keychains`
+
+It also keeps explicit grants for:
+
+- `~/Library/Keychains/login.keychain-db`
+- `~/Library/Keychains/metadata.keychain-db`
+
+This is broader than the older "two DB files only" model. In practice, Claude Code's login and token persistence flow touches more of the user keychain runtime surface than those two files alone, so the narrower grant was not sufficient for reliable auth.
+
+This does **not** grant the system keychain at `/Library/Keychains`.
+
+Security implication:
+
+- a process running under the macOS `claude-code` profile can interact with the user's keychain subtree, not just Claude-specific entries
+
+This was chosen as a compatibility tradeoff for the built-in Claude profile. Users who need a tighter boundary should use a custom profile instead of relying on the built-in `claude-code` profile.
+
+For users who want the built-in Claude profile shape without macOS keychain access, nono also provides:
+
+- `claude-no-kc`
+
+That profile keeps the normal Claude filesystem/runtime allowances but does not relax the macOS keychain deny for `~/Library/Keychains`.
+
 ## The fd Injection Model
 
 When the supervisor approves a request, it does not tell the child "go ahead and open it yourself." It opens the file and hands the child a file descriptor. This distinction is fundamental to the security model.
@@ -221,6 +254,28 @@ Because `stat` and `access` are not trapped, the sandboxed child can enumerate f
 | Path canonicalization fails | Supervisor returns error to child | Safe — fail-closed |
 
 The invariant is: **if anything goes wrong, the child does not get access**. The system fails closed at every decision point.
+
+## Audit Integrity Limits
+
+The audit subsystem has a narrower security claim than the sandbox itself.
+
+- The supervisor is trusted to record events honestly and completely. The sandboxed child cannot write its own audit log, but the audit log still depends on supervisor correctness.
+- Session-local hashes are not, by themselves, sufficient history integrity. nono therefore records audited sessions into a global audit ledger as sessions complete.
+- The current ledger is still local host state. Without a future signature or external anchor, a host attacker who can rewrite both the session files and the ledger can forge a self-consistent history.
+- For supervised sessions, the supervisor hashes the resolved main executable binary and binds that `{ resolved_path, sha256 }` identity into session metadata and the global audit ledger.
+- When `--audit-sign-key` is configured, the supervisor also signs the session's audit Merkle root and session context using a keyed DSSE/in-toto attestation. The signature is written into the session directory and can later be checked with the corresponding public key.
+- That signature is produced once, at session finalization. nono does not sign each individual audit event.
+- That executable identity is not full runtime provenance. Shared libraries, interpreter chains, scripts passed as arguments, and dynamically loaded runtime dependencies are not covered by that binary hash.
+- The executable hash is computed before `exec`, not from the final kernel-loaded file descriptor. A privileged attacker with write access to the executable path could still race between hash and execution.
+- The keyed audit attestation is only as strong as the signing key distribution model. If the verifier does not pin the expected public key, a rewritten session could also rewrite the embedded public key and remain self-consistent.
+- `nono audit verify --public-key-file <FILE>` is the path that pins verification to an expected signer key. Without that, attestation verification checks the keyed signature against the public key recorded in session metadata.
+- Filesystem Merkle roots under `--audit-integrity` or `--rollback` commit tracked writable paths, not the full machine state.
+
+The correct way to read the feature today is:
+
+- sandbox enforcement: kernel-enforced and fail-closed
+- audit trail: supervisor-recorded and tamper-evident within the local integrity model
+- attestation: keyed signing is available for session audit roots, but external anchoring and timestamping are still future work
 
 ## What If the Supervisor Is Compromised?
 

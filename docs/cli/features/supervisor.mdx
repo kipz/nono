@@ -1,9 +1,9 @@
 ---
 title: Supervisor Mode
-description: Transparent capability expansion and runtime approval
+description: Runtime services provided by the trusted parent process
 ---
 
-Supervisor mode keeps a parent process alive outside the sandbox to provide runtime services that a fully sandboxed process cannot perform on its own. This enables transparent capability expansion on Linux and rollback snapshots on both platforms.
+Supervisor mode keeps a parent process alive outside the sandbox to provide runtime services that a fully sandboxed process cannot perform on its own. This includes audit recording, optional audit-integrity hashing, transparent capability expansion on Linux, network proxying, and rollback snapshots on both platforms.
 
 ## Enabling Supervisor Mode
 
@@ -21,7 +21,7 @@ The execution model:
 
 1. nono forks before applying the sandbox
 2. The **child** is sandboxed and runs the command
-3. The **parent** remains unsandboxed to provide supervisor services
+3. The **parent** remains unsandboxed to provide supervisor services such as audit logging, capability decisions, proxy mediation, and optional rollback snapshots
 
 See [Execution Modes](/cli/features/execution-modes) for how this compares to Direct mode (`nono wrap`).
 For the operational runtime workflow built on top of supervisor mode, see [Session Lifecycle](/cli/features/session-lifecycle).
@@ -69,6 +69,20 @@ On macOS, supervised mode provides rollback snapshots and the diagnostic footer,
 
 The supervisor always blocks access to nono's own protected state roots, such as `~/.nono`, before consulting the approval backend. This prevents dynamic grants from exposing rollback data, audit state, or other internal nono files.
 
+## Audit Responsibilities
+
+The supervisor is also the trusted recorder for supervised sessions.
+
+It is responsible for:
+
+- creating the audit session directory
+- writing session metadata
+- recording supervisor-observed events such as capability decisions and URL opens
+- draining proxy network audit events at session end
+- computing the audit-log chain head and Merkle root when `--audit-integrity` is enabled
+
+This means the sandboxed child cannot directly tamper with its own audit log. The trust assumption is that the supervisor records events honestly; `--audit-integrity` then makes later tampering with the recorded log detectable.
+
 ## Approval Backends
 
 The supervisor uses an `ApprovalBackend` trait to determine whether to grant access. The library defines the trait; backends are implemented by clients.
@@ -95,4 +109,5 @@ When the child exits with a non-zero exit code, nono prints a diagnostic footer 
 ## Limitations
 
 - Capability expansion is Linux-only. macOS supervised mode provides rollback snapshots and diagnostics only.
+- Audit recording is supervised-mode only. Direct mode (`nono wrap`) has no parent process and therefore no audit session.
 - **WSL2**: Capability expansion (`--capability-elevation`) is unavailable. WSL2's init process claims the sole seccomp notify listener, causing `EBUSY` when nono tries to install its own ([microsoft/WSL#9548](https://github.com/microsoft/WSL/issues/9548)). Supervised mode still works for rollback snapshots and diagnostics. See [WSL2 Support](/cli/internals/wsl2#seccomp-user-notification-limitation) for details.

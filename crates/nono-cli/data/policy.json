@@ -430,6 +430,20 @@
       "description": "Claude Code macOS-specific state and credential paths",
       "platform": "macos",
       "allow": {
+        "read": [
+          "$HOME/.local/share/claude"
+        ],
+        "readwrite": [
+          "$HOME/Library/Keychains",
+          "$HOME/Library/Keychains/login.keychain-db",
+          "$HOME/Library/Keychains/metadata.keychain-db"
+        ]
+      }
+    },
+    "codex_macos": {
+      "description": "Codex macOS-specific state and credential paths",
+      "platform": "macos",
+      "allow": {
         "readwrite": [
           "$HOME/Library/Keychains/login.keychain-db",
           "$HOME/Library/Keychains/metadata.keychain-db"
@@ -442,16 +456,6 @@
       "allow": {
         "read": [
           "$HOME/.local/share/claude"
-        ]
-      }
-    },
-    "codex_macos": {
-      "description": "Codex macOS-specific state and credential paths",
-      "platform": "macos",
-      "allow": {
-        "readwrite": [
-          "$HOME/Library/Keychains/login.keychain-db",
-          "$HOME/Library/Keychains/metadata.keychain-db"
         ]
       }
     },
@@ -649,6 +653,63 @@
       "security": {
         "groups": [
           "claude_code_macos",
+          "claude_code_linux",
+          "user_caches_macos",
+          "claude_cache_linux",
+          "node_runtime",
+          "rust_runtime",
+          "python_runtime",
+          "vscode_macos",
+          "vscode_linux",
+          "linux_sysfs_read",
+          "nix_runtime",
+          "git_config",
+          "unlink_protection"
+        ],
+        "signal_mode": "isolated",
+        "capability_elevation": false
+      },
+      "filesystem": {
+        "allow": ["$HOME/.claude", "$HOME/.cache/claude", "$XDG_CONFIG_HOME/nono/profiles"],
+        "allow_file": [
+          "$HOME/.claude.json",
+          "$HOME/.claude.json.lock",
+          "$HOME/.claude.lock"
+        ]
+      },
+      "policy": {
+        "add_allow_readwrite": [
+          "$HOME/Library/Keychains"
+        ],
+        "override_deny": [
+          "$HOME/Library/Keychains"
+        ]
+      },
+      "network": { "block": false },
+      "workdir": { "access": "readwrite" },
+      "open_urls": {
+        "allow_origins": [
+          "https://claude.ai"
+        ],
+        "allow_localhost": true
+      },
+      "allow_launch_services": true,
+      "undo": {
+        "exclude_patterns": ["node_modules", ".next", "__pycache__", "target"],
+        "exclude_globs": ["*.tmp.[0-9]*.[0-9]*"]
+      },
+      "interactive": true
+    },
+    "claude-no-kc": {
+      "extends": "default",
+      "meta": {
+        "name": "claude-no-kc",
+        "version": "1.0.0",
+        "description": "Anthropic Claude Code CLI agent without macOS keychain access",
+        "author": "nono-project"
+      },
+      "security": {
+        "groups": [
           "claude_code_linux",
           "user_caches_macos",
           "claude_cache_linux",

@@ -580,17 +580,6 @@ impl CapabilitySetExt for CapabilitySet {
                 port: 0,
                 bind_ports,
             });
-
-            // Add allow_domain ports to Landlock ConnectTcp rules so non-HTTP
-            // protocols (NATS, PostgreSQL, etc.) can connect directly while
-            // HTTP traffic still goes through the proxy.
-            // Only on Linux — macOS uses Seatbelt which cannot filter by port;
-            // the proxy handles domain filtering at the application layer.
-            #[cfg(target_os = "linux")]
-            for entry in &profile.network.allow_domain {
-                let port = parse_allow_domain_port(entry);
-                caps.add_tcp_connect_port(port);
-            }
         }
 
         // Localhost IPC ports from profile
@@ -630,11 +619,17 @@ impl CapabilitySetExt for CapabilitySet {
         // Apply CLI overrides (CLI args take precedence)
         add_cli_overrides(&mut caps, args, allow_parent_of_protected)?;
 
-        // Expand profile-level override_deny paths for finalize_caps
+        // Expand profile-level override_deny paths for finalize_caps.
+        // Existing override targets must fail closed in apply_deny_overrides
+        // when they lack a matching user-intent grant. Non-existent paths are
+        // skipped here to preserve platform-specific built-in profiles whose
+        // grants are intentionally absent on other OSes.
         let mut profile_overrides = Vec::with_capacity(profile.policy.override_deny.len());
         for path_template in &profile.policy.override_deny {
             let path = expand_vars(path_template, workdir)?;
-            profile_overrides.push(path);
+            if path.exists() {
+                profile_overrides.push(path);
+            }
         }
 
         finalize_caps(
@@ -685,18 +680,6 @@ fn finalize_caps(
     Ok(())
 }
 
-/// Extract port number from an allow_domain entry.
-/// Format: `"host:port"` returns the port, bare `"host"` returns 443 (HTTPS default).
-#[cfg(target_os = "linux")]
-fn parse_allow_domain_port(entry: &str) -> u16 {
-    if let Some((_host, port_str)) = entry.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return port;
-        }
-    }
-    443
-}
-
 fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
     if args.block_net {
         caps.set_network_blocked(true);
@@ -709,16 +692,6 @@ fn apply_cli_network_mode(caps: &mut CapabilitySet, args: &SandboxArgs) {
             port: 0,
             bind_ports: args.allow_bind.clone(),
         });
-
-        // Add allow_proxy (--allow-domain) ports to Landlock ConnectTcp rules
-        // so non-HTTP protocols can connect directly.
-        // Only on Linux — macOS Seatbelt cannot filter by port; the proxy
-        // handles domain filtering at the application layer.
-        #[cfg(target_os = "linux")]
-        for entry in &args.allow_proxy {
-            let port = parse_allow_domain_port(entry);
-            caps.add_tcp_connect_port(port);
-        }
     }
 }
 
@@ -870,20 +843,23 @@ mod tests {
 
     #[test]
     fn test_from_args_rejects_protected_state_subtree() {
-        let home = dirs::home_dir().expect("home");
-        let protected_subtree = home.join(".nono").join("rollbacks");
+        with_env_lock(|| {
+            let home = dirs::home_dir().expect("home");
+            let protected_subtree = home.join(".nono").join("rollbacks");
 
-        let args = SandboxArgs {
-            allow: vec![protected_subtree],
-            ..sandbox_args()
-        };
+            let args = SandboxArgs {
+                allow: vec![protected_subtree],
+                ..sandbox_args()
+            };
 
-        let err = from_args_locked(&args).expect_err("must reject protected state path");
-        assert!(
-            err.to_string()
-                .contains("overlaps protected nono state root"),
-            "unexpected error: {err}",
-        );
+            let err =
+                CapabilitySet::from_args(&args).expect_err("must reject protected state path");
+            assert!(
+                err.to_string()
+                    .contains("overlaps protected nono state root"),
+                "unexpected error: {err}",
+            );
+        });
     }
 
     #[test]
@@ -1630,10 +1606,48 @@ mod tests {
     }
 
     #[test]
-    fn test_from_profile_policy_override_deny_requires_matching_grant() {
+    fn test_cli_override_deny_requires_matching_grant() {
         // Override path is under temp dir which is covered by system groups,
         // but the grant check requires user-intent sources (User/Profile),
-        // so group coverage is not sufficient.
+        // so group coverage is not sufficient. Profile-level override_deny
+        // entries may be skipped when their platform-specific grants do not
+        // resolve on the current platform; CLI overrides should still fail.
+        let dir = tempdir().expect("tmpdir");
+        let denied = dir.path().join("denied_no_grant");
+        std::fs::create_dir_all(&denied).expect("mkdir denied");
+
+        let profile_path = dir.path().join("override-deny-no-grant.json");
+        std::fs::write(
+            &profile_path,
+            format!(
+                r#"{{
+                    "meta": {{ "name": "override-deny-no-grant" }},
+                    "policy": {{
+                        "add_deny_access": ["{path}"]
+                    }}
+                }}"#,
+                path = denied.display()
+            ),
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+
+        let workdir = tempdir().expect("workdir");
+        let args = SandboxArgs {
+            override_deny: vec![denied.clone()],
+            ..sandbox_args()
+        };
+
+        let err = from_profile_locked(&profile, workdir.path(), &args)
+            .expect_err("CLI override_deny without user-intent grant should fail");
+        assert!(
+            err.to_string().contains("no matching grant"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_override_deny_requires_matching_grant() {
         let dir = tempdir().expect("tmpdir");
         let denied = dir.path().join("denied_no_grant");
         std::fs::create_dir_all(&denied).expect("mkdir denied");
@@ -1659,7 +1673,7 @@ mod tests {
         let args = sandbox_args();
 
         let err = from_profile_locked(&profile, workdir.path(), &args)
-            .expect_err("override_deny without user-intent grant should fail");
+            .expect_err("profile override_deny without grant should fail");
         assert!(
             err.to_string().contains("no matching grant"),
             "unexpected error: {err}"
@@ -1941,37 +1955,23 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_allow_domain_port_with_explicit_port() {
-        assert_eq!(parse_allow_domain_port("nats.example.com:4222"), 4222);
-        assert_eq!(parse_allow_domain_port("postgres.example.com:5432"), 5432);
-        assert_eq!(parse_allow_domain_port("localhost:8080"), 8080);
+    fn test_regex_escape_path_dots() {
+        assert_eq!(
+            regex_escape_path("/Users/me/.claude.json"),
+            "/Users/me/\\.claude\\.json"
+        );
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_allow_domain_port_default() {
-        assert_eq!(parse_allow_domain_port("api.example.com"), 443);
-        assert_eq!(parse_allow_domain_port("*.example.com"), 443);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_parse_allow_domain_port_invalid_port() {
-        // Invalid port string falls back to 443
-        assert_eq!(parse_allow_domain_port("host:notaport"), 443);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_from_profile_allow_domain_ports_added_to_tcp_connect() {
+    fn test_from_profile_allow_domain_does_not_open_raw_tcp_ports() {
         let dir = tempdir().expect("tmpdir");
-        let profile_path = dir.path().join("allow-domain-ports.json");
+        let profile_path = dir.path().join("allow-domain-no-raw-ports.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "meta": { "name": "allow-domain-ports" },
+                "meta": { "name": "allow-domain-no-raw-ports" },
                 "filesystem": { "allow": ["/tmp"] },
                 "network": {
                     "allow_domain": [
@@ -1990,36 +1990,15 @@ mod tests {
 
         let (caps, _) = from_profile_locked(&profile, workdir.path(), &args).expect("build caps");
 
-        let ports = caps.tcp_connect_ports();
         assert!(
-            ports.contains(&443),
-            "tcp_connect_ports should contain 443 for bare domain, got: {:?}",
-            ports
-        );
-        assert!(
-            ports.contains(&4222),
-            "tcp_connect_ports should contain 4222 for nats.example.com:4222, got: {:?}",
-            ports
-        );
-        assert!(
-            ports.contains(&5432),
-            "tcp_connect_ports should contain 5432 for postgres.example.com:5432, got: {:?}",
-            ports
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn test_regex_escape_path_dots() {
-        assert_eq!(
-            regex_escape_path("/Users/me/.claude.json"),
-            "/Users/me/\\.claude\\.json"
+            caps.tcp_connect_ports().is_empty(),
+            "allow_domain should not grant direct TCP ports in proxy mode, got: {:?}",
+            caps.tcp_connect_ports()
         );
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_from_args_allow_proxy_ports_added_to_tcp_connect() {
+    fn test_from_args_allow_proxy_does_not_open_raw_tcp_ports() {
         let args = SandboxArgs {
             allow_proxy: vec![
                 "api.example.com".to_string(),
@@ -2030,16 +2009,10 @@ mod tests {
 
         let (caps, _) = from_args_locked(&args).expect("build caps");
 
-        let ports = caps.tcp_connect_ports();
         assert!(
-            ports.contains(&443),
-            "tcp_connect_ports should contain 443 for bare domain, got: {:?}",
-            ports
-        );
-        assert!(
-            ports.contains(&4222),
-            "tcp_connect_ports should contain 4222 for nats.example.com:4222, got: {:?}",
-            ports
+            caps.tcp_connect_ports().is_empty(),
+            "allow-domain should not grant direct TCP ports in proxy mode, got: {:?}",
+            caps.tcp_connect_ports()
         );
     }
 

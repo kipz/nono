@@ -294,6 +294,9 @@ fn test_show_format_manifest_all_builtins_succeed() {
     let arr = profiles.as_array().expect("array of profiles");
 
     for profile_val in arr {
+        if profile_val.get("source").and_then(|s| s.as_str()) != Some("built-in") {
+            continue;
+        }
         let name = profile_val
             .get("name")
             .and_then(|n| n.as_str())

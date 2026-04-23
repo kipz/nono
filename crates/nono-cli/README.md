@@ -84,6 +84,7 @@ Precedence is: CLI flag, then `NONO_THEME`, then config file, then the default `
 | Profile | Command |
 |---------|---------|
 | Claude Code | `nono run --profile claude-code -- claude` |
+| Claude Code (No Keychain) | `nono run --profile claude-no-kc -- claude` |
 | Codex | `nono run --profile codex -- codex` |
 | OpenCode | `nono run --profile opencode -- opencode` |
 | OpenClaw | `nono run --profile openclaw -- openclaw gateway` |

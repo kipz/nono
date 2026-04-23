@@ -409,6 +409,23 @@ By default, granting a parent directory of `~/.nono` (e.g. `--allow ~`) is rejec
 
 When `allow_parent_of_protected` is `true` and the platform is macOS, nono permits the parent grant and emits Seatbelt deny rules that protect `~/.nono` from reads and writes. On Linux this field is ignored — Landlock cannot deny a child of an allowed parent, so the pre-flight check always rejects parent-of-protected grants.
 
+### Allowing parent-of-protected-root grants (macOS only)
+
+By default, granting a parent directory of `~/.nono` (e.g. `--allow ~`) is rejected because it would expose nono's internal state. On macOS, Seatbelt can express deny-within-allow rules, so this restriction can be relaxed when the profile opts in with `allow_parent_of_protected`:
+
+```json
+{
+  "extends": "claude-code",
+  "meta": {
+    "name": "home-access",
+    "description": "Claude Code with full home directory access"
+  },
+  "allow_parent_of_protected": true
+}
+```
+
+When `allow_parent_of_protected` is `true` and the platform is macOS, nono permits the parent grant and emits Seatbelt deny rules that protect `~/.nono` from reads and writes. On Linux this field is ignored — Landlock cannot deny a child of an allowed parent, so the pre-flight check always rejects parent-of-protected grants.
+
 ### Profile with group exclusion
 
 Remove an inherited deny group that is too restrictive for your use case:

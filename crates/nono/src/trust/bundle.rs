@@ -140,7 +140,7 @@ pub fn load_trusted_root_from_str(json: &str) -> Result<TrustedRoot> {
 ///
 /// Returns `NonoError::TrustPolicy` if the embedded root cannot be loaded.
 pub fn load_production_trusted_root() -> Result<TrustedRoot> {
-    TrustedRoot::production()
+    TrustedRoot::from_json(sigstore_verify::trust_root::SIGSTORE_PRODUCTION_TRUSTED_ROOT)
         .map_err(|e| NonoError::TrustPolicy(format!("failed to load production trusted root: {e}")))
 }
 

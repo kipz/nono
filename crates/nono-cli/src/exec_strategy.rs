@@ -19,7 +19,7 @@ use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, Pid};
-use nono::supervisor::{ApprovalDecision, SupervisorMessage, SupervisorResponse};
+use nono::supervisor::{ApprovalDecision, AuditEntry, SupervisorMessage, SupervisorResponse};
 use nono::{
     ApprovalBackend, CapabilitySet, DenialReason, DenialRecord, DiagnosticFormatter,
     DiagnosticMode, NonoError, Result, Sandbox, SupervisorSocket,
@@ -33,6 +33,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -311,6 +312,10 @@ pub struct SupervisorConfig<'a> {
     pub open_url_origins: &'a [String],
     /// Whether to allow http://localhost and http://127.0.0.1 URLs.
     pub open_url_allow_localhost: bool,
+    /// Optional append-only audit recorder for supervisor events.
+    pub audit_recorder: Option<
+        &'a Mutex<crate::audit_integrity::AuditRecorder<crate::audit_integrity::AuditEventPayload>>,
+    >,
     /// Whether direct LaunchServices opening is enabled for this session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub allow_launch_services_active: bool,
@@ -2119,6 +2124,7 @@ fn handle_supervisor_message(
 ) -> Result<()> {
     match msg {
         SupervisorMessage::Request(request) => {
+            let decision_started = Instant::now();
             // Replay detection and bounded request-id cache.
             let replay_denial_reason = if seen_request_ids.contains(&request.request_id) {
                 Some("Duplicate request_id rejected (replay detected)")
@@ -2138,12 +2144,19 @@ fn handle_supervisor_message(
                     },
                 );
                 let response = SupervisorResponse::Decision {
-                    request_id: request.request_id,
+                    request_id: request.request_id.clone(),
                     decision: ApprovalDecision::Denied {
                         reason: reason.to_string(),
                     },
                 };
-                return sock.send_response(&response);
+                sock.send_response(&response)?;
+                record_capability_audit(
+                    config,
+                    request,
+                    decision_started,
+                    response_decision(&response),
+                )?;
+                return Ok(());
             }
             seen_request_ids.insert(request.request_id.clone());
 
@@ -2324,63 +2337,116 @@ fn handle_supervisor_message(
                         if let Err(e) = sock.send_fd(file.as_raw_fd()) {
                             warn!("Failed to send fd: {}", e);
                             let response = SupervisorResponse::Decision {
-                                request_id: request.request_id,
+                                request_id: request.request_id.clone(),
                                 decision: ApprovalDecision::Denied {
                                     reason: format!("Failed to send file descriptor: {e}"),
                                 },
                             };
-                            return sock.send_response(&response);
+                            sock.send_response(&response)?;
+                            record_capability_audit(
+                                config,
+                                request,
+                                decision_started,
+                                response_decision(&response),
+                            )?;
+                            return Ok(());
                         }
                     }
                     Err(e) => {
                         warn!("Failed to open path: {}", e);
                         let response = SupervisorResponse::Decision {
-                            request_id: request.request_id,
+                            request_id: request.request_id.clone(),
                             decision: ApprovalDecision::Denied {
                                 reason: format!("Supervisor failed to open path: {e}"),
                             },
                         };
-                        return sock.send_response(&response);
+                        sock.send_response(&response)?;
+                        record_capability_audit(
+                            config,
+                            request,
+                            decision_started,
+                            response_decision(&response),
+                        )?;
+                        return Ok(());
                     }
                 }
             }
 
             // 4. Send decision response
             let response = SupervisorResponse::Decision {
-                request_id: request.request_id,
+                request_id: request.request_id.clone(),
                 decision,
             };
             sock.send_response(&response)?;
+            record_capability_audit(
+                config,
+                request,
+                decision_started,
+                response_decision(&response),
+            )?;
         }
         SupervisorMessage::OpenUrl(url_request) => {
             let request_id = url_request.request_id.clone();
 
-            match validate_and_open_url(&url_request.url, config) {
+            let (success, error) = match validate_and_open_url(&url_request.url, config) {
                 Ok(()) => {
                     info!("Supervisor: opened URL {} for child", url_request.url);
-                    let response = SupervisorResponse::UrlOpened {
-                        request_id,
-                        success: true,
-                        error: None,
-                    };
-                    sock.send_response(&response)?;
+                    (true, None)
                 }
                 Err(reason) => {
                     warn!(
                         "Supervisor: URL open denied for {}: {}",
                         url_request.url, reason
                     );
-                    let response = SupervisorResponse::UrlOpened {
-                        request_id,
-                        success: false,
-                        error: Some(reason),
-                    };
-                    sock.send_response(&response)?;
+                    (false, Some(reason))
                 }
+            };
+            let response = SupervisorResponse::UrlOpened {
+                request_id,
+                success,
+                error: error.clone(),
+            };
+            sock.send_response(&response)?;
+            if let Some(recorder_mutex) = config.audit_recorder {
+                let mut recorder = recorder_mutex
+                    .lock()
+                    .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+                recorder.record_open_url(url_request, success, error)?;
             }
         }
     }
 
+    Ok(())
+}
+
+fn response_decision(response: &SupervisorResponse) -> ApprovalDecision {
+    match response {
+        SupervisorResponse::Decision { decision, .. } => decision.clone(),
+        SupervisorResponse::UrlOpened { .. } => ApprovalDecision::Denied {
+            reason: "invalid supervisor response type for capability decision".to_string(),
+        },
+    }
+}
+
+fn record_capability_audit(
+    config: &SupervisorConfig<'_>,
+    request: nono::supervisor::CapabilityRequest,
+    decision_started: Instant,
+    decision: ApprovalDecision,
+) -> Result<()> {
+    if let Some(recorder_mutex) = config.audit_recorder {
+        let entry = AuditEntry {
+            timestamp: std::time::SystemTime::now(),
+            request,
+            decision,
+            backend: config.approval_backend.backend_name().to_string(),
+            duration_ms: decision_started.elapsed().as_millis() as u64,
+        };
+        let mut recorder = recorder_mutex
+            .lock()
+            .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
+        recorder.record_capability_decision(entry)?;
+    }
     Ok(())
 }
 
@@ -3345,6 +3411,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3445,6 +3512,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 8080,
@@ -3519,6 +3587,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &origins,
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3551,6 +3620,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3581,6 +3651,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: true,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3595,6 +3666,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3630,6 +3702,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: false,
             #[cfg(target_os = "linux")]
             proxy_port: 0,
@@ -3768,6 +3841,7 @@ mod tests {
             detach_sequence: None,
             open_url_origins: &[],
             open_url_allow_localhost: false,
+            audit_recorder: None,
             allow_launch_services_active: true,
             #[cfg(target_os = "linux")]
             proxy_port: 0,

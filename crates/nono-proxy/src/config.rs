@@ -167,6 +167,13 @@ pub struct RouteConfig {
     /// to the certificate in `tls_client_cert`.
     #[serde(default)]
     pub tls_client_key: Option<String>,
+
+    /// Optional OAuth2 client_credentials configuration.
+    /// When present, the proxy handles token exchange automatically instead
+    /// of using a static credential from the keystore.
+    /// Mutually exclusive with `credential_key` — use one or the other.
+    #[serde(default)]
+    pub oauth2: Option<OAuth2Config>,
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -352,6 +359,28 @@ pub struct ExternalProxyAuth {
 
 fn default_auth_scheme() -> String {
     "basic".to_string()
+}
+
+/// OAuth2 client_credentials configuration for automatic token exchange.
+///
+/// When configured on a route, the proxy handles the token lifecycle:
+/// 1. Exchanges client_id + client_secret for an access_token at startup
+/// 2. Caches the token with TTL from the `expires_in` response
+/// 3. Refreshes automatically before expiry (30s buffer)
+/// 4. Injects the access_token as `Authorization: Bearer <token>`
+///
+/// The agent never sees client_id or client_secret — only a phantom token.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OAuth2Config {
+    /// Token endpoint URL (e.g., "https://auth.example.com/oauth/token")
+    pub token_url: String,
+    /// Client ID — plain value or credential reference (env://, file://, op://)
+    pub client_id: String,
+    /// Client secret — credential reference (env://, file://, op://)
+    pub client_secret: String,
+    /// OAuth2 scopes (space-separated). Empty = no scope parameter sent.
+    #[serde(default)]
+    pub scope: String,
 }
 
 #[cfg(test)]
@@ -682,5 +711,66 @@ mod tests {
         let deserialized: EndpointRule = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.method, "GET");
         assert_eq!(deserialized.path, "/api/*/data");
+    }
+
+    // ========================================================================
+    // OAuth2Config tests
+    // ========================================================================
+
+    #[test]
+    fn test_oauth2_config_deserialization() {
+        let json = r#"{
+            "token_url": "https://auth.example.com/oauth/token",
+            "client_id": "my-client",
+            "client_secret": "env://CLIENT_SECRET",
+            "scope": "read write"
+        }"#;
+        let config: OAuth2Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.token_url, "https://auth.example.com/oauth/token");
+        assert_eq!(config.client_id, "my-client");
+        assert_eq!(config.client_secret, "env://CLIENT_SECRET");
+        assert_eq!(config.scope, "read write");
+    }
+
+    #[test]
+    fn test_oauth2_config_default_scope() {
+        let json = r#"{
+            "token_url": "https://auth.example.com/oauth/token",
+            "client_id": "my-client",
+            "client_secret": "env://SECRET"
+        }"#;
+        let config: OAuth2Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.scope, "");
+    }
+
+    #[test]
+    fn test_route_config_with_oauth2() {
+        let json = r#"{
+            "prefix": "/my-api",
+            "upstream": "https://api.example.com",
+            "oauth2": {
+                "token_url": "https://auth.example.com/oauth/token",
+                "client_id": "agent-1",
+                "client_secret": "env://CLIENT_SECRET",
+                "scope": "api.read"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.oauth2.is_some());
+        assert!(route.credential_key.is_none());
+        let oauth2 = route.oauth2.unwrap();
+        assert_eq!(oauth2.token_url, "https://auth.example.com/oauth/token");
+    }
+
+    #[test]
+    fn test_route_config_without_oauth2() {
+        let json = r#"{
+            "prefix": "/openai",
+            "upstream": "https://api.openai.com",
+            "credential_key": "openai"
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.oauth2.is_none());
+        assert!(route.credential_key.is_some());
     }
 }

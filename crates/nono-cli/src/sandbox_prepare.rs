@@ -4,10 +4,12 @@ use crate::command_blocking_deprecation;
 #[cfg(unix)]
 use crate::config;
 use crate::credential_runtime::load_env_credentials;
+use crate::network_policy;
+use crate::output;
 use crate::profile;
 use crate::profile::WorkdirAccess;
 use crate::profile_runtime::{prepare_profile, prepare_profile_for_preflight};
-use crate::{output, policy, protected_paths, sandbox_state};
+use crate::{policy, protected_paths, sandbox_state};
 use crate::{DETACHED_CWD_PROMPT_RESPONSE_ENV, DETACHED_LAUNCH_ENV};
 use colored::Colorize;
 use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result, Sandbox};
@@ -22,6 +24,16 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use tracing::{info, warn};
+
+fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: bool) {
+    if silent {
+        return;
+    }
+
+    for warning in network_policy::collect_allow_domain_port_warnings(entries, context) {
+        output::print_warning(&warning);
+    }
+}
 
 /// Returns `true` if `profile_name` is `"claude-code"` or transitively extends it.
 fn is_claude_code_profile(profile_name: &str) -> bool {
@@ -971,6 +983,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             .as_ref()
             .map(|network| network.allow_domains.clone())
             .unwrap_or_default();
+        print_allow_domain_port_warnings(&allow_domain, "manifest allow_domain", silent);
         let credentials = manifest
             .credentials
             .iter()
@@ -1035,6 +1048,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         let profile_warnings = command_blocking_deprecation::collect_profile_warnings(profile);
         command_blocking_deprecation::print_warnings(&profile_warnings, silent);
     }
+    print_allow_domain_port_warnings(&profile_allow_domain, "profile allow_domain", silent);
+    print_allow_domain_port_warnings(&args.allow_proxy, "--allow-domain", silent);
 
     #[cfg(unix)]
     if args.profile.as_deref().is_some_and(is_claude_code_profile) {

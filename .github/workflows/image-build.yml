@@ -145,7 +145,7 @@ jobs:
 
       - name: Prepare Docker context
         run: |
-          cp Dockerfile docker-context/
+          cp docker/Dockerfile-CI docker-context/Dockerfile
           chmod +x docker-context/nono-amd64 docker-context/nono-arm64
 
       - name: Resolve image metadata

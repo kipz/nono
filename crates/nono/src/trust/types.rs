@@ -718,6 +718,37 @@ mod tests {
     }
 
     #[test]
+    fn publisher_matches_gitlab_ci_config_ref_uri() {
+        // Regression test for the GitLab 18.11 `CI_CONFIG_REF_URI` variable
+        // (see https://gitlab.com/gitlab-org/gitlab/-/merge_requests/226857).
+        // When Nono consumes that variable verbatim as the `workflow` field,
+        // publishers pinned to a non-default pipeline config path must match
+        // without rewriting or stripping the value.
+        let publisher = Publisher {
+            name: "gitlab-ci-release".to_string(),
+            issuer: Some("https://gitlab.com".to_string()),
+            repository: Some("my-group/my-project".to_string()),
+            workflow: Some(
+                "gitlab.com/my-group/my-project//pipelines/release.yml@refs/tags/*".to_string(),
+            ),
+            ref_pattern: Some("refs/tags/*".to_string()),
+            key_id: None,
+            public_key: None,
+            build_signer_uri: None,
+        };
+        let identity = SignerIdentity::Keyless {
+            issuer: "https://gitlab.com".to_string(),
+            repository: "my-group/my-project".to_string(),
+            workflow: "gitlab.com/my-group/my-project//pipelines/release.yml@refs/tags/v1.0.0"
+                .to_string(),
+            git_ref: "refs/tags/v1.0.0".to_string(),
+            build_signer_uri:
+                "gitlab.com/my-group/my-project//pipelines/release.yml@refs/tags/v1.0.0".to_string(),
+        };
+        assert!(publisher.matches(&identity));
+    }
+
+    #[test]
     fn publisher_matches_gitlab_self_managed_keyless() {
         let publisher = Publisher {
             name: "gitlab-self-managed".to_string(),

@@ -70,31 +70,36 @@ fn offer_save_profile(result: &learn::LearnResult, command: &[String]) -> Result
         })?;
 
     eprintln!();
+    eprintln!(
+        "{}",
+        "Profile name must be alphanumeric with hyphens only (e.g. my-profile), no leading or trailing hyphens.".dimmed()
+    );
     eprint!("Save as profile? Enter a name (or press Enter to skip): ");
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| NonoError::LearnError(format!("Failed to read input: {}", e)))?;
+    let profile_name = loop {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| NonoError::LearnError(format!("Failed to read input: {}", e)))?;
 
-    let input = input.trim();
+        let input = input.trim().to_string();
 
-    if input.is_empty() {
-        return Ok(());
-    }
+        if input.is_empty() {
+            return Ok(());
+        }
 
-    let profile_name = input;
+        if profile::is_valid_profile_name(&input) {
+            break input;
+        }
 
-    if !profile_name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '-' || character == '_')
-    {
         eprintln!(
             "{}",
-            "Invalid profile name. Use only letters, numbers, hyphens, and underscores.".red()
+            "Invalid profile name. Use only letters and numbers separated by hyphens, with no leading or trailing hyphens.".red()
         );
-        return Ok(());
-    }
+        eprint!("Enter a name (or press Enter to skip): ");
+    };
+
+    let profile_name = profile_name.as_str();
 
     let profile_json = result.to_profile(profile_name, cmd_name)?;
 

@@ -59,12 +59,76 @@ chmod +x "$SCRIPT_DIR"/lib/*.sh
 # Temp directory for suite output files
 RESULTS_DIR=$(mktemp -d)
 TEST_ENV_DIR=$(mktemp -d)
-trap 'rm -rf "$RESULTS_DIR" "$TEST_ENV_DIR"' EXIT
 
 mkdir -p "$TEST_ENV_DIR/trust-config" "$TEST_ENV_DIR/trust-keystore"
 export NONO_TRUST_TEST_USER_POLICY_PATH="$TEST_ENV_DIR/trust-config/trust-policy.json"
 export NONO_TRUST_TEST_KEYSTORE_DIR="$TEST_ENV_DIR/trust-keystore"
 export NONO_NO_UPDATE_CHECK=1
+
+# Audit is on by default, so every test invocation that does not pass
+# --no-audit writes a session under ~/.nono/audit/ (and ~/.nono/rollbacks/
+# for rollback tests), and appends to ~/.nono/audit/ledger.ndjson. There is
+# no env-var override for the audit root, so snapshot the pre-run state and
+# restore it on exit. This removes only artefacts created during the run;
+# pre-existing user sessions and ledger entries are preserved.
+# Set NONO_TEST_KEEP_AUDIT=1 to skip cleanup for debugging.
+NONO_AUDIT_ROOT="$HOME/.nono/audit"
+NONO_ROLLBACK_ROOT="$HOME/.nono/rollbacks"
+AUDIT_SNAPSHOT_DIR="$TEST_ENV_DIR/audit-snapshot"
+mkdir -p "$AUDIT_SNAPSHOT_DIR"
+
+snapshot_dirs_in() {
+    local root="$1"
+    local out="$2"
+    if [[ -d "$root" ]]; then
+        find "$root" -maxdepth 1 -mindepth 1 -type d -print > "$out" 2>/dev/null || :
+    else
+        : > "$out"
+    fi
+}
+
+snapshot_dirs_in "$NONO_AUDIT_ROOT" "$AUDIT_SNAPSHOT_DIR/audit.before"
+snapshot_dirs_in "$NONO_ROLLBACK_ROOT" "$AUDIT_SNAPSHOT_DIR/rollback.before"
+
+NONO_LEDGER_FILE="$NONO_AUDIT_ROOT/ledger.ndjson"
+NONO_LEDGER_LOCK="$NONO_AUDIT_ROOT/ledger.lock"
+NONO_LEDGER_BACKUP="$AUDIT_SNAPSHOT_DIR/ledger.ndjson"
+NONO_LEDGER_EXISTED=0
+NONO_LEDGER_LOCK_EXISTED=0
+if [[ -f "$NONO_LEDGER_FILE" ]]; then
+    cp "$NONO_LEDGER_FILE" "$NONO_LEDGER_BACKUP"
+    NONO_LEDGER_EXISTED=1
+fi
+[[ -f "$NONO_LEDGER_LOCK" ]] && NONO_LEDGER_LOCK_EXISTED=1
+
+cleanup_test_audit_artifacts() {
+    [[ "${NONO_TEST_KEEP_AUDIT:-0}" == "1" ]] && return 0
+
+    _remove_new_dirs() {
+        local root="$1"
+        local before="$2"
+        [[ -d "$root" ]] || return 0
+        while IFS= read -r -d '' dir; do
+            if ! grep -Fxq "$dir" "$before" 2>/dev/null; then
+                rm -rf "$dir"
+            fi
+        done < <(find "$root" -maxdepth 1 -mindepth 1 -type d -print0)
+    }
+
+    _remove_new_dirs "$NONO_AUDIT_ROOT" "$AUDIT_SNAPSHOT_DIR/audit.before"
+    _remove_new_dirs "$NONO_ROLLBACK_ROOT" "$AUDIT_SNAPSHOT_DIR/rollback.before"
+
+    if [[ "$NONO_LEDGER_EXISTED" -eq 1 ]]; then
+        cp "$NONO_LEDGER_BACKUP" "$NONO_LEDGER_FILE"
+    elif [[ -f "$NONO_LEDGER_FILE" ]]; then
+        rm -f "$NONO_LEDGER_FILE"
+    fi
+    if [[ "$NONO_LEDGER_LOCK_EXISTED" -eq 0 && -f "$NONO_LEDGER_LOCK" ]]; then
+        rm -f "$NONO_LEDGER_LOCK"
+    fi
+}
+
+trap 'cleanup_test_audit_artifacts; rm -rf "$RESULTS_DIR" "$TEST_ENV_DIR"' EXIT
 
 # All suites to run (script:name pairs)
 SUITES=(

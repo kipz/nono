@@ -288,6 +288,8 @@ Available profiles: `minimal`, `developer`, `claude-code`, `codex`, `opencode`, 
 
 Add a domain to the proxy allowlist. Can be specified multiple times. Activates proxy mode if not already active.
 
+This flag only permits HTTP(S) traffic routed through nono's proxy. It does not grant direct raw TCP access to the destination port.
+
 ```bash
 # Allow specific domains
 nono run --allow-cwd --allow-domain api.openai.com --allow-domain api.anthropic.com -- my-agent
@@ -721,14 +723,109 @@ nono run --no-rollback --allow . -- npm test
 
 #### `--no-audit`
 
-Disable the audit trail for this session. By default, every supervised execution records session metadata (command, timestamps, exit code, network events) to `~/.nono/rollbacks/`. Use this flag to suppress audit recording entirely.
+Disable the audit trail for this session. By default, every supervised execution records session metadata and audit events (command, timestamps, exit code, capability decisions, URL opens, network events) to `~/.nono/audit/`. Use this flag to suppress audit recording entirely.
 
 ```bash
 nono run --no-audit --allow-cwd -- my-command
 ```
 
 <Note>
-  `--no-audit` conflicts with `--rollback`. Rollback requires an audit session directory for snapshot storage.
+  `--no-audit` conflicts with `--audit-integrity`. Integrity metadata is computed from the audit event stream.
+</Note>
+
+#### `--audit-integrity`
+
+Enable append-only integrity metadata for the audit log. nono writes an `audit-events.ndjson` stream in session order, hashes each event into a leaf, maintains a running chain head, and stores a final Merkle root in the session metadata. This provides tamper evidence for the recorded audit log without enabling filesystem snapshots.
+
+Audit flags control three different layers:
+
+- **Session audit**
+  Record what happened during one `nono run`.
+
+- **Audit-log integrity**
+  Make the recorded audit event log tamper-evident with a hash chain and Merkle root.
+
+- **Filesystem integrity**
+  Hash the tracked writable filesystem state before and after the run.
+
+The modes are:
+
+- **Default**
+  Session audit + audit-log integrity
+
+- **`--no-audit`**
+  Disable audit recording completely
+
+- **`--no-audit-integrity`**
+  Keep the session audit, but disable the event-log integrity layer
+
+- **`--audit-integrity`**
+  Keep the default audit behavior and also add filesystem-state hashing
+
+- **`--rollback`**
+  Keep all of the above and also store rollback snapshots for restore
+
+```bash
+# Default: session audit + tamper-evident event log
+nono run --allow-cwd -- my-agent
+
+# Session audit only, without the integrity layer
+nono run --no-audit-integrity --allow-cwd -- my-agent
+
+# Add filesystem-state hashing over tracked writable paths
+nono run --audit-integrity --allow-cwd -- my-agent
+
+# Strongest mode: audit + filesystem integrity + restoreable rollback snapshots
+nono run --audit-integrity --rollback --profile claude-code -- claude
+```
+
+<Note>
+  `--audit-integrity` adds filesystem-state hashing for the tracked writable paths. `--rollback` is still the feature that stores full restoreable snapshots.
+</Note>
+
+#### `--audit-sign-key`
+
+Sign the completed session audit record with a keyed signing key loaded by the supervisor.
+
+This happens **once per session**, after the run ends. It does **not** sign every event individually.
+
+The supervisor:
+
+1. records audit events during the session
+2. computes the session's final audit Merkle root
+3. signs that final root plus session context
+4. writes the resulting keyed DSSE attestation to `audit-attestation.bundle`
+
+A summary is also recorded in `session.json`.
+
+Accepted secret references:
+- bare trust key IDs, for example `default`
+- `keystore://name`
+- `file:///absolute/path`
+- `op://vault/item/field`
+- `apple-password://server/account`
+- `keyring://service/account`
+- `env://VAR_NAME`
+
+```bash
+# Sign with the default trust key from the keystore
+nono run --audit-sign-key default --allow-cwd -- my-agent
+
+# Sign with an explicit file-backed key
+nono run --audit-sign-key file:///tmp/nono-audit-key.pem --allow-cwd -- my-agent
+
+# Sign with a 1Password-backed key
+nono run --audit-sign-key op://Development/Nono/audit-key --profile claude-code -- claude
+```
+
+The corresponding attestation can be pinned during verification:
+
+```bash
+nono audit verify <session-id> --public-key-file ./audit-signing-key.pub
+```
+
+<Note>
+  `--audit-sign-key` signs the session audit Merkle root and session context once, after the session completes. It does not, by itself, add an external timestamp, Rekor entry, or full runtime-closure attestation.
 </Note>
 
 #### `--rollback-exclude`

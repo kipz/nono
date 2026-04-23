@@ -214,6 +214,41 @@ pub struct NetworkAuditEvent {
     pub reason: Option<String>,
 }
 
+/// Summary of append-only integrity metadata for an audit log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditIntegritySummary {
+    /// Hash algorithm used for event leaves and chain/root derivation
+    pub hash_algorithm: String,
+    /// Number of audit events written for the session
+    pub event_count: u64,
+    /// Hash-chain head over the append-only audit log
+    pub chain_head: ContentHash,
+    /// Merkle root over ordered audit event leaves
+    pub merkle_root: ContentHash,
+}
+
+/// Signed attestation metadata for an audit session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditAttestationSummary {
+    /// Predicate type embedded in the DSSE/in-toto statement.
+    pub predicate_type: String,
+    /// Signer key identifier derived from the public key.
+    pub key_id: String,
+    /// DER-encoded public key as base64, used for standalone keyed verification.
+    pub public_key: String,
+    /// Filename of the bundle written into the session directory.
+    pub bundle_filename: String,
+}
+
+/// Identity of the executable binary launched for a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutableIdentity {
+    /// Canonical path to the executable file hashed by the supervisor.
+    pub resolved_path: PathBuf,
+    /// SHA-256 digest of the executable file contents.
+    pub sha256: ContentHash,
+}
+
 /// Metadata for an undo session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
@@ -225,6 +260,9 @@ pub struct SessionMetadata {
     pub ended: Option<String>,
     /// Command that was executed
     pub command: Vec<String>,
+    /// Canonical executable identity hashed by the supervisor before launch
+    #[serde(default)]
+    pub executable_identity: Option<ExecutableIdentity>,
     /// Paths being tracked for changes
     pub tracked_paths: Vec<PathBuf>,
     /// Number of snapshots taken
@@ -236,6 +274,22 @@ pub struct SessionMetadata {
     /// Network events captured by the proxy during this session
     #[serde(default)]
     pub network_events: Vec<NetworkAuditEvent>,
+    /// Number of audit events captured for this session
+    #[serde(default)]
+    pub audit_event_count: u64,
+    /// Optional integrity summary for the append-only audit log
+    #[serde(default)]
+    pub audit_integrity: Option<AuditIntegritySummary>,
+    /// Optional integrity summary for the parallel mediation (per-command)
+    /// audit stream. Populated when command mediation is active. Uses the
+    /// same shape as `audit_integrity` but covers a disjoint event type
+    /// and a different filename on disk (`audit.jsonl` vs
+    /// `audit-events.ndjson`).
+    #[serde(default)]
+    pub mediation_integrity: Option<AuditIntegritySummary>,
+    /// Optional keyed signature over the audit Merkle root and session context
+    #[serde(default)]
+    pub audit_attestation: Option<AuditAttestationSummary>,
 }
 
 /// A snapshot manifest capturing filesystem state at a point in time

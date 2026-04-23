@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-// Re-export InjectMode from nono-proxy for use in profiles
-pub use nono_proxy::config::InjectMode;
+// Re-export InjectMode and OAuth2Config from nono-proxy for use in profiles
+pub use nono_proxy::config::{InjectMode, OAuth2Config};
 
 /// Profile metadata
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,8 +102,15 @@ pub struct PolicyPatchConfig {
 pub struct CustomCredentialDef {
     /// Upstream URL to proxy requests to (e.g., "https://api.telegram.org")
     pub upstream: String,
-    /// Keystore account name for the credential (e.g., "telegram_bot_token")
-    pub credential_key: String,
+    /// Keystore account name for the credential (e.g., "telegram_bot_token").
+    /// Mutually exclusive with `auth` — use one or the other.
+    #[serde(default)]
+    pub credential_key: Option<String>,
+    /// Optional OAuth2 client_credentials configuration.
+    /// When present, the proxy handles token exchange automatically.
+    /// Mutually exclusive with `credential_key` — use one or the other.
+    #[serde(default)]
+    pub auth: Option<OAuth2Config>,
     /// Injection mode (default: "header")
     #[serde(default)]
     pub inject_mode: InjectMode,
@@ -280,23 +287,47 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
-    // Validate credential_key - required for all modes
-    validate_credential_key(name, &cred.credential_key)?;
-
-    // When credential_key is a URI manager reference, env_var is required because the URI
-    // cannot be meaningfully uppercased into an env var name (e.g.,
-    // "op://vault/item/field" -> "OP://VAULT/ITEM/FIELD" is nonsensical).
-    if (nono::keystore::is_op_uri(&cred.credential_key)
-        || nono::keystore::is_apple_password_uri(&cred.credential_key)
-        || nono::keystore::is_file_uri(&cred.credential_key))
-        && cred.env_var.is_none()
-    {
+    // Mutual exclusion: credential_key and auth cannot both be set
+    if cred.credential_key.is_some() && cred.auth.is_some() {
         return Err(NonoError::ProfileParse(format!(
-            "env_var is required for custom credential '{}' when credential_key is a URI \
-             manager reference (op://, apple-password://, or file://); \
-             set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
+            "custom credential '{}' has both 'credential_key' and 'auth' set; \
+             these are mutually exclusive — use one or the other",
             name
         )));
+    }
+
+    // At least one of credential_key or auth must be set
+    if cred.credential_key.is_none() && cred.auth.is_none() {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' must have either 'credential_key' or 'auth' set",
+            name
+        )));
+    }
+
+    // Validate OAuth2 auth if present
+    if let Some(ref auth) = cred.auth {
+        validate_oauth2_auth(name, auth)?;
+    }
+
+    // Validate credential_key if present
+    if let Some(ref key) = cred.credential_key {
+        validate_credential_key(name, key)?;
+
+        // When credential_key is a URI manager reference, env_var is required because the URI
+        // cannot be meaningfully uppercased into an env var name (e.g.,
+        // "op://vault/item/field" -> "OP://VAULT/ITEM/FIELD" is nonsensical).
+        if (nono::keystore::is_op_uri(key)
+            || nono::keystore::is_apple_password_uri(key)
+            || nono::keystore::is_file_uri(key))
+            && cred.env_var.is_none()
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "env_var is required for custom credential '{}' when credential_key is a URI \
+                 manager reference (op://, apple-password://, or file://); \
+                 set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
+                name
+            )));
+        }
     }
 
     // Validate env_var format if specified
@@ -319,20 +350,23 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate upstream URL (HTTPS required, HTTP only for loopback)
     validate_upstream_url(&cred.upstream, name)?;
 
-    // Mode-specific validation
-    match cred.inject_mode {
-        InjectMode::Header => {
-            validate_header_mode(name, cred)?;
-        }
-        InjectMode::UrlPath => {
-            validate_url_path_mode(name, cred)?;
-        }
-        InjectMode::QueryParam => {
-            validate_query_param_mode(name, cred)?;
-        }
-        InjectMode::BasicAuth => {
-            // No additional required fields for basic_auth mode
-            // Credential value is expected to be "username:password" format
+    // Mode-specific validation (only applies to credential_key-based routes,
+    // not OAuth2 routes which always inject as Bearer header)
+    if cred.credential_key.is_some() {
+        match cred.inject_mode {
+            InjectMode::Header => {
+                validate_header_mode(name, cred)?;
+            }
+            InjectMode::UrlPath => {
+                validate_url_path_mode(name, cred)?;
+            }
+            InjectMode::QueryParam => {
+                validate_query_param_mode(name, cred)?;
+            }
+            InjectMode::BasicAuth => {
+                // No additional required fields for basic_auth mode
+                // Credential value is expected to be "username:password" format
+            }
         }
     }
 
@@ -454,6 +488,36 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                 )));
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Validate OAuth2 client_credentials auth configuration.
+///
+/// Checks:
+/// - `token_url` must be HTTPS (or HTTP for loopback addresses)
+/// - `client_id` must not be empty
+/// - `client_secret` must not be empty and must be a credential reference
+///   (env://, file://, op://, apple-password://) or plain value
+fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
+    // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
+    validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
+
+    // client_id must not be empty
+    if auth.client_id.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "auth.client_id for custom credential '{}' cannot be empty",
+            name
+        )));
+    }
+
+    // client_secret must not be empty
+    if auth.client_secret.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "auth.client_secret for custom credential '{}' cannot be empty",
+            name
+        )));
     }
 
     Ok(())
@@ -1222,6 +1286,7 @@ struct ProfileDeserialize {
     #[serde(default)]
     packs: Vec<String>,
     #[serde(default)]
+    #[serde(alias = "brokered_commands")]
     command_args: Vec<String>,
     #[serde(default)]
     mediation: crate::mediation::MediationConfig,
@@ -2218,10 +2283,8 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", "/tmp/foo"),
-        ]);
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "/tmp/foo")]);
 
         let workdir = PathBuf::from("/projects/myapp");
         let expanded = expand_vars("$FOO/bar", &workdir).expect("valid env");
@@ -2236,10 +2299,7 @@ mod tests {
         };
         // Pre-register FOO so EnvVarGuard will restore whatever ambient value
         // exists, then remove it for the scope of the test.
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", ""),
-        ]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "")]);
         _env.remove("FOO");
 
         let workdir = PathBuf::from("/projects/myapp");
@@ -2257,10 +2317,7 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("FOO", "/a"),
-        ]);
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("FOO", "/a")]);
 
         let workdir = PathBuf::from("/projects/myapp");
         let expanded = expand_vars("${FOO}/bar", &workdir).expect("valid env");
@@ -2315,10 +2372,8 @@ mod tests {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/user"),
-            ("USER", "jcarnegie"),
-        ]);
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", "/home/user"), ("USER", "jcarnegie")]);
 
         let workdir = PathBuf::from("/projects/myapp");
 
@@ -2802,7 +2857,8 @@ mod tests {
     fn header_cred_builder() -> CustomCredentialDef {
         CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "api_key".to_string(),
+            credential_key: Some("api_key".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -2828,7 +2884,7 @@ mod tests {
     fn test_validate_custom_credential_http_loopback_allowed() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://127.0.0.1:8080/api".to_string();
-        cred.credential_key = "local_key".to_string();
+        cred.credential_key = Some("local_key".to_string());
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
@@ -2862,7 +2918,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_invalid_key_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_key = "api-key".to_string(); // hyphens not allowed
+        cred.credential_key = Some("api-key".to_string()); // hyphens not allowed
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("hyphen in key should be rejected");
         assert!(err.to_string().contains("alphanumeric"));
@@ -2937,7 +2993,7 @@ mod tests {
     fn test_validate_custom_credential_http_localhost_allowed() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://localhost:3000/api".to_string();
-        cred.credential_key = "local_key".to_string();
+        cred.credential_key = Some("local_key".to_string());
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
@@ -2945,7 +3001,7 @@ mod tests {
     fn test_validate_custom_credential_http_ipv6_loopback_allowed() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://[::1]:8080/api".to_string();
-        cred.credential_key = "local_key".to_string();
+        cred.credential_key = Some("local_key".to_string());
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
@@ -2953,7 +3009,7 @@ mod tests {
     fn test_validate_custom_credential_http_0_0_0_0_allowed() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://0.0.0.0:3000/api".to_string();
-        cred.credential_key = "local_key".to_string();
+        cred.credential_key = Some("local_key".to_string());
         assert!(validate_custom_credential("local", &cred).is_ok());
     }
 
@@ -2965,7 +3021,8 @@ mod tests {
     fn test_validate_url_path_mode_valid() {
         let cred = CustomCredentialDef {
             upstream: "https://api.telegram.org".to_string(),
-            credential_key: "telegram_token".to_string(),
+            credential_key: Some("telegram_token".to_string()),
+            auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -2986,7 +3043,8 @@ mod tests {
     fn test_validate_url_path_mode_missing_pattern() {
         let cred = CustomCredentialDef {
             upstream: "https://api.telegram.org".to_string(),
-            credential_key: "telegram_token".to_string(),
+            credential_key: Some("telegram_token".to_string()),
+            auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3009,7 +3067,8 @@ mod tests {
     fn test_validate_url_path_mode_pattern_without_placeholder() {
         let cred = CustomCredentialDef {
             upstream: "https://api.telegram.org".to_string(),
-            credential_key: "telegram_token".to_string(),
+            credential_key: Some("telegram_token".to_string()),
+            auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3032,7 +3091,8 @@ mod tests {
     fn test_validate_url_path_mode_with_replacement() {
         let cred = CustomCredentialDef {
             upstream: "https://api.telegram.org".to_string(),
-            credential_key: "telegram_token".to_string(),
+            credential_key: Some("telegram_token".to_string()),
+            auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3053,7 +3113,8 @@ mod tests {
     fn test_validate_url_path_mode_replacement_without_placeholder() {
         let cred = CustomCredentialDef {
             upstream: "https://api.telegram.org".to_string(),
-            credential_key: "telegram_token".to_string(),
+            credential_key: Some("telegram_token".to_string()),
+            auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3076,7 +3137,8 @@ mod tests {
     fn test_validate_query_param_mode_valid() {
         let cred = CustomCredentialDef {
             upstream: "https://maps.googleapis.com".to_string(),
-            credential_key: "google_maps_key".to_string(),
+            credential_key: Some("google_maps_key".to_string()),
+            auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3097,7 +3159,8 @@ mod tests {
     fn test_validate_query_param_mode_missing_param_name() {
         let cred = CustomCredentialDef {
             upstream: "https://maps.googleapis.com".to_string(),
-            credential_key: "google_maps_key".to_string(),
+            credential_key: Some("google_maps_key".to_string()),
+            auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3120,7 +3183,8 @@ mod tests {
     fn test_validate_query_param_mode_empty_param_name() {
         let cred = CustomCredentialDef {
             upstream: "https://maps.googleapis.com".to_string(),
-            credential_key: "google_maps_key".to_string(),
+            credential_key: Some("google_maps_key".to_string()),
+            auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3143,7 +3207,8 @@ mod tests {
     fn test_validate_basic_auth_mode_valid() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "example_basic_auth".to_string(),
+            credential_key: Some("example_basic_auth".to_string()),
+            auth: None,
             inject_mode: InjectMode::BasicAuth,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -3222,7 +3287,7 @@ mod tests {
         // When credential_key is a URI manager ref, env_var must be set because
         // uppercasing the URI produces a nonsensical env var name.
         let mut cred = header_cred_builder();
-        cred.credential_key = "op://Development/OpenAI/credential".to_string();
+        cred.credential_key = Some("op://Development/OpenAI/credential".to_string());
         cred.env_var = None;
         let result = validate_custom_credential("openai", &cred);
         let err = result.expect_err("op:// URI without env_var should be rejected");
@@ -3232,7 +3297,7 @@ mod tests {
     #[test]
     fn test_validate_env_var_with_op_uri_and_env_var_ok() {
         let mut cred = header_cred_builder();
-        cred.credential_key = "op://Development/OpenAI/credential".to_string();
+        cred.credential_key = Some("op://Development/OpenAI/credential".to_string());
         cred.env_var = Some("OPENAI_API_KEY".to_string());
         assert!(validate_custom_credential("openai", &cred).is_ok());
     }
@@ -3240,7 +3305,7 @@ mod tests {
     #[test]
     fn test_validate_env_var_with_apple_password_uri_requires_env_var() {
         let mut cred = header_cred_builder();
-        cred.credential_key = "apple-password://github.com/alice@example.com".to_string();
+        cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
         cred.env_var = None;
         let result = validate_custom_credential("github", &cred);
         let err = result.expect_err("apple-password URI without env_var should be rejected");
@@ -3250,7 +3315,7 @@ mod tests {
     #[test]
     fn test_validate_env_var_with_apple_password_uri_and_env_var_ok() {
         let mut cred = header_cred_builder();
-        cred.credential_key = "apple-password://github.com/alice@example.com".to_string();
+        cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
         cred.env_var = Some("GITHUB_PASSWORD".to_string());
         assert!(validate_custom_credential("github", &cred).is_ok());
     }
@@ -3288,6 +3353,187 @@ mod tests {
         let mut cred = header_cred_builder();
         cred.env_var = Some("MY_CUSTOM_VAR".to_string());
         assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    // ============================================================================
+    // OAuth2 auth validation tests
+    // ============================================================================
+
+    fn oauth2_cred_builder() -> CustomCredentialDef {
+        CustomCredentialDef {
+            upstream: "https://api.example.com".to_string(),
+            credential_key: None,
+            auth: Some(OAuth2Config {
+                token_url: "https://auth.example.com/oauth/token".to_string(),
+                client_id: "my-client".to_string(),
+                client_secret: "env://CLIENT_SECRET".to_string(),
+                scope: "read write".to_string(),
+            }),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_oauth2_auth_valid() {
+        let cred = oauth2_cred_builder();
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_oauth2_auth_and_credential_key_mutually_exclusive() {
+        let mut cred = oauth2_cred_builder();
+        cred.credential_key = Some("some_key".to_string());
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("both auth and credential_key should be rejected");
+        assert!(err.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_neither_auth_nor_credential_key_rejected() {
+        let mut cred = oauth2_cred_builder();
+        cred.credential_key = None;
+        cred.auth = None;
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("neither auth nor credential_key should be rejected");
+        assert!(err.to_string().contains("must have either"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_token_url_http_remote_rejected() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "http://auth.remote.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+        });
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("HTTP to remote token_url should be rejected");
+        assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_token_url_http_localhost_allowed() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "http://localhost:8080/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+        });
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_oauth2_empty_client_id_rejected() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+        });
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("empty client_id should be rejected");
+        assert!(err.to_string().contains("client_id"));
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_empty_client_secret_rejected() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "".to_string(),
+            scope: String::new(),
+        });
+        let result = validate_custom_credential("test", &cred);
+        let err = result.expect_err("empty client_secret should be rejected");
+        assert!(err.to_string().contains("client_secret"));
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_oauth2_scope_optional() {
+        let mut cred = oauth2_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://SECRET".to_string(),
+            scope: String::new(),
+        });
+        assert!(validate_custom_credential("test", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_parse_profile_with_oauth2_auth() {
+        let json = r#"{
+            "meta": { "name": "oauth2-test" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "auth": {
+                            "token_url": "https://auth.example.com/oauth/token",
+                            "client_id": "my-client",
+                            "client_secret": "env://CLIENT_SECRET",
+                            "scope": "api.read"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("oauth2-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = &profile.network.custom_credentials["my_api"];
+        assert!(cred.credential_key.is_none());
+        assert!(cred.auth.is_some());
+        let auth = cred.auth.as_ref().unwrap();
+        assert_eq!(auth.token_url, "https://auth.example.com/oauth/token");
+        assert_eq!(auth.client_id, "my-client");
+        assert_eq!(auth.client_secret, "env://CLIENT_SECRET");
+        assert_eq!(auth.scope, "api.read");
+    }
+
+    #[test]
+    fn test_parse_profile_with_oauth2_auth_and_credential_key_rejected() {
+        let json = r#"{
+            "meta": { "name": "invalid-test" },
+            "network": {
+                "custom_credentials": {
+                    "my_api": {
+                        "upstream": "https://api.example.com",
+                        "credential_key": "some_key",
+                        "auth": {
+                            "token_url": "https://auth.example.com/oauth/token",
+                            "client_id": "my-client",
+                            "client_secret": "env://CLIENT_SECRET"
+                        }
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("invalid-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let result = load_profile_from_path(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"));
     }
 
     #[test]
@@ -3530,7 +3776,8 @@ mod tests {
             "svc_a".to_string(),
             CustomCredentialDef {
                 upstream: "https://a.example.com".to_string(),
-                credential_key: "key_a".to_string(),
+                credential_key: Some("key_a".to_string()),
+                auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: "Bearer {}".to_string(),
@@ -3551,7 +3798,8 @@ mod tests {
             "svc_b".to_string(),
             CustomCredentialDef {
                 upstream: "https://b.example.com".to_string(),
-                credential_key: "key_b".to_string(),
+                credential_key: Some("key_b".to_string()),
+                auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: "Token {}".to_string(),
@@ -3690,7 +3938,8 @@ mod tests {
             "svc_shared".to_string(),
             CustomCredentialDef {
                 upstream: "https://base.example.com".to_string(),
-                credential_key: "key_base".to_string(),
+                credential_key: Some("key_base".to_string()),
+                auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: "Bearer {}".to_string(),
@@ -3711,7 +3960,8 @@ mod tests {
             "svc_shared".to_string(),
             CustomCredentialDef {
                 upstream: "https://child.example.com".to_string(),
-                credential_key: "key_child".to_string(),
+                credential_key: Some("key_child".to_string()),
+                auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
                 credential_format: "Token {}".to_string(),
@@ -3733,7 +3983,7 @@ mod tests {
             cred.upstream, "https://child.example.com",
             "child should win on same-key collision"
         );
-        assert_eq!(cred.credential_key, "key_child");
+        assert_eq!(cred.credential_key, Some("key_child".to_string()));
     }
 
     // --- Loading pipeline tests ---
@@ -4919,7 +5169,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_accepted() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/api-token".to_string(),
+            credential_key: Some("file:///run/secrets/api-token".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -4943,7 +5194,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_requires_env_var() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/api-token".to_string(),
+            credential_key: Some("file:///run/secrets/api-token".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -4970,7 +5222,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_invalid_rejected() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file://relative/path".to_string(),
+            credential_key: Some("file://relative/path".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -4997,7 +5250,8 @@ mod tests {
     fn test_validate_custom_credential_file_uri_traversal_rejected() {
         let cred = CustomCredentialDef {
             upstream: "https://api.example.com".to_string(),
-            credential_key: "file:///run/secrets/../../../etc/shadow".to_string(),
+            credential_key: Some("file:///run/secrets/../../../etc/shadow".to_string()),
+            auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
             credential_format: "Bearer {}".to_string(),
@@ -5080,7 +5334,10 @@ mod tests {
             .custom_credentials
             .get("my_service")
             .expect("my_service credential should exist");
-        assert_eq!(cred.credential_key, "file:///run/secrets/api-token");
+        assert_eq!(
+            cred.credential_key,
+            Some("file:///run/secrets/api-token".to_string())
+        );
         assert_eq!(cred.env_var, Some("MY_API_KEY".to_string()));
     }
 }

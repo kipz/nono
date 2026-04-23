@@ -399,6 +399,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            oauth2: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -433,6 +434,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            oauth2: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -458,6 +460,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            oauth2: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -484,6 +487,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                oauth2: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -501,6 +505,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                oauth2: None,
             },
         ];
 
@@ -819,6 +824,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             tls_ca: None,
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
+            oauth2: None,
         }];
 
         let store = RouteStore::load(&routes).expect("should load mTLS route");

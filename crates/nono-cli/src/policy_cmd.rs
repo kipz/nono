@@ -1313,15 +1313,17 @@ fn cmd_diff(args: PolicyDiffArgs) -> Result<()> {
                 );
             }
             if old.credential_key != new.credential_key {
+                let old_key = old.credential_key.as_deref().unwrap_or("<none>");
+                let new_key = new.credential_key.as_deref().unwrap_or("<none>");
                 println!(
                     "      {} credential_key: {}",
                     theme::fg("-", t.red),
-                    theme::fg(&old.credential_key, t.red)
+                    theme::fg(old_key, t.red)
                 );
                 println!(
                     "      {} credential_key: {}",
                     theme::fg("+", t.green),
-                    theme::fg(&new.credential_key, t.green)
+                    theme::fg(new_key, t.green)
                 );
             }
             if old.inject_mode != new.inject_mode {
@@ -2150,6 +2152,8 @@ fn resolve_to_manifest(
         };
 
     // Credentials (custom_credentials from profile → manifest credentials)
+    // OAuth2 credentials (auth field) are not yet representable in the manifest
+    // schema, so only static-key credentials are exported.
     let mut credentials = Vec::new();
     for (name, cred) in &prof.network.custom_credentials {
         let inject_mode = match cred.inject_mode {
@@ -2184,10 +2188,12 @@ fn resolve_to_manifest(
                 .upstream
                 .parse()
                 .map_err(|e| NonoError::ConfigParse(format!("invalid credential upstream: {e}")))?,
-            source: cred
-                .credential_key
-                .parse()
-                .map_err(|e| NonoError::ConfigParse(format!("invalid credential source: {e}")))?,
+            source: match cred.credential_key.as_ref() {
+                Some(key) => key.parse().map_err(|e| {
+                    NonoError::ConfigParse(format!("invalid credential source: {e}"))
+                })?,
+                None => continue,
+            },
             inject: Some(manifest::CredentialInject {
                 mode: inject_mode,
                 header: cred.inject_header.clone(),

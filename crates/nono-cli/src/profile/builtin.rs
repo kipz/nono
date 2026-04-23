@@ -37,7 +37,33 @@ mod tests {
             .contains(&"$HOME/.cache/claude".to_string()));
         assert!(profile
             .filesystem
+            .allow_file
+            .contains(&"$HOME/.claude.lock".to_string()));
+    }
+
+    #[test]
+    fn test_get_builtin_claude_no_kc() {
+        let profile = get_builtin("claude-no-kc").expect("Profile not found");
+        assert_eq!(profile.meta.name, "claude-no-kc");
+        assert!(!profile.network.block);
+        assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
+        assert!(profile
+            .security
+            .groups
+            .contains(&"claude_code_linux".to_string()));
+        assert!(!profile
+            .security
+            .groups
+            .contains(&"claude_code_macos".to_string()));
+        assert!(profile.policy.add_allow_readwrite.is_empty());
+        assert!(profile.policy.override_deny.is_empty());
+        assert!(profile
+            .filesystem
             .allow
+            .contains(&"$HOME/.cache/claude".to_string()));
+        assert!(profile
+            .filesystem
+            .allow_file
             .contains(&"$HOME/.claude.lock".to_string()));
     }
 
@@ -81,10 +107,45 @@ mod tests {
             .filesystem
             .allow_file
             .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert_eq!(
+            profile.policy.add_allow_readwrite,
+            vec!["$HOME/Library/Keychains".to_string()]
+        );
+        assert_eq!(
+            profile.policy.override_deny,
+            vec!["$HOME/Library/Keychains".to_string()]
+        );
         assert!(profile
             .filesystem
-            .allow
+            .allow_file
             .contains(&"$HOME/.claude.lock".to_string()));
+    }
+
+    #[test]
+    fn test_get_builtin_claude_no_kc_does_not_relax_keychain_denies() {
+        let profile = get_builtin("claude-no-kc").expect("Profile not found");
+        assert!(!profile
+            .security
+            .groups
+            .contains(&"claude_code_macos".to_string()));
+        assert!(profile
+            .security
+            .groups
+            .contains(&"claude_code_linux".to_string()));
+        assert!(!profile
+            .filesystem
+            .read
+            .contains(&"$HOME/.local/share/claude".to_string()));
+        assert!(!profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
+        assert!(!profile
+            .filesystem
+            .allow_file
+            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
+        assert!(profile.policy.add_allow_readwrite.is_empty());
+        assert!(profile.policy.override_deny.is_empty());
     }
 
     #[test]
@@ -176,6 +237,7 @@ mod tests {
         assert!(profiles.contains(&"default".to_string()));
         assert!(profiles.contains(&"linux-host-compat".to_string()));
         assert!(profiles.contains(&"claude-code".to_string()));
+        assert!(profiles.contains(&"claude-no-kc".to_string()));
         assert!(profiles.contains(&"codex".to_string()));
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"opencode".to_string()));
@@ -346,21 +408,45 @@ mod tests {
     #[test]
     fn test_all_profiles_signal_mode_resolves() {
         use crate::capability_ext::CapabilitySetExt;
-        use tempfile::tempdir;
-
         let _guard = match crate::test_env::ENV_LOCK.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let home = tempfile::Builder::new()
+            .prefix("nono-builtin-profile-home-")
+            .tempdir_in(std::env::current_dir().expect("cwd"))
+            .expect("home tempdir");
+        std::fs::create_dir_all(home.path().join("Library/Keychains")).expect("mkdir keychains");
         let _env = crate::test_env::EnvVarGuard::set_all(&[
-            ("HOME", "/home/nono-test"),
-            ("XDG_CONFIG_HOME", "/home/nono-test/.config"),
-            ("XDG_DATA_HOME", "/home/nono-test/.local/share"),
-            ("XDG_STATE_HOME", "/home/nono-test/.local/state"),
-            ("XDG_CACHE_HOME", "/home/nono-test/.cache"),
+            ("HOME", home.path().to_str().expect("home utf8")),
+            (
+                "XDG_CONFIG_HOME",
+                home.path().join(".config").to_str().expect("config utf8"),
+            ),
+            (
+                "XDG_DATA_HOME",
+                home.path()
+                    .join(".local/share")
+                    .to_str()
+                    .expect("data utf8"),
+            ),
+            (
+                "XDG_STATE_HOME",
+                home.path()
+                    .join(".local/state")
+                    .to_str()
+                    .expect("state utf8"),
+            ),
+            (
+                "XDG_CACHE_HOME",
+                home.path().join(".cache").to_str().expect("cache utf8"),
+            ),
         ]);
 
-        let workdir = tempdir().expect("tmpdir");
+        let workdir = tempfile::Builder::new()
+            .prefix("nono-builtin-profile-workdir-")
+            .tempdir_in(std::env::current_dir().expect("cwd"))
+            .expect("workdir");
         let args = crate::cli::SandboxArgs::default();
 
         let profiles = list_builtin();

@@ -1,5 +1,106 @@
 # Changelog
 
+## [0.39.0] - 2026-04-21
+
+### Bug Fixes
+
+- *(dry)* Duplicated allow_domain warning-print logic
+
+- *(tests)* Tests and format fixes
+
+- *(network)* Keep --allow-domain in strict proxy-only mode
+
+- *(policy)* Add entry for ~.local/share/claude/versions
+
+- *(learn)* Validate profile name and re-prompt on invalid input
+
+- *(oauth)* PR 517 rebase on main
+
+- Compilation against current main after rebase
+
+- *(proxy)* Return early after 413 in read_request_body
+
+
+### Dependencies
+
+- *(deps)* Bump clap from 4.6.0 to 4.6.1
+
+- *(deps)* Bump tokio from 1.51.0 to 1.52.1
+
+- *(deps)* Bump semver from 1.0.27 to 1.0.28
+
+- *(deps)* Bump actions/cache from 5.0.4 to 5.0.5
+
+
+### Features
+
+- *(policy)* Filter profile override deny entries without grants
+
+- *(claude)* Add no-keychain profile and expand existing access
+
+- *(profile)* Support OAuth2 auth config in custom_credentials
+
+- *(proxy)* Implement OAuth2 client_credentials token exchange with cache
+
+- *(config)* Add OAuth2Config type for client_credentials flow
+
+## [0.38.0] - 2026-04-20
+
+### Bug Fixes
+
+- *(trust)* Function or associated item not found in `TrustedRoot`
+
+- *(package)* Harden package installation security
+
+- *(hooks)* Invoke bash via env
+
+
+### Documentation
+
+- *(cli-package-publishing)* Add warning for unreleased feature
+
+- *(cli)* Add installation instructions for nix
+
+
+### Features
+
+- *(trust)* Prefer CI_CONFIG_REF_URI for GitLab workflow identity
+
+- *(claude-code)* Remove claude-code integration package
+
+- *(profile)* Add support for loading profiles from registry packs
+
+- *(profile)* Introduce packs and command_args for profiles
+
+- *(pack)* Introduce pack types and unify package naming
+
+- *(package)* Add install_dir artifact placement and hook unregistration
+
+- *(cli)* Add package management commands (pull, remove, search, list)
+
+- Implements environment variables filtering #688
+
+
+### Miscellaneous
+
+- Release v0.37.1
+
+
+### Refactoring
+
+- *(pkg)* Stream package artifact downloads
+
+- *(package)* Simplify artifact signer validation
+
+- *(package-cmd)* Centralize trust bundle for package verification
+
+- *(cli)* Improve artifact path validation
+
+
+### Style
+
+- Cargo fmt
+
 ## [0.37.1] - 2026-04-17
 
 ### Bug Fixes

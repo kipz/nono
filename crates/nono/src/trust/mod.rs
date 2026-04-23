@@ -57,9 +57,9 @@ pub use policy::{
     load_policy_from_str, merge_policies,
 };
 pub use signing::{
-    export_public_key, generate_signing_key, key_id_hex, sign_bytes, sign_files,
-    sign_instruction_file, sign_policy_bytes, sign_policy_file, sign_skill, write_bundle,
-    write_skill_bundle, KeyPair, SigningScheme, MAX_MULTI_SUBJECT_FILES,
+    export_public_key, generate_signing_key, key_id_hex, public_key_id_hex, sign_bytes, sign_files,
+    sign_instruction_file, sign_policy_bytes, sign_policy_file, sign_skill, sign_statement_bundle,
+    write_bundle, write_skill_bundle, KeyPair, SigningScheme, MAX_MULTI_SUBJECT_FILES,
 };
 pub use skill::{
     find_skill_directories, load_skill_manifest, verify_skill, SkillEntryPoint, SkillHook,

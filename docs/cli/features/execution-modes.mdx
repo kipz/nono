@@ -7,10 +7,10 @@ nono provides two execution modes that trade off between features and attack sur
 
 ## Overview
 
-| Mode | Command | Parent Sandboxed | Rollback | Expansion | Attack Surface |
-|------|---------|-----------------|----------|-----------|----------------|
-| Supervised | `nono run` / `nono shell` | No | Yes | Linux only | Larger |
-| Direct | `nono wrap` | N/A (no parent) | No | No | Minimal |
+| Mode | Command | Parent Sandboxed | Audit | Rollback | Expansion | Attack Surface |
+|------|---------|-----------------|-------|----------|-----------|----------------|
+| Supervised | `nono run` / `nono shell` | No | Yes | Optional | Linux only | Larger |
+| Direct | `nono wrap` | N/A (no parent) | No | No | No | Minimal |
 
 ## Supervised Mode (default)
 
@@ -18,11 +18,13 @@ nono provides two execution modes that trade off between features and attack sur
 nono run --allow-cwd -- my-command
 ```
 
-nono forks first, then sandboxes only the child. The parent remains unsandboxed to provide runtime services: rollback snapshots, capability expansion (Linux), network proxy, and diagnostic output.
+nono forks first, then sandboxes only the child. The parent remains unsandboxed to provide runtime services: audit recording, optional audit-integrity hashing, rollback snapshots, capability expansion (Linux), network proxy, and diagnostic output.
 
 **When to use:**
 - Interactive AI agents (default for `nono run` and `nono shell`)
 - When you want diagnostic output on failures
+- When you want default audit recording
+- When you want audit-integrity (`--audit-integrity`)
 - When you need rollback snapshots (`--rollback`)
 - When you need capability expansion (Linux)
 - When you need network proxy filtering
@@ -33,6 +35,8 @@ nono forks first, then sandboxes only the child. The parent remains unsandboxed 
 **Features:**
 - Diagnostic footer on non-zero exit explaining what went wrong
 - Signal forwarding to child process
+- Audit recording by default
+- Append-only audit integrity metadata with `--audit-integrity`
 - Rollback snapshots (baseline + final) with `--rollback`
 - Interactive post-exit review of changes with `--rollback`
 - Capability expansion prompts (Linux only)
@@ -53,6 +57,7 @@ nono applies the sandbox and then `exec()`s directly into the target command. no
 
 **Trade-offs:**
 - No diagnostic footer on errors
+- No audit recording
 - No rollback snapshots
 - No capability expansion
 - No network proxy (incompatible — proxy requires a parent process)
@@ -60,7 +65,7 @@ nono applies the sandbox and then `exec()`s directly into the target command. no
 ## Choosing a Mode
 
 ```
-Do you need rollback, expansion, proxy, or diagnostics?
+Do you need audit, rollback, expansion, proxy, or diagnostics?
 ├── Yes → nono run (Supervised, default)
 └── No
     │

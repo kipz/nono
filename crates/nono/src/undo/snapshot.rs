@@ -5,8 +5,10 @@
 //! to a previous state.
 
 use crate::error::{NonoError, Result};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -14,7 +16,7 @@ use walkdir::WalkDir;
 use super::exclusion::ExclusionFilter;
 use super::merkle::MerkleTree;
 use super::object_store::ObjectStore;
-use super::types::{Change, ChangeType, FileState, SessionMetadata, SnapshotManifest};
+use super::types::{Change, ChangeType, ContentHash, FileState, SessionMetadata, SnapshotManifest};
 
 /// Budget limits for directory walks during snapshot operations.
 ///
@@ -418,6 +420,19 @@ impl SnapshotManager {
         atomic_write(&path, json.as_bytes())
     }
 
+    /// Compute the Merkle root of the current filesystem state without
+    /// storing objects or writing manifests.
+    ///
+    /// Walks all tracked paths, applies the exclusion filter, hashes each
+    /// file, and returns the Merkle root. This is useful for audit-only
+    /// sessions that need a cryptographic commitment to filesystem state
+    /// without the overhead of full snapshot storage.
+    pub fn compute_merkle_root(&self) -> Result<ContentHash> {
+        let files = self.walk_current()?;
+        let merkle = MerkleTree::from_manifest(&files)?;
+        Ok(*merkle.root())
+    }
+
     /// Get the number of snapshots taken in this session.
     #[must_use]
     pub fn snapshot_count(&self) -> u32 {
@@ -803,11 +818,7 @@ fn compute_changes(
 /// Get file state from metadata (hash is zeroed - used for walk_current where
 /// we only need to track which files exist for deletion during restore).
 fn file_state_from_metadata(path: &Path) -> Result<FileState> {
-    use sha2::{Digest, Sha256};
-
-    let content = fs::read(path)
-        .map_err(|e| NonoError::Snapshot(format!("Failed to read {}: {e}", path.display())))?;
-    let hash_bytes: [u8; 32] = Sha256::digest(&content).into();
+    let hash = hash_file(path)?;
 
     let metadata = fs::metadata(path).map_err(|e| {
         NonoError::Snapshot(format!(
@@ -817,11 +828,30 @@ fn file_state_from_metadata(path: &Path) -> Result<FileState> {
     })?;
 
     Ok(FileState {
-        hash: super::types::ContentHash::from_bytes(hash_bytes),
+        hash,
         size: metadata.len(),
         mtime: metadata.mtime(),
         permissions: metadata.mode(),
     })
+}
+
+fn hash_file(path: &Path) -> Result<ContentHash> {
+    let mut file = fs::File::open(path)
+        .map_err(|e| NonoError::Snapshot(format!("Failed to open {}: {e}", path.display())))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|e| NonoError::Snapshot(format!("Failed to read {}: {e}", path.display())))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(ContentHash::from_bytes(hasher.finalize().into()))
 }
 
 /// Write content to a file atomically via temp file + rename.
@@ -1071,6 +1101,56 @@ mod tests {
     }
 
     #[test]
+    fn compute_merkle_root_matches_baseline() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        // compute_merkle_root uses walk_current (no storage), while
+        // create_baseline uses walk_and_store. Both should produce the
+        // same merkle root for the same filesystem state.
+        let manager = make_manager(&session_dir, &tracked);
+        let root_before = manager.compute_merkle_root().expect("compute root");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        assert_eq!(root_before, baseline.merkle_root);
+    }
+
+    #[test]
+    fn compute_merkle_root_changes_after_modification() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let manager = make_manager(&session_dir, &tracked);
+        let root_before = manager.compute_merkle_root().expect("compute root before");
+
+        fs::write(tracked.join("file1.txt"), b"changed content").expect("modify");
+
+        let root_after = manager.compute_merkle_root().expect("compute root after");
+        assert_ne!(root_before, root_after);
+    }
+
+    #[test]
+    fn file_state_from_metadata_hashes_large_files() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("large.bin");
+        let mut content = Vec::new();
+        for idx in 0..20_000 {
+            content.push((idx % 251) as u8);
+        }
+        fs::write(&path, &content).expect("write large file");
+
+        let state = file_state_from_metadata(&path).expect("file state");
+        let expected = ContentHash::from_bytes(sha2::Sha256::digest(&content).into());
+
+        assert_eq!(state.hash, expected);
+        assert_eq!(state.size, content.len() as u64);
+    }
+
+    #[test]
     fn manifest_roundtrip_via_disk() {
         let (dir, tracked) = setup_test_dir();
         let session_dir = dir.path().join("session");
@@ -1099,11 +1179,16 @@ mod tests {
             started: "2025-01-01T00:00:00Z".to_string(),
             ended: Some("2025-01-01T00:01:00Z".to_string()),
             command: vec!["bash".to_string(), "-c".to_string(), "echo hi".to_string()],
+            executable_identity: None,
             tracked_paths: vec![tracked.to_path_buf()],
             snapshot_count: 2,
             exit_code: Some(0),
             merkle_roots: vec![baseline.merkle_root],
             network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
         };
 
         manager.save_session_metadata(&meta).expect("save metadata");
@@ -1154,11 +1239,16 @@ mod tests {
             started: "2025-01-01T00:00:00Z".to_string(),
             ended: None,
             command: vec!["test".to_string()],
+            executable_identity: None,
             tracked_paths: vec![tracked.to_path_buf()],
             snapshot_count: 1,
             exit_code: None,
             merkle_roots: vec![baseline.merkle_root],
             network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
         };
         manager.save_session_metadata(&meta).expect("save");
 

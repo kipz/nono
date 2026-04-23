@@ -17,7 +17,7 @@ use tracing::debug;
 use zeroize::Zeroizing;
 
 /// Keystore service name for signing keys (private key material)
-const TRUST_SERVICE: &str = "nono-trust";
+pub(crate) const TRUST_SERVICE: &str = "nono-trust";
 
 /// Keystore service name for public keys (verification-only, no private key material)
 const TRUST_PUB_SERVICE: &str = "nono-trust-pub";
@@ -594,15 +594,30 @@ fn gitlab_keyless_predicate() -> Option<serde_json::Map<String, serde_json::Valu
         ),
     };
 
-    let workflow = format!("{host_authority}/{project_path}//.gitlab-ci.yml@{git_ref}");
+    // Prefer GitLab's authoritative pipeline config reference (GitLab 18.11+,
+    // via merge request https://gitlab.com/gitlab-org/gitlab/-/merge_requests/226857).
+    // CI_CONFIG_REF_URI is the fully qualified reference to the pipeline
+    // definition, so it covers includes, component refs, and non-default
+    // pipeline files. Fall back to the hardcoded `.gitlab-ci.yml` shape for
+    // older GitLab versions that don't expose the variable.
+    let workflow = std::env::var("CI_CONFIG_REF_URI")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{host_authority}/{project_path}//.gitlab-ci.yml@{git_ref}"));
+
     let server_url =
         std::env::var("CI_SERVER_URL").unwrap_or_else(|_| "https://gitlab.com".to_string());
 
+    // Mirror the workflow reference into `build_signer_uri` so publishers
+    // pinning on that field (see SignerIdentity matching in
+    // crates/nono/src/trust/types.rs) can match and so format_identity renders
+    // the full URI instead of `repository (workflow)`.
     serde_json::json!({
         "oidc_issuer": server_url,
         "server_url": server_url,
         "repository": project_path,
         "workflow": workflow,
+        "build_signer_uri": workflow,
         "ref": git_ref
     })
     .as_object()
@@ -1860,5 +1875,77 @@ mod tests {
 
         std::env::set_current_dir(original).unwrap();
         result.unwrap();
+    }
+
+    #[test]
+    fn gitlab_keyless_predicate_prefers_ci_config_ref_uri() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_HOST", "gitlab.com"),
+            ("CI_SERVER_PORT", "443"),
+            ("CI_SERVER_URL", "https://gitlab.com"),
+            ("CI_PROJECT_PATH", "my-group/my-project"),
+            ("CI_COMMIT_REF_NAME", "main"),
+            ("CI_COMMIT_TAG", ""),
+            (
+                "CI_CONFIG_REF_URI",
+                "gitlab.com/my-group/my-project//pipelines/release.yml@refs/tags/v1.0.0",
+            ),
+        ]);
+
+        let pred = gitlab_keyless_predicate().expect("predicate should be Some in GitLab CI");
+        assert_eq!(
+            pred.get("workflow").and_then(|v| v.as_str()),
+            Some("gitlab.com/my-group/my-project//pipelines/release.yml@refs/tags/v1.0.0"),
+            "workflow must mirror CI_CONFIG_REF_URI verbatim when set"
+        );
+        assert_eq!(
+            pred.get("repository").and_then(|v| v.as_str()),
+            Some("my-group/my-project")
+        );
+        assert_eq!(
+            pred.get("oidc_issuer").and_then(|v| v.as_str()),
+            Some("https://gitlab.com")
+        );
+        assert_eq!(
+            pred.get("build_signer_uri").and_then(|v| v.as_str()),
+            pred.get("workflow").and_then(|v| v.as_str()),
+            "build_signer_uri must mirror workflow so format_identity and build_signer_uri-pinned publishers work"
+        );
+    }
+
+    #[test]
+    fn gitlab_keyless_predicate_falls_back_to_hardcoded_workflow() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITLAB_CI", "true"),
+            ("CI_SERVER_HOST", "gitlab.com"),
+            ("CI_SERVER_PORT", "443"),
+            ("CI_SERVER_URL", "https://gitlab.com"),
+            ("CI_PROJECT_PATH", "my-group/my-project"),
+            ("CI_COMMIT_REF_NAME", "main"),
+            ("CI_COMMIT_TAG", ""),
+            ("CI_CONFIG_REF_URI", ""),
+        ]);
+
+        let pred =
+            gitlab_keyless_predicate().expect("predicate should be Some when GITLAB_CI=true");
+        assert_eq!(
+            pred.get("workflow").and_then(|v| v.as_str()),
+            Some("gitlab.com/my-group/my-project//.gitlab-ci.yml@refs/heads/main"),
+            "fallback workflow must reconstruct the legacy .gitlab-ci.yml@ref shape"
+        );
+        assert_eq!(
+            pred.get("build_signer_uri").and_then(|v| v.as_str()),
+            pred.get("workflow").and_then(|v| v.as_str()),
+            "build_signer_uri must mirror workflow in the legacy fallback too"
+        );
     }
 }

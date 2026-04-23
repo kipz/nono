@@ -1,9 +1,15 @@
+use crate::audit_attestation::prepare_audit_signer;
 use crate::launch_runtime::{select_threading_context, LaunchPlan};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{execute_supervised_runtime, SupervisedRuntimeContext};
-use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state};
+use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state, session};
+use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -50,6 +56,49 @@ fn next_capability_state_file_path() -> std::path::PathBuf {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     std::env::temp_dir().join(format!(".nono-{suffix}.json"))
+}
+
+fn compute_executable_identity(resolved_program: &std::path::Path) -> Result<ExecutableIdentity> {
+    let canonical_path = resolved_program.canonicalize().map_err(|e| {
+        NonoError::CommandExecution(std::io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to canonicalize executable {}: {e}",
+                resolved_program.display()
+            ),
+        ))
+    })?;
+    let mut file = File::open(&canonical_path).map_err(|e| {
+        NonoError::CommandExecution(std::io::Error::new(
+            e.kind(),
+            format!(
+                "Failed to open executable {}: {e}",
+                canonical_path.display()
+            ),
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| {
+            NonoError::CommandExecution(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to read executable {}: {e}",
+                    canonical_path.display()
+                ),
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(ExecutableIdentity {
+        resolved_path: canonical_path,
+        sha256: ContentHash::from_bytes(hasher.finalize().into()),
+    })
 }
 
 pub(crate) fn execution_start_dir(
@@ -161,12 +210,33 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
+    // Build session audit context before mediation setup.
+    // session_id and session_name must be consistent between the mediation audit
+    // log and the session record written by supervised_runtime.
+    let mediation_session_id = std::env::var(crate::DETACHED_SESSION_ID_ENV)
+        .ok()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(session::generate_session_id);
+    let mediation_session_name = flags
+        .session
+        .session_name
+        .clone()
+        .unwrap_or_else(session::generate_random_name);
+    let sandboxed_pid_latch: Arc<OnceLock<u32>> = Arc::new(OnceLock::new());
+    let audit_info = crate::mediation::SessionAuditInfo {
+        session_id: mediation_session_id.clone(),
+        session_name: Some(mediation_session_name.clone()),
+        nono_pid: std::process::id(),
+        sandboxed_pid: Arc::clone(&sandboxed_pid_latch),
+    };
+
     // Set up command mediation (shim dir, server, env blocking) before sandbox.
     // The workdir is threaded through so per-command sandbox paths that
     // reference `$WORKDIR` / `$VAR` resolve against the same directory the
-    // main sandbox uses.
+    // main sandbox uses. `audit_info` stamps session/PID context on every
+    // audit entry.
     let mediation_handle =
-        crate::mediation::session::setup(&flags.mediation, flags.workdir.clone())?;
+        crate::mediation::session::setup(&flags.mediation, flags.workdir.clone(), audit_info)?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;
@@ -208,6 +278,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 
     let current_dir = execution_start_dir(&flags.workdir, &caps)?;
+    let executable_identity = if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        Some(compute_executable_identity(&resolved_program)?)
+    } else {
+        None
+    };
+    let audit_signer = prepare_audit_signer(rollback.audit_sign_key.as_deref())?;
+    if audit_signer.is_some() && !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        return Err(NonoError::ConfigParse(
+            "--audit-sign-key requires supervised execution".to_string(),
+        ));
+    }
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
@@ -333,7 +414,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 trust,
                 proxy,
                 proxy_handle: proxy_handle.as_ref(),
+                executable_identity: executable_identity.as_ref(),
+                audit_signer: audit_signer.as_ref(),
                 silent: flags.silent,
+                pre_session_id: Some(mediation_session_id),
+                pre_session_name: Some(mediation_session_name),
+                mediation_sandboxed_pid_latch: mediation_handle
+                    .as_ref()
+                    .map(|_| Arc::clone(&sandboxed_pid_latch)),
+                mediation_audit_recorder: mediation_handle
+                    .as_ref()
+                    .map(|h| Arc::clone(&h.audit_recorder)),
             })?;
 
             cleanup_capability_state_file(&cap_file_path);
@@ -392,7 +483,11 @@ fn write_capability_state_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{recommended_builtin_profile, should_apply_startup_timeout};
+    use super::{
+        compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
+    };
+    use sha2::{Digest, Sha256};
+    use std::fs;
     use std::path::Path;
 
     #[test]
@@ -421,5 +516,21 @@ mod tests {
             &["--version"]
         ));
         assert!(!should_apply_startup_timeout(None, &no_args));
+    }
+
+    #[test]
+    fn compute_executable_identity_hashes_canonical_binary_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("tool");
+        fs::write(&binary, b"#!/bin/sh\necho hello\n").expect("write binary");
+
+        let identity = compute_executable_identity(&binary).expect("compute identity");
+        let expected = Sha256::digest(b"#!/bin/sh\necho hello\n");
+
+        assert_eq!(
+            identity.resolved_path,
+            binary.canonicalize().expect("canonical")
+        );
+        assert_eq!(identity.sha256.as_bytes(), &<[u8; 32]>::from(expected));
     }
 }

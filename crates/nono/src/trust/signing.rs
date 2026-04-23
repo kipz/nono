@@ -56,6 +56,11 @@ pub fn generate_signing_key() -> Result<KeyPair> {
 ///
 /// This is the canonical identifier used to reference keys in trust policies
 /// and bundle `publicKey.hint` fields.
+pub fn public_key_id_hex(public_key_der: &[u8]) -> String {
+    sha256(public_key_der).to_hex()
+}
+
+/// Compute the key ID (SHA-256 of DER-encoded SPKI public key) as a hex string.
 ///
 /// # Errors
 ///
@@ -67,8 +72,7 @@ pub fn key_id_hex(key_pair: &KeyPair) -> Result<String> {
             path: String::new(),
             reason: format!("failed to export public key: {e}"),
         })?;
-    let hash = sha256(spki.as_bytes());
-    Ok(hash.to_hex())
+    Ok(public_key_id_hex(spki.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +233,7 @@ fn sign_bytes_inner(
     // Create the in-toto statement with the appropriate predicate type
     let statement = dsse::new_statement(filename, &digest_hex, signer_predicate, predicate_type);
 
-    sign_statement(&statement, key_pair)
+    sign_statement_bundle(&statement, key_pair)
 }
 
 /// Maximum number of files allowed in a multi-subject attestation.
@@ -289,7 +293,7 @@ pub fn sign_files(
     });
 
     let statement = dsse::new_multi_subject_statement(&subjects, signer_predicate);
-    sign_statement(&statement, key_pair)
+    sign_statement_bundle(&statement, key_pair)
 }
 
 /// Sign a skill directory, producing a Sigstore bundle.
@@ -389,7 +393,7 @@ pub fn sign_skill(skill_dir: &Path, key_pair: &KeyPair, key_id: &str) -> Result<
         predicate: signer_predicate,
     };
 
-    sign_statement(&statement, key_pair)
+    sign_statement_bundle(&statement, key_pair)
 }
 
 /// Write a skill bundle JSON string to the conventional path within the skill directory.
@@ -409,7 +413,10 @@ pub fn write_skill_bundle(skill_dir: &Path, bundle_json: &str) -> Result<()> {
 ///
 /// Shared signing engine: serializes the statement to JSON, computes PAE,
 /// signs with ECDSA P-256, and constructs a Sigstore bundle v0.3.
-fn sign_statement(statement: &dsse::InTotoStatement, key_pair: &KeyPair) -> Result<String> {
+pub fn sign_statement_bundle(
+    statement: &dsse::InTotoStatement,
+    key_pair: &KeyPair,
+) -> Result<String> {
     // Serialize the statement to JSON (this becomes the DSSE payload)
     let statement_json = serde_json::to_string(statement).map_err(|e| NonoError::TrustSigning {
         path: String::new(),

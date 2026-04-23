@@ -122,10 +122,10 @@ fn cmd_list(args: RollbackListArgs) -> Result<()> {
 
     if filtered.is_empty() {
         if args.all {
-            eprintln!("{} No rollback sessions found.", prefix());
+            eprintln!("{} No rollback entries found.", prefix());
         } else {
             eprintln!(
-                "{} No sessions with file changes. Use --all to see all sessions.",
+                "{} No snapshots with file changes. Use --all to see all rollback entries.",
                 prefix()
             );
         }
@@ -134,16 +134,24 @@ fn cmd_list(args: RollbackListArgs) -> Result<()> {
 
     // Group sessions by their primary tracked path (project directory)
     let grouped = group_by_project(&filtered);
-    let total: usize = grouped.values().map(|v| v.len()).sum();
-    eprintln!("{} {} session(s)\n", prefix(), total);
+    let total_snapshots: u32 = grouped
+        .values()
+        .flat_map(|group| group.iter())
+        .map(|(s, _)| s.metadata.snapshot_count)
+        .sum();
+    eprintln!("{} {} snapshot(s)\n", prefix(), total_snapshots);
 
     for (project_path, sessions) in &grouped {
         let display_path = shorten_home(project_path);
+        let snapshot_count: u32 = sessions
+            .iter()
+            .map(|(s, _)| s.metadata.snapshot_count)
+            .sum();
         eprintln!(
-            "  {} ({} session{})",
+            "  {} ({} snapshot{})",
             display_path.white().bold(),
-            sessions.len(),
-            if sessions.len() == 1 { "" } else { "s" },
+            snapshot_count,
+            if snapshot_count == 1 { "" } else { "s" },
         );
         for (s, (created, modified, deleted)) in sessions {
             print_session_line(s, *created, *modified, *deleted);
@@ -592,6 +600,10 @@ fn print_show_json(session: &SessionInfo) -> Result<()> {
         "started": session.metadata.started,
         "ended": session.metadata.ended,
         "command": session.metadata.command,
+        "executable_identity": session.metadata.executable_identity.as_ref().map(|identity| serde_json::json!({
+            "resolved_path": identity.resolved_path,
+            "sha256": identity.sha256.to_string(),
+        })),
         "tracked_paths": session.metadata.tracked_paths,
         "exit_code": session.metadata.exit_code,
         "disk_size": session.disk_size,
@@ -800,7 +812,7 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
 
     let sessions = discover_sessions()?;
     if sessions.is_empty() {
-        eprintln!("{} No rollback sessions to clean up.", prefix());
+        eprintln!("{} No rollback entries to clean up.", prefix());
         return Ok(());
     }
 
@@ -859,7 +871,7 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
     }
 
     if to_remove.is_empty() {
-        eprintln!("{} Nothing to clean up.", prefix());
+        eprintln!("{} No rollback entries to clean up.", prefix());
         return Ok(());
     }
 
@@ -867,9 +879,10 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
 
     if args.dry_run {
         eprintln!(
-            "{} Dry run: would remove {} session(s) ({})\n",
+            "{} Dry run: would remove {} rollback entr{} ({})\n",
             prefix(),
             to_remove.len(),
+            if to_remove.len() == 1 { "y" } else { "ies" },
             format_bytes(total_size)
         );
         for s in &to_remove {
@@ -905,9 +918,10 @@ fn cmd_cleanup(args: RollbackCleanupArgs) -> Result<()> {
     }
 
     eprintln!(
-        "{} Removed {} session(s), freed {}.",
+        "{} Removed {} rollback entr{}, freed {}.",
         prefix(),
         removed,
+        if removed == 1 { "y" } else { "ies" },
         format_bytes(total_size)
     );
 
@@ -926,9 +940,10 @@ fn cleanup_all(dry_run: bool) -> Result<()> {
 
     if alive_count > 0 {
         eprintln!(
-            "{} {} session(s) still running, skipping those.",
+            "{} {} rollback entr{} still running, skipping those.",
             prefix(),
             alive_count,
+            if alive_count == 1 { "y is" } else { "ies are" },
         );
     }
 
@@ -936,15 +951,16 @@ fn cleanup_all(dry_run: bool) -> Result<()> {
     let total_size: u64 = removable.iter().map(|s| s.disk_size).sum();
 
     if removable.is_empty() {
-        eprintln!("{} No sessions to remove.", prefix());
+        eprintln!("{} No rollback entries to remove.", prefix());
         return Ok(());
     }
 
     if dry_run {
         eprintln!(
-            "{} Dry run: would remove {} session(s) ({})",
+            "{} Dry run: would remove {} rollback entr{} ({})",
             prefix(),
             removable.len(),
+            if removable.len() == 1 { "y" } else { "ies" },
             format_bytes(total_size)
         );
         return Ok(());
@@ -964,9 +980,10 @@ fn cleanup_all(dry_run: bool) -> Result<()> {
     }
 
     eprintln!(
-        "{} Removed {} session(s), freed {}.",
+        "{} Removed {} rollback entr{}, freed {}.",
         prefix(),
         removed,
+        if removed == 1 { "y" } else { "ies" },
         format_bytes(total_size)
     );
 
@@ -1314,11 +1331,16 @@ mod tests {
             started: "2026-02-19T10:00:00Z".to_string(),
             ended: None,
             command: vec!["claude".to_string()],
+            executable_identity: None,
             tracked_paths: vec![std::path::PathBuf::from("/home/user/widgets")],
             snapshot_count: 2,
             exit_code: None,
             merkle_roots: vec![],
             network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
         };
 
         let session = SessionInfo {
@@ -1345,22 +1367,32 @@ mod tests {
             started: "2026-02-19T10:00:00Z".to_string(),
             ended: None,
             command: vec!["claude".to_string()],
+            executable_identity: None,
             tracked_paths: vec![std::path::PathBuf::from("/home/user/widgets")],
             snapshot_count: 2,
             exit_code: None,
             merkle_roots: vec![],
             network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
         };
         let meta2 = SessionMetadata {
             session_id: "20260219-110000-67890".to_string(),
             started: "2026-02-19T11:00:00Z".to_string(),
             ended: None,
             command: vec!["opencode".to_string()],
+            executable_identity: None,
             tracked_paths: vec![std::path::PathBuf::from("/home/user/thingamajigs")],
             snapshot_count: 2,
             exit_code: None,
             merkle_roots: vec![],
             network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
         };
 
         let s1 = SessionInfo {
@@ -1387,6 +1419,44 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert!(grouped.contains_key(std::path::Path::new("/home/user/widgets")));
         assert!(grouped.contains_key(std::path::Path::new("/home/user/thingamajigs")));
+    }
+
+    #[test]
+    fn rollback_group_header_uses_snapshot_count() {
+        use nono::undo::SessionMetadata;
+
+        let metadata = SessionMetadata {
+            session_id: "20260219-100000-12345".to_string(),
+            started: "2026-02-19T10:00:00Z".to_string(),
+            ended: None,
+            command: vec!["claude".to_string()],
+            executable_identity: None,
+            tracked_paths: vec![std::path::PathBuf::from("/home/user/widgets")],
+            snapshot_count: 3,
+            exit_code: None,
+            merkle_roots: vec![],
+            network_events: vec![],
+            audit_event_count: 0,
+            audit_integrity: None,
+            mediation_integrity: None,
+            audit_attestation: None,
+        };
+
+        let session = SessionInfo {
+            metadata,
+            dir: std::path::PathBuf::from("/tmp/test"),
+            disk_size: 0,
+            is_alive: false,
+            is_stale: false,
+        };
+
+        let grouped = group_by_project(&[(&session, (0usize, 0usize, 0usize))]);
+        let snapshots: u32 = grouped
+            .values()
+            .flat_map(|group| group.iter())
+            .map(|(s, _)| s.metadata.snapshot_count)
+            .sum();
+        assert_eq!(snapshots, 3);
     }
 
     #[test]

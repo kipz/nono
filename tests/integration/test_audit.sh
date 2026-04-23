@@ -2,8 +2,8 @@
 # Audit Trail Tests
 # Verifies that audit sessions are recorded correctly in all execution scenarios.
 # Audit is on by default for all supervised sessions (#269). Plain `nono run`
-# creates an audit session; `--no-audit` opts out. Rollback and audit are
-# orthogonal — `--rollback --no-audit` is a valid combination.
+# creates an audit session; `--no-audit` opts out. Rollback requires audit and
+# is rejected when paired with `--no-audit`.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
@@ -21,13 +21,21 @@ fi
 TMPDIR=$(setup_test_dir)
 trap 'cleanup_test_dir "$TMPDIR"' EXIT
 
-# Use the real rollback root (same as nono uses via dirs::home_dir)
+# Use the real audit and rollback roots (same as nono uses via dirs::home_dir)
+AUDIT_ROOT="$HOME/.nono/audit"
 ROLLBACK_ROOT="$HOME/.nono/rollbacks"
-mkdir -p "$ROLLBACK_ROOT"
+mkdir -p "$AUDIT_ROOT" "$ROLLBACK_ROOT"
 
 # Helper: find the session.json for a specific nono PID.
 # Session dirs are named YYYYMMDD-HHMMSS-PID so we can grep for the PID suffix.
-find_session_for_pid() {
+find_audit_session_for_pid() {
+    local pid="$1"
+    local match=""
+    match=$(grep -rl "\"session_id\": \"[^\"]*-${pid}\"" "$AUDIT_ROOT" --include='session.json' 2>/dev/null | head -1) || true
+    echo "$match"
+}
+
+find_rollback_session_for_pid() {
     local pid="$1"
     local match=""
     match=$(grep -rl "\"session_id\": \"[^\"]*-${pid}\"" "$ROLLBACK_ROOT" --include='session.json' 2>/dev/null | head -1) || true
@@ -45,6 +53,7 @@ run_nono() {
 
 echo ""
 echo "Test directory: $TMPDIR"
+echo "Audit root: $AUDIT_ROOT"
 echo "Rollback root: $ROLLBACK_ROOT"
 echo ""
 
@@ -57,7 +66,7 @@ echo "--- Default Audit (Session Created) ---"
 # Test 1: Plain run creates an audit session by default
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --allow-cwd --allow "$TMPDIR" -- echo "audit test"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: plain run creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -70,7 +79,7 @@ fi
 # Test 2: Read-only run creates an audit session
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --allow-cwd --read "$TMPDIR" -- echo "readonly audit"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: read-only run creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -83,7 +92,7 @@ fi
 # Test 3: Non-zero exit still creates an audit session
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: non-zero exit creates audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -103,7 +112,7 @@ echo "--- Audit Opt-Out (--no-audit) ---"
 # Test 4: --no-audit suppresses audit session
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --no-audit --allow-cwd --allow "$TMPDIR" -- echo "no audit"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
 if [[ -z "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: --no-audit run does not create audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -113,18 +122,9 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
-# Test: --no-audit + --rollback is a valid combination (rollback without audit)
-TESTS_RUN=$((TESTS_RUN + 1))
-run_nono run --silent --no-audit --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- echo "rollback no audit"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
-if [[ -n "$session_file" && -f "$session_file" ]]; then
-    echo -e "  ${GREEN}PASS${NC}: --no-audit --rollback creates rollback session without audit"
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-else
-    echo -e "  ${RED}FAIL${NC}: --no-audit --rollback creates rollback session without audit"
-    echo "       PID: $LAST_NONO_PID, session_file: ${session_file:-not found}"
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-fi
+# Test: --no-audit + --rollback is rejected by CLI validation
+expect_failure "--no-audit --rollback is rejected" \
+    "$NONO_BIN" run --silent --no-audit --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- echo "rollback no audit"
 
 # =============================================================================
 # Audit with rollback
@@ -136,7 +136,7 @@ echo "--- Audit with Rollback ---"
 # Test 5: --rollback with read-only paths still creates an audit session
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --read "$TMPDIR" -- echo "readonly rollback audit"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" && -f "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: rollback read-only session creates audit"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -173,7 +173,7 @@ fi
 # Test 7: rollback session records correct exit code
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$TMPDIR" -- sh -c "exit 42"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" ]] && grep -q '"exit_code": 42' "$session_file"; then
     echo -e "  ${GREEN}PASS${NC}: rollback session records non-zero exit code"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -189,7 +189,7 @@ fi
 TESTS_RUN=$((TESTS_RUN + 1))
 WRITE_DIR=$(mktemp -d "$TMPDIR/write-XXXXXX")
 run_nono run --silent --rollback --no-rollback-prompt --allow-cwd --allow "$WRITE_DIR" -- touch "$WRITE_DIR/testfile"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_rollback_session_for_pid "$LAST_NONO_PID")
 if [[ -n "$session_file" ]] && grep -q '"snapshot_count"' "$session_file"; then
     snapshot_count=$(grep -o '"snapshot_count": [0-9]*' "$session_file" | grep -o '[0-9]*$')
     if [[ "$snapshot_count" -gt 0 ]]; then
@@ -220,7 +220,7 @@ echo "--- Direct Mode (nono wrap) ---"
 # Test 9: nono wrap does not create audit sessions (no parent process)
 TESTS_RUN=$((TESTS_RUN + 1))
 run_nono wrap --allow "$TMPDIR" -- echo "wrap no audit"
-session_file=$(find_session_for_pid "$LAST_NONO_PID")
+session_file=$(find_audit_session_for_pid "$LAST_NONO_PID")
 if [[ -z "$session_file" ]]; then
     echo -e "  ${GREEN}PASS${NC}: nono wrap does not create audit session"
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -243,7 +243,7 @@ set +e
 list_output=$("$NONO_BIN" audit list 2>&1)
 list_exit=$?
 set -e
-if [[ "$list_exit" -eq 0 ]] && echo "$list_output" | grep -q "session"; then
+if [[ "$list_exit" -eq 0 ]] && echo "$list_output" | grep -q "command"; then
     echo -e "  ${GREEN}PASS${NC}: audit list shows sessions"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else

@@ -10,6 +10,8 @@
 use crate::error::{NonoError, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use super::types::{ContentHash, FileState};
@@ -112,9 +114,19 @@ impl MerkleTree {
 fn compute_leaf_hash(path: &Path, content_hash: &ContentHash) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update([LEAF_PREFIX]);
-    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update(path_bytes(path));
     hasher.update(content_hash.as_bytes());
     hasher.finalize().into()
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 /// Compute an internal node hash: SHA-256(0x01 || left || right)
@@ -131,6 +143,10 @@ fn compute_internal_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     fn make_file_state(hash_byte: u8) -> FileState {
         FileState {
@@ -227,6 +243,25 @@ mod tests {
 
         let mut files2 = files1.clone();
         files2.insert(PathBuf::from("/b.txt"), make_file_state(0x02));
+
+        let tree1 = MerkleTree::from_manifest(&files1).expect("tree1");
+        let tree2 = MerkleTree::from_manifest(&files2).expect("tree2");
+        assert_ne!(tree1.root(), tree2.root());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_hash_distinctly() {
+        let mut files1 = HashMap::new();
+        let mut files2 = HashMap::new();
+        files1.insert(
+            PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xff])),
+            make_file_state(0x01),
+        );
+        files2.insert(
+            PathBuf::from(OsString::from_vec(vec![b'/', b'a', 0xfe])),
+            make_file_state(0x01),
+        );
 
         let tree1 = MerkleTree::from_manifest(&files1).expect("tree1");
         let tree2 = MerkleTree::from_manifest(&files2).expect("tree2");

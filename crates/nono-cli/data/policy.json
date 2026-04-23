@@ -431,7 +431,8 @@
       "platform": "macos",
       "allow": {
         "read": [
-          "$HOME/.local/share/claude"
+          "$HOME/.local/share/claude",
+          "$HOME/Applications/Claude Code URL Handler.app"
         ],
         "readwrite": [
           "$HOME/Library/Keychains",

@@ -1034,36 +1034,42 @@ pub fn apply_unlink_overrides(caps: &mut CapabilitySet) {
         return; // Unlink overrides are Seatbelt-specific
     }
 
-    // Collect writable paths from existing capabilities
-    let writable_paths: Vec<PathBuf> = caps
+    let mut unlink_rules = Vec::new();
+
+    for cap in caps
         .fs_capabilities()
         .iter()
         .filter(|cap| matches!(cap.access, AccessMode::Write | AccessMode::ReadWrite))
-        .filter(|cap| !cap.is_file)
-        .map(|cap| cap.resolved.clone())
-        .collect();
+    {
+        for path in [&cap.original, &cap.resolved] {
+            let path_str = match path_to_utf8(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Skipping unlink override for {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            let escaped = match escape_seatbelt_path(path_str) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Skipping unlink override for {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            let filter = if cap.is_file {
+                format!("literal \"{}\"", escaped)
+            } else {
+                format!("subpath \"{}\"", escaped)
+            };
+            unlink_rules.push(format!("(allow file-write-unlink ({}))", filter));
+        }
+    }
 
-    for path in writable_paths {
-        let path_str = match path_to_utf8(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Skipping unlink override for {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        let escaped = match escape_seatbelt_path(path_str) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("Skipping unlink override for {}: {}", path.display(), e);
-                continue;
-            }
-        };
-        // These rules are well-formed S-expressions for user-granted writable paths,
-        // so validation should not fail. Log and skip on error to avoid breaking the sandbox.
-        if let Err(e) = caps.add_platform_rule(format!(
-            "(allow file-write-unlink (subpath \"{}\"))",
-            escaped
-        )) {
+    unlink_rules.sort_unstable();
+    unlink_rules.dedup();
+
+    for rule in unlink_rules {
+        if let Err(e) = caps.add_platform_rule(rule) {
             tracing::warn!("Skipping unlink override rule: {}", e);
         }
     }
@@ -1503,6 +1509,12 @@ mod tests {
             .expect("claude_code_macos allow missing")
             .read
             .contains(&"$HOME/.local/share/claude".to_string()));
+        assert!(claude_code_macos
+            .allow
+            .as_ref()
+            .expect("claude_code_macos allow missing")
+            .read
+            .contains(&"$HOME/Applications/Claude Code URL Handler.app".to_string()));
         assert!(claude_code_macos_paths.contains(&"$HOME/Library/Keychains".to_string()));
         assert!(claude_code_macos_paths
             .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
@@ -2683,6 +2695,34 @@ mod tests {
         assert!(
             rules.contains("subpath"),
             "should use subpath for directory, got: {}",
+            rules
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_apply_unlink_overrides_emits_literal_rule_for_writable_file_caps() {
+        let mut caps = CapabilitySet::new();
+        let file_path = PathBuf::from("/tmp/.claude.lock");
+        caps.add_fs(FsCapability {
+            original: file_path.clone(),
+            resolved: file_path.clone(),
+            access: AccessMode::ReadWrite,
+            is_file: true,
+            source: CapabilitySource::Profile,
+        });
+
+        apply_unlink_overrides(&mut caps);
+
+        let escaped =
+            escape_seatbelt_path(file_path.to_str().expect("utf8 path")).expect("escaped path");
+        let rules = caps.platform_rules().join("\n");
+        assert!(
+            rules.contains(&format!(
+                "(allow file-write-unlink (literal \"{}\"))",
+                escaped
+            )),
+            "expected literal unlink override for writable file cap, got: {}",
             rules
         );
     }

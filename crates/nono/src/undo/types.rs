@@ -280,6 +280,13 @@ pub struct SessionMetadata {
     /// Optional integrity summary for the append-only audit log
     #[serde(default)]
     pub audit_integrity: Option<AuditIntegritySummary>,
+    /// Optional integrity summary for the parallel mediation (per-command)
+    /// audit stream. Populated when command mediation is active. Uses the
+    /// same shape as `audit_integrity` but covers a disjoint event type
+    /// and a different filename on disk (`audit.jsonl` vs
+    /// `audit-events.ndjson`).
+    #[serde(default)]
+    pub mediation_integrity: Option<AuditIntegritySummary>,
     /// Optional keyed signature over the audit Merkle root and session context
     #[serde(default)]
     pub audit_attestation: Option<AuditAttestationSummary>,

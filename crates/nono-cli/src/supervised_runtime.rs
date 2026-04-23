@@ -43,6 +43,12 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) pre_session_name: Option<String>,
     /// Latch to fill in with the sandboxed process PID once forked; shared with the mediation server.
     pub(crate) mediation_sandboxed_pid_latch: Option<Arc<OnceLock<u32>>>,
+    /// Shared mediation audit recorder. When command mediation is active, this
+    /// is the chain-hashed Merkle recorder behind `audit.jsonl`. Finalized in
+    /// `rollback_runtime::finalize_supervised_exit` to populate
+    /// `SessionMetadata.mediation_integrity`.
+    pub(crate) mediation_audit_recorder:
+        Option<std::sync::Arc<std::sync::Mutex<AuditRecorder<crate::mediation::AuditEvent>>>>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -166,6 +172,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pre_session_id,
         pre_session_name,
         mediation_sandboxed_pid_latch,
+        mediation_audit_recorder,
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -284,6 +291,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder: audit_recorder.as_ref(),
+        mediation_audit_recorder: mediation_audit_recorder.as_deref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,

@@ -1187,6 +1187,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            mediation_integrity: None,
             audit_attestation: None,
         };
 
@@ -1246,6 +1247,7 @@ mod tests {
             network_events: vec![],
             audit_event_count: 0,
             audit_integrity: None,
+            mediation_integrity: None,
             audit_attestation: None,
         };
         manager.save_session_metadata(&meta).expect("save");

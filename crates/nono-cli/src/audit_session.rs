@@ -262,6 +262,7 @@ mod tests {
                 network_events: Vec::new(),
                 audit_event_count: 2,
                 audit_integrity: None,
+                mediation_integrity: None,
                 audit_attestation: None,
             },
         )
@@ -286,6 +287,7 @@ mod tests {
                 network_events: Vec::new(),
                 audit_event_count: 2,
                 audit_integrity: None,
+                mediation_integrity: None,
                 audit_attestation: None,
             },
         )
@@ -310,6 +312,7 @@ mod tests {
                 network_events: Vec::new(),
                 audit_event_count: 2,
                 audit_integrity: None,
+                mediation_integrity: None,
                 audit_attestation: None,
             },
         )

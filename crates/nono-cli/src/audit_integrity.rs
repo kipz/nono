@@ -34,6 +34,20 @@ pub(crate) const AUDIT_EVENTS_CONFIG: RecorderConfig = RecorderConfig {
     merkle_scheme_label: "alpha",
 };
 
+/// Configuration for the mediation (per-command) audit stream.
+///
+/// Distinct domain-separation labels from `AUDIT_EVENTS_CONFIG` prevent
+/// cross-stream replay: a leaf record produced in this stream cannot be
+/// spliced into `audit-events.ndjson`, and vice versa, because the hashes
+/// won't match under the other stream's domain tag.
+pub(crate) const MEDIATION_EVENTS_CONFIG: RecorderConfig = RecorderConfig {
+    filename: "audit.jsonl",
+    event_domain: b"nono.mediation.event.alpha\n",
+    chain_domain: b"nono.mediation.chain.alpha\n",
+    merkle_domain: b"nono.mediation.merkle.alpha\n",
+    merkle_scheme_label: "alpha",
+};
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AuditEventPayload {

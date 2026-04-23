@@ -784,6 +784,7 @@ mod list_tests {
             network_events: vec![],
             audit_event_count: 4,
             audit_integrity: None,
+            mediation_integrity: None,
             audit_attestation: None,
         };
 

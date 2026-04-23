@@ -422,6 +422,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 mediation_sandboxed_pid_latch: mediation_handle
                     .as_ref()
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
+                mediation_audit_recorder: mediation_handle
+                    .as_ref()
+                    .map(|h| Arc::clone(&h.audit_recorder)),
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

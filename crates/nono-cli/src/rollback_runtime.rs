@@ -2,6 +2,7 @@ use crate::audit_attestation::{write_audit_attestation, AuditSigner};
 use crate::audit_integrity::{AuditEventPayload, AuditRecorder};
 use crate::audit_ledger;
 use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
+use crate::mediation::AuditEvent as MediationAuditEvent;
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
 use nono::undo::ExecutableIdentity;
 use nono::{AccessMode, CapabilitySet, Result};
@@ -36,6 +37,14 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_snapshot_state: Option<AuditSnapshotState>,
     pub(crate) audit_tracked_paths: Vec<PathBuf>,
     pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder<AuditEventPayload>>>,
+    /// Optional shared mediation audit recorder. When present, `finalize()`
+    /// is called here to compute the mediation Merkle root and stash it on
+    /// `SessionMetadata.mediation_integrity`. Must be the last appender on
+    /// this recorder — by the time we run, the sandboxed child has exited
+    /// and the mediation server has no active clients, so further appends
+    /// are not expected. See `mediation/session.rs::SessionHandle` for the
+    /// locking contract.
+    pub(crate) mediation_audit_recorder: Option<&'a Mutex<AuditRecorder<MediationAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
@@ -459,6 +468,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder,
+        mediation_audit_recorder,
         audit_integrity_enabled,
         proxy_handle,
         executable_identity,
@@ -494,6 +504,21 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         (0, None)
     };
 
+    // Finalize the mediation (per-command) audit stream, if any. Short
+    // critical section — lock, read final state, drop guard. By this
+    // point the sandboxed child has exited so no more shim events will
+    // be appended; any straggler mid-append completes under the Mutex
+    // before finalize() reads the state, so the summary is consistent
+    // with the on-disk file.
+    let mediation_integrity = if let Some(recorder_mutex) = mediation_audit_recorder {
+        let recorder = recorder_mutex.lock().map_err(|_| {
+            nono::NonoError::Snapshot("Mediation audit recorder lock poisoned".to_string())
+        })?;
+        recorder.finalize()
+    } else {
+        None
+    };
+
     let mut audit_saved = false;
 
     if let Some(RollbackRuntimeState {
@@ -521,6 +546,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
             network_events: std::mem::take(&mut network_events),
             audit_event_count,
             audit_integrity: audit_integrity.clone(),
+            mediation_integrity: mediation_integrity.clone(),
             audit_attestation: None,
         };
         if let Some(signer) = audit_signer {
@@ -571,6 +597,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
                 network_events,
                 audit_event_count,
                 audit_integrity,
+                mediation_integrity,
                 audit_attestation: None,
             };
             if let Some(signer) = audit_signer {
@@ -859,6 +886,7 @@ mod tests {
                 chain_head: nono::undo::ContentHash::from_bytes([0x11; 32]),
                 merkle_root: nono::undo::ContentHash::from_bytes([0x22; 32]),
             }),
+            mediation_integrity: None,
             audit_attestation: None,
         };
 

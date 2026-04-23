@@ -594,6 +594,7 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
                 chain_head: ContentHash::from_bytes([0x11; 32]),
                 merkle_root: ContentHash::from_bytes([0x22; 32]),
             }),
+            mediation_integrity: None,
             audit_attestation: None,
         }
     }

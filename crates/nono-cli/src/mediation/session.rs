@@ -10,12 +10,15 @@
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
-use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo};
+use super::{
+    AuditEvent, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+};
+use crate::audit_integrity::{AuditRecorder, MEDIATION_EVENTS_CONFIG};
 use nix::libc;
 use nono::{NonoError, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
@@ -77,6 +80,22 @@ pub struct SessionHandle {
     /// Latch set to the sandboxed process PID after the sandboxed process is forked.
     /// Callers must call `latch.set(sandboxed_pid)` in their post-fork callback.
     pub sandboxed_pid_latch: Arc<OnceLock<u32>>,
+    /// Chain-hashed, Merkle-rooted recorder for per-command mediation events.
+    ///
+    /// Shared (via `Arc`) with both the stream handler (mediated commands)
+    /// and the datagram receiver (audit-only shims) running on
+    /// `_runtime`.
+    ///
+    /// Lock discipline:
+    /// 1. Acquire `.lock()`, call `append_event` (or `finalize`), drop guard.
+    /// 2. Never hold the guard across `.await`.
+    /// 3. Never call back into the mediation server or TokenBroker while
+    ///    holding this lock (no reentrancy, no lock-order inversion).
+    ///
+    /// Finalize happens from outside the server (from `rollback_runtime`
+    /// while this handle is still alive) to read the final Merkle root into
+    /// `SessionMetadata.mediation_integrity`.
+    pub audit_recorder: Arc<Mutex<AuditRecorder<AuditEvent>>>,
     // Tokio runtime kept alive so the server task continues running in the parent.
     _runtime: tokio::runtime::Runtime,
 }
@@ -312,6 +331,18 @@ pub fn setup(
     let audit_sock = audit_socket_path.clone();
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
     let audit_info_for_server = Arc::clone(&audit_info_arc);
+
+    // Construct the mediation audit recorder. Writes `audit.jsonl` with
+    // chain-hashed, Merkle-rooted entries under MEDIATION_EVENTS_CONFIG's
+    // distinct domain-sep labels (see audit_integrity.rs). The Arc is
+    // cloned for the server task; one clone stays on SessionHandle so
+    // rollback_runtime can finalize() via the lock at session end.
+    let audit_recorder = Arc::new(Mutex::new(AuditRecorder::<AuditEvent>::new(
+        audit_log_dir.clone(),
+        &MEDIATION_EVENTS_CONFIG,
+    )?));
+    let audit_recorder_for_server = Arc::clone(&audit_recorder);
+
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -325,6 +356,7 @@ pub fn setup(
             audit_log_dir,
             workdir,
             audit_info_for_server,
+            audit_recorder_for_server,
         )
         .await
         {
@@ -366,6 +398,7 @@ pub fn setup(
         mediated_commands,
         audit_socket_path,
         sandboxed_pid_latch,
+        audit_recorder,
         _runtime: runtime,
     }))
 }

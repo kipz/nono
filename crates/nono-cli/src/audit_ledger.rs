@@ -376,6 +376,7 @@ mod tests {
             network_events: Vec::new(),
             audit_event_count: 2,
             audit_integrity: None,
+            mediation_integrity: None,
             audit_attestation: None,
         }
     }
@@ -430,6 +431,7 @@ mod tests {
                 chain_head: ContentHash::from_bytes([2; 32]),
                 merkle_root: ContentHash::from_bytes([3; 32]),
             }),
+            mediation_integrity: None,
             audit_attestation: None,
         };
         let base_digest = compute_session_digest(&base).unwrap();

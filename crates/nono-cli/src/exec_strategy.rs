@@ -313,7 +313,9 @@ pub struct SupervisorConfig<'a> {
     /// Whether to allow http://localhost and http://127.0.0.1 URLs.
     pub open_url_allow_localhost: bool,
     /// Optional append-only audit recorder for supervisor events.
-    pub audit_recorder: Option<&'a Mutex<crate::audit_integrity::AuditRecorder>>,
+    pub audit_recorder: Option<
+        &'a Mutex<crate::audit_integrity::AuditRecorder<crate::audit_integrity::AuditEventPayload>>,
+    >,
     /// Whether direct LaunchServices opening is enabled for this session.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub allow_launch_services_active: bool,

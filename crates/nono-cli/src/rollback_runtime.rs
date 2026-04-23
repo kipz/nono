@@ -1,5 +1,5 @@
 use crate::audit_attestation::{write_audit_attestation, AuditSigner};
-use crate::audit_integrity::AuditRecorder;
+use crate::audit_integrity::{AuditEventPayload, AuditRecorder};
 use crate::audit_ledger;
 use crate::launch_runtime::{rollback_base_exclusions, RollbackLaunchOptions};
 use crate::{config, output, rollback_preflight, rollback_session, rollback_ui};
@@ -35,7 +35,7 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) rollback_state: Option<RollbackRuntimeState>,
     pub(crate) audit_snapshot_state: Option<AuditSnapshotState>,
     pub(crate) audit_tracked_paths: Vec<PathBuf>,
-    pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
+    pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder<AuditEventPayload>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,

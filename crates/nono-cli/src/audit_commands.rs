@@ -3,7 +3,7 @@
 //! Handles `nono audit list|show` for viewing the audit trail of sandboxed sessions.
 
 use crate::audit_attestation::verify_audit_attestation;
-use crate::audit_integrity::verify_audit_log;
+use crate::audit_integrity::{verify_audit_log, AuditEventPayload, AUDIT_EVENTS_CONFIG};
 use crate::audit_ledger::verify_session_in_ledger;
 use crate::audit_session::{
     discover_sessions, format_bytes, is_legacy_audit_only_session, is_primary_audit_session,
@@ -384,7 +384,11 @@ fn cmd_show(args: AuditShowArgs) -> Result<()> {
 
 fn cmd_verify(args: AuditVerifyArgs) -> Result<()> {
     let session = load_session(&args.session_id)?;
-    let result = verify_audit_log(&session.dir, session.metadata.audit_integrity.as_ref())?;
+    let result = verify_audit_log::<AuditEventPayload>(
+        &session.dir,
+        session.metadata.audit_integrity.as_ref(),
+        &AUDIT_EVENTS_CONFIG,
+    )?;
     let ledger = verify_session_in_ledger(&session.metadata)?;
     let attestation = verify_audit_attestation(
         &session.dir,

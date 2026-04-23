@@ -1,5 +1,5 @@
 use crate::audit_attestation::AuditSigner;
-use crate::audit_integrity::AuditRecorder;
+use crate::audit_integrity::{AuditEventPayload, AuditRecorder, AUDIT_EVENTS_CONFIG};
 use crate::launch_runtime::{
     ProxyLaunchOptions, RollbackLaunchOptions, SessionLaunchOptions, TrustLaunchOptions,
 };
@@ -208,7 +208,13 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     let audit_recorder = if audit_state.is_some() && !rollback.no_audit_integrity {
         audit_state
             .as_ref()
-            .map(|state| AuditRecorder::new(state.session_dir.clone()).map(Mutex::new))
+            .map(|state| {
+                AuditRecorder::<AuditEventPayload>::new(
+                    state.session_dir.clone(),
+                    &AUDIT_EVENTS_CONFIG,
+                )
+                .map(Mutex::new)
+            })
             .transpose()?
     } else {
         None

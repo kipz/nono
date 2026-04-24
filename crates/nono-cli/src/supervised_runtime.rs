@@ -52,6 +52,10 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     /// shim-routed invocations. `None` when mediation is inactive.
     #[cfg(target_os = "linux")]
     pub(crate) exec_shim_dir: Option<std::path::PathBuf>,
+    /// Directory the exec filter appends FilterAuditEvent JSONL
+    /// lines to (shared with the shim's audit stream).
+    #[cfg(target_os = "linux")]
+    pub(crate) exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -161,7 +165,11 @@ fn create_session_runtime_state(
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     #[cfg(target_os = "linux")]
-    let (exec_deny_set, exec_shim_dir) = (ctx.exec_deny_set.clone(), ctx.exec_shim_dir.clone());
+    let (exec_deny_set, exec_shim_dir, exec_audit_log_dir) = (
+        ctx.exec_deny_set.clone(),
+        ctx.exec_shim_dir.clone(),
+        ctx.exec_audit_log_dir.clone(),
+    );
     let SupervisedRuntimeContext {
         config,
         caps,
@@ -259,6 +267,8 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         exec_deny_set,
         #[cfg(target_os = "linux")]
         exec_shim_dir,
+        #[cfg(target_os = "linux")]
+        exec_audit_log_dir,
     };
 
     if !session.detached_start {

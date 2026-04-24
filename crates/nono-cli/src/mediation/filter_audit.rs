@@ -24,8 +24,6 @@ pub mod reasons {
     /// Double-read detected user-memory or file-content mutation between
     /// our check and the kernel's re-read.
     pub const TOCTOU_MISMATCH: &str = "toctou_mismatch";
-    /// Path argument could not be resolved or canonicalized; fail-closed.
-    pub const PATH_RESOLUTION_FAILED: &str = "path_resolution_failed";
 }
 
 /// `action_type` values identifying filter-emitted audit records.
@@ -123,6 +121,28 @@ impl FilterAuditEvent {
     pub fn with_interpreter_chain(mut self, chain: Vec<String>) -> Self {
         self.interpreter_chain = Some(chain);
         self
+    }
+}
+
+/// Append a single `FilterAuditEvent` as a JSONL line to
+/// `<audit_log_dir>/audit.jsonl`. Creates the file with mode 0o600 if
+/// it does not exist. Best-effort: errors are silently swallowed so a
+/// failed audit write does not block the exec filter's decision. The
+/// caller's decision (allow or deny) has already been applied to the
+/// kernel by the time this is called.
+pub fn append_filter_audit_event(audit_log_dir: &std::path::Path, event: &FilterAuditEvent) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let log_path = audit_log_dir.join("audit.jsonl");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+    {
+        if let Ok(line) = serde_json::to_string(event) {
+            let _ = writeln!(f, "{}", line);
+        }
     }
 }
 

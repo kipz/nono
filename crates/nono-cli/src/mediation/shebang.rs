@@ -116,8 +116,31 @@ impl ShebangFileReader for StdFileReader {
 /// interpreter's argv but do not themselves trigger another binfmt
 /// lookup.
 pub fn parse_shebang(bytes: &[u8]) -> Option<&str> {
-    let _ = bytes;
-    todo!("Phase 4: parse shebang interpreter from leading bytes")
+    // Must start with the shebang magic. Handle the common "#!" and
+    // the "#!/..." forms uniformly: start scanning at index 2.
+    if bytes.len() < 2 || &bytes[0..2] != b"#!" {
+        return None;
+    }
+    // Skip ASCII whitespace after #! (space, tab).
+    let mut start = 2;
+    while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+        start += 1;
+    }
+    // Find the end of the interpreter token: first whitespace (space,
+    // tab, newline, carriage return) or end-of-buffer.
+    let mut end = start;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
+            break;
+        }
+        end += 1;
+    }
+    if end == start {
+        // Buffer was "#!" + whitespace only — no interpreter.
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..end]).ok()
 }
 
 /// Walk the shebang chain of a file, checking each interpreter against
@@ -154,8 +177,51 @@ pub fn check_shebang_chain_with_reader<R: ShebangFileReader>(
     deny_set: &DenySet,
     reader: &R,
 ) -> ShebangResult {
-    let _ = (path, depth, deny_set, reader);
-    todo!("Phase 4: walk shebang chain, check deny set, recurse up to MAX_SHEBANG_RECURSION")
+    // Terminate at the recursion limit. This is a safe default: the
+    // kernel's own limit is lower than ours, so reaching this limit
+    // means the kernel would have refused to load the chain anyway.
+    if depth >= MAX_SHEBANG_RECURSION {
+        return ShebangResult::NotScript;
+    }
+
+    let mut buf = [0u8; 256];
+    let n = match reader.read_first_bytes(path, &mut buf) {
+        Ok(n) => n,
+        Err(_) => {
+            // Unreadable file: terminate the chain. The kernel will
+            // separately fail the exec on a missing/unreadable target,
+            // so returning NotScript here does not open a bypass.
+            return ShebangResult::NotScript;
+        }
+    };
+    let interpreter = match parse_shebang(&buf[..n]) {
+        Some(s) => s,
+        None => return ShebangResult::NotScript,
+    };
+    let interpreter_path = PathBuf::from(interpreter);
+
+    // Canonicalize the interpreter for deny-set comparison. On a mock
+    // reader that returns sibling-interpreter paths (no real files on
+    // the filesystem), canonicalize will fail; fall back to the raw
+    // path so tests can still drive the chain through the deny check.
+    let canonical = std::fs::canonicalize(&interpreter_path)
+        .unwrap_or_else(|_| interpreter_path.clone());
+
+    if deny_set.contains(&canonical) {
+        return ShebangResult::Deny(vec![canonical]);
+    }
+
+    // Recurse into the interpreter. If the recursion finds a deny,
+    // prepend this level's interpreter to the returned chain so the
+    // caller sees outermost-first order.
+    match check_shebang_chain_with_reader(&interpreter_path, depth + 1, deny_set, reader) {
+        ShebangResult::Deny(mut inner) => {
+            let mut chain = vec![canonical];
+            chain.append(&mut inner);
+            ShebangResult::Deny(chain)
+        }
+        ShebangResult::NotScript => ShebangResult::NotScript,
+    }
 }
 
 #[cfg(test)]

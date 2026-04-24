@@ -862,12 +862,38 @@ pub(super) fn handle_exec_notification(
         }
     };
 
-    let decision = classify_exec_path(
+    let mut decision = classify_exec_path(
         &resolved,
         &canonical,
         &config.exec_deny_set,
         config.exec_shim_dir.as_deref(),
     );
+
+    // Shebang bypass check. The kernel's binfmt_script handler resolves
+    // a script's `#!` interpreter internally without issuing a second
+    // `execve` syscall, so an agent could write a script whose shebang
+    // names a mediated binary and exec the script to reach the binary
+    // unobserved. Walk the chain in userspace and flip the decision to
+    // deny if any interpreter resolves to a deny-set entry.
+    if matches!(
+        decision,
+        ExecDecision::AllowShim | ExecDecision::AllowUnmediated
+    ) && !config.exec_deny_set.is_empty()
+    {
+        use crate::mediation::shebang::{check_shebang_chain, DenySet, ShebangResult};
+        let set = DenySet::with_paths(config.exec_deny_set.clone());
+        match check_shebang_chain(&canonical, 0, &set) {
+            ShebangResult::Deny(_chain) => {
+                debug!(
+                    "exec filter deny (shebang chain): path={} canonical={}",
+                    resolved.display(),
+                    canonical.display()
+                );
+                decision = ExecDecision::Deny;
+            }
+            ShebangResult::NotScript => {}
+        }
+    }
 
     match decision {
         ExecDecision::Deny => {

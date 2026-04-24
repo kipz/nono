@@ -1930,35 +1930,143 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 // Exec filter for mediation full-path bypass closure
 // ============================================================================
 
-/// Build a seccomp-notify BPF filter that traps `execve` and `execveat`.
+/// Build a seccomp-notify BPF filter that traps `execve` and `execveat`
+/// and lets every other syscall through.
 ///
-/// Instruction layout (indices refer to the vec):
-///  0: ld [nr]                         — load syscall number
-///  1: jeq SYS_EXECVE   jt=+2 -> 4     — execve traps
-///  2: jeq SYS_EXECVEAT jt=+1 -> 4     — execveat traps
-///  3: ret ALLOW                       — default for every other syscall
-///  4: ret USER_NOTIF                  — queue a userspace notification
-///
-/// Phase 1b: stub, RED against the structure test. Phase 2 fills in the
-/// real BPF program and `install_seccomp_exec_filter` starts calling it.
-/// Until then the function is only referenced from the test module.
+/// Instruction layout:
+///   0: ld [nr]                         — load syscall number
+///   1: jeq SYS_EXECVE   jt=+2 -> 4     — execve traps
+///   2: jeq SYS_EXECVEAT jt=+1 -> 4     — execveat traps
+///   3: ret ALLOW                       — any other syscall
+///   4: ret USER_NOTIF                  — route to supervisor
 #[cfg(target_os = "linux")]
-#[allow(dead_code)] // removed in Phase 2 when install_seccomp_exec_filter calls this.
 fn build_seccomp_exec_filter() -> Vec<SockFilterInsn> {
-    todo!("Phase 2: build BPF program for execve/execveat trap")
+    vec![
+        // 0: Load syscall number
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+        // 1: jeq SYS_EXECVE -> jump +2 to insn 4 (notify)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: SYS_EXECVE as u32,
+        },
+        // 2: jeq SYS_EXECVEAT -> jump +1 to insn 4 (notify)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: SYS_EXECVEAT as u32,
+        },
+        // 3: Allow all other syscalls
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+        // 4: Route to user notification
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
+    ]
 }
 
 /// Install a seccomp-notify BPF filter that traps `execve` and `execveat`.
 ///
-/// Returns the notify fd that the supervisor must poll for exec
+/// Returns the notify fd that the supervisor polls for exec
 /// interceptions. The filter is installed in the current process and is
-/// inherited by all descendants via `fork`/`exec`.
+/// inherited by all descendants via `fork`/`exec`. Once installed, it is
+/// permanent (the `PR_SET_NO_NEW_PRIVS` flag is set, which the kernel
+/// requires for unprivileged seccomp filter installation and which is
+/// also one-way).
 ///
-/// Phase 1b: stub. Phase 2 implements the real install, mirroring the
-/// structure of `install_seccomp_notify` and `install_seccomp_proxy_filter`.
+/// This mirrors the structure of [`install_seccomp_notify`] and
+/// [`install_seccomp_proxy_filter`]. It is safe to call alongside either
+/// of those — multiple seccomp filters coexist in a single process, and
+/// the other filters' BPF programs `RET_ALLOW` on execve/execveat so our
+/// filter sees every exec.
+///
+/// # Errors
+///
+/// Returns [`NonoError::SandboxInit`] if `prctl(PR_SET_NO_NEW_PRIVS)`
+/// fails or if `seccomp(SECCOMP_SET_MODE_FILTER, ...)` fails. The latter
+/// implies the kernel lacks seccomp user notification support
+/// (kernel < 5.0).
 #[cfg(target_os = "linux")]
 pub fn install_seccomp_exec_filter() -> Result<std::os::fd::OwnedFd> {
-    todo!("Phase 2: install seccomp-notify filter for execve/execveat")
+    use std::os::fd::FromRawFd;
+
+    let filter = build_seccomp_exec_filter();
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+
+    // PR_SET_NO_NEW_PRIVS should already be set by Landlock's
+    // restrict_self() or by a sibling install of the openat/proxy
+    // filters. Set it again defensively; it is idempotent.
+    // SAFETY: prctl(PR_SET_NO_NEW_PRIVS) takes only scalar arguments and
+    // does not dereference pointers.
+    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if ret != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Try with WAIT_KILLABLE_RECV first (kernel 5.19+). If the kernel
+    // does not know that flag, retry without it.
+    let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV;
+
+    // SAFETY: seccomp(SECCOMP_SET_MODE_FILTER) installs a BPF filter.
+    // The prog pointer is valid for the duration of the syscall; the
+    // filter vec is alive in this stack frame.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            flags,
+            &prog as *const SockFprog,
+        )
+    };
+
+    let notify_fd = if ret < 0 {
+        // Retry without WAIT_KILLABLE_RECV for pre-5.19 kernels.
+        let flags = SECCOMP_FILTER_FLAG_NEW_LISTENER;
+        // SAFETY: same as above, retrying with fewer flags.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER,
+                flags,
+                &prog as *const SockFprog,
+            )
+        };
+        if ret < 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "seccomp(SECCOMP_SET_MODE_FILTER) for exec filter failed: {}. \
+                 Requires kernel >= 5.0 with SECCOMP_FILTER_FLAG_NEW_LISTENER.",
+                std::io::Error::last_os_error()
+            )));
+        }
+        ret as i32
+    } else {
+        ret as i32
+    };
+
+    // SAFETY: The fd returned by seccomp() with NEW_LISTENER is a valid,
+    // newly-created file descriptor that we now own.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(notify_fd) })
 }
 
 /// Read a sockaddr from a seccomp notification's connect/bind arguments.

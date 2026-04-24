@@ -287,6 +287,13 @@ pub struct SupervisorConfig<'a> {
     /// `None` when mediation is inactive.
     #[cfg(target_os = "linux")]
     pub exec_shim_dir: Option<std::path::PathBuf>,
+    /// Directory to which the exec filter should append
+    /// `FilterAuditEvent` JSONL lines. Same directory the shim's
+    /// audit events land in (`~/.nono/sessions`). `None` when
+    /// mediation is inactive; no filter events are emitted in that
+    /// case.
+    #[cfg(target_os = "linux")]
+    pub exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3600,6 +3607,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3702,6 +3710,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3780,6 +3789,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3815,6 +3825,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3848,6 +3859,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3865,6 +3877,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -3903,6 +3916,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -4044,6 +4058,7 @@ mod tests {
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
             exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         assert!(

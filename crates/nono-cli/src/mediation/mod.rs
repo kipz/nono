@@ -17,6 +17,7 @@ pub mod admin;
 pub mod approval;
 pub mod broker;
 pub mod control;
+pub mod filter_audit;
 pub mod policy;
 pub mod server;
 pub mod session;

@@ -895,6 +895,50 @@ pub(super) fn handle_exec_notification(
         }
     }
 
+    // TOCTOU double-read. seccomp-unotify re-reads path arguments from
+    // the child's memory after we respond CONTINUE, so a cooperating
+    // racing thread in the child could swap the pathname buffer
+    // between our initial read and the kernel's post-response re-read.
+    // Mitigate by re-reading and flipping to deny on mismatch. This
+    // does not close the race (the kernel still re-reads after our
+    // response), but it collapses the vulnerable window from
+    // 'classify + canonicalize + shebang' to 'single response round-
+    // trip', defeating naive spin-flip attackers. Applied only on
+    // allow decisions — a deny already fails the syscall, so no
+    // re-read happens kernel-side. Skipped for AT_EMPTY_PATH (which
+    // reads a stable fd link, not a user-memory pathname).
+    if matches!(
+        decision,
+        ExecDecision::AllowShim | ExecDecision::AllowUnmediated
+    ) {
+        let is_at_empty_path = notif.data.nr == SYS_EXECVEAT
+            && (flags & AT_EMPTY_PATH_BIT) != 0;
+        if !is_at_empty_path {
+            match read_notif_path(notif.pid, path_arg_ptr) {
+                Ok(second_raw) => {
+                    // Resolve the second raw read the same way as the first.
+                    let second_resolved = resolve_notif_path(notif.pid, dirfd, &second_raw)
+                        .unwrap_or(second_raw.clone());
+                    if second_resolved != resolved {
+                        debug!(
+                            "exec filter deny (toctou_mismatch): first={} second={}",
+                            resolved.display(),
+                            second_resolved.display()
+                        );
+                        decision = ExecDecision::Deny;
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        "exec filter deny (toctou double-read failed): {}",
+                        e
+                    );
+                    decision = ExecDecision::Deny;
+                }
+            }
+        }
+    }
+
     match decision {
         ExecDecision::Deny => {
             debug!(

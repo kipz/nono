@@ -614,7 +614,12 @@
       "properties": {
         "event": {
           "type": "string",
-          "description": "Event that triggers the hook (e.g., \"PostToolUseFailure\")."
+          "description": "Primary event that triggers the hook (e.g., \"PostToolUseFailure\")."
+        },
+        "events": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional events that run the same script with the same matcher. Empty by default; used by multi-event hooks like the trajectory-spec dispatcher."
         },
         "matcher": {
           "type": "string",

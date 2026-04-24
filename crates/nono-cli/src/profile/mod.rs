@@ -905,12 +905,28 @@ pub struct SecretsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
-    /// Event that triggers the hook (e.g., "PostToolUseFailure")
+    /// Primary event that triggers the hook (e.g., "PostToolUseFailure").
     pub event: String,
+    /// Additional events that should run the same script with the same
+    /// matcher. Empty by default; used by multi-event hooks like the
+    /// trajectory dispatcher which registers on `SessionStart`,
+    /// `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `SessionEnd`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
     /// Regex pattern to match tool names (e.g., "Read|Write|Edit|Bash")
     pub matcher: String,
     /// Script filename from data/hooks/ to install
     pub script: String,
+}
+
+impl HookConfig {
+    /// Full list of events this hook should register on: the primary
+    /// `event` followed by each entry in `events`, in declaration order.
+    pub fn event_list(&self) -> Vec<&str> {
+        std::iter::once(self.event.as_str())
+            .chain(self.events.iter().map(String::as_str))
+            .collect()
+    }
 }
 
 /// Hooks configuration in a profile
@@ -3882,6 +3898,7 @@ mod tests {
             "claude-code".to_string(),
             HookConfig {
                 event: "PostToolUseFailure".to_string(),
+                events: Vec::new(),
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             },
@@ -3892,6 +3909,7 @@ mod tests {
             "opencode".to_string(),
             HookConfig {
                 event: "PreToolUse".to_string(),
+                events: Vec::new(),
                 matcher: "Write".to_string(),
                 script: "child-hook.sh".to_string(),
             },
@@ -3907,6 +3925,7 @@ mod tests {
             "claude-code".to_string(),
             HookConfig {
                 event: "PostToolUseFailure".to_string(),
+                events: Vec::new(),
                 matcher: "Bash".to_string(),
                 script: "base-hook.sh".to_string(),
             },
@@ -3917,6 +3936,7 @@ mod tests {
             "claude-code".to_string(),
             HookConfig {
                 event: "PreToolUse".to_string(),
+                events: Vec::new(),
                 matcher: "Read".to_string(),
                 script: "child-hook.sh".to_string(),
             },

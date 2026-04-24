@@ -15,12 +15,16 @@ use std::path::PathBuf;
 mod embedded {
     /// nono-hook.sh for Claude Code integration
     pub const NONO_HOOK_SH: &str = include_str!(concat!(env!("OUT_DIR"), "/nono-hook.sh"));
+    /// nono-trajectory.sh - trajectory-spec JSONL dispatcher for Claude Code
+    pub const NONO_TRAJECTORY_SH: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/nono-trajectory.sh"));
 }
 
 /// Get embedded hook script by name
 fn get_embedded_script(name: &str) -> Option<&'static str> {
     match name {
         "nono-hook.sh" => Some(embedded::NONO_HOOK_SH),
+        "nono-trajectory.sh" => Some(embedded::NONO_TRAJECTORY_SH),
         _ => None,
     }
 }
@@ -145,8 +149,9 @@ fn install_claude_code_hook(
     Ok(result)
 }
 
-/// Update Claude Code settings.json to register the hook
-/// Returns true if settings were modified, false if hook was already registered
+/// Update Claude Code settings.json to register the hook on each event in
+/// `config.event_list()`. Registration is idempotent per (event, command).
+/// Returns true if settings were modified, false if every registration was already present.
 fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Result<bool> {
     // Load existing settings or create new
     let mut settings: Value = if settings_path.exists() {
@@ -176,36 +181,42 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
         .and_then(|v| v.as_object_mut())
         .ok_or_else(|| NonoError::HookInstall("hooks is not a JSON object".to_string()))?;
 
-    // Get or create event array
-    if !hooks.contains_key(&config.event) {
-        hooks.insert(config.event.clone(), json!([]));
-    }
-    let event_hooks = hooks
-        .get_mut(&config.event)
-        .and_then(|v| v.as_array_mut())
-        .ok_or_else(|| NonoError::HookInstall(format!("{} is not a JSON array", config.event)))?;
-
     // Build the hook command path (use $HOME for portability)
     let hook_command = format!("$HOME/.claude/hooks/{}", config.script);
 
-    // Check if hook already registered
-    let hook_exists = event_hooks.iter().any(|h| {
-        if let Some(hooks_array) = h.get("hooks").and_then(|v| v.as_array()) {
-            hooks_array.iter().any(|hook| {
-                hook.get("command")
-                    .and_then(|c| c.as_str())
-                    .map(|c| c == hook_command)
-                    .unwrap_or(false)
-            })
-        } else {
-            false
+    let mut any_changed = false;
+    for event in config.event_list() {
+        // Get or create event array
+        if !hooks.contains_key(event) {
+            hooks.insert(event.to_string(), json!([]));
         }
-    });
+        let event_hooks = hooks
+            .get_mut(event)
+            .and_then(|v| v.as_array_mut())
+            .ok_or_else(|| NonoError::HookInstall(format!("{} is not a JSON array", event)))?;
 
-    if !hook_exists {
+        // Check if hook already registered on this event
+        let hook_exists = event_hooks.iter().any(|h| {
+            if let Some(hooks_array) = h.get("hooks").and_then(|v| v.as_array()) {
+                hooks_array.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c == hook_command)
+                        .unwrap_or(false)
+                })
+            } else {
+                false
+            }
+        });
+
+        if hook_exists {
+            tracing::debug!("Hook already registered for {} event", event);
+            continue;
+        }
+
         tracing::info!(
             "Registering hook for {} event with matcher '{}'",
-            config.event,
+            event,
             config.matcher
         );
 
@@ -217,8 +228,10 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
             }]
         });
         event_hooks.push(hook_entry);
+        any_changed = true;
+    }
 
-        // Write updated settings
+    if any_changed {
         let content = serde_json::to_string_pretty(&settings)
             .map_err(|e| NonoError::HookInstall(format!("Failed to serialize settings: {}", e)))?;
         fs::write(settings_path, content).map_err(|e| {
@@ -230,11 +243,8 @@ fn update_claude_settings(settings_path: &PathBuf, config: &HookConfig) -> Resul
         })?;
 
         tracing::info!("Updated {}", settings_path.display());
-        Ok(true)
-    } else {
-        tracing::debug!("Hook already registered in settings.json");
-        Ok(false)
     }
+    Ok(any_changed)
 }
 
 /// Install all hooks from a profile's hooks configuration
@@ -292,6 +302,7 @@ mod tests {
     #[test]
     fn test_embedded_script_exists() {
         assert!(get_embedded_script("nono-hook.sh").is_some());
+        assert!(get_embedded_script("nono-trajectory.sh").is_some());
         assert!(get_embedded_script("nonexistent.sh").is_none());
     }
 
@@ -300,5 +311,34 @@ mod tests {
         let script = get_embedded_script("nono-hook.sh").expect("Script not found");
         assert!(script.contains("NONO_CAP_FILE"));
         assert!(script.contains("jq"));
+    }
+
+    #[test]
+    fn test_embedded_trajectory_script_content() {
+        let script = get_embedded_script("nono-trajectory.sh").expect("Script not found");
+        // Guardrails that must be present.
+        assert!(
+            script.contains("NONO_CAP_FILE"),
+            "trajectory hook must gate on nono env"
+        );
+        // Every trajectory-spec event emitted by this hook.
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "SessionEnd",
+        ] {
+            assert!(
+                script.contains(event),
+                "trajectory hook missing case for {}",
+                event
+            );
+        }
+        // No raw-output leak at standard capture level (spec I11).
+        assert!(
+            !script.contains("output: .tool_response.output"),
+            "trajectory hook must not emit raw output at standard capture"
+        );
     }
 }

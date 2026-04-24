@@ -288,6 +288,11 @@ fn direct_path_mediated_invocation_is_denied() {
     let testbin_path = h.testbin.display().to_string();
     // Wrap in sh -c so the shell sees the full path and does not do
     // PATH lookup — this is the bypass the filter exists to close.
+    // The shell reports EACCES in different ways across shells (some
+    // emit "permission denied" to stderr, some silently exit 126 or
+    // 127). The load-bearing assertion is that the real binary did
+    // NOT run: absence of REAL_BINARY_RAN in stdout proves the filter
+    // intercepted the execve. exit != 0 is a secondary signal.
     let out = h.run_nono(&["sh", "-c", &format!("{} direct", testbin_path)]);
 
     assert!(
@@ -297,15 +302,7 @@ fn direct_path_mediated_invocation_is_denied() {
     );
     assert!(
         out.exit_code != 0,
-        "expected non-zero exit (shell should propagate EACCES); {}",
-        out.combined()
-    );
-    let stderr_lower = out.stderr.to_lowercase();
-    assert!(
-        stderr_lower.contains("permission denied")
-            || stderr_lower.contains("eacces")
-            || stderr_lower.contains("cannot execute"),
-        "expected permission-denied-style message; {}",
+        "expected non-zero exit after filter deny; {}",
         out.combined()
     );
 }

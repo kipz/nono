@@ -217,6 +217,13 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
+    /// Whether the exec filter should be installed in the agent child.
+    /// True when mediation is active (mediation.commands non-empty). The
+    /// child installs `install_seccomp_exec_filter()` and sends its
+    /// notify fd to the parent; the parent polls and classifies
+    /// execve/execveat traps via `handle_exec_notification`.
+    #[cfg(target_os = "linux")]
+    pub install_exec_filter: bool,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -267,6 +274,19 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Canonicalized real paths of mediated commands. Populated from
+    /// mediation.commands at session start. Used by the exec filter's
+    /// supervisor handler to classify trapped `execve`/`execveat`
+    /// notifications into the three buckets: shim / deny / allow. Empty
+    /// when mediation is inactive; the exec filter is then not
+    /// installed and this field is unused.
+    #[cfg(target_os = "linux")]
+    pub exec_deny_set: Vec<std::path::PathBuf>,
+    /// Session shim directory (absolute). The exec filter allows every
+    /// path lexically under this directory (shim-routed invocations).
+    /// `None` when mediation is inactive.
+    #[cfg(target_os = "linux")]
+    pub exec_shim_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -278,8 +298,9 @@ fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> 
 const fn linux_child_requires_dumpable(
     capability_elevation: bool,
     seccomp_proxy_fallback: bool,
+    install_exec_filter: bool,
 ) -> bool {
-    capability_elevation || seccomp_proxy_fallback
+    capability_elevation || seccomp_proxy_fallback || install_exec_filter
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -406,6 +427,7 @@ pub fn execute_supervised(
     let needs_child_ipc = supervisor.is_some()
         && (config.capability_elevation
             || config.seccomp_proxy_fallback
+            || config.install_exec_filter
             || trust_interceptor.is_some());
 
     #[cfg(not(target_os = "linux"))]
@@ -832,9 +854,57 @@ pub fn execute_supervised(
                     }
                 }
 
+                // Exec filter: install when mediation is active so the
+                // supervisor can classify trapped execve/execveat
+                // notifications into shim / deny / allow. The
+                // install function sets PR_SET_NO_NEW_PRIVS (idempotent
+                // with any sibling installs above) and returns a
+                // listener fd which we send to the parent via
+                // SCM_RIGHTS.
+                if config.install_exec_filter {
+                    if let Some(fd) = child_sock_fd {
+                        match nono::sandbox::install_seccomp_exec_filter() {
+                            Ok(exec_notify_fd) => {
+                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
+                                    fd,
+                                    exec_notify_fd.as_raw_fd(),
+                                ) {
+                                    let detail = format!(
+                                        "nono: failed to send exec seccomp notify fd: {}\n",
+                                        e
+                                    );
+                                    let msg = detail.as_bytes();
+                                    unsafe {
+                                        libc::write(
+                                            libc::STDERR_FILENO,
+                                            msg.as_ptr().cast::<libc::c_void>(),
+                                            msg.len(),
+                                        );
+                                        libc::_exit(126);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let detail =
+                                    format!("nono: seccomp exec filter not available: {}\n", e);
+                                let msg = detail.as_bytes();
+                                unsafe {
+                                    libc::write(
+                                        libc::STDERR_FILENO,
+                                        msg.as_ptr().cast::<libc::c_void>(),
+                                        msg.len(),
+                                    );
+                                    libc::_exit(126);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if !linux_child_requires_dumpable(
                     config.capability_elevation,
                     config.seccomp_proxy_fallback,
+                    config.install_exec_filter,
                 ) {
                     use nix::sys::prctl;
 
@@ -1019,6 +1089,29 @@ pub fn execute_supervised(
                 None
             };
 
+            // On Linux: if mediation is active, the child installed an exec
+            // filter and sent us its notify fd. Receive it here so the
+            // supervisor loop can poll and classify trapped execves.
+            #[cfg(target_os = "linux")]
+            let exec_notify_fd: Option<OwnedFd> = if config.install_exec_filter {
+                if let Some(ref sup_sock) = supervisor_sock {
+                    match sup_sock.recv_fd() {
+                        Ok(fd) => {
+                            debug!("Received exec seccomp notify fd from child");
+                            Some(fd)
+                        }
+                        Err(e) => {
+                            warn!("Failed to receive exec seccomp notify fd: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1073,6 +1166,7 @@ pub fn execute_supervised(
                             config.startup_timeout,
                             seccomp_notify_fd.as_ref(),
                             proxy_notify_fd.as_ref(),
+                            exec_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
                             pty_proxy.as_mut(),
@@ -1945,6 +2039,7 @@ fn run_supervisor_loop(
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     seccomp_fd: Option<&OwnedFd>,
     proxy_seccomp_fd: Option<&OwnedFd>,
+    exec_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
@@ -1952,6 +2047,7 @@ fn run_supervisor_loop(
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
     let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
+    let exec_notify_raw_fd = exec_seccomp_fd.map(|fd| fd.as_raw_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
@@ -1978,6 +2074,15 @@ fn run_supervisor_loop(
             let idx = pfds.len();
             pfds.push(libc::pollfd {
                 fd: pfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            idx
+        });
+        let exec_notify_idx = exec_notify_raw_fd.map(|efd| {
+            let idx = pfds.len();
+            pfds.push(libc::pollfd {
+                fd: efd,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -2075,6 +2180,17 @@ fn run_supervisor_loop(
                                 &mut rate_limiter,
                             ) {
                                 debug!("Error handling proxy seccomp notification: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(exec_notify_idx) = exec_notify_idx {
+                    if pfds[exec_notify_idx].revents & libc::POLLIN != 0 {
+                        if let Some(efd) = exec_notify_raw_fd {
+                            if let Err(e) = supervisor_linux::handle_exec_notification(efd, config)
+                            {
+                                debug!("Error handling exec seccomp notification: {}", e);
                             }
                         }
                     }
@@ -3164,10 +3280,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
-        assert!(!linux_child_requires_dumpable(false, false));
-        assert!(linux_child_requires_dumpable(true, false));
-        assert!(linux_child_requires_dumpable(false, true));
-        assert!(linux_child_requires_dumpable(true, true));
+        assert!(!linux_child_requires_dumpable(false, false, false));
+        assert!(linux_child_requires_dumpable(true, false, false));
+        assert!(linux_child_requires_dumpable(false, true, false));
+        assert!(linux_child_requires_dumpable(false, false, true));
+        assert!(linux_child_requires_dumpable(true, true, true));
     }
 
     #[test]
@@ -3481,6 +3598,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3505,6 +3624,7 @@ mod tests {
                     None, // no startup timeout
                     None, // no seccomp
                     None, // no proxy seccomp
+                    None, // no exec seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
@@ -3580,6 +3700,8 @@ mod tests {
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3603,6 +3725,7 @@ mod tests {
                     None, // no startup timeout
                     None, // no openat seccomp
                     None, // no proxy seccomp — V4+ Landlock handles it
+                    None, // no exec seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay
@@ -3655,6 +3778,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3688,6 +3813,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3719,6 +3846,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3734,6 +3863,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -3770,6 +3901,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -3909,6 +4042,8 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
         };
 
         assert!(

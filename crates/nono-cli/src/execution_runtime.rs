@@ -15,6 +15,30 @@ use tracing::{error, info};
 
 const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Build the exec-filter state for the supervisor from a mediation
+/// session handle.
+///
+/// Returns a canonicalized deny set (empty when mediation is inactive or
+/// a canonicalization fails — those entries are simply dropped) and the
+/// shim directory, used by the supervisor's exec-filter handler to
+/// classify trapped `execve` notifications.
+#[cfg(target_os = "linux")]
+fn exec_filter_state_from_mediation(
+    handle: Option<&crate::mediation::session::SessionHandle>,
+) -> (Vec<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    match handle {
+        Some(h) => {
+            let deny_set: Vec<std::path::PathBuf> = h
+                .blocked_binaries
+                .iter()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                .collect();
+            (deny_set, Some(h.shim_dir.clone()))
+        }
+        None => (Vec::new(), None),
+    }
+}
+
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
     caps: &CapabilitySet,
@@ -400,6 +424,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
+        #[cfg(target_os = "linux")]
+        install_exec_filter: mediation_handle
+            .as_ref()
+            .map(|h| !h.blocked_binaries.is_empty())
+            .unwrap_or(false),
         allowed_env_vars: flags.allowed_env_vars,
         extra_blocked_env: &mediation_env_block,
     };
@@ -410,6 +439,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             unreachable!("execute_direct only returns on error");
         }
         exec_strategy::ExecStrategy::Supervised => {
+            #[cfg(target_os = "linux")]
+            let (exec_deny_set, exec_shim_dir) =
+                exec_filter_state_from_mediation(mediation_handle.as_ref());
+
             let exit_code = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
                 caps: &caps,
@@ -427,6 +460,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 mediation_sandboxed_pid_latch: mediation_handle
                     .as_ref()
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
+                #[cfg(target_os = "linux")]
+                exec_deny_set,
+                #[cfg(target_os = "linux")]
+                exec_shim_dir,
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

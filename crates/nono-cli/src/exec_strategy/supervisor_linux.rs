@@ -713,6 +713,229 @@ pub(super) fn handle_network_notification(
     Ok(())
 }
 
+/// Classification of a trapped `execve`/`execveat` notification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecDecision {
+    /// Path is under the session's shim directory. Let it proceed so the
+    /// shim's downstream mediation takes over. No filter audit event.
+    AllowShim,
+    /// Path is not in the deny set and not a shim. Let it proceed as a
+    /// direct-path invocation of a non-mediated binary.
+    AllowUnmediated,
+    /// Path is the canonical real path of a mediated command; return
+    /// EACCES. POSIX convention; matches the shim's `exit_code: 126`
+    /// for denied mediation.
+    Deny,
+}
+
+/// Classify a resolved execve target against the exec filter's rules.
+///
+/// `resolved` is the dirfd/cwd-resolved absolute path (not yet
+/// canonicalized for symlinks). `canonical` is the canonicalized form
+/// used for the deny-set check. The shim-prefix check uses `resolved`
+/// because canonicalizing a shim symlink would follow it to the
+/// `nono-shim` binary and lose the prefix.
+fn classify_exec_path(
+    resolved: &std::path::Path,
+    canonical: &std::path::Path,
+    deny_set: &[std::path::PathBuf],
+    shim_dir: Option<&std::path::Path>,
+) -> ExecDecision {
+    if let Some(sd) = shim_dir {
+        if resolved.starts_with(sd) {
+            return ExecDecision::AllowShim;
+        }
+    }
+    if deny_set.iter().any(|p| p == canonical) {
+        return ExecDecision::Deny;
+    }
+    ExecDecision::AllowUnmediated
+}
+
+/// Handle a seccomp notification for an `execve` or `execveat` syscall.
+///
+/// Extracts the target path (handling both `execve`'s `args[0]` form and
+/// `execveat`'s dirfd+pathname / `AT_EMPTY_PATH` forms), canonicalizes
+/// it, classifies against the deny set, and responds to the kernel with
+/// EACCES on deny or CONTINUE on allow.
+///
+/// Fail-closed on any parse or resolution error: unreadable path, dead
+/// notification, missing `/proc/<tid>/...` entry — all of these lead to
+/// a `deny_notif` response.
+///
+/// Beyond the basic three-way classification, the handler also walks
+/// shebang chains to catch interpreters that the kernel resolves
+/// internally without issuing a second `execve`, performs a double-read
+/// of the user-memory path before responding CONTINUE to mitigate
+/// TOCTOU races, and emits a `FilterAuditEvent` for `allow_unmediated`
+/// and `deny` decisions.
+pub(super) fn handle_exec_notification(
+    notify_fd: std::os::fd::RawFd,
+    config: &SupervisorConfig<'_>,
+) -> nono::error::Result<()> {
+    use nono::sandbox::{
+        continue_notif, deny_notif, notif_id_valid, read_notif_path, recv_notif,
+        resolve_notif_path, respond_notif_errno, SYS_EXECVE, SYS_EXECVEAT,
+    };
+
+    let notif = recv_notif(notify_fd)?;
+
+    // Extract the pathname pointer and the dirfd for execveat. The
+    // layout differs:
+    //   execve(pathname, argv, envp)           — args[0] = pathname
+    //   execveat(dirfd, pathname, argv, envp, flags)
+    //                                          — args[0] = dirfd,
+    //                                            args[1] = pathname,
+    //                                            args[4] = flags
+    // AT_EMPTY_PATH (flag bit 0x1000): target is whatever dirfd refers
+    // to; args[1] is an empty string.
+    const AT_EMPTY_PATH_BIT: u64 = 0x1000;
+    let (path_arg_ptr, dirfd, flags) = match notif.data.nr {
+        SYS_EXECVE => (notif.data.args[0], libc::AT_FDCWD as i64 as u64, 0u64),
+        SYS_EXECVEAT => (notif.data.args[1], notif.data.args[0], notif.data.args[4]),
+        other => {
+            warn!(
+                "Unexpected syscall {} in exec seccomp handler, denying",
+                other
+            );
+            let _ = deny_notif(notify_fd, notif.id);
+            return Ok(());
+        }
+    };
+
+    // Resolve the path. Two cases:
+    //   1. execveat with AT_EMPTY_PATH: read /proc/<tid>/fd/<dirfd> as a
+    //      symlink to discover what the fd points at.
+    //   2. otherwise: read the C string from the child's memory via
+    //      /proc/<tid>/mem, then apply dirfd/cwd resolution.
+    let resolved = if notif.data.nr == SYS_EXECVEAT && (flags & AT_EMPTY_PATH_BIT) != 0 {
+        let link = format!("/proc/{}/fd/{}", notif.pid, dirfd);
+        match std::fs::read_link(&link) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(
+                    "Failed to read {} for AT_EMPTY_PATH exec resolution: {}",
+                    link, e
+                );
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        }
+    } else {
+        let raw = match read_notif_path(notif.pid, path_arg_ptr) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Failed to read path from exec notification: {}", e);
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        };
+        match resolve_notif_path(notif.pid, dirfd, &raw) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("Failed to resolve dirfd-relative exec path: {}", e);
+                let _ = deny_notif(notify_fd, notif.id);
+                return Ok(());
+            }
+        }
+    };
+
+    // Liveness check: if the child was killed between trap and now, the
+    // notification ID is no longer valid and responding is a no-op.
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Exec seccomp notification expired (liveness check)");
+        return Ok(());
+    }
+
+    // Canonicalize for the deny-set check. Failure to canonicalize is
+    // fail-closed — the kernel would likely fail the exec anyway.
+    let canonical = match std::fs::canonicalize(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                "Failed to canonicalize exec target {}: {}",
+                resolved.display(),
+                e
+            );
+            let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+            return Ok(());
+        }
+    };
+
+    let decision = classify_exec_path(
+        &resolved,
+        &canonical,
+        &config.exec_deny_set,
+        config.exec_shim_dir.as_deref(),
+    );
+
+    match decision {
+        ExecDecision::Deny => {
+            debug!(
+                "exec filter deny: path={} canonical={}",
+                resolved.display(),
+                canonical.display()
+            );
+            respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
+        }
+        ExecDecision::AllowShim | ExecDecision::AllowUnmediated => {
+            if let Err(e) = continue_notif(notify_fd, notif.id) {
+                debug!("continue_notif failed for exec notification: {}", e);
+                return deny_notif(notify_fd, notif.id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod exec_filter_classify_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn classify_allow_shim_when_under_shim_dir() {
+        let shim_dir = PathBuf::from("/tmp/nono-session-42/shims");
+        let resolved = PathBuf::from("/tmp/nono-session-42/shims/ddtool");
+        let canonical = PathBuf::from("/home/bits/.local/bin/nono-shim");
+        let deny = vec![PathBuf::from("/home/bits/.local/bin/ddtool")];
+        let d = classify_exec_path(&resolved, &canonical, &deny, Some(&shim_dir));
+        assert_eq!(d, ExecDecision::AllowShim);
+    }
+
+    #[test]
+    fn classify_deny_when_canonical_in_deny_set() {
+        let resolved = PathBuf::from("/home/bits/.local/bin/ddtool");
+        let canonical = resolved.clone();
+        let deny = vec![resolved.clone()];
+        let d = classify_exec_path(&resolved, &canonical, &deny, None);
+        assert_eq!(d, ExecDecision::Deny);
+    }
+
+    #[test]
+    fn classify_allow_unmediated_when_not_in_deny_or_shim() {
+        let resolved = PathBuf::from("/bin/ls");
+        let canonical = PathBuf::from("/usr/bin/ls");
+        let deny = vec![PathBuf::from("/opt/homebrew/bin/gh")];
+        let d = classify_exec_path(&resolved, &canonical, &deny, None);
+        assert_eq!(d, ExecDecision::AllowUnmediated);
+    }
+
+    #[test]
+    fn shim_prefix_check_is_pre_canonical() {
+        // Even if the canonical path is NOT under shim_dir (because the
+        // shim is a symlink to nono-shim outside shim_dir), the
+        // classifier must still recognize shim invocations.
+        let shim_dir = PathBuf::from("/tmp/nono-session-42/shims");
+        let resolved = PathBuf::from("/tmp/nono-session-42/shims/gh");
+        let canonical = PathBuf::from("/home/bits/.local/bin/nono-shim");
+        let deny = vec![PathBuf::from("/usr/bin/gh")];
+        let d = classify_exec_path(&resolved, &canonical, &deny, Some(&shim_dir));
+        assert_eq!(d, ExecDecision::AllowShim);
+    }
+}
+
 /// Check if a path matches any capability in the initial set.
 ///
 /// Prefers the most specific capability. If the path is covered but the
@@ -985,6 +1208,8 @@ mod tests {
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,
+                exec_deny_set: Vec::new(),
+                exec_shim_dir: None,
             }
         }
 

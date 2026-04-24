@@ -43,6 +43,15 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) pre_session_name: Option<String>,
     /// Latch to fill in with the sandboxed process PID once forked; shared with the mediation server.
     pub(crate) mediation_sandboxed_pid_latch: Option<Arc<OnceLock<u32>>>,
+    /// Canonicalized real paths of mediated commands. Used by the exec
+    /// filter's supervisor handler for the deny-set check. Empty when
+    /// mediation is inactive. Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec_deny_set: Vec<std::path::PathBuf>,
+    /// Session shim directory. Used by the exec filter to recognize
+    /// shim-routed invocations. `None` when mediation is inactive.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec_shim_dir: Option<std::path::PathBuf>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -151,6 +160,8 @@ fn create_session_runtime_state(
 }
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
+    #[cfg(target_os = "linux")]
+    let (exec_deny_set, exec_shim_dir) = (ctx.exec_deny_set.clone(), ctx.exec_shim_dir.clone());
     let SupervisedRuntimeContext {
         config,
         caps,
@@ -166,6 +177,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pre_session_id,
         pre_session_name,
         mediation_sandboxed_pid_latch,
+        ..
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -243,6 +255,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        #[cfg(target_os = "linux")]
+        exec_deny_set,
+        #[cfg(target_os = "linux")]
+        exec_shim_dir,
     };
 
     if !session.detached_start {

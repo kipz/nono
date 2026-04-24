@@ -808,6 +808,12 @@ pub const SYS_CONNECT: i32 = libc::SYS_connect as i32;
 #[cfg(target_os = "linux")]
 pub const SYS_BIND: i32 = libc::SYS_bind as i32;
 
+// Syscall numbers for execve/execveat (public for CLI supervisor handler)
+#[cfg(target_os = "linux")]
+pub const SYS_EXECVE: i32 = libc::SYS_execve as i32;
+#[cfg(target_os = "linux")]
+pub const SYS_EXECVEAT: i32 = libc::SYS_execveat as i32;
+
 /// struct open_how from <linux/openat2.h>
 ///
 /// Used by openat2() syscall. args[2] is a pointer to this struct, NOT the flags integer.
@@ -1920,6 +1926,41 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(notify_fd) })
 }
 
+// ============================================================================
+// Exec filter for mediation full-path bypass closure
+// ============================================================================
+
+/// Build a seccomp-notify BPF filter that traps `execve` and `execveat`.
+///
+/// Instruction layout (indices refer to the vec):
+///  0: ld [nr]                         — load syscall number
+///  1: jeq SYS_EXECVE   jt=+2 -> 4     — execve traps
+///  2: jeq SYS_EXECVEAT jt=+1 -> 4     — execveat traps
+///  3: ret ALLOW                       — default for every other syscall
+///  4: ret USER_NOTIF                  — queue a userspace notification
+///
+/// Phase 1b: stub, RED against the structure test. Phase 2 fills in the
+/// real BPF program and `install_seccomp_exec_filter` starts calling it.
+/// Until then the function is only referenced from the test module.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)] // removed in Phase 2 when install_seccomp_exec_filter calls this.
+fn build_seccomp_exec_filter() -> Vec<SockFilterInsn> {
+    todo!("Phase 2: build BPF program for execve/execveat trap")
+}
+
+/// Install a seccomp-notify BPF filter that traps `execve` and `execveat`.
+///
+/// Returns the notify fd that the supervisor must poll for exec
+/// interceptions. The filter is installed in the current process and is
+/// inherited by all descendants via `fork`/`exec`.
+///
+/// Phase 1b: stub. Phase 2 implements the real install, mirroring the
+/// structure of `install_seccomp_notify` and `install_seccomp_proxy_filter`.
+#[cfg(target_os = "linux")]
+pub fn install_seccomp_exec_filter() -> Result<std::os::fd::OwnedFd> {
+    todo!("Phase 2: install seccomp-notify filter for execve/execveat")
+}
+
 /// Read a sockaddr from a seccomp notification's connect/bind arguments.
 ///
 /// Reads from `/proc/PID/mem` at the pointer in args[1] (the sockaddr pointer
@@ -2780,6 +2821,42 @@ mod tests {
             "bind must route to USER_NOTIF regardless of has_bind_ports so \
              the supervisor can permit AF_UNIX pathname bind (#685)"
         );
+    }
+
+    /// The exec filter's BPF program traps `execve` and `execveat` and
+    /// falls through to `RET_ALLOW` for every other syscall. Structure-only:
+    /// does not install the filter in the kernel.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_build_seccomp_exec_filter_traps_execve_and_execveat() {
+        let filter = build_seccomp_exec_filter();
+        assert_eq!(
+            filter.len(),
+            5,
+            "exec filter should be 5 instructions: ld nr, jeq execve, jeq execveat, ret ALLOW, ret USER_NOTIF"
+        );
+
+        // Instruction 0: load syscall number
+        assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+
+        // Instruction 1: jeq execve -> notify (jump +2 to insn 4)
+        assert_eq!(filter[1].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(filter[1].k, SYS_EXECVE as u32);
+        assert_eq!(filter[1].jt, 2);
+
+        // Instruction 2: jeq execveat -> notify (jump +1 to insn 4)
+        assert_eq!(filter[2].code, BPF_JMP | BPF_JEQ | BPF_K);
+        assert_eq!(filter[2].k, SYS_EXECVEAT as u32);
+        assert_eq!(filter[2].jt, 1);
+
+        // Instruction 3: ret ALLOW (default for any non-exec syscall)
+        assert_eq!(filter[3].code, BPF_RET | BPF_K);
+        assert_eq!(filter[3].k, SECCOMP_RET_ALLOW);
+
+        // Instruction 4: ret USER_NOTIF (route to supervisor)
+        assert_eq!(filter[4].code, BPF_RET | BPF_K);
+        assert_eq!(filter[4].k, SECCOMP_RET_USER_NOTIF);
     }
 
     #[test]

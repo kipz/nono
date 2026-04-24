@@ -584,3 +584,48 @@ fn agent_cannot_install_bypass_seccomp_filter() {
         out.combined()
     );
 }
+
+/// Exec of a nonexistent path must surface the kernel's native errno
+/// (`ENOENT` / "No such file or directory"), not `EACCES` from the
+/// filter. PATH-walking shells (`bash`, glibc's `execvp`) treat `EACCES`
+/// as sticky and `ENOENT` as a continuation signal; if the filter turned
+/// PATH-miss `ENOENT`s into `EACCES`es, every PATH lookup that walked
+/// through any nonexistent candidate before its hit would fail. The
+/// filter must also not emit a deny audit event for these PATH misses,
+/// because they are normal lookup misses, not exec attempts.
+#[test]
+fn nonexistent_path_exec_returns_kernel_errno_not_eacces() {
+    let h = ExecFilterHarness::new();
+    let bogus = "/nono-test-bogus-path-that-does-not-exist";
+    let out = h.run_nono(&[
+        "bash",
+        "-c",
+        &format!("{bogus} 2>&1; echo exit=$?"),
+    ]);
+
+    assert!(
+        !out.combined().to_lowercase().contains("permission denied"),
+        "exec of nonexistent path must not surface 'Permission denied' (EACCES); {}",
+        out.combined()
+    );
+    let lower = out.combined().to_lowercase();
+    assert!(
+        lower.contains("no such file") || lower.contains("not found"),
+        "exec of nonexistent path should surface a kernel-native ENOENT-class error; {}",
+        out.combined()
+    );
+
+    let events = h.read_audit_events();
+    let bogus_deny = events.iter().any(|e| {
+        e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_deny")
+            && e.get("path")
+                .and_then(|v| v.as_str())
+                .map(|p| p.contains("nono-test-bogus-path-that-does-not-exist"))
+                .unwrap_or(false)
+    });
+    assert!(
+        !bogus_deny,
+        "filter must not emit a deny audit event for nonexistent paths; events={:?}",
+        events
+    );
+}

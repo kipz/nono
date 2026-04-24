@@ -757,25 +757,30 @@ fn classify_exec_path(
 /// Extracts the target path (handling both `execve`'s `args[0]` form and
 /// `execveat`'s dirfd+pathname / `AT_EMPTY_PATH` forms), canonicalizes
 /// it, classifies against the deny set, and responds to the kernel with
-/// EACCES on deny or CONTINUE on allow.
+/// `EACCES` on deny or `CONTINUE` on allow.
 ///
-/// Fail-closed on any parse or resolution error: unreadable path, dead
-/// notification, missing `/proc/<tid>/...` entry — all of these lead to
-/// a `deny_notif` response.
+/// On path resolution or canonicalization failure, the handler responds
+/// `CONTINUE` and returns without emitting an audit event: the kernel
+/// re-runs the same resolution and surfaces the native errno
+/// (typically `ENOENT`). Synthesizing `EACCES` here would corrupt
+/// PATH-walking shells.
 ///
 /// Beyond the basic three-way classification, the handler also walks
 /// shebang chains to catch interpreters that the kernel resolves
 /// internally without issuing a second `execve`, performs a double-read
 /// of the user-memory path before responding CONTINUE to mitigate
 /// TOCTOU races, and emits a `FilterAuditEvent` for `allow_unmediated`
-/// and `deny` decisions.
+/// and `deny` decisions. Every Deny path — whether from the deny-set
+/// check, the shebang walker, or the TOCTOU double-read — falls through
+/// to the same emit and the same `respond_notif_errno(EACCES)` reply.
 pub(super) fn handle_exec_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
 ) -> nono::error::Result<()> {
+    use crate::mediation::filter_audit::reasons;
     use nono::sandbox::{
-        continue_notif, deny_notif, notif_id_valid, read_notif_path, recv_notif,
-        resolve_notif_path, respond_notif_errno, SYS_EXECVE, SYS_EXECVEAT,
+        continue_notif, deny_notif, notif_id_valid, recv_notif, resolve_notif_path,
+        respond_notif_errno, SYS_EXECVE, SYS_EXECVEAT,
     };
 
     let notif = recv_notif(notify_fd)?;
@@ -790,162 +795,258 @@ pub(super) fn handle_exec_notification(
     // AT_EMPTY_PATH (flag bit 0x1000): target is whatever dirfd refers
     // to; args[1] is an empty string.
     const AT_EMPTY_PATH_BIT: u64 = 0x1000;
-    let (path_arg_ptr, dirfd, flags) = match notif.data.nr {
-        SYS_EXECVE => (notif.data.args[0], libc::AT_FDCWD as i64 as u64, 0u64),
-        SYS_EXECVEAT => (notif.data.args[1], notif.data.args[0], notif.data.args[4]),
+    // Argv layout in the syscall's register args:
+    //   execve(pathname, argv, envp)            — args[0] = pathname,
+    //                                             args[1] = argv ptr
+    //   execveat(dirfd, pathname, argv, envp,
+    //            flags)                          — args[2] = argv ptr
+    let (path_arg_ptr, dirfd, flags, argv_ptr) = match notif.data.nr {
+        SYS_EXECVE => (
+            notif.data.args[0],
+            libc::AT_FDCWD as i64 as u64,
+            0u64,
+            notif.data.args[1],
+        ),
+        SYS_EXECVEAT => (
+            notif.data.args[1],
+            notif.data.args[0],
+            notif.data.args[4],
+            notif.data.args[2],
+        ),
         other => {
             warn!(
                 "Unexpected syscall {} in exec seccomp handler, denying",
                 other
-            );
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    };
-
-    // Resolve the path. Two cases:
-    //   1. execveat with AT_EMPTY_PATH: read /proc/<tid>/fd/<dirfd> as a
-    //      symlink to discover what the fd points at.
-    //   2. otherwise: read the C string from the child's memory via
-    //      /proc/<tid>/mem, then apply dirfd/cwd resolution.
-    let resolved = if notif.data.nr == SYS_EXECVEAT && (flags & AT_EMPTY_PATH_BIT) != 0 {
-        let link = format!("/proc/{}/fd/{}", notif.pid, dirfd);
-        match std::fs::read_link(&link) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(
-                    "Failed to read {} for AT_EMPTY_PATH exec resolution: {}",
-                    link, e
-                );
-                let _ = deny_notif(notify_fd, notif.id);
-                return Ok(());
-            }
-        }
-    } else {
-        let raw = match read_notif_path(notif.pid, path_arg_ptr) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!("Failed to read path from exec notification: {}", e);
-                let _ = deny_notif(notify_fd, notif.id);
-                return Ok(());
-            }
-        };
-        match resolve_notif_path(notif.pid, dirfd, &raw) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!("Failed to resolve dirfd-relative exec path: {}", e);
-                let _ = deny_notif(notify_fd, notif.id);
-                return Ok(());
-            }
-        }
-    };
-
-    // Liveness check: if the child was killed between trap and now, the
-    // notification ID is no longer valid and responding is a no-op.
-    if !notif_id_valid(notify_fd, notif.id)? {
-        debug!("Exec seccomp notification expired (liveness check)");
-        return Ok(());
-    }
-
-    // Canonicalize for the deny-set check. Failure to canonicalize is
-    // fail-closed — the kernel would likely fail the exec anyway.
-    let canonical = match std::fs::canonicalize(&resolved) {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(
-                "Failed to canonicalize exec target {}: {}",
-                resolved.display(),
-                e
             );
             let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
             return Ok(());
         }
     };
 
-    let mut decision = classify_exec_path(
-        &resolved,
-        &canonical,
-        &config.exec_deny_set,
-        config.exec_shim_dir.as_deref(),
-    );
+    let mut decision: ExecDecision;
+    let mut deny_reason: Option<&'static str> = None;
+    let mut shebang_chain: Vec<std::path::PathBuf> = Vec::new();
+    let canonical: std::path::PathBuf;
 
-    // Shebang bypass check. The kernel's binfmt_script handler resolves
-    // a script's `#!` interpreter internally without issuing a second
-    // `execve` syscall, so an agent could write a script whose shebang
-    // names a mediated binary and exec the script to reach the binary
-    // unobserved. Walk the chain in userspace and flip the decision to
-    // deny if any interpreter resolves to a deny-set entry.
-    if matches!(
-        decision,
-        ExecDecision::AllowShim | ExecDecision::AllowUnmediated
-    ) && !config.exec_deny_set.is_empty()
+    // Open /proc/<tid>/mem once and reuse it for every read in this
+    // handler (initial path read, TOCTOU re-read, argv read at audit
+    // time). Yama's ptrace_may_access check fires at open() time, not
+    // on each read(), so a single open() taken before the daemonize
+    // double-fork-and-reap sequence avoids an EACCES on later reads
+    // when the trapped task is reparented to init.
+    let mut mem_file = std::fs::File::open(format!("/proc/{}/mem", notif.pid)).ok();
+
     {
-        use crate::mediation::shebang::{check_shebang_chain, DenySet, ShebangResult};
-        let set = DenySet::with_paths(config.exec_deny_set.clone());
-        match check_shebang_chain(&canonical, 0, &set) {
-            ShebangResult::Deny(_chain) => {
-                debug!(
-                    "exec filter deny (shebang chain): path={} canonical={}",
-                    resolved.display(),
-                    canonical.display()
-                );
-                decision = ExecDecision::Deny;
+        let raw = if notif.data.nr == SYS_EXECVEAT && (flags & AT_EMPTY_PATH_BIT) != 0 {
+            let link = format!("/proc/{}/fd/{}", notif.pid, dirfd);
+            match std::fs::read_link(&link) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(
+                        "Failed to read {} for AT_EMPTY_PATH exec resolution: {}; \
+                         deferring to kernel",
+                        link, e
+                    );
+                    return continue_notif(notify_fd, notif.id);
+                }
             }
-            ShebangResult::NotScript => {}
+        } else {
+            // Defer to kernel on resolution failure: glibc's execvp
+            // treats our EACCES as sticky and ENOENT as "try next PATH
+            // entry," so synthesizing EACCES here would break every
+            // PATH-walking shell.
+            let raw = match mem_file
+                .as_mut()
+                .ok_or_else(|| "open /proc/<pid>/mem failed".to_string())
+                .and_then(|f| read_path_at(f, path_arg_ptr).map_err(|e| e.to_string()))
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("Failed to read exec pathname: {}; deferring to kernel", e);
+                    return continue_notif(notify_fd, notif.id);
+                }
+            };
+            match resolve_notif_path(notif.pid, dirfd, &raw) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!(
+                        "Failed to resolve dirfd-relative exec path: {}; deferring to kernel",
+                        e
+                    );
+                    return continue_notif(notify_fd, notif.id);
+                }
+            }
+        };
+
+        // Liveness check: if the child was killed between trap and now,
+        // the notification ID is no longer valid and responding is a
+        // no-op. Return without emitting — the trap doesn't exist as
+        // far as the kernel is concerned.
+        if !notif_id_valid(notify_fd, notif.id)? {
+            debug!("Exec seccomp notification expired (liveness check)");
+            return Ok(());
+        }
+
+        let cano = match std::fs::canonicalize(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "Failed to canonicalize exec target {}: {}; deferring to kernel",
+                    raw.display(),
+                    e
+                );
+                return continue_notif(notify_fd, notif.id);
+            }
+        };
+
+        decision = classify_exec_path(
+            &raw,
+            &cano,
+            &config.exec_deny_set,
+            config.exec_shim_dir.as_deref(),
+        );
+        if matches!(decision, ExecDecision::Deny) {
+            deny_reason = Some(reasons::DENY_SET);
+        }
+
+        // Shebang bypass check. The kernel's binfmt_script handler
+        // resolves a script's `#!` interpreter internally without
+        // issuing a second `execve` syscall, so an agent could write a
+        // script whose shebang names a mediated binary and exec the
+        // script to reach the binary unobserved. Walk the chain in
+        // userspace and flip the decision to deny if any interpreter
+        // resolves to a deny-set entry. AllowShim is excluded: the
+        // shim binary is never a script.
+        if matches!(decision, ExecDecision::AllowUnmediated) && !config.exec_deny_set.is_empty() {
+            use crate::mediation::shebang::{check_shebang_chain, DenySet, ShebangResult};
+            let set = DenySet::with_paths(config.exec_deny_set.clone());
+            match check_shebang_chain(&cano, 0, &set) {
+                ShebangResult::Deny(chain) => {
+                    debug!(
+                        "exec filter deny (shebang chain): path={} canonical={}",
+                        raw.display(),
+                        cano.display()
+                    );
+                    decision = ExecDecision::Deny;
+                    deny_reason = Some(reasons::SHEBANG_CHAIN);
+                    shebang_chain = chain;
+                }
+                ShebangResult::NotScript => {}
+            }
+        }
+
+        // TOCTOU double-read. seccomp-unotify re-reads path arguments
+        // from the child's memory after we respond CONTINUE, so a
+        // cooperating racing thread in the child could swap the
+        // pathname buffer between our initial read and the kernel's
+        // post-response re-read. Mitigate by re-reading and flipping to
+        // deny on mismatch. This does not close the race (the kernel
+        // still re-reads after our response), but it collapses the
+        // vulnerable window from 'classify + canonicalize + shebang' to
+        // 'single response round-trip', defeating naive spin-flip
+        // attackers. Applied only on allow decisions — a deny already
+        // fails the syscall, so no re-read happens kernel-side. Skipped
+        // for AT_EMPTY_PATH (which reads a stable fd link, not a
+        // user-memory pathname). AllowShim is excluded: the shim path
+        // is fixed and the kernel's re-read against it is benign.
+        if matches!(decision, ExecDecision::AllowUnmediated) {
+            let is_at_empty_path = notif.data.nr == SYS_EXECVEAT
+                && (flags & AT_EMPTY_PATH_BIT) != 0;
+            if !is_at_empty_path {
+                let second = mem_file
+                    .as_mut()
+                    .ok_or_else(|| "mem fd unavailable".to_string())
+                    .and_then(|f| read_path_at(f, path_arg_ptr).map_err(|e| e.to_string()));
+                match second {
+                    Ok(second_raw) => {
+                        let second_resolved = resolve_notif_path(notif.pid, dirfd, &second_raw)
+                            .unwrap_or(second_raw.clone());
+                        if second_resolved != raw {
+                            debug!(
+                                "exec filter deny (toctou_mismatch): first={} second={}",
+                                raw.display(),
+                                second_resolved.display()
+                            );
+                            decision = ExecDecision::Deny;
+                            deny_reason = Some(reasons::TOCTOU_MISMATCH);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("exec filter deny (toctou double-read failed): {}", e);
+                        decision = ExecDecision::Deny;
+                        deny_reason = Some(reasons::TOCTOU_MISMATCH);
+                    }
+                }
+            }
+        }
+
+        canonical = cano;
+    }
+
+    // Common emit. allow_shim is intentionally not emitted: the
+    // downstream shim emits its own completion event and a filter-side
+    // record there would double-count.
+    if let Some(log_dir) = config.exec_audit_log_dir.as_deref() {
+        let command = canonical
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "<unresolved>".to_string());
+        let path_str = canonical.display().to_string();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Reconstruct argv from the execve syscall's argv pointer in
+        // the child's memory. /proc/<tid>/cmdline can't be used here:
+        // at trap time the process image hasn't been replaced yet, so
+        // cmdline reflects the calling program's argv (e.g., the
+        // wrapping shell), not the argv being passed to the new
+        // image. Best-effort: a failed read yields an empty argv,
+        // which is better than missing the event entirely.
+        let args = mem_file
+            .as_mut()
+            .and_then(|f| read_execve_argv_at(f, argv_ptr))
+            .unwrap_or_default();
+        match decision {
+            ExecDecision::Deny => {
+                let reason = deny_reason.unwrap_or(reasons::DENY_SET);
+                let mut evt = crate::mediation::filter_audit::FilterAuditEvent::deny(
+                    command, args, ts, reason, path_str,
+                );
+                if !shebang_chain.is_empty() {
+                    evt = evt.with_interpreter_chain(
+                        shebang_chain
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect(),
+                    );
+                }
+                crate::mediation::filter_audit::append_filter_audit_event(log_dir, &evt);
+            }
+            ExecDecision::AllowUnmediated => {
+                let evt = crate::mediation::filter_audit::FilterAuditEvent::allow_unmediated(
+                    command, args, ts, path_str,
+                );
+                crate::mediation::filter_audit::append_filter_audit_event(log_dir, &evt);
+            }
+            ExecDecision::AllowShim => {}
         }
     }
 
-    // TOCTOU double-read. seccomp-unotify re-reads path arguments from
-    // the child's memory after we respond CONTINUE, so a cooperating
-    // racing thread in the child could swap the pathname buffer
-    // between our initial read and the kernel's post-response re-read.
-    // Mitigate by re-reading and flipping to deny on mismatch. This
-    // does not close the race (the kernel still re-reads after our
-    // response), but it collapses the vulnerable window from
-    // 'classify + canonicalize + shebang' to 'single response round-
-    // trip', defeating naive spin-flip attackers. Applied only on
-    // allow decisions — a deny already fails the syscall, so no
-    // re-read happens kernel-side. Skipped for AT_EMPTY_PATH (which
-    // reads a stable fd link, not a user-memory pathname).
-    if matches!(
-        decision,
-        ExecDecision::AllowShim | ExecDecision::AllowUnmediated
-    ) {
-        let is_at_empty_path = notif.data.nr == SYS_EXECVEAT
-            && (flags & AT_EMPTY_PATH_BIT) != 0;
-        if !is_at_empty_path {
-            match read_notif_path(notif.pid, path_arg_ptr) {
-                Ok(second_raw) => {
-                    // Resolve the second raw read the same way as the first.
-                    let second_resolved = resolve_notif_path(notif.pid, dirfd, &second_raw)
-                        .unwrap_or(second_raw.clone());
-                    if second_resolved != resolved {
-                        debug!(
-                            "exec filter deny (toctou_mismatch): first={} second={}",
-                            resolved.display(),
-                            second_resolved.display()
-                        );
-                        decision = ExecDecision::Deny;
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "exec filter deny (toctou double-read failed): {}",
-                        e
-                    );
-                    decision = ExecDecision::Deny;
-                }
-            }
-        }
+    // Common respond. Every Deny — whether classified, shebang-chained,
+    // TOCTOU-flipped, or resolution-failed — replies with EACCES for a
+    // single uniform errno seen by the agent.
+    // Second liveness check: matches the openat handler's pattern of
+    // checking once before reading the path and once before responding.
+    // The response primitive itself handles dead notifications, but the
+    // explicit check keeps the two handlers symmetric.
+    if !notif_id_valid(notify_fd, notif.id)? {
+        debug!("Exec seccomp notification expired before respond");
+        return Ok(());
     }
 
     match decision {
         ExecDecision::Deny => {
-            debug!(
-                "exec filter deny: path={} canonical={}",
-                resolved.display(),
-                canonical.display()
-            );
             respond_notif_errno(notify_fd, notif.id, libc::EACCES)?;
         }
         ExecDecision::AllowShim | ExecDecision::AllowUnmediated => {
@@ -957,6 +1058,111 @@ pub(super) fn handle_exec_notification(
     }
 
     Ok(())
+}
+
+/// Read a NUL-terminated path string from an already-open
+/// `/proc/<tid>/mem` file at `addr`. Mirrors
+/// [`nono::sandbox::read_notif_path`] but takes a caller-provided
+/// `File`, so the supervisor can reuse one fd across the initial read,
+/// the TOCTOU re-read, and the argv walk. The kernel's
+/// `ptrace_may_access` check fires at `open()` time only, so reusing
+/// the fd avoids an `EACCES` when the trapped task gets reparented to
+/// init mid-handler (the daemonize double-fork pattern).
+fn read_path_at(file: &mut std::fs::File, addr: u64) -> nono::error::Result<std::path::PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const MAX_PATH_LEN: usize = 4096;
+
+    file.seek(SeekFrom::Start(addr)).map_err(|e| {
+        nono::NonoError::SandboxInit(format!("seek /proc/<pid>/mem at {addr:#x}: {e}"))
+    })?;
+    let mut buf = vec![0u8; MAX_PATH_LEN];
+    let n = file
+        .read(&mut buf)
+        .map_err(|e| nono::NonoError::SandboxInit(format!("read /proc/<pid>/mem: {e}")))?;
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    if end == 0 || end >= MAX_PATH_LEN {
+        return Err(nono::NonoError::SandboxInit(
+            "Invalid path in seccomp notification (empty or too long)".to_string(),
+        ));
+    }
+    let s = std::str::from_utf8(&buf[..end]).map_err(|_| {
+        nono::NonoError::SandboxInit(
+            "Path in seccomp notification is not valid UTF-8".to_string(),
+        )
+    })?;
+    Ok(std::path::PathBuf::from(s))
+}
+
+/// Read the argv array passed to `execve`/`execveat` from the trapped
+/// child's memory, returning the args **without** `argv[0]` to match
+/// the shim audit-event convention.
+///
+/// `argv_ptr` is the user-space pointer the child passed as the argv
+/// argument to the syscall. It points at a NULL-terminated array of
+/// `char*`; each entry points at a NULL-terminated C string. Both
+/// layers are read via the caller-provided `/proc/<tid>/mem` fd.
+///
+/// Bounded to defend against pathological input: at most
+/// `MAX_ARGV_ENTRIES` pointers and `MAX_ARG_LEN` bytes per string. I/O
+/// errors during the walk truncate the result at that point — a
+/// partial argv is preferred to no audit event at all.
+fn read_execve_argv_at(file: &mut std::fs::File, argv_ptr: u64) -> Option<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const MAX_ARGV_ENTRIES: usize = 1024;
+    const MAX_ARG_LEN: usize = 4096;
+    const PTR_SIZE: u64 = std::mem::size_of::<usize>() as u64;
+
+    if argv_ptr == 0 {
+        return Some(Vec::new());
+    }
+
+    // Walk the array of pointers until we hit NULL or the bound.
+    let mut ptrs = Vec::new();
+    for i in 0..MAX_ARGV_ENTRIES {
+        let offset = argv_ptr + (i as u64) * PTR_SIZE;
+        let mut buf = [0u8; std::mem::size_of::<usize>()];
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            break;
+        }
+        if file.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let ptr = u64::from_ne_bytes(buf);
+        if ptr == 0 {
+            break;
+        }
+        ptrs.push(ptr);
+    }
+
+    // Dereference each pointer and read the C string.
+    let mut args = Vec::with_capacity(ptrs.len());
+    for ptr in ptrs {
+        let mut s = Vec::new();
+        for i in 0..MAX_ARG_LEN {
+            let offset = ptr + i as u64;
+            let mut byte = [0u8; 1];
+            if file.seek(SeekFrom::Start(offset)).is_err() {
+                break;
+            }
+            if file.read_exact(&mut byte).is_err() {
+                break;
+            }
+            if byte[0] == 0 {
+                break;
+            }
+            s.push(byte[0]);
+        }
+        args.push(String::from_utf8_lossy(&s).into_owned());
+    }
+
+    // Drop argv[0] to match the shim's audit-event convention (which
+    // also stores args without argv[0]).
+    if !args.is_empty() {
+        args.remove(0);
+    }
+    Some(args)
 }
 
 #[cfg(test)]
@@ -1280,6 +1486,7 @@ mod tests {
                 proxy_bind_ports,
                 exec_deny_set: Vec::new(),
                 exec_shim_dir: None,
+                exec_audit_log_dir: None,
             }
         }
 

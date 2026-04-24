@@ -20,6 +20,7 @@ pub mod control;
 pub mod policy;
 pub mod server;
 pub mod session;
+pub mod shebang;
 
 use std::sync::{Arc, OnceLock};
 

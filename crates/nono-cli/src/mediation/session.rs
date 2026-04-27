@@ -10,7 +10,9 @@
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
-use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo};
+use super::{
+    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+};
 use nix::libc;
 use nono::{NonoError, Result};
 use std::os::unix::fs::PermissionsExt;
@@ -46,6 +48,8 @@ pub struct ResolvedCommand {
     pub intercepts: Vec<ResolvedIntercept>,
     /// Optional sandbox profile to apply when exec-ing the real binary.
     pub sandbox: Option<CommandSandbox>,
+    /// Gate that decides whether a given caller may invoke this command.
+    pub caller_policy: CallerPolicy,
 }
 
 /// Handle returned by `setup()`. Dropping this shuts down the runtime.
@@ -478,6 +482,7 @@ fn resolve_command(
         real_path,
         intercepts,
         sandbox: entry.sandbox.clone(),
+        caller_policy: entry.caller_policy.clone(),
     }))
 }
 
@@ -709,6 +714,7 @@ mod tests {
                 },
             }],
             sandbox: None,
+            caller_policy: CallerPolicy::default(),
         };
 
         let workdir = tmp.path();

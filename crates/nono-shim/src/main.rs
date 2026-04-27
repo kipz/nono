@@ -6,16 +6,25 @@
 //! **Mediated mode** (command listed in `NONO_MEDIATED_COMMANDS`):
 //! Forwards the invocation to the nono mediation server running in the
 //! unsandboxed parent process, which applies policy and either returns a
-//! configured response or execs the real binary.
+//! configured response or execs the real binary. The shim's own
+//! stdin/stdout/stderr are passed to the server via SCM_RIGHTS so that the
+//! real binary, when it is exec'd, can stream binary data through them
+//! directly (e.g. ssh/git over a binary pipe).
 //!
 //! **Audit mode** (all other commands):
 //! Sends a fire-and-forget audit event via datagram to the audit socket,
 //! then resolves the real binary (skipping the shim directory) and `execve`s
 //! it directly. The command runs inside the sandbox with no mediation overhead.
 //!
-//! Protocol (mediated mode): length-prefixed JSON over a Unix stream socket.
-//!   Request:  u32 (big-endian length) || JSON {"command":..., "args":..., "stdin":...}
-//!   Response: u32 (big-endian length) || JSON {"stdout":..., "stderr":..., "exit_code":...}
+//! Mediated protocol:
+//!   1. Request:  u32 (big-endian length) || JSON {"command":..., "args":..., ...}
+//!   2. Three SCM_RIGHTS messages on the same socket — fds 0, 1, 2 in that order.
+//!   3. Response: u32 (big-endian length) || JSON {"stdout":..., "stderr":..., "exit_code":...}
+//!
+//! For passthrough cases the response's stdout/stderr are empty strings; the
+//! real binary already streamed its output through the passed fds. For
+//! buffered cases (Capture/Respond/Approve) the response carries the buffered
+//! output and the shim writes it to its own stdout/stderr.
 //!
 //! The shim reads its own name from argv[0] to determine which command it represents.
 //! The socket path is passed via NONO_MEDIATION_SOCKET.
@@ -23,7 +32,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
@@ -31,7 +41,6 @@ use std::path::Path;
 struct ShimRequest {
     command: String,
     args: Vec<String>,
-    stdin: String,
     session_token: String,
     env: HashMap<String, String>,
     /// PID of this shim process — used by the server as `command_pid` in audit logs.
@@ -58,29 +67,65 @@ struct AuditEvent {
     command_pid: u32,
 }
 
-/// Read piped stdin without blocking indefinitely.
+/// Buffer capacity for SCM_RIGHTS ancillary data — matches the value used in
+/// the nono crate's supervisor::socket helpers.
+const SCM_RIGHTS_BUFFER_CAPACITY: usize = 64;
+
+/// Send a single file descriptor over a Unix stream socket via SCM_RIGHTS.
 ///
-/// Spawns a background thread that performs the blocking `read_to_end`, then
-/// waits for it with a timeout.  If no data arrives within 50ms we assume
-/// the pipe is idle (e.g. Node.js `spawn()` with default stdio) and proceed
-/// with empty stdin.  Real piped input (e.g. `echo data | cmd`) will be fully
-/// available well within that window.
-fn read_stdin_nonblocking() -> String {
-    use std::sync::mpsc;
-    use std::time::Duration;
+/// Inlined from `nono::supervisor::socket::send_fd_via_socket` so the shim's
+/// dependency footprint stays minimal.
+fn send_fd_via_socket(sock_fd: RawFd, fd: RawFd) -> std::io::Result<()> {
+    let mut data = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: data.len(),
+    };
+    // SAFETY: `CMSG_SPACE` and `CMSG_LEN` are pure libc size calculations.
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let expected_cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) } as usize;
 
-    let (tx, rx) = mpsc::channel();
-
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut buf);
-        let _ = tx.send(buf);
-    });
-
-    match rx.recv_timeout(Duration::from_millis(50)) {
-        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
-        Err(_) => String::new(),
+    if cmsg_space > SCM_RIGHTS_BUFFER_CAPACITY {
+        return Err(std::io::Error::other(
+            "Unexpected ancillary buffer size for SCM_RIGHTS send",
+        ));
     }
+
+    let mut cmsg_buf = [0u8; SCM_RIGHTS_BUFFER_CAPACITY];
+    // SAFETY: `msghdr` is plain old data and will be fully initialized below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = cmsg_space as _;
+
+    // SAFETY: `msg` references `cmsg_buf`, which is large enough for one header.
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
+    if cmsg.is_null() {
+        return Err(std::io::Error::other(
+            "Missing ancillary header for SCM_RIGHTS send",
+        ));
+    }
+
+    // SAFETY: `cmsg` points into `cmsg_buf`, which is sized for exactly one fd payload.
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = expected_cmsg_len as _;
+        std::ptr::copy_nonoverlapping(
+            (&fd as *const RawFd).cast::<u8>(),
+            libc::CMSG_DATA(cmsg),
+            std::mem::size_of::<RawFd>(),
+        );
+    }
+
+    // SAFETY: `sock_fd` is a valid Unix socket and `msg` points to live stack buffers.
+    let sent = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
+    if sent < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 fn main() {
@@ -126,6 +171,10 @@ fn run() -> i32 {
 }
 
 /// Mediated mode: full request-response flow via the mediation server.
+///
+/// In addition to the JSON request, the shim sends its stdin/stdout/stderr
+/// fds over SCM_RIGHTS so the server can stream binary data directly to/from
+/// the real binary in passthrough cases without any buffering.
 fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     let socket_path = match std::env::var("NONO_MEDIATION_SOCKET") {
         Ok(p) => p,
@@ -143,28 +192,11 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Read stdin only when data is being piped in.  A TTY means interactive
-    // use — no data to forward.  A pipe *might* carry data (e.g. `echo x |
-    // ddtool …`), but it might also be an open pipe from a parent process that
-    // never intends to write (e.g. Node.js `spawn()` with default stdio).
-    // Blocking on `read_to_end` in that case hangs the shim forever.
-    //
-    // Strategy: set a short read timeout on stdin.  If nothing arrives within
-    // 50 ms we treat stdin as empty and proceed.  Real piped input (even large
-    // payloads) will arrive well within that window because the writer has
-    // already buffered everything before exec-ing the shim.
-    let stdin = if std::io::stdin().is_terminal() {
-        String::new()
-    } else {
-        read_stdin_nonblocking()
-    };
-
     let env: HashMap<String, String> = std::env::vars().collect();
 
     let request = ShimRequest {
         command: command_name.to_string(),
         args: args.to_vec(),
-        stdin,
         session_token,
         env,
         pid: std::process::id(),
@@ -193,6 +225,17 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         return 127;
     }
 
+    // Pass stdin/stdout/stderr fds over SCM_RIGHTS so the server can stream
+    // binary data directly to/from the real binary in passthrough cases.
+    // Order matches the server's recv: stdin, stdout, stderr.
+    let sock_fd = stream.as_raw_fd();
+    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if let Err(e) = send_fd_via_socket(sock_fd, fd) {
+            eprintln!("nono-shim: failed to send fd {}: {}", fd, e);
+            return 127;
+        }
+    }
+
     // Read length-prefixed response
     let mut len_buf = [0u8; 4];
     if stream.read_exact(&mut len_buf).is_err() {
@@ -215,8 +258,15 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
-    let _ = std::io::stdout().write_all(response.stdout.as_bytes());
-    let _ = std::io::stderr().write_all(response.stderr.as_bytes());
+    // For passthrough cases the real binary already wrote to our stdout/stderr
+    // directly via the passed fds, so these strings are empty. Buffered cases
+    // (Capture/Respond/Approve) carry the output here.
+    if !response.stdout.is_empty() {
+        let _ = std::io::stdout().write_all(response.stdout.as_bytes());
+    }
+    if !response.stderr.is_empty() {
+        let _ = std::io::stderr().write_all(response.stderr.as_bytes());
+    }
 
     response.exit_code
 }

@@ -58,6 +58,47 @@ pub struct CommandEntry {
     /// Optional sandbox profile applied when exec-ing the real binary.
     #[serde(default)]
     pub sandbox: Option<CommandSandbox>,
+    /// Restrict who is allowed to invoke this command. Default: any caller
+    /// (agent or any mediated parent) — backward compatible.
+    #[serde(default)]
+    pub caller_policy: CallerPolicy,
+}
+
+/// Caller-policy gate for a mediated command.
+///
+/// Evaluated before any intercept or per-command sandbox logic. A request
+/// from the agent (no `NONO_SANDBOX_CONTEXT`) is gated by `agent_allowed`;
+/// a request from a mediated parent is gated by `allowed_parents`.
+///
+/// Defaults preserve pre-existing behaviour: `agent_allowed: true` and
+/// `allowed_parents: None` (any mediated parent).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CallerPolicy {
+    /// If false, reject invocations originating from the primary (agent)
+    /// sandbox. Default: true.
+    #[serde(default = "default_true")]
+    pub agent_allowed: bool,
+    /// Restrict which mediated parents may invoke this command.
+    ///
+    /// - `None` (field absent in JSON): any mediated parent allowed.
+    /// - `Some(vec![])`: no mediated parent allowed (only the agent, if
+    ///   `agent_allowed`).
+    /// - `Some(vec!["git"])`: only the listed parents allowed.
+    #[serde(default)]
+    pub allowed_parents: Option<Vec<String>>,
+}
+
+impl Default for CallerPolicy {
+    fn default() -> Self {
+        Self {
+            agent_allowed: true,
+            allowed_parents: None,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// An intercept rule: if `args_prefix` matches the invocation's positional args,
@@ -334,5 +375,57 @@ mod tests {
     fn test_command_sandbox_default_has_keychain_access_false() {
         let sb = CommandSandbox::default();
         assert!(!sb.keychain_access);
+    }
+
+    #[test]
+    fn test_caller_policy_defaults_are_backward_compatible() {
+        let policy = CallerPolicy::default();
+        assert!(
+            policy.agent_allowed,
+            "default must allow agent invocations to preserve existing behaviour"
+        );
+        assert!(
+            policy.allowed_parents.is_none(),
+            "default must accept any mediated parent (None means unrestricted)"
+        );
+    }
+
+    #[test]
+    fn test_caller_policy_omitted_in_json_uses_default() {
+        let json = r#"{ "name": "git" }"#;
+        let entry: CommandEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(entry.caller_policy.agent_allowed);
+        assert!(entry.caller_policy.allowed_parents.is_none());
+    }
+
+    #[test]
+    fn test_caller_policy_distinguishes_null_vs_empty_allowed_parents() {
+        // Field absent: any parent allowed.
+        let p1: CallerPolicy = serde_json::from_str(r#"{ "agent_allowed": true }"#).unwrap();
+        assert!(p1.allowed_parents.is_none());
+
+        // Empty array: no mediated parent allowed.
+        let p2: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
+        assert_eq!(p2.allowed_parents.as_deref(), Some(&[][..]));
+
+        // Listed: only the named parents allowed.
+        let p3: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
+        assert_eq!(
+            p3.allowed_parents.as_deref(),
+            Some(&["git".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn test_caller_policy_agent_allowed_can_be_false() {
+        let json = r#"{ "agent_allowed": false, "allowed_parents": ["git"] }"#;
+        let policy: CallerPolicy = serde_json::from_str(json).expect("deserialize");
+        assert!(!policy.agent_allowed);
+        assert_eq!(
+            policy.allowed_parents.as_deref(),
+            Some(&["git".to_string()][..])
+        );
     }
 }

@@ -15,17 +15,22 @@ use super::session::{ResolvedAction, ResolvedCommand};
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Request forwarded from the shim binary to the mediation server.
+///
+/// The shim sends this JSON request followed by three SCM_RIGHTS messages
+/// carrying its stdin/stdout/stderr fds (in that order). The fds are received
+/// out-of-band by the server and threaded into `apply` — they are not part of
+/// this struct.
 #[derive(Debug, Default, Deserialize)]
 pub struct ShimRequest {
     pub command: String,
     pub args: Vec<String>,
-    pub stdin: String,
     /// Session authentication token. Must match the token injected via
     /// `NONO_SESSION_TOKEN`. Requests with a missing or wrong token are
     /// silently rejected. Old shims missing this field fail deserialization
@@ -81,12 +86,22 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
 /// - If an intercept rule matches with `Respond`: returns the pre-resolved output.
 /// - If an intercept rule matches with `Capture`: runs the binary/script, issues a nonce.
 /// - Otherwise: execs the real binary with strict env filtering.
+///
+/// `stdin_fd`/`stdout_fd`/`stderr_fd` are the shim's stdio fds, received via
+/// SCM_RIGHTS. The streaming passthrough path moves them into the spawned
+/// child via `Stdio::from(...)` so binary streams (ssh/git) are not buffered
+/// or corrupted. The `Capture`/`Respond`/`Approve` paths drop them and keep
+/// the existing `Stdio::piped()` + `wait_with_output` behaviour.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     request: ShimRequest,
     commands: &[ResolvedCommand],
     broker: Arc<TokenBroker>,
     ctx: &SessionCtx<'_>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
+    stdin_fd: OwnedFd,
+    stdout_fd: OwnedFd,
+    stderr_fd: OwnedFd,
 ) -> (ShimResponse, &'static str) {
     // Find matching command entry
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
@@ -120,15 +135,16 @@ pub async fn apply(
                         // The real binary needs full access to system resources
                         // (e.g. Keychain, vault) to fetch credentials. Security
                         // comes from the parent's sandbox, not the child's.
+                        // Stream stdio directly through the shim's fds.
                         let result = exec_passthrough(
                             cmd,
                             &request.args,
-                            &request.stdin,
                             &request.env,
                             &broker,
                             None,
                             ctx,
                             commands,
+                            Some((stdin_fd, stdout_fd, stderr_fd)),
                         )
                         .await;
                         return (result, "passthrough");
@@ -177,6 +193,13 @@ pub async fn apply(
                 }
             }
 
+            // Buffered intercept paths: the passed stdio fds are not used —
+            // the duplicated fds drop here, leaving the originals open in the
+            // shim so it can write the buffered response to them.
+            drop(stdin_fd);
+            drop(stdout_fd);
+            drop(stderr_fd);
+
             return match &rule.action {
                 ResolvedAction::Respond { stdout } => (
                     ShimResponse {
@@ -195,12 +218,12 @@ pub async fn apply(
                             exec_passthrough(
                                 cmd,
                                 &request.args,
-                                &request.stdin,
                                 &request.env,
                                 &broker,
                                 None,
                                 ctx,
                                 commands,
+                                None,
                             )
                             .await
                         }
@@ -233,12 +256,12 @@ pub async fn apply(
                             exec_passthrough(
                                 cmd,
                                 &request.args,
-                                &request.stdin,
                                 &request.env,
                                 &broker,
                                 None,
                                 ctx,
                                 commands,
+                                None,
                             )
                             .await
                         }
@@ -249,7 +272,7 @@ pub async fn apply(
         }
     }
 
-    // No intercept matched — pass through to the real binary
+    // No intercept matched — pass through to the real binary, streaming stdio.
     debug!(
         "mediation: passthrough '{}' {:?} -> {}",
         request.command,
@@ -259,12 +282,12 @@ pub async fn apply(
     let resp = exec_passthrough(
         cmd,
         &request.args,
-        &request.stdin,
         &request.env,
         &broker,
         cmd.sandbox.clone(),
         ctx,
         commands,
+        Some((stdin_fd, stdout_fd, stderr_fd)),
     )
     .await;
     (resp, "passthrough")
@@ -275,9 +298,15 @@ pub async fn apply(
 ///
 /// This is an intentional bypass. The operator explicitly granted admin mode
 /// via biometric or password auth. All calls are logged at WARN level.
+///
+/// Stdio is streamed directly through the shim's passed fds so binary
+/// streams (e.g. ssh/git) work correctly under admin mode too.
 pub async fn admin_passthrough(
     request: &ShimRequest,
     commands: &[ResolvedCommand],
+    stdin_fd: OwnedFd,
+    stdout_fd: OwnedFd,
+    stderr_fd: OwnedFd,
 ) -> (ShimResponse, &'static str) {
     let Some(cmd) = commands.iter().find(|c| c.name == request.command) else {
         warn!("admin passthrough: unknown command '{}'", request.command);
@@ -297,11 +326,9 @@ pub async fn admin_passthrough(
     // Build env from parent process — no filtering, no nonce promotion.
     let env: HashMap<String, String> = std::env::vars().collect();
     let args = request.args.clone();
-    let stdin_data = request.stdin.clone();
     let real_path = cmd.real_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> nono::Result<ShimResponse> {
-        use std::io::Write;
         use std::process::{Command, Stdio};
 
         let mut cmd_builder = Command::new(&real_path);
@@ -309,28 +336,20 @@ pub async fn admin_passthrough(
             .args(&args)
             .env_clear()
             .envs(&env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdin(Stdio::from(stdin_fd))
+            .stdout(Stdio::from(stdout_fd))
+            .stderr(Stdio::from(stderr_fd));
 
         let mut child = cmd_builder
             .spawn()
             .map_err(nono::NonoError::CommandExecution)?;
 
-        if !stdin_data.is_empty() {
-            if let Some(mut si) = child.stdin.take() {
-                let _ = si.write_all(stdin_data.as_bytes());
-            }
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(nono::NonoError::CommandExecution)?;
+        let status = child.wait().map_err(nono::NonoError::CommandExecution)?;
 
         Ok(ShimResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code().unwrap_or(1),
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: status.code().unwrap_or(1),
         })
     })
     .await;
@@ -436,16 +455,26 @@ static FILTERED_SHIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// When `allow_commands` is non-empty on the sandbox, a filtered shim directory is
 /// created containing symlinks only for commands NOT in the allow list. Allowed
 /// commands run directly (real binary) inside the per-command sandbox.
+///
+/// `stdio_fds`:
+/// - `Some((stdin, stdout, stderr))`: streaming mode — the real binary inherits
+///   the shim's fds directly, the response carries empty stdout/stderr and the
+///   call uses `wait()` instead of `wait_with_output()`. This is required for
+///   binary streams (ssh, git over ssh) and avoids buffering for any
+///   long-running command (gh, kubectl, dd-attest, etc.).
+/// - `None`: buffered mode — the real binary's stdout/stderr are captured
+///   into the `ShimResponse` (used by Capture/Approve flows so the server can
+///   inspect or relay the output).
 #[allow(clippy::too_many_arguments)]
 async fn exec_passthrough(
     cmd: &ResolvedCommand,
     args: &[String],
-    stdin_data: &str,
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
     sandbox: Option<super::CommandSandbox>,
     ctx: &SessionCtx<'_>,
     all_commands: &[ResolvedCommand],
+    stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
 ) -> ShimResponse {
     let mut env = build_exec_env(sandbox_env, broker);
 
@@ -553,7 +582,6 @@ async fn exec_passthrough(
 
     let real_path = cmd.real_path.clone();
     let cmd_name = cmd.name.clone();
-    let stdin_data = stdin_data.to_string();
     // Owned shim paths for use in spawn_blocking (which requires 'static captures).
     let shim_dir_buf = effective_shim_dir.clone();
     let real_shim_binary = std::fs::canonicalize(ctx.shim_dir.join(&cmd.name)).ok();
@@ -612,19 +640,32 @@ async fn exec_passthrough(
 
     let maybe_sandbox = sandbox;
 
+    let streaming = stdio_fds.is_some();
+
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
-        use std::io::Write;
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         let mut cmd_builder = Command::new(&real_path);
-        cmd_builder
-            .args(&args)
-            .env_clear()
-            .envs(&env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd_builder.args(&args).env_clear().envs(&env);
+
+        // Streaming: child inherits the shim's stdio fds directly so binary
+        // data (ssh/git) flows through unmodified. Buffered: capture stdout
+        // and stderr so the server can read them (e.g. Capture nonce flow).
+        match stdio_fds {
+            Some((stdin_fd, stdout_fd, stderr_fd)) => {
+                cmd_builder
+                    .stdin(Stdio::from(stdin_fd))
+                    .stdout(Stdio::from(stdout_fd))
+                    .stderr(Stdio::from(stderr_fd));
+            }
+            None => {
+                cmd_builder
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+            }
+        }
 
         if let Some(sb) = maybe_sandbox {
             let mut caps = nono::CapabilitySet::new();
@@ -737,21 +778,25 @@ async fn exec_passthrough(
 
         let mut child = cmd_builder.spawn().map_err(NonoError::CommandExecution)?;
 
-        if !stdin_data.is_empty() {
-            if let Some(mut si) = child.stdin.take() {
-                let _ = si.write_all(stdin_data.as_bytes());
-            }
+        if streaming {
+            // Streaming: stdio is connected directly to the shim's fds. Just
+            // wait for exit; there is no buffered output to collect.
+            let status = child.wait().map_err(NonoError::CommandExecution)?;
+            Ok(ShimResponse {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: status.code().unwrap_or(1),
+            })
+        } else {
+            let output = child
+                .wait_with_output()
+                .map_err(NonoError::CommandExecution)?;
+            Ok(ShimResponse {
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                exit_code: output.status.code().unwrap_or(1),
+            })
         }
-
-        let output = child
-            .wait_with_output()
-            .map_err(NonoError::CommandExecution)?;
-
-        Ok(ShimResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            exit_code: output.status.code().unwrap_or(1),
-        })
     })
     .await;
 
@@ -1013,16 +1058,102 @@ mod tests {
         }
     }
 
+    /// Test harness for the streaming-passthrough fd protocol.
+    ///
+    /// Holds the test-side of the three socketpairs that back the child's
+    /// stdin/stdout/stderr. Tests call `make_passthrough_fds()` to get the
+    /// child fds (to pass into `apply`) plus this harness. Drainer threads
+    /// (started by `apply_capture`) consume the child's output concurrently
+    /// so a chatty child can't block on a full socketpair buffer.
+    struct PassthroughHarness {
+        stdin_writer: std::os::unix::net::UnixStream,
+        stdout_reader: std::os::unix::net::UnixStream,
+        stderr_reader: std::os::unix::net::UnixStream,
+    }
+
+    /// Create three socketpair-backed fds for streaming passthrough tests.
+    ///
+    /// Returns `(child_stdin, child_stdout, child_stderr, harness)`. Pass the
+    /// three `OwnedFd`s into `apply`; keep `harness` bound until after `apply`
+    /// returns so the child does not see EPIPE while writing.
+    fn make_passthrough_fds() -> (OwnedFd, OwnedFd, OwnedFd, PassthroughHarness) {
+        use std::os::unix::net::UnixStream;
+        let (child_in, test_in) = UnixStream::pair().expect("socketpair stdin");
+        let (child_out, test_out) = UnixStream::pair().expect("socketpair stdout");
+        let (child_err, test_err) = UnixStream::pair().expect("socketpair stderr");
+        (
+            OwnedFd::from(child_in),
+            OwnedFd::from(child_out),
+            OwnedFd::from(child_err),
+            PassthroughHarness {
+                stdin_writer: test_in,
+                stdout_reader: test_out,
+                stderr_reader: test_err,
+            },
+        )
+    }
+
+    /// Test wrapper around `apply` that handles the new fd-passing protocol.
+    ///
+    /// Creates a streaming socketpair harness, drains stdout/stderr in
+    /// background threads while the child runs (so a chatty child cannot
+    /// block on a full socketpair buffer), and merges what the child
+    /// streamed into the returned `ShimResponse` so existing tests can
+    /// continue to assert on `resp.stdout`/`resp.stderr` regardless of
+    /// whether the path was streaming (passthrough) or buffered (Capture/
+    /// Respond/Approve).
+    async fn apply_capture(
+        req: ShimRequest,
+        cmds: &[ResolvedCommand],
+        broker: Arc<TokenBroker>,
+        ctx: &SessionCtx<'_>,
+        approval: Arc<dyn ApprovalGate + Send + Sync>,
+    ) -> (ShimResponse, &'static str) {
+        let (stdin_fd, stdout_fd, stderr_fd, harness) = make_passthrough_fds();
+
+        // Close the parent-side stdin writer so any child that reads stdin
+        // sees an immediate EOF instead of hanging.
+        drop(harness.stdin_writer);
+
+        let stdout_reader = harness.stdout_reader;
+        let stderr_reader = harness.stderr_reader;
+        let stdout_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = (&stdout_reader).read_to_end(&mut buf);
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let _ = (&stderr_reader).read_to_end(&mut buf);
+            buf
+        });
+
+        let (mut resp, action) =
+            apply(req, cmds, broker, ctx, approval, stdin_fd, stdout_fd, stderr_fd).await;
+
+        let stdout_streamed = stdout_handle.join().unwrap_or_default();
+        let stderr_streamed = stderr_handle.join().unwrap_or_default();
+
+        if resp.stdout.is_empty() {
+            resp.stdout = String::from_utf8_lossy(&stdout_streamed).into_owned();
+        }
+        if resp.stderr.is_empty() {
+            resp.stderr = String::from_utf8_lossy(&stderr_streamed).into_owned();
+        }
+        (resp, action)
+    }
+
     #[tokio::test]
     async fn test_unknown_command_returns_127() {
         let req = ShimRequest {
             command: "doesnotexist".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[],
             make_broker(),
@@ -1060,11 +1191,10 @@ mod tests {
                 "github".to_string(),
                 "token".to_string(),
             ],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1095,11 +1225,10 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["auth".to_string(), "github".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1130,12 +1259,11 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["status".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
         // Falls through to passthrough exec of /usr/bin/true
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1165,11 +1293,10 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["repo".to_string(), "delete".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1200,11 +1327,10 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["repo".to_string(), "delete".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1236,11 +1362,10 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["status".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             make_broker(),
@@ -1354,12 +1479,11 @@ mod tests {
             command: "testcmd".to_string(),
             // args passed to echo: "auth" "hello" → output "auth hello"
             args: vec!["auth".to_string(), "hello".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1398,12 +1522,11 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec!["auth".to_string()],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1629,13 +1752,12 @@ mod tests {
         let req = ShimRequest {
             command: "gh".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
 
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd, ddtool_cmd],
             Arc::clone(&broker),
@@ -1714,13 +1836,12 @@ mod tests {
             command: "testcmd".to_string(),
             // `env` prints its own environment; grep output for HTTPS_PROXY
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
 
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1777,13 +1898,12 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             ..Default::default()
         };
 
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1843,14 +1963,13 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
         };
 
         let broker = make_broker();
-        let (resp, action_type) = apply(
+        let (resp, action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1905,14 +2024,13 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
         };
 
         let broker = make_broker();
-        let (resp, action_type) = apply(
+        let (resp, action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -1963,14 +2081,13 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
         };
 
         let broker = make_broker();
-        let (resp, action_type) = apply(
+        let (resp, action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -2022,14 +2139,13 @@ mod tests {
         let req = ShimRequest {
             command: "testcmd".to_string(),
             args: vec![],
-            stdin: String::new(),
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
         };
 
         let broker = make_broker();
-        let (resp, _action_type) = apply(
+        let (resp, _action_type) = apply_capture(
             req,
             &[cmd],
             Arc::clone(&broker),
@@ -2047,6 +2163,145 @@ mod tests {
             !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
             "keychain_access should not override network block, but HTTPS_PROXY found: {}",
             resp.stdout
+        );
+    }
+
+    // --- Streaming passthrough fd-protocol tests ---
+
+    /// Pipe binary data (every byte 0x00..=0xFF, including 0xFF) through the
+    /// child's stdin and read it back via stdout. Verifies the new SCM_RIGHTS
+    /// path streams bytes unchanged — no UTF-8 lossy conversion, no 50ms
+    /// stdin truncation, no buffering.
+    #[tokio::test]
+    async fn test_passthrough_streams_binary_stdin_unchanged() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/bin/cat"),
+            intercepts: vec![],
+            sandbox: None,
+        };
+
+        let (child_in, mut test_in) = UnixStream::pair().expect("pair stdin");
+        let (child_out, test_out) = UnixStream::pair().expect("pair stdout");
+        let (child_err, _test_err) = UnixStream::pair().expect("pair stderr");
+
+        // 4 KiB of binary data covering every byte value, including 0xFF.
+        let payload: Vec<u8> = (0u32..4096).map(|i| (i & 0xff) as u8).collect();
+
+        // Drain stdout in a thread so cat doesn't block on a full buffer.
+        let payload_clone = payload.clone();
+        let drain = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut received = Vec::with_capacity(payload_clone.len());
+            let mut r = test_out;
+            let _ = r.read_to_end(&mut received);
+            received
+        });
+
+        // Write the payload, then close the writer so cat sees EOF and exits.
+        test_in.write_all(&payload).expect("write payload");
+        drop(test_in);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+            OwnedFd::from(child_in),
+            OwnedFd::from(child_out),
+            OwnedFd::from(child_err),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        // Streaming path: the response carries no buffered output.
+        assert!(resp.stdout.is_empty(), "expected empty resp.stdout in streaming mode, got {} bytes", resp.stdout.len());
+        assert!(resp.stderr.is_empty(), "expected empty resp.stderr in streaming mode, got {} bytes", resp.stderr.len());
+
+        let received = drain.join().expect("drain thread");
+        assert_eq!(
+            received,
+            payload,
+            "binary payload corrupted: lengths {} vs {}",
+            received.len(),
+            payload.len()
+        );
+    }
+
+    /// Capture/Respond/Approve paths drop the passed fds and produce buffered
+    /// output via the response. Verifies the dropped fds let the test side
+    /// see EOF (no hang) and that the buffered stdout flows through normally.
+    #[tokio::test]
+    async fn test_buffered_paths_drop_passed_fds_and_buffer_output() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["auth".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "buffered_response\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+
+        let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
+        let (child_out, mut test_out) = UnixStream::pair().expect("pair stdout");
+        let (child_err, _test_err) = UnixStream::pair().expect("pair stderr");
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["auth".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+            OwnedFd::from(child_in),
+            OwnedFd::from(child_out),
+            OwnedFd::from(child_err),
+        )
+        .await;
+
+        assert_eq!(action_type, "respond");
+        assert_eq!(resp.stdout, "buffered_response\n");
+
+        // The Respond path dropped the child_out fd, so the test side
+        // immediately sees EOF — read_to_end returns 0 bytes without
+        // hanging because there are no other writers on the socketpair.
+        let mut buf = Vec::new();
+        let _ = test_out.read_to_end(&mut buf);
+        assert!(
+            buf.is_empty(),
+            "Respond path should not write anything to passed stdout fd, got {:?}",
+            buf
         );
     }
 }

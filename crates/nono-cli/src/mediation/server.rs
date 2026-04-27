@@ -15,6 +15,7 @@ use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
 use super::{AuditEvent, SessionAuditInfo};
 use nix::libc;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -176,6 +177,22 @@ async fn handle_connection(
         request.command, request.args
     );
 
+    // Receive the three stdio fds the shim sent over SCM_RIGHTS after the JSON
+    // request. These are used for streaming passthrough (see policy::apply).
+    let (stdin_fd, stdout_fd, stderr_fd) = match recv_three_fds(&stream).await {
+        Ok(fds) => fds,
+        Err(e) => {
+            warn!("mediation: failed to receive stdio fds: {}", e);
+            let err_resp = ShimResponse {
+                stdout: String::new(),
+                stderr: format!("nono-mediation: failed to receive stdio fds: {}\n", e),
+                exit_code: 127,
+            };
+            write_response(&mut stream, &err_resp).await?;
+            return Ok(());
+        }
+    };
+
     // Check admin mode — bypass all policy if active
     if admin_receiver.borrow().is_active() {
         warn!(
@@ -185,7 +202,8 @@ async fn handle_connection(
             std::process::id()
         );
         let command_pid = request.pid;
-        let (response, action_type) = admin_passthrough(&request, commands).await;
+        let (response, action_type) =
+            admin_passthrough(&request, commands, stdin_fd, stdout_fd, stderr_fd).await;
         write_response(&mut stream, &response).await?;
         log_mediated_audit(
             audit_log_dir,
@@ -208,7 +226,10 @@ async fn handle_connection(
         session_token: &session_token,
         workdir,
     };
-    let (response, action_type) = apply(request, commands, broker, &ctx, approval).await;
+    let (response, action_type) = apply(
+        request, commands, broker, &ctx, approval, stdin_fd, stdout_fd, stderr_fd,
+    )
+    .await;
 
     write_response(&mut stream, &response).await?;
     log_mediated_audit(
@@ -221,6 +242,54 @@ async fn handle_connection(
         audit_info,
     );
     Ok(())
+}
+
+/// Receive three SCM_RIGHTS messages — stdin, stdout, stderr — from the shim.
+///
+/// The shim sends each fd accompanied by a one-byte payload (the SCM_RIGHTS
+/// convention). We temporarily switch the underlying fd to blocking mode so
+/// `recvmsg` waits for the messages inside `spawn_blocking` rather than
+/// busy-looping on EAGAIN.
+async fn recv_three_fds(
+    stream: &tokio::net::UnixStream,
+) -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+    let raw_fd = stream.as_raw_fd();
+
+    // Switch to blocking mode for the duration of the recvmsg calls.
+    let original_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
+    if original_flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let was_nonblock = (original_flags & libc::O_NONBLOCK) != 0;
+    if was_nonblock {
+        let r =
+            unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags & !libc::O_NONBLOCK) };
+        if r < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    let recv_result = tokio::task::spawn_blocking(move || {
+        let stdin_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
+        let stdout_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
+        let stderr_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
+        Ok::<_, nono::NonoError>((stdin_fd, stdout_fd, stderr_fd))
+    })
+    .await;
+
+    if was_nonblock {
+        // Restore non-blocking mode for tokio.
+        unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags) };
+    }
+
+    match recv_result {
+        Ok(Ok(fds)) => Ok(fds),
+        Ok(Err(e)) => Err(std::io::Error::other(e.to_string())),
+        Err(e) => Err(std::io::Error::other(format!(
+            "spawn_blocking join error: {}",
+            e
+        ))),
+    }
 }
 
 /// Log an audit event for a mediated command response.

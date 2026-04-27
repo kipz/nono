@@ -119,6 +119,63 @@ pub async fn apply(
         );
     };
 
+    // Caller-policy gate. Decides whether this caller is permitted to invoke
+    // the command at all, before any intercept / sandbox logic runs.
+    //
+    // - No NONO_SANDBOX_CONTEXT → caller is the agent (primary sandbox).
+    //   Reject unless `agent_allowed` is true.
+    // - NONO_SANDBOX_CONTEXT present → caller is a mediated parent.
+    //   If `allowed_parents` is `Some(list)`, the parent name (resolved via
+    //   the broker nonce) must be in `list`. `Some(empty list)` denies all
+    //   mediated parents. `None` allows any.
+    let caller_parent = request
+        .env
+        .get("NONO_SANDBOX_CONTEXT")
+        .and_then(|nonce| broker.resolve(nonce));
+    match &caller_parent {
+        None => {
+            if !cmd.caller_policy.agent_allowed {
+                warn!(
+                    "mediation: rejecting '{}' from primary sandbox (agent_allowed=false)",
+                    request.command
+                );
+                return (
+                    ShimResponse {
+                        stdout: String::new(),
+                        stderr: format!(
+                            "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
+                            request.command
+                        ),
+                        exit_code: 126,
+                    },
+                    "denied",
+                );
+            }
+        }
+        Some(parent) => {
+            if let Some(allowed) = &cmd.caller_policy.allowed_parents {
+                let parent_name: &str = parent;
+                if !allowed.iter().any(|p| p == parent_name) {
+                    warn!(
+                        "mediation: rejecting '{}' invoked from '{}' (not in allowed_parents)",
+                        request.command, parent_name
+                    );
+                    return (
+                        ShimResponse {
+                            stdout: String::new(),
+                            stderr: format!(
+                                "nono-mediation: '{}' cannot be invoked from '{}'\n",
+                                request.command, parent_name
+                            ),
+                            exit_code: 126,
+                        },
+                        "denied",
+                    );
+                }
+            }
+        }
+    }
+
     // If the request comes from within a per-command sandbox (via allow_commands),
     // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
     // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
@@ -1035,6 +1092,7 @@ mod tests {
     use super::*;
     use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
     use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
+    use crate::mediation::CallerPolicy;
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
@@ -1055,6 +1113,7 @@ mod tests {
             real_path: PathBuf::from("/usr/bin/true"),
             intercepts,
             sandbox: None,
+            caller_policy: CallerPolicy::default(),
         }
     }
 
@@ -1167,6 +1226,204 @@ mod tests {
         )
         .await;
         assert_eq!(resp.exit_code, 127);
+    }
+
+    // --- caller_policy gate ---
+
+    fn ctx() -> SessionCtx<'static> {
+        SessionCtx {
+            shim_dir: std::path::Path::new("/tmp"),
+            socket_path: std::path::Path::new("/tmp/test.sock"),
+            session_token: "test_token",
+            workdir: std::path::Path::new("/tmp"),
+        }
+    }
+
+    /// Default `CallerPolicy` (agent_allowed=true, allowed_parents=None) lets
+    /// the agent invoke a command. Regression for backward compatibility:
+    /// existing profiles that omit `caller_policy` keep the old behaviour.
+    #[tokio::test]
+    async fn test_caller_policy_agent_allowed_by_default() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec![],
+            action: ResolvedAction::Respond {
+                stdout: "ok\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+        // Default caller_policy from make_cmd.
+        assert!(cmd.caller_policy.agent_allowed);
+        assert!(cmd.caller_policy.allowed_parents.is_none());
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            // No NONO_SANDBOX_CONTEXT — caller is the agent.
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "respond");
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "ok\n");
+    }
+
+    /// `agent_allowed: false` rejects a call from the primary sandbox
+    /// (no NONO_SANDBOX_CONTEXT) with exit 126.
+    #[tokio::test]
+    async fn test_caller_policy_rejects_agent_when_agent_allowed_false() {
+        let mut cmd = make_cmd(vec![]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: false,
+            allowed_parents: Some(vec!["git".to_string()]),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("primary sandbox"),
+            "stderr should mention primary sandbox: {}",
+            resp.stderr
+        );
+    }
+
+    /// `allowed_parents: Some(["git"])` permits ssh-from-git: the broker
+    /// resolves the request's NONO_SANDBOX_CONTEXT nonce to "git" and the
+    /// gate falls through to the existing policy logic.
+    #[tokio::test]
+    async fn test_caller_policy_allows_listed_parent() {
+        let mut cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec![],
+            action: ResolvedAction::Respond {
+                stdout: "from_git\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: false,
+            allowed_parents: Some(vec!["git".to_string()]),
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "respond", "stderr: {}", resp.stderr);
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "from_git\n");
+    }
+
+    /// A parent not in `allowed_parents` is rejected with exit 126.
+    #[tokio::test]
+    async fn test_caller_policy_rejects_unlisted_parent() {
+        let mut cmd = make_cmd(vec![]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: Some(vec!["git".to_string()]),
+        };
+
+        let broker = make_broker();
+        // Caller is "kubectl", not in the allowed list.
+        let nonce = broker.issue(Zeroizing::new("kubectl".to_string()));
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("kubectl"),
+            "stderr should name the rejected parent: {}",
+            resp.stderr
+        );
+    }
+
+    /// `allowed_parents: Some(vec![])` (explicit empty list) blocks every
+    /// mediated parent. With `agent_allowed: true` the command is still
+    /// reachable from the agent — useful for "agent-only" tools.
+    #[tokio::test]
+    async fn test_caller_policy_empty_allowed_parents_blocks_all_parents() {
+        let mut cmd = make_cmd(vec![]);
+        cmd.caller_policy = CallerPolicy {
+            agent_allowed: true,
+            allowed_parents: Some(vec![]),
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+    }
+
+    /// `allowed_parents: None` (the default) accepts any mediated parent —
+    /// preserves backward compatibility with profiles that don't set the field.
+    #[tokio::test]
+    async fn test_caller_policy_none_allowed_parents_accepts_any() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec![],
+            action: ResolvedAction::Respond {
+                stdout: "any_parent_ok\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+        // Confirm default state.
+        assert!(cmd.caller_policy.allowed_parents.is_none());
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("anything".to_string()));
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "respond");
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "any_parent_ok\n");
     }
 
     #[tokio::test]
@@ -1646,18 +1903,21 @@ mod tests {
                 real_path: PathBuf::from("/usr/bin/gh"),
                 intercepts: vec![],
                 sandbox: None,
+                caller_policy: CallerPolicy::default(),
             },
             ResolvedCommand {
                 name: "ddtool".to_string(),
                 real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
                 intercepts: vec![],
                 sandbox: None,
+                caller_policy: CallerPolicy::default(),
             },
             ResolvedCommand {
                 name: "kubectl".to_string(),
                 real_path: PathBuf::from("/usr/local/bin/kubectl"),
                 intercepts: vec![],
                 sandbox: None,
+                caller_policy: CallerPolicy::default(),
             },
         ];
 
@@ -1739,6 +1999,7 @@ mod tests {
                 allow_commands: vec!["ddtool".to_string()],
                 keychain_access: false,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         // Provide a ddtool entry so build_filtered_shim_dir can find its real path.
@@ -1747,6 +2008,7 @@ mod tests {
             real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
             intercepts: vec![],
             sandbox: None,
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -1830,6 +2092,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -1893,6 +2156,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -1958,6 +2222,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -2019,6 +2284,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: true,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -2076,6 +2342,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -2134,6 +2401,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: true,
             }),
+            caller_policy: CallerPolicy::default(),
         };
 
         let req = ShimRequest {
@@ -2182,6 +2450,7 @@ mod tests {
             real_path: PathBuf::from("/bin/cat"),
             intercepts: vec![],
             sandbox: None,
+            caller_policy: CallerPolicy::default(),
         };
 
         let (child_in, mut test_in) = UnixStream::pair().expect("pair stdin");

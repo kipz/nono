@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- *(mediation)* Add `args_must_include` to intercept rules: a flag-aware refinement on `args_prefix` that requires every listed arg to appear (any position) before a rule fires. Lets profiles capture flag variants like `kubectl config view --raw` while still allowing `kubectl config view` to pass through.
+
 ## [0.42.0] - 2026-04-25
 
 ### Bug Fixes

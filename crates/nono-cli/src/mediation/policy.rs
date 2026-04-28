@@ -213,10 +213,12 @@ pub async fn apply(
 
     // Check intercept rules in order
     for rule in &cmd.intercepts {
-        if subcommand_matches(&rule.args_prefix, &request.args) {
+        if subcommand_matches(&rule.args_prefix, &request.args)
+            && args_contain_all(&rule.args_must_include, &request.args)
+        {
             debug!(
-                "mediation: intercepting '{}' with prefix {:?}",
-                request.command, rule.args_prefix
+                "mediation: intercepting '{}' with prefix {:?} must_include {:?}",
+                request.command, rule.args_prefix, rule.args_must_include
             );
 
             // Admin gate: require user authentication before executing this rule.
@@ -441,6 +443,18 @@ pub fn subcommand_matches(prefix: &[String], args: &[String]) -> bool {
         return false;
     }
     prefix.iter().zip(positional.iter()).all(|(p, a)| p == *a)
+}
+
+/// Returns true iff every entry in `required` appears at least once in `args`
+/// (exact string match, any position). Empty `required` returns true.
+///
+/// Used as a flag-aware refinement on top of `subcommand_matches` to
+/// discriminate between flag variants of the same subcommand without relying
+/// on flag position. E.g. `args_must_include = ["--raw"]` lets a rule fire on
+/// `kubectl config view --raw` and `kubectl config view --minify --raw` but
+/// not on `kubectl config view`.
+pub fn args_contain_all(required: &[String], args: &[String]) -> bool {
+    required.iter().all(|r| args.iter().any(|a| a == r))
 }
 
 /// Execute a shell script and collect its output.
@@ -1246,6 +1260,7 @@ mod tests {
     async fn test_caller_policy_agent_allowed_by_default() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
@@ -1304,6 +1319,7 @@ mod tests {
     async fn test_caller_policy_allows_listed_parent() {
         let mut cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "from_git\n".to_string(),
             },
@@ -1399,6 +1415,7 @@ mod tests {
     async fn test_caller_policy_none_allowed_parents_accepts_any() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec![],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "any_parent_ok\n".to_string(),
             },
@@ -1434,6 +1451,7 @@ mod tests {
                 "github".to_string(),
                 "token".to_string(),
             ],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "static_output\n".to_string(),
             },
@@ -1472,6 +1490,7 @@ mod tests {
     async fn test_intercept_prefix_matches_longer_args() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "matched\n".to_string(),
             },
@@ -1506,6 +1525,7 @@ mod tests {
     async fn test_no_intercept_match_falls_through() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string(), "github".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "secret\n".to_string(),
             },
@@ -1536,10 +1556,93 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
     }
 
+    /// `args_must_include` makes a rule fire only when the named flag is
+    /// somewhere in the args, regardless of position. Models the
+    /// `kubectl config view --raw` use case from issue DataDog/shadowfax#47.
+    #[tokio::test]
+    async fn test_intercept_args_must_include_matches_when_flag_present() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["config".to_string(), "view".to_string()],
+            args_must_include: vec!["--raw".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "captured\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+
+        // --raw appearing AFTER another flag still triggers the rule.
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "config".to_string(),
+                "view".to_string(),
+                "--minify".to_string(),
+                "--raw".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, _action_type) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "captured\n");
+    }
+
+    /// Same rule as above but the required flag is absent — the rule must
+    /// not fire, and the request falls through to the real binary.
+    #[tokio::test]
+    async fn test_intercept_args_must_include_no_match_when_flag_absent() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            args_prefix: vec!["config".to_string(), "view".to_string()],
+            args_must_include: vec!["--raw".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "captured\n".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["config".to_string(), "view".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        // Falls through to passthrough exec of /usr/bin/true (real_path from make_cmd).
+        let (resp, _action_type) = apply_capture(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+        assert_eq!(resp.exit_code, 0);
+        assert_ne!(resp.stdout, "captured\n");
+    }
+
     #[tokio::test]
     async fn test_admin_rule_allow_proceeds() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
@@ -1574,6 +1677,7 @@ mod tests {
     async fn test_admin_rule_deny_blocks() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["repo".to_string(), "delete".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "deleted\n".to_string(),
             },
@@ -1609,6 +1713,7 @@ mod tests {
         // admin=false rule with AlwaysDeny gate — gate must NOT be called, action executes.
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["status".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "ok\n".to_string(),
             },
@@ -1716,12 +1821,91 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_args_contain_all_basic() {
+        // Empty required → always matches.
+        assert!(args_contain_all(&[], &["anything".to_string()]));
+        assert!(args_contain_all(&[], &[]));
+        // Single required flag present.
+        assert!(args_contain_all(
+            &["--raw".to_string()],
+            &[
+                "config".to_string(),
+                "view".to_string(),
+                "--raw".to_string(),
+            ]
+        ));
+        // Single required flag absent.
+        assert!(!args_contain_all(
+            &["--raw".to_string()],
+            &["config".to_string(), "view".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_args_contain_all_position_independent() {
+        let req = vec!["--raw".to_string()];
+        // Flag at the end after another flag.
+        assert!(args_contain_all(
+            &req,
+            &[
+                "config".to_string(),
+                "view".to_string(),
+                "--minify".to_string(),
+                "--raw".to_string(),
+            ]
+        ));
+        // Flag at the start.
+        assert!(args_contain_all(
+            &req,
+            &[
+                "--raw".to_string(),
+                "config".to_string(),
+                "view".to_string(),
+            ]
+        ));
+        // Flag in the middle.
+        assert!(args_contain_all(
+            &req,
+            &[
+                "config".to_string(),
+                "--raw".to_string(),
+                "view".to_string(),
+            ]
+        ));
+    }
+
+    #[test]
+    fn test_args_contain_all_requires_all() {
+        // Both flags required and present.
+        let req = vec!["--raw".to_string(), "--minify".to_string()];
+        assert!(args_contain_all(
+            &req,
+            &[
+                "config".to_string(),
+                "view".to_string(),
+                "--raw".to_string(),
+                "--minify".to_string(),
+            ]
+        ));
+        // One flag missing → no match.
+        assert!(!args_contain_all(
+            &req,
+            &[
+                "config".to_string(),
+                "view".to_string(),
+                "--raw".to_string(),
+            ]
+        ));
+    }
+
     // --- Capture tests ---
 
     #[tokio::test]
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Capture { script: None },
             exit_code: 0,
             admin: false,
@@ -1769,6 +1953,7 @@ mod tests {
     async fn test_capture_script_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
             },
@@ -2206,6 +2391,7 @@ mod tests {
             real_path: PathBuf::from("/usr/bin/env"),
             intercepts: vec![ResolvedIntercept {
                 args_prefix: vec![],
+                args_must_include: Vec::new(),
                 action: ResolvedAction::Approve { script: None },
                 exit_code: 0,
                 admin: false,
@@ -2524,6 +2710,7 @@ mod tests {
 
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
+            args_must_include: Vec::new(),
             action: ResolvedAction::Respond {
                 stdout: "buffered_response\n".to_string(),
             },

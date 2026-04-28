@@ -83,6 +83,19 @@ pub struct OAuth2Route {
     pub upstream: String,
 }
 
+/// An exec-credential route entry: TTL cache + upstream URL.
+#[derive(Debug)]
+pub struct ExecRoute {
+    /// TTL cache for the credential issued by the configured command.
+    pub cache: crate::exec::ExecTokenCache,
+    /// Upstream URL (e.g., "https://ai-gateway.us1.ddbuild.io").
+    pub upstream: String,
+    /// HTTP header to inject the credential into (e.g. "Authorization").
+    pub header_name: String,
+    /// Format string applied to the credential value (e.g. "Bearer {}").
+    pub credential_format: String,
+}
+
 /// Credential store for all configured routes.
 #[derive(Debug)]
 pub struct CredentialStore {
@@ -90,6 +103,8 @@ pub struct CredentialStore {
     credentials: HashMap<String, LoadedCredential>,
     /// Map from route prefix to OAuth2 route (token cache + upstream)
     oauth2_routes: HashMap<String, OAuth2Route>,
+    /// Map from route prefix to exec route (TTL cache + upstream)
+    exec_routes: HashMap<String, ExecRoute>,
 }
 
 impl CredentialStore {
@@ -110,6 +125,7 @@ impl CredentialStore {
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
+        let mut exec_routes = HashMap::new();
 
         for route in routes {
             // Normalize prefix: strip leading/trailing slashes so it matches
@@ -262,12 +278,54 @@ impl CredentialStore {
                         continue;
                     }
                 }
+                continue;
+            }
+
+            // Exec credential path
+            if let Some(ref exec_cfg) = route.exec {
+                debug!(
+                    "Loading exec credential for route prefix: {}",
+                    normalized_prefix
+                );
+
+                let resolved = match crate::exec::ExecResolvedConfig::from_config(exec_cfg) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            "Exec credential config invalid for route '{}': {}, skipping",
+                            normalized_prefix, e
+                        );
+                        continue;
+                    }
+                };
+
+                match crate::exec::ExecTokenCache::new(resolved) {
+                    Ok(cache) => {
+                        exec_routes.insert(
+                            normalized_prefix.clone(),
+                            ExecRoute {
+                                cache,
+                                upstream: route.upstream.clone(),
+                                header_name: route.inject_header.clone(),
+                                credential_format: route.credential_format.clone(),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Exec credential initial fetch failed for route '{}': {}, skipping",
+                            normalized_prefix, e
+                        );
+                        continue;
+                    }
+                }
             }
         }
 
         Ok(Self {
             credentials,
             oauth2_routes,
+            exec_routes,
         })
     }
 
@@ -277,6 +335,7 @@ impl CredentialStore {
         Self {
             credentials: HashMap::new(),
             oauth2_routes: HashMap::new(),
+            exec_routes: HashMap::new(),
         }
     }
 
@@ -292,27 +351,36 @@ impl CredentialStore {
         self.oauth2_routes.get(prefix)
     }
 
-    /// Check if any credentials (static or OAuth2) are loaded.
+    /// Check if any credentials (static, OAuth2, or exec) are loaded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.credentials.is_empty() && self.oauth2_routes.is_empty()
+        self.credentials.is_empty()
+            && self.oauth2_routes.is_empty()
+            && self.exec_routes.is_empty()
     }
 
-    /// Number of loaded credentials (static + OAuth2).
+    /// Number of loaded credentials (static + OAuth2 + exec).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.credentials.len() + self.oauth2_routes.len()
+        self.credentials.len() + self.oauth2_routes.len() + self.exec_routes.len()
     }
 
     /// Returns the set of route prefixes that have loaded credentials
-    /// (both static keystore and OAuth2 routes).
+    /// across all credential source types.
     #[must_use]
     pub fn loaded_prefixes(&self) -> std::collections::HashSet<String> {
         self.credentials
             .keys()
             .chain(self.oauth2_routes.keys())
+            .chain(self.exec_routes.keys())
             .cloned()
             .collect()
+    }
+
+    /// Get an exec route (TTL cache + upstream) for a route prefix, if configured.
+    #[must_use]
+    pub fn get_exec(&self, prefix: &str) -> Option<&ExecRoute> {
+        self.exec_routes.get(prefix)
     }
 }
 
@@ -444,6 +512,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            exec: None,
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -478,6 +547,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            exec_routes: HashMap::new(),
         };
 
         assert!(
@@ -506,6 +576,7 @@ mod tests {
         let store = CredentialStore {
             credentials: HashMap::new(),
             oauth2_routes,
+            exec_routes: HashMap::new(),
         };
 
         let prefixes = store.loaded_prefixes();
@@ -546,6 +617,7 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            exec: None,
         }];
 
         let store = CredentialStore::load(&routes, &tls);

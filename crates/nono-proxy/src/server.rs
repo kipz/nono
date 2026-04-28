@@ -622,6 +622,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -667,6 +668,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -721,6 +723,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -781,6 +784,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    exec: None,
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -799,6 +803,7 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    exec: None,
                 },
             ],
             ..Default::default()
@@ -861,6 +866,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -895,6 +901,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -946,6 +953,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };
@@ -984,6 +992,7 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             }],
             ..Default::default()
         };

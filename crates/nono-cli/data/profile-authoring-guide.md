@@ -139,8 +139,10 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | Field               | Type            | Required    | Description |
 |---------------------|-----------------|-------------|-------------|
 | `upstream`          | string          | yes         | Upstream URL. Must be HTTPS (HTTP only for loopback). |
-| `credential_key`    | string          | yes         | Keystore account name, `op://` URI, `apple-password://` URI, or `file://` URI. |
-| `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. |
+| `credential_key`    | string          | one of      | Keystore account name, `op://` URI, `apple-password://` URI, or `file://` URI. Mutually exclusive with `auth` and `exec`. |
+| `auth`              | object          | one of      | OAuth2 `client_credentials` config (`token_url`, `client_id`, `client_secret`, optional `scope`). Proxy refreshes the token automatically. Mutually exclusive with `credential_key` and `exec`. |
+| `exec`              | object          | one of      | Exec-based credential source (see below). Proxy runs the configured command at startup and on TTL expiry, treats trimmed stdout as the credential. Mutually exclusive with `credential_key` and `auth`. |
+| `inject_mode`       | string          | no          | One of: `"header"` (default), `"url_path"`, `"query_param"`, `"basic_auth"`. Exec routes only support `"header"`. |
 | `inject_header`     | string          | header mode | HTTP header name. Default: `"Authorization"`. |
 | `credential_format` | string          | header mode | Format string with `{}` placeholder. Default: `"Bearer {}"`. |
 | `path_pattern`      | string          | url_path    | Pattern to match in URL path. Use `{}` for placeholder. |
@@ -154,6 +156,36 @@ Define a custom reverse proxy credential route for services not in `network-poli
 | `tls_client_key`    | string (path)   | no          | Path to the PEM-encoded private key matching `tls_client_cert`. |
 
 `proxy` overrides apply only to how the local proxy validates incoming phantom tokens from the sandboxed process. Outbound upstream credential injection continues to use top-level fields.
+
+#### Exec credential source
+
+Use `exec` when the upstream credential is produced by a short-lived issuance command (e.g. `ddtool auth token <audience>`, `gcloud auth print-access-token`) rather than a static keystore value. The proxy runs the command in the unsandboxed parent process, captures trimmed stdout, and re-runs the command on TTL expiry.
+
+```json
+{
+  "upstream": "https://ai-gateway.example.com",
+  "exec": {
+    "command": ["/opt/local/bin/issue-token", "--audience", "ai-gateway"],
+    "ttl_secs": 3600,
+    "timeout_secs": 30
+  },
+  "env_var": "ANTHROPIC_AUTH_TOKEN",
+  "inject_header": "Authorization",
+  "credential_format": "Bearer {}"
+}
+```
+
+| Field          | Type             | Required | Description |
+|----------------|------------------|----------|-------------|
+| `command`      | array of string  | yes      | Argv. `command[0]` must be an absolute path — PATH lookup is refused. argv elements may not contain CR/LF/NUL bytes. |
+| `ttl_secs`     | integer (>0)     | yes      | Cache lifetime. The proxy refreshes a small buffer before this expires. |
+| `timeout_secs` | integer (1..600) | no       | Per-invocation timeout. Defaults to 30. |
+
+Constraints:
+- `inject_mode` must be `"header"` (default). Other modes are not meaningful for opaque tokens.
+- `env_var` is required so the proxy can hand the agent a phantom session token under a known SDK API-key variable name (e.g., `ANTHROPIC_AUTH_TOKEN`).
+- The command runs with the parent process's environment; do not point at user-writable paths.
+- If the command fails on refresh, the proxy returns the stale value with a warning rather than failing the request — same graceful-degradation behaviour as OAuth2 routes.
 
 ### env_credentials (alias: secrets)
 

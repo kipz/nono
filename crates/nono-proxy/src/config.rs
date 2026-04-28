@@ -181,6 +181,13 @@ pub struct RouteConfig {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub oauth2: Option<OAuth2Config>,
+
+    /// Optional exec-based credential source.
+    /// When present, the proxy runs the configured command at startup and on
+    /// TTL expiry, captures its trimmed stdout, and injects the result as a
+    /// `Bearer` header. Mutually exclusive with `credential_key` and `oauth2`.
+    #[serde(default)]
+    pub exec: Option<ExecConfig>,
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -388,6 +395,39 @@ pub struct OAuth2Config {
     /// OAuth2 scopes (space-separated). Empty = no scope parameter sent.
     #[serde(default)]
     pub scope: String,
+}
+
+/// Exec-based credential source: run a command, treat its trimmed stdout as
+/// the credential, refresh on TTL expiry.
+///
+/// Designed for credentials that are produced by short-lived issuance commands
+/// (e.g., `ddtool auth token <audience>`, `gcloud auth print-access-token`)
+/// rather than static keystore values. The command runs in the unsandboxed
+/// parent process at proxy startup and on each refresh.
+///
+/// # Security
+///
+/// - `command[0]` must be an absolute path. PATH lookup is refused to prevent
+///   a sibling on PATH from shadowing the intended binary.
+/// - The command runs with the parent's environment. Callers should ensure
+///   the binary is trusted; configuration that points at user-writable paths
+///   is rejected by the profile validator.
+/// - stdout is trimmed (single trailing newline removed, Unix or Windows) and
+///   wrapped in `Zeroizing<String>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecConfig {
+    /// Argv for the credential-fetch command. `command[0]` must be an absolute
+    /// path; subsequent entries are arguments. At least one element is required.
+    pub command: Vec<String>,
+
+    /// Time-to-live for a fetched credential, in seconds. The proxy refreshes
+    /// the credential `EXPIRY_BUFFER_SECS` seconds before this expires.
+    pub ttl_secs: u64,
+
+    /// Maximum time to allow the command to run, in seconds.
+    /// Defaults to 30s if omitted.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[cfg(test)]

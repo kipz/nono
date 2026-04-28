@@ -132,6 +132,13 @@ pub struct CustomCredentialDef {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub auth: Option<OAuth2Config>,
+    /// Optional exec-based credential source.
+    /// When present, the proxy runs the configured command at startup and on
+    /// TTL expiry, treats trimmed stdout as the credential, and injects it
+    /// using the configured `inject_header` and `credential_format`.
+    /// Mutually exclusive with `credential_key` and `auth`.
+    #[serde(default)]
+    pub exec: Option<nono_proxy::config::ExecConfig>,
     /// Injection mode (default: "header")
     #[serde(default)]
     pub inject_mode: InjectMode,
@@ -308,19 +315,27 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
-    // Mutual exclusion: credential_key and auth cannot both be set
-    if cred.credential_key.is_some() && cred.auth.is_some() {
+    // Mutual exclusion: at most one of credential_key, auth, exec may be set.
+    let source_count = [
+        cred.credential_key.is_some(),
+        cred.auth.is_some(),
+        cred.exec.is_some(),
+    ]
+    .iter()
+    .filter(|&&v| v)
+    .count();
+    if source_count > 1 {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' has both 'credential_key' and 'auth' set; \
-             these are mutually exclusive — use one or the other",
+            "custom credential '{}' sets more than one of 'credential_key', 'auth', or 'exec'; \
+             these are mutually exclusive — use exactly one credential source",
             name
         )));
     }
 
-    // At least one of credential_key or auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() {
+    // At least one credential source must be set
+    if cred.credential_key.is_none() && cred.auth.is_none() && cred.exec.is_none() {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key' or 'auth' set",
+            "custom credential '{}' must have one of 'credential_key', 'auth', or 'exec' set",
             name
         )));
     }
@@ -328,6 +343,28 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate OAuth2 auth if present
     if let Some(ref auth) = cred.auth {
         validate_oauth2_auth(name, auth)?;
+    }
+
+    // Validate exec credential source if present.
+    if let Some(ref exec) = cred.exec {
+        validate_exec_credential(name, exec)?;
+        // Exec routes always inject as a header; URL/query-param injection
+        // is not meaningful for opaque tokens. Reject anything else early.
+        if !matches!(cred.inject_mode, InjectMode::Header) {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' uses exec source; only inject_mode 'header' is supported",
+                name
+            )));
+        }
+        // env_var is required so the proxy can inject the phantom session
+        // token under a known SDK API-key variable name. Without it the
+        // agent has no Authorization header to send.
+        if cred.env_var.is_none() {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{}' uses exec source; env_var is required (e.g. \"ANTHROPIC_AUTH_TOKEN\")",
+                name
+            )));
+        }
     }
 
     // Validate credential_key if present
@@ -539,6 +576,76 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
             "auth.client_secret for custom credential '{}' cannot be empty",
             name
         )));
+    }
+
+    Ok(())
+}
+
+/// Validate an exec-based credential source.
+///
+/// Mirrors `nono_proxy::exec::ExecResolvedConfig::from_config` plus a few
+/// stricter rules that only make sense at profile-author time:
+///
+/// - argv must be non-empty
+/// - argv[0] must be an absolute path (no PATH lookup)
+/// - argv may not contain CR/LF/NUL bytes
+/// - ttl_secs must be > 0
+/// - timeout_secs (if set) must be > 0 and <= 600 (10 min)
+fn validate_exec_credential(name: &str, exec: &nono_proxy::config::ExecConfig) -> Result<()> {
+    if exec.command.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "exec.command for custom credential '{}' must contain at least the binary path",
+            name
+        )));
+    }
+
+    let bin = &exec.command[0];
+    if bin.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "exec.command[0] for custom credential '{}' is empty",
+            name
+        )));
+    }
+    if !std::path::Path::new(bin).is_absolute() {
+        return Err(NonoError::ProfileParse(format!(
+            "exec.command[0] for custom credential '{}' must be an absolute path \
+             (PATH lookup is refused so a sibling on PATH can't shadow the binary), got: {}",
+            name, bin
+        )));
+    }
+
+    // Reject control characters in any argv element. CR/LF cannot appear in
+    // a shell-free argv-style invocation; if a profile contains them it's
+    // either a typo or a content-smuggling attempt.
+    for (i, arg) in exec.command.iter().enumerate() {
+        if arg.contains('\r') || arg.contains('\n') || arg.contains('\0') {
+            return Err(NonoError::ProfileParse(format!(
+                "exec.command[{}] for custom credential '{}' contains a control character (CR/LF/NUL)",
+                i, name
+            )));
+        }
+    }
+
+    if exec.ttl_secs == 0 {
+        return Err(NonoError::ProfileParse(format!(
+            "exec.ttl_secs for custom credential '{}' must be greater than zero",
+            name
+        )));
+    }
+
+    if let Some(timeout) = exec.timeout_secs {
+        if timeout == 0 {
+            return Err(NonoError::ProfileParse(format!(
+                "exec.timeout_secs for custom credential '{}' must be greater than zero",
+                name
+            )));
+        }
+        if timeout > 600 {
+            return Err(NonoError::ProfileParse(format!(
+                "exec.timeout_secs for custom credential '{}' must be <= 600 (10 minutes), got {}",
+                name, timeout
+            )));
+        }
     }
 
     Ok(())
@@ -2943,7 +3050,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        }
+            exec: None,        }
     }
 
     #[test]
@@ -3107,7 +3214,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
 
@@ -3129,7 +3236,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
         assert!(err.to_string().contains("path_pattern is required"));
@@ -3153,7 +3260,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
         assert!(err.to_string().contains("{}"));
@@ -3177,7 +3284,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
 
@@ -3199,7 +3306,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
         assert!(err.to_string().contains("{}"));
@@ -3223,7 +3330,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
 
@@ -3245,7 +3352,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
         assert!(err.to_string().contains("query_param_name is required"));
@@ -3269,7 +3376,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
         assert!(err.to_string().contains("cannot be empty"));
@@ -3293,7 +3400,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
         assert!(validate_custom_credential("example", &cred).is_ok());
@@ -3453,7 +3560,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        }
+            exec: None,        }
     }
 
     #[test]
@@ -3476,9 +3583,15 @@ mod tests {
         let mut cred = oauth2_cred_builder();
         cred.credential_key = None;
         cred.auth = None;
+        cred.exec = None;
         let result = validate_custom_credential("test", &cred);
-        let err = result.expect_err("neither auth nor credential_key should be rejected");
-        assert!(err.to_string().contains("must have either"));
+        let err = result
+            .expect_err("no credential source (credential_key, auth, or exec) should be rejected");
+        assert!(
+            err.to_string().contains("must have one of"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]
@@ -3606,6 +3719,225 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"));
+    }
+
+    // ========================================================================
+    // Exec credential source — validation
+    // ========================================================================
+
+    /// Helper: a minimal CustomCredentialDef wired up for an exec source. The
+    /// returned value should pass `validate_custom_credential` when given a
+    /// real absolute binary path; tests can mutate fields to force failure.
+    fn exec_cred_builder() -> CustomCredentialDef {
+        CustomCredentialDef {
+            upstream: "https://ai-gateway.example.com".to_string(),
+            credential_key: None,
+            auth: None,
+            exec: Some(nono_proxy::config::ExecConfig {
+                command: vec!["/usr/bin/true".to_string()],
+                ttl_secs: 3600,
+                timeout_secs: Some(30),
+            }),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: "Bearer {}".to_string(),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: Some("ANTHROPIC_AUTH_TOKEN".to_string()),
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_exec_valid() {
+        let cred = exec_cred_builder();
+        validate_custom_credential("ai-gateway", &cred)
+            .expect("a well-formed exec credential should validate");
+    }
+
+    #[test]
+    fn test_validate_exec_and_credential_key_mutually_exclusive() {
+        let mut cred = exec_cred_builder();
+        cred.credential_key = Some("some_key".to_string());
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec + credential_key should be rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_and_auth_mutually_exclusive() {
+        let mut cred = exec_cred_builder();
+        cred.auth = Some(OAuth2Config {
+            token_url: "https://auth.example.com/oauth/token".to_string(),
+            client_id: "my-client".to_string(),
+            client_secret: "env://CLIENT_SECRET".to_string(),
+            scope: String::new(),
+        });
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec + auth should be rejected");
+        assert!(err.to_string().contains("mutually exclusive"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_requires_env_var() {
+        let mut cred = exec_cred_builder();
+        cred.env_var = None;
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec without env_var should be rejected");
+        assert!(err.to_string().contains("env_var"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_non_header_inject_mode() {
+        let mut cred = exec_cred_builder();
+        cred.inject_mode = InjectMode::QueryParam;
+        cred.query_param_name = Some("api_key".to_string());
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec + non-header inject_mode should be rejected");
+        assert!(
+            err.to_string().contains("inject_mode 'header'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_relative_path() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.command = vec!["ddtool".to_string(), "auth".to_string()];
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec with relative path should be rejected");
+        assert!(err.to_string().contains("absolute path"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_empty_command() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.command = vec![];
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec with empty argv should be rejected");
+        assert!(
+            err.to_string().contains("must contain at least"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_zero_ttl() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.ttl_secs = 0;
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec with ttl_secs=0 should be rejected");
+        assert!(err.to_string().contains("ttl_secs"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_zero_timeout() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.timeout_secs = Some(0);
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec with timeout_secs=0 should be rejected");
+        assert!(err.to_string().contains("timeout_secs"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_oversized_timeout() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.timeout_secs = Some(601);
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec with timeout_secs > 600 should be rejected");
+        assert!(err.to_string().contains("<= 600"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_validate_exec_rejects_control_chars_in_argv() {
+        let mut cred = exec_cred_builder();
+        if let Some(ref mut exec) = cred.exec {
+            exec.command =
+                vec!["/usr/bin/true".to_string(), "arg-with\nnewline".to_string()];
+        }
+        let err = validate_custom_credential("ai-gateway", &cred)
+            .expect_err("exec argv with CR/LF/NUL should be rejected");
+        assert!(
+            err.to_string().contains("control character"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_profile_with_exec_credential() {
+        let json = r#"{
+            "meta": { "name": "exec-test" },
+            "network": {
+                "custom_credentials": {
+                    "anthropic": {
+                        "upstream": "https://ai-gateway.example.com",
+                        "exec": {
+                            "command": ["/usr/bin/true", "auth", "token"],
+                            "ttl_secs": 3600
+                        },
+                        "env_var": "ANTHROPIC_AUTH_TOKEN"
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("exec-test.json");
+        std::fs::write(&path, json).expect("write profile");
+        let profile = load_profile_from_path(&path).expect("parse profile");
+        let cred = profile
+            .network
+            .custom_credentials
+            .get("anthropic")
+            .expect("anthropic route present");
+        let exec = cred.exec.as_ref().expect("exec field present");
+        assert_eq!(exec.command, vec!["/usr/bin/true", "auth", "token"]);
+        assert_eq!(exec.ttl_secs, 3600);
+        assert_eq!(cred.env_var.as_deref(), Some("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn test_parse_profile_with_exec_and_credential_key_rejected() {
+        let json = r#"{
+            "meta": { "name": "exec-conflict" },
+            "network": {
+                "custom_credentials": {
+                    "anthropic": {
+                        "upstream": "https://ai-gateway.example.com",
+                        "credential_key": "anthropic_key",
+                        "exec": {
+                            "command": ["/usr/bin/true"],
+                            "ttl_secs": 3600
+                        },
+                        "env_var": "ANTHROPIC_AUTH_TOKEN"
+                    }
+                }
+            }
+        }"#;
+        let dir = tempdir().expect("tmpdir");
+        let path = dir.path().join("exec-conflict.json");
+        std::fs::write(&path, json).expect("write profile");
+        let err = load_profile_from_path(&path)
+            .expect_err("conflict should be rejected")
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "got: {}", err);
     }
 
     #[test]
@@ -3874,7 +4206,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let mut child = child_profile();
@@ -3896,7 +4228,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let merged = merge_profiles(base, child);
@@ -4036,7 +4368,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let mut child = child_profile();
@@ -4058,7 +4390,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let merged = merge_profiles(base, child);
@@ -5267,7 +5599,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
             "file:// URI with env_var should be accepted"
@@ -5292,7 +5624,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
         assert!(
@@ -5320,7 +5652,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
         assert!(
@@ -5348,7 +5680,7 @@ mod tests {
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
-        };
+            exec: None,        };
         let result = validate_custom_credential("example", &cred);
         assert!(
             result.is_err(),

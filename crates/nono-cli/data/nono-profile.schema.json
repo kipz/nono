@@ -386,7 +386,7 @@
     },
     "CustomCredentialDef": {
       "type": "object",
-      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have either credential_key or auth (mutually exclusive).",
+      "description": "Custom credential route definition for the reverse proxy. Defines how to route requests and inject credentials for a service. Must have exactly one of credential_key, auth, or exec.",
       "additionalProperties": false,
       "required": ["upstream"],
       "properties": {
@@ -396,11 +396,15 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, or an apple-password:// URI. Mutually exclusive with auth."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, or an apple-password:// URI. Mutually exclusive with auth and exec."
         },
         "auth": {
           "$ref": "#/$defs/OAuth2Config",
-          "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key."
+          "description": "OAuth2 client_credentials configuration. When present, the proxy handles token exchange automatically. Mutually exclusive with credential_key and exec."
+        },
+        "exec": {
+          "$ref": "#/$defs/ExecConfig",
+          "description": "Exec-based credential source. The proxy runs the configured command at startup and on TTL expiry, treating its trimmed stdout as the credential. Header injection only; env_var is required. Mutually exclusive with credential_key and auth."
         },
         "inject_mode": {
           "$ref": "#/$defs/InjectMode",
@@ -576,6 +580,32 @@
           "type": "string",
           "description": "OAuth2 scopes (space-separated). Empty or omitted means no scope parameter is sent.",
           "default": ""
+        }
+      }
+    },
+    "ExecConfig": {
+      "type": "object",
+      "description": "Exec-based credential source. The proxy runs the configured command at startup, captures its trimmed stdout as the credential, caches the result for ttl_secs, and re-runs the command on expiry.",
+      "additionalProperties": false,
+      "required": ["command", "ttl_secs"],
+      "properties": {
+        "command": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "description": "Argv for the credential-fetch command. command[0] must be an absolute path (no PATH lookup). Subsequent entries are arguments. argv elements may not contain CR, LF, or NUL bytes."
+        },
+        "ttl_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Cache lifetime in seconds. The proxy refreshes the credential a small buffer before this expires."
+        },
+        "timeout_secs": {
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 600 },
+            { "type": "null" }
+          ],
+          "description": "Maximum time the credential-fetch command may run, in seconds. Defaults to 30 if omitted. Capped at 600 (10 minutes)."
         }
       }
     },

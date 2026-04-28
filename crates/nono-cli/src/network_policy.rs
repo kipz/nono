@@ -226,6 +226,7 @@ pub fn resolve_credentials(
             }
 
             let oauth2 = cred.auth.clone();
+            let exec = cred.exec.clone();
 
             routes.push(RouteConfig {
                 prefix: name.clone(),
@@ -256,6 +257,7 @@ pub fn resolve_credentials(
                     .map(|p| crate::profile::expand_str(p, workdir))
                     .transpose()?,
                 oauth2,
+                exec,
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -287,6 +289,7 @@ pub fn resolve_credentials(
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                exec: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -506,7 +509,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -548,7 +551,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -585,7 +588,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         // Request both custom and built-in
@@ -632,7 +635,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -715,7 +718,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -749,7 +752,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -783,7 +786,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -822,7 +825,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes = resolve_credentials(&policy, &["openai".to_string()], &custom, test_workdir())
@@ -873,6 +876,7 @@ mod tests {
                 tls_ca: Some("$HOME/.config/pki/ca.pem".to_string()),
                 tls_client_cert: Some("${NONO_TEST_PKI_DIR}/cert.pem".to_string()),
                 tls_client_key: Some("~/.config/pki/key.pem".to_string()),
+                exec: None,
             },
         );
 
@@ -992,7 +996,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let result = resolve_credentials(&policy, &["evil".to_string()], &custom, test_workdir());
@@ -1050,7 +1054,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =
@@ -1099,7 +1103,7 @@ mod tests {
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
-            },
+                exec: None,            },
         );
 
         let routes =

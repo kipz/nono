@@ -39,6 +39,9 @@ pub enum ProxyError {
     #[error("OAuth2 token exchange error: {0}")]
     OAuth2Exchange(String),
 
+    #[error("Exec credential fetch error: {0}")]
+    ExecFetch(String),
+
     #[error("Proxy shutdown")]
     Shutdown,
 

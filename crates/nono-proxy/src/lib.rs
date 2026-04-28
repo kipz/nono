@@ -22,6 +22,7 @@ pub mod config;
 pub mod connect;
 pub mod credential;
 pub mod error;
+pub mod exec;
 pub mod external;
 pub mod filter;
 pub mod oauth2;

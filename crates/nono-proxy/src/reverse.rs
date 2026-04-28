@@ -89,6 +89,7 @@ pub async fn handle_reverse_proxy(
         })?;
     let static_cred = ctx.credential_store.get(&service);
     let oauth2_route = ctx.credential_store.get_oauth2(&service);
+    let exec_route = ctx.credential_store.get_exec(&service);
 
     // L7 endpoint filtering runs for all reverse-proxy routes, whether or not
     // they inject a credential.
@@ -112,6 +113,22 @@ pub async fn handle_reverse_proxy(
     if let Some(oauth2_route) = oauth2_route {
         return handle_oauth2_credential(
             oauth2_route,
+            route,
+            &service,
+            &upstream_path,
+            &method,
+            &version,
+            stream,
+            remaining_header,
+            buffered_body,
+            ctx,
+        )
+        .await;
+    }
+
+    if let Some(exec_route) = exec_route {
+        return handle_exec_credential(
+            exec_route,
             route,
             &service,
             &upstream_path,
@@ -484,6 +501,408 @@ async fn handle_oauth2_credential(
     };
 
     audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, status_code);
+    Ok(())
+}
+
+/// Handle a reverse proxy request using an exec-fetched credential.
+///
+/// Mirrors [`handle_oauth2_credential`] in shape: validate the agent's
+/// phantom token, refresh-or-cache the upstream credential via the configured
+/// command, then inject it into the upstream request as a header. Only header
+/// injection is supported for exec routes today.
+///
+/// ## 401 recovery
+///
+/// If the upstream rejects the cached credential with `401`, we force-refresh
+/// the cache (re-running the configured command) and retry the request once.
+/// This covers the case where the issuer rotated or revoked a credential
+/// before our cached TTL would have expired it. The retry only fires on
+/// `401`, only fires once, and is recorded as a separate audit entry so a
+/// misbehaving issuer surfaces in the audit trail rather than masking as
+/// gateway flakiness.
+#[allow(clippy::too_many_arguments)]
+async fn handle_exec_credential(
+    exec_route: &crate::credential::ExecRoute,
+    route: &crate::route::LoadedRoute,
+    service: &str,
+    upstream_path: &str,
+    method: &str,
+    version: &str,
+    stream: &mut TcpStream,
+    remaining_header: &[u8],
+    buffered_body: &[u8],
+    ctx: &ReverseProxyCtx<'_>,
+) -> Result<()> {
+    // Phantom-token authentication. Even though there is no client-side
+    // credential, we still require the agent to present the proxy session
+    // token in the Authorization header — this is the localhost auth
+    // boundary preventing other local processes from using the proxy.
+    if let Err(e) = validate_phantom_token(remaining_header, "Authorization", ctx.session_token) {
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &e.to_string(),
+        );
+        send_error(stream, 401, "Unauthorized").await?;
+        return Ok(());
+    }
+
+    let upstream_url = format!(
+        "{}{}",
+        exec_route.upstream.trim_end_matches('/'),
+        upstream_path
+    );
+    debug!("Exec forwarding to upstream: {} {}", method, upstream_url);
+
+    let (upstream_scheme, upstream_host, upstream_port, upstream_path_full) =
+        parse_upstream_url(&upstream_url)?;
+    let check = ctx.filter.check_host(&upstream_host, upstream_port).await?;
+    if !check.result.is_allowed() {
+        let reason = check.result.reason();
+        warn!("Upstream host denied by filter: {}", reason);
+        send_error(stream, 403, "Forbidden").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+    if let Err(reason) =
+        validate_http_upstream_target(upstream_scheme, &upstream_host, &check.resolved_addrs)
+    {
+        warn!("{}", reason);
+        send_error(stream, 502, "Bad Gateway").await?;
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::Reverse,
+            service,
+            0,
+            &reason,
+        );
+        return Ok(());
+    }
+
+    // Strip the client's phantom-bearing Authorization so we don't forward
+    // both the session token and the real credential.
+    let filtered_headers = filter_headers(remaining_header, &exec_route.header_name);
+    let content_length = extract_content_length(remaining_header);
+
+    let body = match read_request_body(stream, content_length, buffered_body).await? {
+        Some(body) => body,
+        None => return Ok(()),
+    };
+
+    let upstream_authority = format_host_header(upstream_scheme, &upstream_host, upstream_port);
+
+    // First attempt: use whatever the cache hands back (either still-fresh
+    // or refreshed because we crossed the TTL buffer).
+    let credential = exec_route.cache.get_or_refresh().await;
+    let request = build_exec_request(
+        &credential,
+        &exec_route.header_name,
+        &exec_route.credential_format,
+        method,
+        &upstream_path_full,
+        version,
+        &upstream_authority,
+        &filtered_headers,
+        &body,
+    );
+
+    let attempt_outcome = run_exec_attempt(
+        upstream_scheme,
+        &upstream_host,
+        upstream_port,
+        &check.resolved_addrs,
+        route,
+        ctx.tls_connector,
+        &request,
+        &body,
+    )
+    .await;
+
+    let mut attempt = match attempt_outcome {
+        Ok(a) => a,
+        Err(e) => {
+            warn!("Upstream connection failed: {}", e);
+            send_error(stream, 502, "Bad Gateway").await?;
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::Reverse,
+                service,
+                0,
+                &e.to_string(),
+            );
+            return Ok(());
+        }
+    };
+
+    let initial_status = attempt.status();
+    let mut final_status = initial_status;
+
+    if initial_status == 401 {
+        // Treat upstream 401 as a signal that the cached credential is no
+        // good — drain the failed response, force-refresh, retry once.
+        warn!(
+            "Upstream returned 401 for service '{}'; force-refreshing exec credential and retrying once",
+            service
+        );
+        audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, initial_status);
+        attempt.drain().await;
+        drop(attempt);
+
+        let new_credential = exec_route.cache.force_refresh().await;
+        let retry_request = build_exec_request(
+            &new_credential,
+            &exec_route.header_name,
+            &exec_route.credential_format,
+            method,
+            &upstream_path_full,
+            version,
+            &upstream_authority,
+            &filtered_headers,
+            &body,
+        );
+
+        match run_exec_attempt(
+            upstream_scheme,
+            &upstream_host,
+            upstream_port,
+            &check.resolved_addrs,
+            route,
+            ctx.tls_connector,
+            &retry_request,
+            &body,
+        )
+        .await
+        {
+            Ok(retry_attempt) => {
+                final_status = retry_attempt.status();
+                retry_attempt.forward_to_client(stream).await?;
+            }
+            Err(e) => {
+                warn!("Upstream retry connection failed: {}", e);
+                send_error(stream, 502, "Bad Gateway").await?;
+                audit::log_denied(
+                    ctx.audit_log,
+                    audit::ProxyMode::Reverse,
+                    service,
+                    0,
+                    &e.to_string(),
+                );
+                return Ok(());
+            }
+        }
+    } else {
+        attempt.forward_to_client(stream).await?;
+    }
+
+    audit::log_reverse_proxy(ctx.audit_log, service, method, upstream_path, final_status);
+    Ok(())
+}
+
+/// Build a fully-formed HTTP request line + headers for an exec-credential
+/// route, with the configured `inject_header` set to `credential_format`
+/// applied to `credential`.
+#[allow(clippy::too_many_arguments)]
+fn build_exec_request(
+    credential: &str,
+    header_name: &str,
+    credential_format: &str,
+    method: &str,
+    upstream_path_full: &str,
+    version: &str,
+    upstream_authority: &str,
+    filtered_headers: &[(String, String)],
+    body: &[u8],
+) -> Zeroizing<String> {
+    let mut request = Zeroizing::new(format!(
+        "{} {} {}\r\nHost: {}\r\n",
+        method, upstream_path_full, version, upstream_authority
+    ));
+
+    // Apply the configured format ("Bearer {}" by default) once. Wrapping in
+    // Zeroizing keeps the formatted header off the heap after this fn drops.
+    let header_value = Zeroizing::new(credential_format.replace("{}", credential));
+    request.push_str(&format!("{}: {}\r\n", header_name, header_value.as_str()));
+
+    // Strip any client-side header that would collide with the injected one
+    // (case-insensitive, RFC 7230) so we never forward two of them.
+    let auth_header_lower = header_name.to_lowercase();
+    for (name, value) in filtered_headers {
+        if name.to_lowercase() == auth_header_lower {
+            continue;
+        }
+        request.push_str(&format!("{}: {}\r\n", name, value));
+    }
+
+    request.push_str("Connection: close\r\n");
+    if !body.is_empty() {
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    request.push_str("\r\n");
+    request
+}
+
+/// Connection + first response chunk + status, captured so the caller can
+/// decide whether to forward the response or discard it (e.g. on 401-retry).
+///
+/// The TLS variant is boxed because `TlsStream` is significantly larger than
+/// a plain `TcpStream`; without the indirection clippy flags the enum as
+/// having a 1+ KiB size difference between variants.
+enum ExecAttempt {
+    Tls {
+        stream: Box<tokio_rustls::client::TlsStream<TcpStream>>,
+        first_chunk: Vec<u8>,
+        status: u16,
+    },
+    Tcp {
+        stream: TcpStream,
+        first_chunk: Vec<u8>,
+        status: u16,
+    },
+}
+
+impl ExecAttempt {
+    fn status(&self) -> u16 {
+        match self {
+            Self::Tls { status, .. } | Self::Tcp { status, .. } => *status,
+        }
+    }
+
+    /// Read until EOF on the upstream and discard everything. Used after a
+    /// failed attempt that we plan to retry — we don't want to forward the
+    /// 401 body to the client, but we do want the upstream to see a clean
+    /// close before we open a fresh connection.
+    async fn drain(&mut self) {
+        let mut buf = [0u8; 8192];
+        match self {
+            Self::Tls { stream, .. } => loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            },
+            Self::Tcp { stream, .. } => loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            },
+        }
+    }
+
+    /// Forward the captured first chunk + everything that follows to the
+    /// client until the upstream closes.
+    async fn forward_to_client(self, client: &mut TcpStream) -> Result<()> {
+        match self {
+            Self::Tls {
+                mut stream,
+                first_chunk,
+                ..
+            } => forward_remaining(&mut stream, client, &first_chunk).await,
+            Self::Tcp {
+                mut stream,
+                first_chunk,
+                ..
+            } => forward_remaining(&mut stream, client, &first_chunk).await,
+        }
+    }
+}
+
+/// One end-to-end attempt: connect, write, read first response chunk, parse
+/// status. Caller inspects the status and decides whether to forward or to
+/// drain + retry.
+#[allow(clippy::too_many_arguments)]
+async fn run_exec_attempt(
+    upstream_scheme: UpstreamScheme,
+    upstream_host: &str,
+    upstream_port: u16,
+    resolved_addrs: &[SocketAddr],
+    route: &crate::route::LoadedRoute,
+    fallback_tls: &TlsConnector,
+    request: &str,
+    body: &[u8],
+) -> Result<ExecAttempt> {
+    match upstream_scheme {
+        UpstreamScheme::Https => {
+            let connector = route.tls_connector.as_ref().unwrap_or(fallback_tls);
+            let mut stream =
+                connect_upstream_tls(upstream_host, upstream_port, resolved_addrs, connector)
+                    .await?;
+            write_upstream_request(&mut stream, request, body).await?;
+            let (first_chunk, status) = peek_response_status(&mut stream).await;
+            Ok(ExecAttempt::Tls {
+                stream: Box::new(stream),
+                first_chunk,
+                status,
+            })
+        }
+        UpstreamScheme::Http => {
+            let mut stream =
+                connect_upstream_tcp(upstream_host, upstream_port, resolved_addrs).await?;
+            write_upstream_request(&mut stream, request, body).await?;
+            let (first_chunk, status) = peek_response_status(&mut stream).await;
+            Ok(ExecAttempt::Tcp {
+                stream,
+                first_chunk,
+                status,
+            })
+        }
+    }
+}
+
+/// Read up to one buffer's worth of upstream response, parse the status line,
+/// return both. Status defaults to 502 if the upstream sent garbage or
+/// zero-length bytes.
+async fn peek_response_status<S>(upstream: &mut S) -> (Vec<u8>, u16)
+where
+    S: AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    match upstream.read(&mut buf).await {
+        Ok(0) => (Vec::new(), 502),
+        Ok(n) => {
+            let status = parse_response_status(&buf[..n]);
+            (buf[..n].to_vec(), status)
+        }
+        Err(e) => {
+            debug!("Upstream read error while peeking status: {}", e);
+            (Vec::new(), 502)
+        }
+    }
+}
+
+/// Forward an already-read first chunk plus everything that follows from the
+/// upstream to the client.
+async fn forward_remaining<R, W>(upstream: &mut R, client: &mut W, initial: &[u8]) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if !initial.is_empty() {
+        client.write_all(initial).await?;
+        client.flush().await?;
+    }
+
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match upstream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                debug!("Upstream read error: {}", e);
+                break;
+            }
+        };
+        client.write_all(&buf[..n]).await?;
+        client.flush().await?;
+    }
     Ok(())
 }
 

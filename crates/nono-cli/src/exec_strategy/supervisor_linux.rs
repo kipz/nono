@@ -99,6 +99,19 @@ fn read_tgid(tid: u32) -> u32 {
         .unwrap_or(tid)
 }
 
+/// Read the `Threads:` field from /proc/<tgid>/status. Returns `None`
+/// if the file is missing or unparseable; callers must fail closed on
+/// `None`.
+fn count_threads(tgid: u32) -> Option<u32> {
+    std::fs::read_to_string(format!("/proc/{}/status", tgid))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("Threads:\t"))
+                .and_then(|l| l["Threads:\t".len()..].trim().parse::<u32>().ok())
+        })
+}
+
 /// Handle a seccomp notification on Linux.
 ///
 /// Flow:
@@ -765,14 +778,14 @@ fn classify_exec_path(
 /// (typically `ENOENT`). Synthesizing `EACCES` here would corrupt
 /// PATH-walking shells.
 ///
-/// Beyond the basic three-way classification, the handler also walks
-/// shebang chains to catch interpreters that the kernel resolves
-/// internally without issuing a second `execve`, performs a double-read
-/// of the user-memory path before responding CONTINUE to mitigate
-/// TOCTOU races, and emits a `FilterAuditEvent` for `allow_unmediated`
-/// and `deny` decisions. Every Deny path — whether from the deny-set
-/// check, the shebang walker, or the TOCTOU double-read — falls through
-/// to the same emit and the same `respond_notif_errno(EACCES)` reply.
+/// Beyond the basic three-way classification, the handler refuses
+/// multi-threaded callers up front (TOCTOU mitigation), walks shebang
+/// chains to catch interpreters that the kernel resolves internally
+/// without issuing a second `execve`, and emits a `FilterAuditEvent`
+/// for `allow_unmediated` and `deny` decisions. Multi-threaded denies
+/// emit and respond inline; deny-set and shebang-chain denies fall
+/// through to the common emit and `respond_notif_errno(EACCES)` at
+/// the end of the handler.
 pub(super) fn handle_exec_notification(
     notify_fd: std::os::fd::RawFd,
     config: &SupervisorConfig<'_>,
@@ -823,17 +836,62 @@ pub(super) fn handle_exec_notification(
         }
     };
 
+    // Refuse execve from a process whose tgid has more than one live
+    // thread. seccomp-unotify pauses only the trapped thread; siblings
+    // race the kernel's post-CONTINUE re-read of args[0] from user
+    // memory and can swap the pathname after we classify it. With
+    // Threads == 1 the trapped thread is the only thread in the tgid
+    // and is paused in the kernel for the duration of this handler, so
+    // no user code can run to mutate the buffer. See
+    // docs/linux-exec-filter-plan.md for trade-offs and residuals.
+    let trapped_tid = notif.pid;
+    let trapped_tgid = read_tgid(trapped_tid);
+    match count_threads(trapped_tgid) {
+        Some(1) => {}
+        Some(n) => {
+            debug!(
+                "exec filter deny (multi_threaded_unsafe): tid={} tgid={} threads={}",
+                trapped_tid, trapped_tgid, n
+            );
+            if let Some(log_dir) = config.exec_audit_log_dir.as_deref() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let evt = crate::mediation::filter_audit::FilterAuditEvent::deny(
+                    "<multi_threaded>".to_string(),
+                    Vec::new(),
+                    ts,
+                    crate::mediation::filter_audit::reasons::MULTI_THREADED_UNSAFE,
+                    String::new(),
+                );
+                crate::mediation::filter_audit::append_filter_audit_event(log_dir, &evt);
+            }
+            let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+            return Ok(());
+        }
+        None => {
+            // status file unreadable — fail closed.
+            debug!(
+                "exec filter deny (multi_threaded_unsafe): status read failed for tgid={}",
+                trapped_tgid
+            );
+            let _ = respond_notif_errno(notify_fd, notif.id, libc::EACCES);
+            return Ok(());
+        }
+    }
+
     let mut decision: ExecDecision;
     let mut deny_reason: Option<&'static str> = None;
     let mut shebang_chain: Vec<std::path::PathBuf> = Vec::new();
     let canonical: std::path::PathBuf;
 
-    // Open /proc/<tid>/mem once and reuse it for every read in this
-    // handler (initial path read, TOCTOU re-read, argv read at audit
-    // time). Yama's ptrace_may_access check fires at open() time, not
-    // on each read(), so a single open() taken before the daemonize
-    // double-fork-and-reap sequence avoids an EACCES on later reads
-    // when the trapped task is reparented to init.
+    // Open /proc/<tid>/mem once and reuse it for the initial path read
+    // and for the argv read at audit time. Yama's ptrace_may_access
+    // check fires at open() time, not on each read(), so a single
+    // open() taken before the daemonize double-fork-and-reap sequence
+    // avoids an EACCES on later reads when the trapped task is
+    // reparented to init.
     let mut mem_file = std::fs::File::open(format!("/proc/{}/mem", notif.pid)).ok();
 
     {
@@ -932,51 +990,6 @@ pub(super) fn handle_exec_notification(
                     shebang_chain = chain;
                 }
                 ShebangResult::NotScript => {}
-            }
-        }
-
-        // TOCTOU double-read. seccomp-unotify re-reads path arguments
-        // from the child's memory after we respond CONTINUE, so a
-        // cooperating racing thread in the child could swap the
-        // pathname buffer between our initial read and the kernel's
-        // post-response re-read. Mitigate by re-reading and flipping to
-        // deny on mismatch. This does not close the race (the kernel
-        // still re-reads after our response), but it collapses the
-        // vulnerable window from 'classify + canonicalize + shebang' to
-        // 'single response round-trip', defeating naive spin-flip
-        // attackers. Applied only on allow decisions — a deny already
-        // fails the syscall, so no re-read happens kernel-side. Skipped
-        // for AT_EMPTY_PATH (which reads a stable fd link, not a
-        // user-memory pathname). AllowShim is excluded: the shim path
-        // is fixed and the kernel's re-read against it is benign.
-        if matches!(decision, ExecDecision::AllowUnmediated) {
-            let is_at_empty_path = notif.data.nr == SYS_EXECVEAT
-                && (flags & AT_EMPTY_PATH_BIT) != 0;
-            if !is_at_empty_path {
-                let second = mem_file
-                    .as_mut()
-                    .ok_or_else(|| "mem fd unavailable".to_string())
-                    .and_then(|f| read_path_at(f, path_arg_ptr).map_err(|e| e.to_string()));
-                match second {
-                    Ok(second_raw) => {
-                        let second_resolved = resolve_notif_path(notif.pid, dirfd, &second_raw)
-                            .unwrap_or(second_raw.clone());
-                        if second_resolved != raw {
-                            debug!(
-                                "exec filter deny (toctou_mismatch): first={} second={}",
-                                raw.display(),
-                                second_resolved.display()
-                            );
-                            decision = ExecDecision::Deny;
-                            deny_reason = Some(reasons::TOCTOU_MISMATCH);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("exec filter deny (toctou double-read failed): {}", e);
-                        decision = ExecDecision::Deny;
-                        deny_reason = Some(reasons::TOCTOU_MISMATCH);
-                    }
-                }
             }
         }
 

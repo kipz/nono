@@ -4,7 +4,7 @@
 //! `nono inspect`, and `nono prune`.
 
 use crate::cli::{AttachArgs, DetachArgs, InspectArgs, LogsArgs, PruneArgs, PsArgs, StopArgs};
-use crate::command_display::format_command_line;
+use crate::command_display::{format_command_line, truncate_command};
 use crate::session::{self, SessionAttachment, SessionRecord, SessionStatus};
 use colored::Colorize;
 use nono::{NonoError, Result};
@@ -399,16 +399,6 @@ pub fn run_prune(args: &PruneArgs) -> Result<()> {
     Ok(())
 }
 
-/// Truncate command display to max_len characters.
-fn truncate_command(command: &[String], max_len: usize) -> String {
-    let full = format_command_line(command);
-    if full.len() <= max_len {
-        full
-    } else {
-        format!("{}...", &full[..max_len.saturating_sub(3)])
-    }
-}
-
 fn read_event_log_lines(path: &Path, tail: Option<usize>) -> Result<Vec<String>> {
     let file = std::fs::File::open(path).map_err(|e| NonoError::ConfigRead {
         path: path.to_path_buf(),
@@ -500,23 +490,6 @@ fn follow_event_log(path: &Path, tail: Option<usize>, as_json: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_truncate_command_short() {
-        let cmd = vec!["echo".to_string(), "hello".to_string()];
-        assert_eq!(truncate_command(&cmd, 40), "echo hello");
-    }
-
-    #[test]
-    fn test_truncate_command_long() {
-        let cmd = vec![
-            "very-long-command".to_string(),
-            "with-many-arguments-that-exceed-the-limit".to_string(),
-        ];
-        let result = truncate_command(&cmd, 20);
-        assert!(result.len() <= 20);
-        assert!(result.ends_with("..."));
-    }
 
     #[test]
     fn test_format_uptime_seconds() {

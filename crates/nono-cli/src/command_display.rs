@@ -44,6 +44,35 @@ pub(crate) fn format_command_line(command: &[String]) -> String {
         .join(" ")
 }
 
+/// Render a command via [`format_command_line`] and truncate it to at most
+/// `max_len` characters, appending an ellipsis (`...`) when truncated.
+///
+/// Truncation operates on Unicode scalar values (`char`s), not bytes, so it
+/// will never split a multi-byte UTF-8 sequence — byte slicing the result
+/// of `format_command_line` is a panic hazard whenever a recorded command
+/// contains non-ASCII text. Grapheme-cluster width (e.g. emoji ZWJ
+/// sequences, combining marks) is out of scope; callers that render to a
+/// fixed-width terminal column should size `max_len` conservatively.
+///
+/// Edge case: when `max_len < 3` and truncation is needed, the result is
+/// just `"..."` (3 chars), which technically exceeds `max_len`. This
+/// preserves the prior behaviour and matches the only sensible thing to
+/// do — there is no shorter way to signal truncation. Callers should pass
+/// `max_len >= 3`.
+pub(crate) fn truncate_command(command: &[String], max_len: usize) -> String {
+    let full = format_command_line(command);
+    // Fast path: byte length is always >= char count, so when bytes fit, we
+    // know the char count fits too and no truncation (or char counting) is
+    // needed.
+    if full.len() <= max_len {
+        return full;
+    }
+    let keep = max_len.saturating_sub(3);
+    let mut truncated: String = full.chars().take(keep).collect();
+    truncated.push_str("...");
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +139,34 @@ mod tests {
         assert_ne!(rendered, naive);
         let reparsed = shlex::split(&rendered).expect("round-trips through shlex");
         assert_eq!(reparsed, vec!["echo", "foo bar", "baz"]);
+    }
+
+    #[test]
+    fn truncate_command_short_passes_through() {
+        let cmd = vec!["echo".to_string(), "hello".to_string()];
+        assert_eq!(truncate_command(&cmd, 40), "echo hello");
+    }
+
+    #[test]
+    fn truncate_command_handles_multibyte_utf8() {
+        // shlex single-quotes non-ASCII args, so the rendered line is
+        // `'éééééé'` — each `é` is 2 bytes in UTF-8. With `max_len = 5`,
+        // byte slicing at index `max_len - 3 = 2` lands inside the first
+        // `é` (between its two bytes, which is *not* a char boundary)
+        // and would panic under the previous implementation.
+        let cmd = vec!["éééééé".to_string()];
+        let result = truncate_command(&cmd, 5);
+        // Char-aware: keep `max_len - 3 = 2` chars (`'é`), append "...".
+        assert_eq!(result, "'é...");
+        assert!(result.chars().count() <= 5);
+    }
+
+    #[test]
+    fn truncate_command_max_len_smaller_than_ellipsis() {
+        // `max_len.saturating_sub(3)` underflows to 0 — we should still
+        // produce a non-panicking result.
+        let cmd = vec!["echo".to_string(), "hello world".to_string()];
+        let result = truncate_command(&cmd, 2);
+        assert_eq!(result, "...");
     }
 }

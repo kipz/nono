@@ -12,7 +12,7 @@ use crate::audit_session::{
 use crate::cli::{
     AuditArgs, AuditCleanupArgs, AuditCommands, AuditListArgs, AuditShowArgs, AuditVerifyArgs,
 };
-use crate::command_display::format_command_line;
+use crate::command_display::{format_command_line, truncate_command};
 use crate::theme;
 use colored::Colorize;
 use nono::undo::SnapshotManager;
@@ -732,15 +732,6 @@ fn shorten_home(path: &Path) -> String {
         }
     }
     s
-}
-
-fn truncate_command(cmd: &[String], max_len: usize) -> String {
-    let full = format_command_line(cmd);
-    if full.len() <= max_len {
-        full
-    } else {
-        format!("{}...", &full[..max_len.saturating_sub(3)])
-    }
 }
 
 fn change_symbol(ct: &nono::undo::ChangeType) -> colored::ColoredString {

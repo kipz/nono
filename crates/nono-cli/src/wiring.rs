@@ -25,7 +25,7 @@ use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
@@ -146,11 +146,15 @@ pub struct JsonLeaf {
     pub prior_value: Option<Value>,
 }
 
-/// Per-entry record for `JsonArrayAppend`. `prior` is the entry that
-/// was at this dedup key before we replaced it (None for newly added).
+/// Per-entry record for `JsonArrayAppend`. `installed` is the entry
+/// we placed (so reverse can verify the entry is still as we wrote it
+/// before touching it — user edits are preserved). `prior` is the
+/// entry that was at this dedup key before we replaced it (None for
+/// newly added).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AppendedEntry {
     pub key: String,
+    pub installed: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior: Option<Value>,
 }
@@ -197,15 +201,18 @@ pub struct WiringReport {
 /// conflicts (a real file where we'd symlink) are recorded and
 /// execution continues with the next directive.
 ///
-/// `pack_owned_files` is the set of absolute paths the lockfile says
-/// were written by **this same pack** in a previous install. WriteFile
-/// uses it to permit overwrites of files we already own (idempotent
-/// re-pull) while refusing to clobber pre-existing files written by
-/// the user or by a different pack. Pass an empty set on first install.
+/// `pack_owned_files` maps absolute paths the lockfile says were
+/// written by **this same pack** in a previous install to the SHA-256
+/// of what we wrote. WriteFile uses this to permit overwrites of
+/// files we own AND haven't been edited since (`current_hash ==
+/// recorded_hash`). It refuses if the path is owned by a different
+/// pack/the user (no entry) or owned by us but edited (hash
+/// mismatch). Caller (`run_pull`) typically empties this map by
+/// reversing prior records first — but the safety net is here.
 pub fn execute(
     directives: &[WiringDirective],
     ctx: &WiringContext,
-    pack_owned_files: &HashSet<PathBuf>,
+    pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<WiringReport> {
     let mut report = WiringReport::default();
     for directive in directives {
@@ -217,7 +224,7 @@ pub fn execute(
 fn execute_one(
     directive: &WiringDirective,
     ctx: &WiringContext,
-    pack_owned_files: &HashSet<PathBuf>,
+    pack_owned_files: &HashMap<PathBuf, String>,
     report: &mut WiringReport,
 ) -> Result<()> {
     match directive {
@@ -245,17 +252,41 @@ fn execute_one(
         WiringDirective::WriteFile { source, dest } => {
             let source_path = pack_relative(source, ctx)?;
             let dest_path = expand_to_path(dest, ctx)?;
-            // Hard-fail conflict policy (security review fix): if the
-            // dest exists and was not previously written by this same
-            // pack, refuse rather than overwrite. Backup-and-restore
-            // can be added later if conflict patterns warrant it.
-            if dest_path.exists() && !pack_owned_files.contains(&dest_path) {
-                return Err(NonoError::PackageInstall(format!(
-                    "write_file: refusing to overwrite '{}' — \
-                     file already exists and was not written by a \
-                     managed pack. Move/remove it manually then re-pull.",
-                    dest_path.display()
-                )));
+            // Conflict policy (security review fix). If the dest
+            // exists, decide based on ownership:
+            //   - Not in pack_owned_files → refuse (user/other pack
+            //     owns it; we never overwrite).
+            //   - In pack_owned_files but on-disk content has been
+            //     edited since we wrote it → refuse (user has made
+            //     changes and we mustn't clobber them).
+            //   - In pack_owned_files and content matches → overwrite
+            //     freely (true idempotent re-pull).
+            if dest_path.exists() {
+                let recorded_hash = pack_owned_files.get(&dest_path);
+                let current_hash = match fs::read(&dest_path) {
+                    Ok(b) => hash_bytes(&b),
+                    Err(e) => return Err(NonoError::Io(e)),
+                };
+                match recorded_hash {
+                    None => {
+                        return Err(NonoError::PackageInstall(format!(
+                            "write_file: refusing to overwrite '{}' — \
+                             file already exists and was not written by a \
+                             managed pack. Move/remove it manually then re-pull.",
+                            dest_path.display()
+                        )));
+                    }
+                    Some(prior) if prior != &current_hash => {
+                        return Err(NonoError::PackageInstall(format!(
+                            "write_file: refusing to overwrite '{}' — \
+                             file has been edited since the last install \
+                             (sha256 mismatch). Either revert your changes \
+                             then re-pull, or `nono remove` this pack first.",
+                            dest_path.display()
+                        )));
+                    }
+                    _ => {}
+                }
             }
             let outcome = copy_file_atomic(&source_path, &dest_path)?;
             if outcome.mutated {
@@ -823,6 +854,7 @@ fn append_json_entries(
         }
         applied.push(AppendedEntry {
             key: key_owned,
+            installed: entry.clone(),
             prior: prior_value,
         });
     }
@@ -1012,9 +1044,14 @@ fn restore_one_leaf(
 
 /// Reverse of `append_json_entries`: walk to the array and for each
 /// recorded entry, only act if the current entry at that key still
-/// matches the installed shape. If we replaced a prior entry,
-/// restore it; otherwise filter the entry out. Entries the user has
-/// since modified (or that no longer exist) are left alone.
+/// equals the installed shape (security review fix — a user edit
+/// post-install must be preserved). If equal:
+///
+///   - prior is Some → restore the prior entry (we replaced it).
+///   - prior is None → drop the entry (we added it).
+///
+/// If the current entry differs from installed (user edited it) or
+/// the key is no longer present, leave the array alone for that key.
 fn restore_json_array_entries(
     file: &Path,
     path: &str,
@@ -1029,25 +1066,24 @@ fn restore_json_array_entries(
         return Ok(());
     };
     let mut changed = false;
-    // Build a quick lookup: which keys had a prior value?
-    let priors: BTreeMap<&str, &Value> = entries
+    // Build a quick lookup keyed by dedup key: (installed, prior).
+    let by_key: BTreeMap<&str, (&Value, Option<&Value>)> = entries
         .iter()
-        .filter_map(|e| e.prior.as_ref().map(|p| (e.key.as_str(), p)))
+        .map(|e| (e.key.as_str(), (&e.installed, e.prior.as_ref())))
         .collect();
-    let known_keys: HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
     let mut new_array: Vec<Value> = Vec::with_capacity(array.len());
     for entry in array.drain(..) {
         let key = extract_string_at(&entry, key_field);
-        match key {
-            Some(k) if known_keys.contains(k) => {
-                // We placed this key. If a prior existed, restore it;
-                // otherwise drop the entry entirely.
-                if let Some(&prior) = priors.get(k) {
-                    new_array.push(prior.clone());
+        let action = key.and_then(|k| by_key.get(k).copied());
+        match action {
+            Some((installed, prior)) if &entry == installed => {
+                // We placed this and it hasn't been touched.
+                if let Some(p) = prior {
+                    new_array.push((*p).clone());
                 }
                 changed = true;
             }
-            _ => new_array.push(entry),
+            _ => new_array.push(entry), // user edit OR not ours
         }
     }
     *array = new_array;
@@ -1186,7 +1222,7 @@ mod tests {
     /// Test wrapper for `execute` with no pre-existing pack-owned
     /// files (the fresh-install case most tests want).
     fn exec(directives: &[WiringDirective], ctx: &WiringContext) -> Result<WiringReport> {
-        execute(directives, ctx, &HashSet::new())
+        execute(directives, ctx, &HashMap::new())
     }
 
     /// Test wrapper for `reverse` that asserts there were no
@@ -1457,11 +1493,16 @@ mod tests {
             assert!(r1.changed);
 
             // Re-pull simulation: caller passes the dest as
-            // already-owned by this same pack (collected from the
-            // lockfile). With that, identical content is a no-op;
-            // without it, the conflict guard would reject.
-            let mut owned = HashSet::new();
-            owned.insert(home.join("dest"));
+            // already-owned by this same pack with the prior hash.
+            // Identical content is a no-op; if the hash didn't match,
+            // the conflict guard would reject (covered by the
+            // `write_file_refuses_to_overwrite_edited_file` test).
+            let prior_sha = match &r1.records[0] {
+                WiringRecord::WriteFile { sha256, .. } => sha256.clone(),
+                other => panic!("expected WriteFile, got {other:?}"),
+            };
+            let mut owned: HashMap<PathBuf, String> = HashMap::new();
+            owned.insert(home.join("dest"), prior_sha);
             let r2 = execute(&directives, &ctx, &owned).expect("second");
             assert!(!r2.changed, "identical content is no-op");
 
@@ -1609,6 +1650,89 @@ mod tests {
             assert!(
                 failures[0].record_summary.contains("json_merge"),
                 "summary should identify the directive"
+            );
+        });
+    }
+
+    #[test]
+    fn write_file_refuses_to_overwrite_edited_file_on_repull() {
+        // Security review (round 2): re-pull must NOT clobber a file
+        // the user has edited since the previous install. The
+        // owned-files map carries the prior hash; mismatch refuses.
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack-v2").expect("seed v2");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+
+            // Simulate prior install having written "from-pack-v1".
+            fs::write(home.join("dest"), "from-pack-v1").expect("seed prior");
+            let prior_sha = hash_bytes(b"from-pack-v1");
+
+            // User edits the file post-install.
+            fs::write(home.join("dest"), "user edited").expect("user edit");
+
+            // Re-pull: caller passes prior hash. Mismatch must refuse.
+            let mut owned: HashMap<PathBuf, String> = HashMap::new();
+            owned.insert(home.join("dest"), prior_sha);
+            let err = execute(&directives, &ctx, &owned).expect_err("must refuse");
+            assert!(
+                err.to_string().contains("sha256 mismatch") || err.to_string().contains("edited"),
+                "error must mention edit/mismatch: {err}"
+            );
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("read"),
+                "user edited",
+                "user edit must be preserved",
+            );
+        });
+    }
+
+    #[test]
+    fn json_array_append_reverse_leaves_user_edit_alone() {
+        // Security review (round 2): if the user edits the entry
+        // after install, reverse must NOT delete it. AppendedEntry
+        // carries `installed`, and reverse only acts when current
+        // entry equals installed.
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("entries.json"),
+                r#"[{ "name": "nono", "value": "from-pack" }]"#,
+            )
+            .expect("write entries");
+
+            let target = home.join("hooks.json");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::JsonArrayAppend {
+                file: "$HOME/hooks.json".to_string(),
+                path: "hooks.PostToolUse".to_string(),
+                patch_entries: "entries.json".to_string(),
+                key_field: "name".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("install");
+
+            // User edits the entry post-install (e.g. customised
+            // a flag on the hook).
+            let mut doc: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            doc["hooks"]["PostToolUse"][0]["value"] = Value::String("user-customised".to_string());
+            fs::write(&target, serde_json::to_string_pretty(&doc).expect("ser"))
+                .expect("write user edit");
+
+            rev(&report.records);
+
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            // The entry stays — reverse refused to touch a user edit.
+            assert_eq!(
+                v["hooks"]["PostToolUse"][0]["value"], "user-customised",
+                "user-edited entry must be preserved",
             );
         });
     }

@@ -266,6 +266,21 @@ fn prepare_profile_with_options(
     workdir: &Path,
     options: PrepareProfileOptions,
 ) -> crate::Result<PreparedProfile> {
+    // Ensure the user-profile dir exists before the sandbox is built.
+    // It's a nono-managed location that profiles routinely reference
+    // in `filesystem.allow` (so a sandboxed agent can write extension
+    // profiles there following hook guidance), but Landlock can't
+    // mkdir a path that's only granted by name — the parent needs
+    // write permission. Pre-creating here means the leaf grant is
+    // sufficient. Best-effort: a permission error here just means the
+    // sandbox will deny writes the same as before.
+    if let Ok(config_dir) = profile::resolve_user_config_dir() {
+        let profiles_dir = config_dir.join("nono").join("profiles");
+        if !profiles_dir.exists() {
+            let _ = std::fs::create_dir_all(&profiles_dir);
+        }
+    }
+
     let loaded_profile = if let Some(ref profile_name) = args.profile {
         // The claude-code → registry-pack migration is wired into
         // `load_profile` itself so it fires from every call site (run,

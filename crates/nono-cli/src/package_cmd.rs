@@ -50,10 +50,39 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         args.force,
     )?;
 
-    // Files this same pack wrote on a previous install. Passed to
-    // the wiring interpreter so re-pull can overwrite its own files
-    // (idempotent re-pull) while still refusing to clobber user- or
-    // other-pack-owned paths.
+    // Re-pull semantics (security review fix): if this pack is
+    // already installed, reverse its prior wiring records first so
+    // the new install captures `prior_value` against the user's true
+    // pre-install state — not against a previous pack-written value.
+    // This also handles the case where the new manifest dropped
+    // directives the old one had: their reversal happens here, since
+    // the new install won't touch them.
+    //
+    // If reversal fails for any record, abort the re-pull (do not
+    // proceed to apply the new directives). The lockfile entry stays
+    // intact so the user can investigate.
+    if let Some(prior_pkg) = lockfile.packages.get(&package_ref.key()) {
+        if !prior_pkg.wiring_record.is_empty() {
+            let failures = crate::wiring::reverse(&prior_pkg.wiring_record);
+            if !failures.is_empty() {
+                for f in &failures {
+                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
+                }
+                return Err(NonoError::PackageInstall(format!(
+                    "re-pull of {} aborted — {} prior wiring directive(s) failed to reverse. \
+                     Resolve the failures above (or `nono remove --force` first) before retrying.",
+                    package_ref.key(),
+                    failures.len()
+                )));
+            }
+        }
+    }
+
+    // Files this same pack wrote on a previous install — empty after
+    // the reverse above succeeded (we tore down everything). Kept
+    // around as a safety net: if reverse left anything behind, the
+    // wiring interpreter can still verify it owns + matches before
+    // overwriting.
     let pack_owned_files = pack_owned_write_file_paths(&lockfile, &package_ref);
     let install = install_package(
         &package_ref,
@@ -159,20 +188,22 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Collect the absolute paths of `WriteFile` destinations recorded
-/// against this exact pack in the lockfile. The wiring interpreter
-/// uses this to allow idempotent re-pulls (overwrite our own files)
-/// while still refusing to clobber pre-existing files written by the
-/// user or by a different pack.
+/// Collect the absolute paths and prior SHA-256 of `WriteFile`
+/// destinations recorded against this exact pack in the lockfile.
+/// The wiring interpreter uses both pieces to allow idempotent
+/// re-pulls — only when the on-disk content still matches the
+/// recorded hash (i.e. the user hasn't edited the file since we
+/// wrote it). A user edit OR a path not in this map causes the
+/// re-pull to refuse rather than silently clobber.
 fn pack_owned_write_file_paths(
     lockfile: &package::Lockfile,
     package_ref: &PackageRef,
-) -> HashSet<PathBuf> {
-    let mut owned = HashSet::new();
+) -> HashMap<PathBuf, String> {
+    let mut owned = HashMap::new();
     if let Some(pkg) = lockfile.packages.get(&package_ref.key()) {
         for record in &pkg.wiring_record {
-            if let crate::wiring::WiringRecord::WriteFile { dest, .. } = record {
-                owned.insert(PathBuf::from(dest));
+            if let crate::wiring::WiringRecord::WriteFile { dest, sha256 } = record {
+                owned.insert(PathBuf::from(dest), sha256.clone());
             }
         }
     }
@@ -448,7 +479,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
-    pack_owned_files: &HashSet<PathBuf>,
+    pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
         .join(".staging")

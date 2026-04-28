@@ -9,15 +9,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Bumped to 3 with the security-review-driven changes to wiring
-/// records: WriteFile now stores SHA-256, JsonMerge stores per-leaf
-/// (path, prior_value), JsonArrayAppend stores per-entry prior value.
-/// Together these prevent uninstall from deleting user-modified or
-/// user-pre-existing config. Bumped to 2 in the prior release with
-/// the move from agent-specific wiring code to declarative directives.
-/// No back-compat — reading an older lockfile fails the parse, the
-/// user re-pulls.
-pub const LOCKFILE_VERSION: u32 = 3;
+/// Bumped to 4 with the second-pass security-review changes:
+/// WriteFile re-pulls now verify the on-disk hash before overwriting
+/// (no clobber of user edits); re-pulls reverse the prior wiring
+/// record set before applying the new one (so prior_value always
+/// tracks the user's original, not a previous pack-written value);
+/// JsonArrayAppend records the installed entry so reverse can leave
+/// user-edited entries alone. Bumped to 3 with the first-pass review
+/// (schema for prior values + parent tracking + failure surface).
+/// Bumped to 2 with the move from agent-specific wiring code to
+/// declarative directives. No back-compat — reading an older
+/// lockfile fails the parse, the user re-pulls.
+pub const LOCKFILE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {

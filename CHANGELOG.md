@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.43.0] - 2026-04-28
+
+### Bug Fixes
+
+- *(cli)* Fail fast on --allow-connect-port on macOS
+
+- Set system-keyring as default feature for backward compatibility
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.2 to 1.16.3
+
+- *(deps)* Bump hyper from 1.8.1 to 1.9.0
+
+
+### Features
+
+- *(cli)* Add --allow-connect-port for outbound TCP port allowlisting
+
+- Make system keyring optional for headless/container builds
+
+
+### Style
+
+- Run cargo fmt
+
 ## [0.42.0] - 2026-04-25
 
 ### Bug Fixes

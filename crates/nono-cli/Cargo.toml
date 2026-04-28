@@ -31,13 +31,17 @@ name = "nono"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["system-keyring"]
+# Enables OS system keyring access (macOS Keychain / Linux Secret Service).
+# Disable this for headless/container environments without libdbus.
+# Controls keyring for nono-cli, nono, and nono-proxy in one flag.
+system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyring"]
 # Enables test-only trust root overrides used by the integration harness.
 test-trust-overrides = []
 
 [dependencies]
-nono = { version = "0.42.0", path = "../nono" }
-nono-proxy = { version = "0.42.0", path = "../nono-proxy" }
+nono = { version = "0.42.0", path = "../nono", default-features = false }
+nono-proxy = { version = "0.42.0", path = "../nono-proxy", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 colored = "3"
 similar = "3"
@@ -53,8 +57,8 @@ chrono = { version = "0.4", features = ["serde"] }
 # Signing key PKCS#8 serialization (already transitive via sigstore-verify)
 aws-lc-rs = "1"
 
-# Keystore access for trust signing keys
-keyring = "3"
+# Keystore access for trust signing keys (optional: requires libdbus on Linux)
+keyring = { version = "3", optional = true }
 
 # Keyless (Sigstore/Fulcio/Rekor) signing for instruction file attestation
 sigstore-sign = "0.6"
@@ -78,12 +82,12 @@ vt100 = "0.16.2"
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term"] }
 landlock = "0.4"
 dns-lookup = "2"
-keyring = { version = "3", features = ["sync-secret-service"] }
+keyring = { version = "3", features = ["sync-secret-service"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31", features = ["process", "signal", "fs", "user", "term"] }
 dns-lookup = "2"
-keyring = { version = "3", features = ["apple-native"] }
+keyring = { version = "3", features = ["apple-native"], optional = true }
 
 [build-dependencies]
 toml = "1.0"

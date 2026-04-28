@@ -1646,7 +1646,6 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
- "keyring",
  "nono",
  "rustls",
  "serde",

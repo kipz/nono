@@ -260,63 +260,65 @@ interpreter has to be a dynamic linker format (`/lib64/ld-linux-x86-64.so.2`),
 and none of the binaries under mediation are dynamic linkers. Out of scope;
 not pursued unless the mediation list grows to include linker-shaped binaries.
 
-### TOCTOU mitigation: double-read
+### TOCTOU mitigation: refuse multi-threaded execve
 
-**The race.** seccomp-unotify traps only the thread that made the syscall;
-sibling threads in the same process continue to run. If the supervisor
-responds CONTINUE (allow), the kernel re-reads the pathname from the child's
-memory before actually performing the exec. A cooperating sibling thread can
-modify the pathname buffer between our check and the kernel's re-read,
-substituting a deny-set path the supervisor already approved. The same race
-applies to the file content we read for shebang handling: the agent can write
-a benign file, let us read it, swap it to a malicious shebang, and have the
-kernel load the swapped version.
+**The race.** seccomp-unotify traps only the thread that made the
+syscall; sibling threads in the same process continue to run. If the
+supervisor responds CONTINUE (allow), the kernel re-reads the pathname
+from the child's memory before actually performing the exec. A
+cooperating sibling thread can modify the pathname buffer between our
+check and the kernel's re-read, substituting a deny-set path the
+supervisor already approved. (An earlier draft of this plan attempted
+to mitigate via a "double-read", a second supervisor read of the same
+address immediately before responding. However, the kernel's
+post-CONTINUE re-read window is microseconds and can be hit by any
+cooperating swap thread regardless of how tightly we re-read before
+responding. The double-read was removed as ineffective.)
 
-**Mitigation.** Before responding CONTINUE on an `allow_unmediated`
-decision, the supervisor performs a second read of the pathname from the
-same user-memory address and compares against the first read; if it
-differs bytewise, flip the response to `deny`. This does not close the
-race — after we respond CONTINUE, the kernel still performs its own
-re-read — but it collapses the vulnerable window from "full
-classification + canonicalization + shebang traversal" down to "single
-ioctl round-trip," which defeats naive spin-flip exploits and forces any
-attack to synchronize with opaque kernel timing.
+**Mitigation.** At the start of `handle_exec_notification`, the
+supervisor reads `/proc/<tgid>/status`'s `Threads:` field. If `> 1`,
+respond `EACCES` immediately with `reason: multi_threaded_unsafe` and
+emit a filter audit event. If unreadable, fail closed (deny).
 
-**Single-open `/proc/<tid>/mem`.** Both the initial read and the
-TOCTOU re-read use the same `/proc/<tid>/mem` file descriptor, opened
-once at the start of the handler. The kernel runs `ptrace_may_access`
-at `open()` time, not on each `read()`; sharing one fd avoids a
-re-check that fails when the trapped task gets reparented to init
-mid-handler under Yama `ptrace_scope=1` (the daemonize double-fork
-pattern: a process forks, second-forks, the intermediate exits, and
-the orphan grandchild's `execve` traps after the supervisor has lost
-its descendant relationship). The byte-comparison guarantee is
-preserved because each `read()` still copies from the target's current
-address space — the fd share is a permission optimization, not a
-content snapshot.
+When `Threads == 1`, the trapped thread is the only thread in its tgid,
+and seccomp-unotify has paused it in the kernel for the duration of our
+handler. No user code in the agent process can run while we hold the
+notification, so the user-memory pathname buffer at `args[0]` cannot
+mutate between our read and the kernel's post-CONTINUE re-read. This
+makes the per-classify path stable structurally, not statistically.
 
-The re-read is skipped on `allow_shim` decisions: the shim path is a
-known location and the kernel's post-CONTINUE re-read against it is
-benign. It is also skipped on `execveat(..., AT_EMPTY_PATH)`, which
-resolves through a stable fd link rather than a user-memory pathname.
+The check itself is not racable: a new thread can only be created by
+`clone(CLONE_THREAD, ...)` from an existing thread in the tgid, and
+the only thread in the tgid is paused waiting for our response. So
+`Threads == 1` at our check stays `1` until we reply.
 
-**Shebang content not re-read.** The shebang interpreter chain is read
-once, during classification. A shebang content swap (benign script →
-mediated-binary shebang, raced between our read and the kernel's load)
-falls under the multi-threaded residual below and is not separately
-mitigated.
+**Why this is acceptable in practice.** The check denies any execve
+issued from a process that has more than one live thread at trap
+time. In normal Linux software this is essentially never the path
+real subprocess primitives take:
 
-**Residual, stated honestly.** A multi-threaded binary with tight
-synchronization against the kernel's post-CONTINUE re-read remains a
-theoretical bypass. The agent can compile such a binary (compilers are
-available inside the sandbox). We do not close this residual in v1.
-Justification: the threat profile this feature targets is a prompt-injected
-agent executing shell commands and well-known tools, not one producing
-tailored race-exploit binaries. Closing the residual requires `ptrace`-freezing
-every sibling thread for the duration of each exec trap, which is a
-significant performance, complexity, and compatibility cost (see "TOCTOU
-residual" in Trade-offs). The filter design does not foreclose adding this
-later if the threat changes.
+- `fork() + execve()`: classic POSIX. `fork()` copies only the calling
+  thread, so the child starts with `Threads == 1`. ✅
+- `vfork() + execve()` (used by glibc's `posix_spawn` fast path on
+  Linux): the vfork child is its own tgid with `Threads == 1`. ✅
+- `posix_spawn`, libuv's `child_process.spawn`, JVM's
+  `ProcessBuilder.start`, Go's `exec.Command`, Python's `subprocess`,
+  Ruby's `Process.spawn`, bash/zsh/fish/sh, Bun.spawn,
+  Deno.Command: all dispatch to one of the three patterns above. ✅
+- The agent itself (Claude, Codex, Bun, etc.) is multi-threaded, but
+  it doesn't call `execve` directly — it forks first.
+
+What the check denies is `pthread_create() + execve()` from the same
+process. This is structurally pointless in legitimate code: `execve`
+unilaterally kills sibling threads anyway, so spawning a thread before
+calling `execve` accomplishes nothing for the calling program. The
+demonstrated use case is exactly the POC: spawn a swap thread, then
+race the kernel's post-CONTINUE re-read.
+
+The vfork-bomb edge case (multi-threaded parent vforks a
+single-threaded child whose execve traps while the parent's siblings
+race shared memory) remains and is documented in the Trade-offs
+section below.
 
 ### Audit
 
@@ -375,12 +377,13 @@ shape.
   point. Serialized with `skip_serializing_if = "Option::is_none"` so
   absence is represented by field omission, not `null`.
 - `reason` (`Option<String>`): present only on `exec_filter_deny`. One
-  of `"deny_set"`, `"shebang_chain"`, `"toctou_mismatch"`. Absent on
-  allow events.
+  of `"deny_set"`, `"shebang_chain"`, `"multi_threaded_unsafe"`.
+  Absent on allow events.
 - `path` (`Option<String>`): canonical resolved path of the target.
-  Present on all filter events (the basename `command` field doesn't
-  preserve path context, which is load-bearing on direct-path events).
-  Absent on shim events.
+  Present on `deny_set` and `shebang_chain` denies and on
+  `allow_unmediated` events. Empty (or absent) on
+  `multi_threaded_unsafe` denies because the early-deny path runs
+  before path read+canonicalize. Absent on shim events.
 - `interpreter_chain` (`Option<Vec<String>>`): only on shebang-driven
   denies, the list of interpreter paths the filter chased (outermost
   first). Absent otherwise.
@@ -459,29 +462,57 @@ security benefit.
 
 ## Trade-offs and residuals
 
-### TOCTOU residual (post-CONTINUE race)
+### Multi-threaded execve restriction
 
-The race window between the supervisor's pre-response read and the kernel's
-post-response re-read remains exploitable by a multi-threaded binary with
-tight synchronization. The double-read mitigation tightens the window but does
-not close it. Closing it would require `ptrace`-freezing every sibling thread
-for the duration of each exec trap, which we rejected as disproportionate for
-reasons summarized here:
+The mitigation in "TOCTOU mitigation" denies execve entirely from any
+process whose tgid has more than one live thread at trap time. This
+preserves POSIX execve semantics for every legitimate subprocess
+primitive (fork+exec, vfork+exec, posix_spawn, language-runtime
+shell-out — they all dispatch to a single-threaded child) but is
+incompatible with the rare pattern of `pthread_create() + execve()`
+from the same process. Programs that genuinely need that pattern would
+have to refactor to fork-first; in the agent's normal workload no such
+program is expected. If a real-world false-positive surfaces, the
+options are: (a) add a per-binary opt-out in the profile, (b) build a
+narrower mitigation (e.g., ptrace-freeze siblings just for the trap
+duration). We default to the strict deny because the typical security
+benefit is structural — single-threaded callers are race-free by
+construction — and because the closest alternative (ptrace-freeze)
+carries significant cost:
 
-- **Performance**: per-exec cost grows from microseconds to milliseconds as
-  the number of `PTRACE_SEIZE`/`PTRACE_INTERRUPT`/`waitpid`/`PTRACE_DETACH`
+- **Performance**: per-exec cost would grow from microseconds to
+  milliseconds as the number of
+  `PTRACE_SEIZE`/`PTRACE_INTERRUPT`/`waitpid`/`PTRACE_DETACH`
   syscalls scales with thread count.
-- **Tracer exclusivity**: a `ptrace`-traced process cannot be simultaneously
-  traced by another tool (gdb, strace, perf in some modes), which matters on
-  a developer workspace where debugging sessions are a normal workflow.
-- **Bug surface**: ptrace's interaction with signal-stops, group-stops, and
-  `clone3` is famously subtle; every existing seccomp-notify supervisor in
-  production (Docker, Firefox, Chromium renderer, systemd-nspawn) has
-  deliberately chosen not to combine ptrace with seccomp-notify for this
-  reason.
+- **Tracer exclusivity**: a `ptrace`-traced process cannot be
+  simultaneously traced by another tool (gdb, strace, perf in some
+  modes), which matters on a developer workspace where debugging is a
+  normal workflow.
+- **Bug surface**: ptrace's interaction with signal-stops,
+  group-stops, and `clone3` is famously subtle; every existing
+  seccomp-notify supervisor in production (Docker, Firefox, Chromium
+  renderer, systemd-nspawn) has deliberately chosen not to combine
+  ptrace with seccomp-notify for this reason.
 
-The design does not foreclose adding ptrace-freeze later if we observe the
-residual being exploited in practice.
+### vfork-bomb residual
+
+A multi-threaded parent that calls `vfork()` (or
+`clone(CLONE_VM, !CLONE_THREAD)`) produces a child with `Threads == 1`
+that shares the parent's memory map. Sibling threads in the parent can
+write the path buffer in shared memory while the child is in the execve
+trap, bypassing the multi-threaded check (which only sees the child's
+tgid). Not closed in v1.
+
+This is the default subprocess-spawn path for Go (`syscall.ForkExec`
+unconditionally sets `CLONE_VFORK | CLONE_VM`) and for glibc
+`posix_spawn` ≥ 2.24, so any in-band fix at the seccomp-unotify layer
+denies the bypass and legitimate Go / glibc spawns alike. The
+structural fix is to move exec mediation to a BPF LSM program at
+`bprm_check_security`: the kernel has already copied the pathname to
+`bprm->filename` and resolved `bprm->file` before the hook fires, so
+the user-memory race does not exist there. Tracked as v2; out of scope
+for this PR (requires `CONFIG_BPF_LSM=y` and `CAP_SYS_ADMIN`-class
+privilege to load the LSM program).
 
 ### Performance
 
@@ -800,26 +831,33 @@ the real implementation:
 **Tests flipped GREEN by this phase:** 4, 5. The `check_shebang_chain`
 termination and `parse_shebang` unit tests also flip GREEN.
 
-### Phase 5: TOCTOU double-read
+### Phase 5: refuse multi-threaded execve
 
-In the handler, immediately before responding `CONTINUE`:
+At the top of `handle_exec_notification`, after `recv_notif` and
+syscall-arg extraction:
 
-- Re-read the raw path string from the same `/proc/<tid>/mem` address,
-  reusing the fd opened at the start of the handler (not re-opening).
-  If the bytes differ from the first read, flip the decision to deny
-  with reason `toctou_mismatch`. The shared fd avoids a re-trip
-  through `ptrace_may_access` that fails under Yama
-  `ptrace_scope=1` when the trapped task has been reparented mid-handler.
+- Read the trapped TID's TGID via the existing `read_tgid()` helper.
+- Read `/proc/<tgid>/status`, parse the `Threads:` line.
+- If `Threads > 1`, respond `EACCES` immediately, emit a deny audit
+  event with reason `multi_threaded_unsafe`, and return.
+- If the status file is unreadable, fail closed (deny).
+- Otherwise (`Threads == 1`), proceed with the rest of the handler.
 
-Deny decisions skip the double-read (they already fail the syscall; no
-re-read happens kernel-side).
+This replaces the earlier "double-read" mitigation. A reviewer's POC
+on PR #20 showed the double-read did not meaningfully reduce
+bypass rate against a multi-threaded buffer-swap attacker (~3% per
+attempt on x86_64 even with both `allow_shim` and `allow_unmediated`
+covered): the kernel's post-CONTINUE re-read window is microseconds
+and a sibling thread can simply hold the swap pattern through any
+finite number of supervisor reads. The only structural fix is to
+ensure no sibling thread can run during the trap, which is what
+denying multi-threaded execve achieves.
 
-**Tests flipped GREEN by this phase:** none. The mitigation is internal
-robustness against a race that the Phase 1 integration list doesn't
-attempt to reproduce end-to-end, and a unit test would require
-restructuring the handler around a mock user-memory reader (out of
-scope for v1). A targeted multi-threaded end-to-end test is possible
-but also out of scope.
+**Tests flipped GREEN by this phase:** none in the Phase 1 list (the
+multi-threaded race wasn't represented there). Validation is via the
+external POC at PR #20 comment 4337852261, which goes from
+demonstrably exploitable (8/300 bypasses without the check) to
+provably blocked (0/600 bypasses with the check).
 
 ### Phase 6: audit integration
 
@@ -866,7 +904,9 @@ equivalent) and does not affect this PR's scope.
 ## Out of scope
 
 - Landlock ABI v5/v6 features.
-- ptrace-freeze TOCTOU closure.
+- vfork-bomb closure (multi-threaded parent vforks single-threaded
+  child that execs while parent's siblings race the shared MM). See
+  the "vfork-bomb residual" section in Trade-offs.
 - Fast-path BPF optimizations for the allow bucket. Not needed pending
   measurement.
 

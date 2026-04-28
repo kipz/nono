@@ -21,9 +21,11 @@ pub mod reasons {
     pub const DENY_SET: &str = "deny_set";
     /// Shebang chain walker found an interpreter in the deny set.
     pub const SHEBANG_CHAIN: &str = "shebang_chain";
-    /// Double-read detected user-memory or file-content mutation between
-    /// our check and the kernel's re-read.
-    pub const TOCTOU_MISMATCH: &str = "toctou_mismatch";
+    /// Calling thread group has more than one thread. With sibling threads
+    /// the kernel's post-CONTINUE re-read of args[0] from user memory
+    /// races against any of them, so the supervisor refuses to let the
+    /// exec proceed. See `handle_exec_notification` for details.
+    pub const MULTI_THREADED_UNSAFE: &str = "multi_threaded_unsafe";
 }
 
 /// `action_type` values identifying filter-emitted audit records.

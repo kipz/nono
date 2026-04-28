@@ -101,13 +101,21 @@ fn default_true() -> bool {
     true
 }
 
-/// An intercept rule: if `args_prefix` matches the invocation's positional args,
-/// perform the configured action without (or with) calling the real binary.
+/// An intercept rule: if `args_prefix` matches the invocation's positional args
+/// and every entry in `args_must_include` appears somewhere in the args, perform
+/// the configured action without (or with) calling the real binary.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptRule {
     /// The leading positional args that must match (flags are ignored during matching).
     /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
     pub args_prefix: Vec<String>,
+    /// Optional set of args (typically flags) that must ALL appear somewhere in
+    /// the invocation's args (any position, exact string match) for this rule
+    /// to match. Empty (default) imposes no constraint — backward compatible.
+    /// Use this to discriminate between flag variants of the same subcommand,
+    /// e.g. capture `kubectl config view --raw` but allow `kubectl config view`.
+    #[serde(default)]
+    pub args_must_include: Vec<String>,
     /// If true, the user must authenticate via a native macOS biometric/password dialog
     /// before the action is executed. Requires `nono-approve` to be installed alongside nono.
     /// Defaults to false.

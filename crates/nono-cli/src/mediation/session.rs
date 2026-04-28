@@ -33,6 +33,9 @@ pub enum ResolvedAction {
 #[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
     pub args_prefix: Vec<String>,
+    /// Args (typically flags) that must all be present in the invocation for
+    /// this rule to match. Empty = no constraint.
+    pub args_must_include: Vec<String>,
     pub action: ResolvedAction,
     pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
@@ -470,6 +473,7 @@ fn resolve_command(
             };
             Ok(ResolvedIntercept {
                 args_prefix,
+                args_must_include: rule.args_must_include.clone(),
                 action,
                 exit_code,
                 admin: rule.admin,
@@ -707,6 +711,7 @@ mod tests {
                     "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
                     "Claude Code-credentials".to_string(),
                 ],
+                args_must_include: Vec::new(),
                 admin: false,
                 action: InterceptAction::Respond {
                     stdout: String::new(),

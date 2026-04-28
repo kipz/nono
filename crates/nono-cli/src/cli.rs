@@ -615,6 +615,15 @@ pub struct RemoveArgs {
     /// Installed package reference (<namespace>/<name>)
     pub package_ref: String,
 
+    /// Continue removal even if some wiring directives fail to reverse.
+    /// Without this flag, partial reversal failures keep the lockfile
+    /// entry intact so the user can retry, since silently forgetting a
+    /// half-removed pack would orphan agent wiring (e.g. a hook entry
+    /// in `~/.codex/hooks.json` left active with no record of who put
+    /// it there).
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+
     /// Print help
     #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
     pub help: Option<bool>,

@@ -9,11 +9,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Bumped to 2 with the move from agent-specific wiring code (the
-/// pre-v0.44 `hooks.rs` Claude/Codex hard-codes) to declarative
-/// `wiring` directives recorded into the lockfile. No back-compat —
-/// reading an older lockfile fails the parse, the user re-pulls.
-pub const LOCKFILE_VERSION: u32 = 2;
+/// Bumped to 3 with the security-review-driven changes to wiring
+/// records: WriteFile now stores SHA-256, JsonMerge stores per-leaf
+/// (path, prior_value), JsonArrayAppend stores per-entry prior value.
+/// Together these prevent uninstall from deleting user-modified or
+/// user-pre-existing config. Bumped to 2 in the prior release with
+/// the move from agent-specific wiring code to declarative directives.
+/// No back-compat — reading an older lockfile fails the parse, the
+/// user re-pulls.
+pub const LOCKFILE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {

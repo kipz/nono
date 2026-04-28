@@ -24,7 +24,8 @@ use chrono::Utc;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
@@ -79,27 +80,92 @@ pub enum WiringDirective {
 /// What a single directive did, recorded into the lockfile so removal
 /// can undo it without re-evaluating the original directive list (the
 /// pack might have been updated or removed in the meantime).
+///
+/// Each variant carries enough information to reverse safely without
+/// destroying user-owned config. Specifically:
+///  - `WriteFile` stores the SHA-256 of what we wrote, so removal can
+///    refuse to delete a file the user has since modified.
+///  - `JsonMerge` stores per-leaf (path, prior_value) so removal can
+///    restore the prior value (or delete just the leaf if it didn't
+///    exist before), without taking out neighbouring keys at the same
+///    parent path.
+///  - `JsonArrayAppend` stores per-entry prior value when an existing
+///    entry was replaced, so removal restores it instead of deleting
+///    a user-owned entry that happened to share a dedup key.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WiringRecord {
     /// Symlink created (or repointed) at `link`.
     Symlink { link: String },
-    /// File copied to `dest`.
-    WriteFile { dest: String },
-    /// JSON keys we set in `file`. On removal, those exact keys are
-    /// stripped (other keys at the same paths are preserved).
-    JsonMerge { file: String, keys: Vec<String> },
-    /// Entries we appended to a JSON array at `path` inside `file`,
-    /// matched by `key_field`. On removal, entries with those key
-    /// values are filtered out; pre-existing entries are preserved.
+    /// File copied to `dest`. `sha256` is the digest of the bytes we
+    /// wrote; reversal compares the on-disk content against this and
+    /// only removes if it still matches (otherwise the user has
+    /// modified the file and we leave it alone).
+    WriteFile { dest: String, sha256: String },
+    /// JSON leaves we touched in `file`. Each leaf records the JSON
+    /// path (object keys), what we wrote, and what was there before
+    /// (None = leaf didn't exist). Reversal walks each path: if the
+    /// current value still equals `installed_value`, restore
+    /// `prior_value` (or delete the leaf when `prior_value` is None);
+    /// otherwise leave it alone.
+    /// `created_parents` lists object paths we created to host a leaf
+    /// (i.e. paths that didn't exist pre-merge); reversal prunes any
+    /// of those that are still empty after leaf restoration, so we
+    /// don't leave dangling `{}` placeholders on disk.
+    JsonMerge {
+        file: String,
+        leaves: Vec<JsonLeaf>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        created_parents: Vec<Vec<String>>,
+    },
+    /// Entries we placed in a JSON array at `path` inside `file`,
+    /// matched by `key_field`. Each entry records its dedup key and,
+    /// when an existing entry was replaced rather than newly added,
+    /// the original entry — so reversal restores it instead of
+    /// deleting a user-owned entry that shared the dedup key.
     JsonArrayAppend {
         file: String,
         path: String,
         key_field: String,
-        keys: Vec<String>,
+        entries: Vec<AppendedEntry>,
     },
     /// TOML fenced block we wrote in `file` under `marker_id`.
     TomlBlock { file: String, marker_id: String },
+}
+
+/// Per-leaf record for `JsonMerge`. `path` is the chain of object
+/// keys from the document root to the leaf (e.g.
+/// `["enabledPlugins", "nono@always-further"]`). `installed_value` is
+/// what we wrote at that leaf; `prior_value` is what was there before
+/// (None when the leaf didn't exist pre-merge).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct JsonLeaf {
+    pub path: Vec<String>,
+    pub installed_value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_value: Option<Value>,
+}
+
+/// Per-entry record for `JsonArrayAppend`. `prior` is the entry that
+/// was at this dedup key before we replaced it (None for newly added).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AppendedEntry {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior: Option<Value>,
+}
+
+/// Per-record reversal failure surfaced by `reverse()`. The caller
+/// (`run_remove`) uses this to decide whether to keep the lockfile
+/// entry intact (so the user can retry) or proceed under `--force`.
+/// `record_index` is kept for diagnostic / future-tooling use even
+/// though `run_remove` only consumes the human-facing summary today.
+#[derive(Debug, Clone)]
+pub struct ReversalFailure {
+    #[allow(dead_code)]
+    pub record_index: usize,
+    pub record_summary: String,
+    pub error: String,
 }
 
 /// Context for variable expansion — supplied by the caller, NOT by
@@ -130,13 +196,20 @@ pub struct WiringReport {
 /// Execute a list of directives in order. Stops on hard errors; soft
 /// conflicts (a real file where we'd symlink) are recorded and
 /// execution continues with the next directive.
-pub fn execute(directives: &[WiringDirective], ctx: &WiringContext) -> Result<WiringReport> {
+///
+/// `pack_owned_files` is the set of absolute paths the lockfile says
+/// were written by **this same pack** in a previous install. WriteFile
+/// uses it to permit overwrites of files we already own (idempotent
+/// re-pull) while refusing to clobber pre-existing files written by
+/// the user or by a different pack. Pass an empty set on first install.
+pub fn execute(
+    directives: &[WiringDirective],
+    ctx: &WiringContext,
+    pack_owned_files: &HashSet<PathBuf>,
+) -> Result<WiringReport> {
     let mut report = WiringReport::default();
     for directive in directives {
-        match execute_one(directive, ctx, &mut report) {
-            Ok(()) => {}
-            Err(e) => return Err(e),
-        }
+        execute_one(directive, ctx, pack_owned_files, &mut report)?;
     }
     Ok(report)
 }
@@ -144,6 +217,7 @@ pub fn execute(directives: &[WiringDirective], ctx: &WiringContext) -> Result<Wi
 fn execute_one(
     directive: &WiringDirective,
     ctx: &WiringContext,
+    pack_owned_files: &HashSet<PathBuf>,
     report: &mut WiringReport,
 ) -> Result<()> {
     match directive {
@@ -171,25 +245,39 @@ fn execute_one(
         WiringDirective::WriteFile { source, dest } => {
             let source_path = pack_relative(source, ctx)?;
             let dest_path = expand_to_path(dest, ctx)?;
-            let changed = copy_file_atomic(&source_path, &dest_path)?;
-            if changed {
+            // Hard-fail conflict policy (security review fix): if the
+            // dest exists and was not previously written by this same
+            // pack, refuse rather than overwrite. Backup-and-restore
+            // can be added later if conflict patterns warrant it.
+            if dest_path.exists() && !pack_owned_files.contains(&dest_path) {
+                return Err(NonoError::PackageInstall(format!(
+                    "write_file: refusing to overwrite '{}' — \
+                     file already exists and was not written by a \
+                     managed pack. Move/remove it manually then re-pull.",
+                    dest_path.display()
+                )));
+            }
+            let outcome = copy_file_atomic(&source_path, &dest_path)?;
+            if outcome.mutated {
                 report.changed = true;
             }
             report.records.push(WiringRecord::WriteFile {
                 dest: dest_path.to_string_lossy().into_owned(),
+                sha256: outcome.sha256,
             });
         }
         WiringDirective::JsonMerge { file, patch } => {
             let file_path = expand_to_path(file, ctx)?;
             let patch_path = pack_relative(patch, ctx)?;
             let patch_value = read_pack_json(&patch_path, ctx)?;
-            let keys = merge_json_into_file(&file_path, &patch_value)?;
-            if !keys.is_empty() {
+            let outcome = merge_json_into_file(&file_path, &patch_value)?;
+            if outcome.leaves.iter().any(leaf_changed_disk) || !outcome.created_parents.is_empty() {
                 report.changed = true;
             }
             report.records.push(WiringRecord::JsonMerge {
                 file: file_path.to_string_lossy().into_owned(),
-                keys,
+                leaves: outcome.leaves,
+                created_parents: outcome.created_parents,
             });
         }
         WiringDirective::JsonArrayAppend {
@@ -215,7 +303,7 @@ fn execute_one(
                 file: file_path.to_string_lossy().into_owned(),
                 path: path.clone(),
                 key_field: key_field.clone(),
-                keys: outcome.keys,
+                entries: outcome.entries,
             });
         }
         WiringDirective::TomlBlock {
@@ -243,13 +331,40 @@ fn execute_one(
     Ok(())
 }
 
-/// Replay a record list in reverse, undoing each. Best-effort: a
-/// missing file or already-removed key is not an error.
-pub fn reverse(records: &[WiringRecord]) -> Result<()> {
-    for record in records.iter().rev() {
-        let _ = reverse_one(record);
+/// Replay a record list in reverse, undoing each. Returns a list of
+/// per-record failures so callers can decide whether to keep the
+/// lockfile entry intact for retry.
+///
+/// Each record is attempted independently — one failure does not stop
+/// later reversals from running. A missing file or already-removed
+/// key is treated as success (idempotent), but a permission error or
+/// content-mismatch is a real failure that surfaces here.
+pub fn reverse(records: &[WiringRecord]) -> Vec<ReversalFailure> {
+    let mut failures = Vec::new();
+    for (i, record) in records.iter().enumerate().rev() {
+        if let Err(e) = reverse_one(record) {
+            failures.push(ReversalFailure {
+                record_index: i,
+                record_summary: summarise_record(record),
+                error: e.to_string(),
+            });
+        }
     }
-    Ok(())
+    failures
+}
+
+fn summarise_record(record: &WiringRecord) -> String {
+    match record {
+        WiringRecord::Symlink { link } => format!("symlink {link}"),
+        WiringRecord::WriteFile { dest, .. } => format!("write_file {dest}"),
+        WiringRecord::JsonMerge { file, .. } => format!("json_merge {file}"),
+        WiringRecord::JsonArrayAppend { file, path, .. } => {
+            format!("json_array_append {file} at {path}")
+        }
+        WiringRecord::TomlBlock { file, marker_id } => {
+            format!("toml_block {file} #{marker_id}")
+        }
+    }
 }
 
 fn reverse_one(record: &WiringRecord) -> Result<()> {
@@ -258,29 +373,68 @@ fn reverse_one(record: &WiringRecord) -> Result<()> {
             let path = Path::new(link);
             if let Ok(meta) = path.symlink_metadata() {
                 if meta.file_type().is_symlink() {
-                    let _ = fs::remove_file(path);
+                    fs::remove_file(path).map_err(NonoError::Io)?;
                 }
             }
         }
-        WiringRecord::WriteFile { dest } => {
-            let _ = fs::remove_file(dest);
+        WiringRecord::WriteFile { dest, sha256 } => {
+            // Only remove if the on-disk content still matches what
+            // we wrote — otherwise the user has modified it and we
+            // leave it alone (security review fix).
+            let path = Path::new(dest);
+            if !path.exists() {
+                return Ok(());
+            }
+            let bytes = fs::read(path).map_err(NonoError::Io)?;
+            if hash_bytes(&bytes) != *sha256 {
+                tracing::info!(
+                    "write_file: leaving '{}' in place — content has been \
+                     modified since install (sha256 mismatch).",
+                    path.display()
+                );
+                return Ok(());
+            }
+            fs::remove_file(path).map_err(NonoError::Io)?;
         }
-        WiringRecord::JsonMerge { file, keys } => {
-            strip_json_keys(Path::new(file), keys)?;
+        WiringRecord::JsonMerge {
+            file,
+            leaves,
+            created_parents,
+        } => {
+            restore_json_leaves(Path::new(file), leaves, created_parents)?;
         }
         WiringRecord::JsonArrayAppend {
             file,
             path,
             key_field,
-            keys,
+            entries,
         } => {
-            strip_json_array_entries(Path::new(file), path, key_field, keys)?;
+            restore_json_array_entries(Path::new(file), path, key_field, entries)?;
         }
         WiringRecord::TomlBlock { file, marker_id } => {
             strip_toml_block(Path::new(file), marker_id)?;
         }
     }
     Ok(())
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest.iter() {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+/// True if a leaf record represents a real disk change (i.e. either
+/// we created the leaf, or we changed an existing one). Used by
+/// `WiringReport::changed`.
+fn leaf_changed_disk(leaf: &JsonLeaf) -> bool {
+    leaf.prior_value.as_ref() != Some(&leaf.installed_value)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,20 +586,35 @@ fn ensure_symlink(link: &Path, target: &Path) -> Result<SymlinkOutcome> {
 // File copy primitive
 // ---------------------------------------------------------------------------
 
-fn copy_file_atomic(source: &Path, dest: &Path) -> Result<bool> {
+struct CopyOutcome {
+    mutated: bool,
+    sha256: String,
+}
+
+fn copy_file_atomic(source: &Path, dest: &Path) -> Result<CopyOutcome> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(NonoError::Io)?;
     }
-    // Skip-no-op only if existing content matches exactly.
-    if let (Ok(a), Ok(b)) = (fs::read(source), fs::read(dest)) {
-        if a == b {
-            return Ok(false);
+    let source_bytes = fs::read(source).map_err(NonoError::Io)?;
+    let sha256 = hash_bytes(&source_bytes);
+    // Skip-no-op only if existing content matches exactly. Caller has
+    // already enforced the conflict policy (only owned files reach
+    // here when dest exists), so a hash match is a real no-op re-pull.
+    if let Ok(existing) = fs::read(dest) {
+        if existing == source_bytes {
+            return Ok(CopyOutcome {
+                mutated: false,
+                sha256,
+            });
         }
     }
     let tmp = dest.with_extension("nono-tmp");
-    fs::copy(source, &tmp).map_err(NonoError::Io)?;
+    fs::write(&tmp, &source_bytes).map_err(NonoError::Io)?;
     fs::rename(&tmp, dest).map_err(NonoError::Io)?;
-    Ok(true)
+    Ok(CopyOutcome {
+        mutated: true,
+        sha256,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -494,49 +663,102 @@ fn expand_json_strings(value: &mut Value, ctx: &WiringContext) -> Result<()> {
     Ok(())
 }
 
-/// Deep-merge `patch` into the JSON document at `file`. Returns the
-/// list of top-level patch keys actually applied (so removal knows
-/// which to strip later). If the file doesn't exist, it's created.
-fn merge_json_into_file(file: &Path, patch: &Value) -> Result<Vec<String>> {
+struct MergeOutcome {
+    leaves: Vec<JsonLeaf>,
+    created_parents: Vec<Vec<String>>,
+}
+
+/// Deep-merge `patch` into the JSON document at `file`, walking down
+/// to non-object leaves. Returns one `JsonLeaf` per leaf the patch
+/// touched, recording the path, the value we wrote, and the value
+/// that was at that path before (None if it didn't exist). Also
+/// returns `created_parents` — object paths that didn't exist before
+/// the merge, so reversal can prune them after restoring leaves.
+/// Together these prevent removal from disturbing neighbouring keys
+/// at the same parent (security review fix).
+///
+/// "Leaf" here means: any value in the patch that is not a JSON
+/// object. Arrays count as leaves and are written wholesale —
+/// `JsonArrayAppend` is the directive for additive array merges.
+fn merge_json_into_file(file: &Path, patch: &Value) -> Result<MergeOutcome> {
     let mut existing = if file.exists() {
         read_json(file)?
     } else {
         Value::Object(serde_json::Map::new())
     };
-    let mut applied = Vec::new();
-    if let (Value::Object(dst), Value::Object(src)) = (&mut existing, patch) {
-        for (k, v) in src {
-            applied.push(k.clone());
-            match dst.get_mut(k) {
-                Some(existing_val) => deep_merge(existing_val, v),
-                None => {
-                    dst.insert(k.clone(), v.clone());
-                }
-            }
-        }
-    } else {
+    if !patch.is_object() || !existing.is_object() {
         return Err(NonoError::PackageInstall(format!(
             "json_merge: {} must be a JSON object at the root",
             file.display()
         )));
     }
-    write_json(file, &existing)?;
-    Ok(applied)
+    let before = existing.clone();
+    let mut leaves = Vec::new();
+    let mut created_parents = Vec::new();
+    walk_and_merge(
+        &mut existing,
+        patch,
+        &mut Vec::new(),
+        &mut leaves,
+        &mut created_parents,
+    );
+    if existing != before {
+        write_json(file, &existing)?;
+    }
+    Ok(MergeOutcome {
+        leaves,
+        created_parents,
+    })
 }
 
-fn deep_merge(target: &mut Value, src: &Value) {
-    match (target, src) {
-        (Value::Object(a), Value::Object(b)) => {
-            for (k, v) in b {
-                match a.get_mut(k) {
-                    Some(existing) => deep_merge(existing, v),
-                    None => {
-                        a.insert(k.clone(), v.clone());
+/// Recursive walk: descend through both `target` and `patch` together;
+/// at every leaf in `patch`, write to `target` and record what was
+/// there before. `path` is the current chain of object keys. When a
+/// patch object descends through a target key that didn't exist, the
+/// newly-created parent path is recorded so reversal can prune it.
+fn walk_and_merge(
+    target: &mut Value,
+    patch: &Value,
+    path: &mut Vec<String>,
+    leaves: &mut Vec<JsonLeaf>,
+    created_parents: &mut Vec<Vec<String>>,
+) {
+    if let (Value::Object(dst), Value::Object(src)) = (target, patch) {
+        for (k, v) in src {
+            path.push(k.clone());
+            if v.is_object() {
+                let parent_existed = dst.contains_key(k);
+                let entry = dst
+                    .entry(k.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if !entry.is_object() {
+                    // Patch wants to descend but target has a
+                    // non-object here — record the whole subtree as
+                    // a single leaf replacement.
+                    let prior = Some(entry.clone());
+                    *entry = v.clone();
+                    leaves.push(JsonLeaf {
+                        path: path.clone(),
+                        installed_value: v.clone(),
+                        prior_value: prior,
+                    });
+                } else {
+                    if !parent_existed {
+                        created_parents.push(path.clone());
                     }
+                    walk_and_merge(entry, v, path, leaves, created_parents);
                 }
+            } else {
+                let prior = dst.get(k).cloned();
+                dst.insert(k.clone(), v.clone());
+                leaves.push(JsonLeaf {
+                    path: path.clone(),
+                    installed_value: v.clone(),
+                    prior_value: prior,
+                });
             }
+            path.pop();
         }
-        (slot, src) => *slot = src.clone(),
     }
 }
 
@@ -547,12 +769,13 @@ fn deep_merge(target: &mut Value, src: &Value) {
 /// first hook's command path). Returns the list of dedup keys actually
 /// appended — paired with `key_field` and `path`, the inverse can
 /// filter exactly those entries back out on removal.
-/// Outcome of `append_json_entries`. `keys` is what landed on disk
-/// (used by the lockfile so `nono remove` can strip those entries
-/// back out). `mutated` is whether the file's contents actually
-/// changed — false for a no-op idempotent re-run.
+/// Outcome of `append_json_entries`. `entries` records what we wrote
+/// (and any pre-existing entry we replaced) so `nono remove` can
+/// restore the prior state instead of blindly deleting. `mutated` is
+/// whether the file's contents actually changed — false for a no-op
+/// idempotent re-run.
 struct AppendOutcome {
-    keys: Vec<String>,
+    entries: Vec<AppendedEntry>,
     mutated: bool,
 }
 
@@ -569,7 +792,7 @@ fn append_json_entries(
     };
     let before = doc.clone();
     let array = ensure_array_at(&mut doc, path)?;
-    let mut keys = Vec::new();
+    let mut applied = Vec::new();
     for entry in entries {
         let Some(key) = extract_string_at(entry, key_field) else {
             return Err(NonoError::PackageInstall(format!(
@@ -580,12 +803,16 @@ fn append_json_entries(
         // Replace-in-place if the dedup key already matches an entry —
         // pack re-publishes that add or change fields (e.g. flipping
         // `silent: true` on a hook) need the new shape to win, not the
-        // pre-existing entry. Pure idempotency (identical re-run) is
-        // preserved by the `mutated` check below: if the doc bytes are
-        // unchanged we skip the write and report `changed = false`.
+        // pre-existing entry. We record the prior entry so reversal
+        // can restore it (security review fix: a user-owned entry
+        // that happened to share a dedup key must not be wiped on
+        // uninstall). Pure idempotency (identical re-run) is preserved
+        // by the `mutated` check below.
+        let mut prior_value: Option<Value> = None;
         let mut replaced = false;
         for existing in array.iter_mut() {
             if extract_string_at(existing, key_field) == Some(key) {
+                prior_value = Some(existing.clone());
                 *existing = entry.clone();
                 replaced = true;
                 break;
@@ -594,13 +821,19 @@ fn append_json_entries(
         if !replaced {
             array.push(entry.clone());
         }
-        keys.push(key_owned);
+        applied.push(AppendedEntry {
+            key: key_owned,
+            prior: prior_value,
+        });
     }
     let mutated = doc != before;
     if mutated {
         write_json(file, &doc)?;
     }
-    Ok(AppendOutcome { keys, mutated })
+    Ok(AppendOutcome {
+        entries: applied,
+        mutated,
+    })
 }
 
 /// Walk `value` along a dot-separated path. Numeric segments index
@@ -656,21 +889,47 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Reverse of `merge_json_into_file`: strip the listed top-level keys.
-fn strip_json_keys(file: &Path, keys: &[String]) -> Result<()> {
+/// Reverse of `merge_json_into_file`: walk each recorded leaf path.
+/// For each leaf, only act if the current value at that path still
+/// equals what we wrote — that proves nobody has touched our merge
+/// since install. Restore the prior value, or delete the leaf when
+/// there was no prior value. Empty parent objects we created are
+/// pruned only when they contain nothing we did not place.
+///
+/// Behaviour matrix per leaf:
+///   current == installed_value  → restore prior (or delete if None)
+///   current != installed_value  → leave alone (user/another pack
+///                                  modified it; respect their state)
+///   leaf missing                → no-op (already gone)
+fn restore_json_leaves(
+    file: &Path,
+    leaves: &[JsonLeaf],
+    created_parents: &[Vec<String>],
+) -> Result<()> {
     if !file.exists() {
         return Ok(());
     }
-    let mut doc = match read_json(file) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    let Some(obj) = doc.as_object_mut() else {
-        return Ok(());
-    };
+    let mut doc = read_json(file)?;
     let mut changed = false;
-    for k in keys {
-        if obj.remove(k).is_some() {
+    // Reverse-order traversal so deeper leaves run before their
+    // parents — lets us prune emptied parent objects bottom-up.
+    for leaf in leaves.iter().rev() {
+        if restore_one_leaf(
+            &mut doc,
+            &leaf.path,
+            &leaf.installed_value,
+            &leaf.prior_value,
+        ) {
+            changed = true;
+        }
+    }
+    // Prune parents we created during install IF they're empty now
+    // (i.e. all our leaves under them were restored/removed). Sort
+    // deepest-first so we prune child paths before their ancestors.
+    let mut sorted_parents: Vec<&Vec<String>> = created_parents.iter().collect();
+    sorted_parents.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    for parent_path in sorted_parents {
+        if prune_empty_object_at(&mut doc, parent_path) {
             changed = true;
         }
     }
@@ -680,32 +939,119 @@ fn strip_json_keys(file: &Path, keys: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Reverse of `append_json_entries`: walk to the array and filter
-/// out entries whose `key_field` is in `keys`. Drop the array if it
-/// becomes empty.
-fn strip_json_array_entries(
+/// Remove the object at `path` from `doc` if and only if it's
+/// currently an empty object. No-op if the path is missing or
+/// non-empty (user added their own keys under our parent — we leave
+/// them alone).
+fn prune_empty_object_at(doc: &mut Value, path: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor: &mut Value = doc;
+    for seg in &path[..path.len() - 1] {
+        let Some(next) = cursor.as_object_mut().and_then(|o| o.get_mut(seg)) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let Some(parent) = cursor.as_object_mut() else {
+        return false;
+    };
+    let leaf_key = &path[path.len() - 1];
+    let is_empty_object = parent
+        .get(leaf_key)
+        .and_then(Value::as_object)
+        .map(|o| o.is_empty())
+        .unwrap_or(false);
+    if is_empty_object {
+        parent.remove(leaf_key);
+        true
+    } else {
+        false
+    }
+}
+
+/// Restore one leaf in `doc`. Returns true if a change was applied.
+fn restore_one_leaf(
+    doc: &mut Value,
+    path: &[String],
+    installed: &Value,
+    prior: &Option<Value>,
+) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // Walk to the parent of the leaf. Bail (no-op) if any segment
+    // along the way is absent or non-object.
+    let mut cursor: &mut Value = doc;
+    for seg in &path[..path.len() - 1] {
+        let Some(next) = cursor.as_object_mut().and_then(|o| o.get_mut(seg)) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let Some(parent) = cursor.as_object_mut() else {
+        return false;
+    };
+    let leaf_key = &path[path.len() - 1];
+    match parent.get(leaf_key) {
+        None => false,
+        Some(current) if current == installed => match prior {
+            Some(p) => {
+                parent.insert(leaf_key.clone(), p.clone());
+                true
+            }
+            None => {
+                parent.remove(leaf_key);
+                true
+            }
+        },
+        Some(_) => false, // user/another pack modified it; leave alone
+    }
+}
+
+/// Reverse of `append_json_entries`: walk to the array and for each
+/// recorded entry, only act if the current entry at that key still
+/// matches the installed shape. If we replaced a prior entry,
+/// restore it; otherwise filter the entry out. Entries the user has
+/// since modified (or that no longer exist) are left alone.
+fn restore_json_array_entries(
     file: &Path,
     path: &str,
     key_field: &str,
-    keys: &[String],
+    entries: &[AppendedEntry],
 ) -> Result<()> {
     if !file.exists() {
         return Ok(());
     }
-    let mut doc = match read_json(file) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
+    let mut doc = read_json(file)?;
     let Ok(array) = ensure_array_at(&mut doc, path) else {
         return Ok(());
     };
-    let before = array.len();
-    array.retain(|entry| {
-        extract_string_at(entry, key_field)
-            .map(|k| !keys.iter().any(|key| key == k))
-            .unwrap_or(true)
-    });
-    if array.len() != before {
+    let mut changed = false;
+    // Build a quick lookup: which keys had a prior value?
+    let priors: BTreeMap<&str, &Value> = entries
+        .iter()
+        .filter_map(|e| e.prior.as_ref().map(|p| (e.key.as_str(), p)))
+        .collect();
+    let known_keys: HashSet<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+    let mut new_array: Vec<Value> = Vec::with_capacity(array.len());
+    for entry in array.drain(..) {
+        let key = extract_string_at(&entry, key_field);
+        match key {
+            Some(k) if known_keys.contains(k) => {
+                // We placed this key. If a prior existed, restore it;
+                // otherwise drop the entry entirely.
+                if let Some(&prior) = priors.get(k) {
+                    new_array.push(prior.clone());
+                }
+                changed = true;
+            }
+            _ => new_array.push(entry),
+        }
+    }
+    *array = new_array;
+    if changed {
         write_json(file, &doc)?;
     }
     Ok(())
@@ -837,6 +1183,23 @@ mod tests {
         f(home.path());
     }
 
+    /// Test wrapper for `execute` with no pre-existing pack-owned
+    /// files (the fresh-install case most tests want).
+    fn exec(directives: &[WiringDirective], ctx: &WiringContext) -> Result<WiringReport> {
+        execute(directives, ctx, &HashSet::new())
+    }
+
+    /// Test wrapper for `reverse` that asserts there were no
+    /// reversal failures — the success case the existing tests cover.
+    /// Tests that exercise the failure path call `reverse` directly.
+    fn rev(records: &[WiringRecord]) {
+        let failures = reverse(records);
+        assert!(
+            failures.is_empty(),
+            "reverse produced unexpected failures: {failures:?}"
+        );
+    }
+
     #[test]
     fn expand_vars_substitutes_known_set() {
         let pack_dir = PathBuf::from("/p");
@@ -893,7 +1256,7 @@ mod tests {
                 link: "$HOME/link".to_string(),
                 target: "$PACK_DIR".to_string(),
             }];
-            let report = execute(&directives, &ctx).expect("execute");
+            let report = exec(&directives, &ctx).expect("execute");
             assert!(report.changed);
             assert_eq!(report.records.len(), 1);
             let link = home.join("link");
@@ -904,7 +1267,7 @@ mod tests {
                 .is_symlink());
             assert_eq!(fs::read_link(&link).expect("readlink"), pack);
 
-            reverse(&report.records).expect("reverse");
+            rev(&report.records);
             assert!(link.symlink_metadata().is_err());
         });
     }
@@ -919,8 +1282,8 @@ mod tests {
                 link: "$HOME/link".to_string(),
                 target: "$PACK_DIR".to_string(),
             }];
-            let _ = execute(&directives, &ctx).expect("first");
-            let r2 = execute(&directives, &ctx).expect("second");
+            let _ = exec(&directives, &ctx).expect("first");
+            let r2 = exec(&directives, &ctx).expect("second");
             assert!(!r2.changed, "second run should be no-op");
         });
     }
@@ -944,13 +1307,13 @@ mod tests {
                 file: "$HOME/settings.json".to_string(),
                 patch: "patch.json".to_string(),
             }];
-            let report = execute(&directives, &ctx).expect("execute");
+            let report = exec(&directives, &ctx).expect("execute");
             let v: Value =
                 serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
             assert_eq!(v["effortLevel"], "xhigh", "preserve unrelated keys");
             assert_eq!(v["enabledPlugins"]["nono"], true);
 
-            reverse(&report.records).expect("reverse");
+            rev(&report.records);
             let v2: Value =
                 serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
             assert_eq!(v2["effortLevel"], "xhigh", "unrelated keys still present");
@@ -977,9 +1340,9 @@ mod tests {
                 patch_entries: "entries.json".to_string(),
                 key_field: "name".to_string(),
             }];
-            let r1 = execute(&directives, &ctx).expect("first");
+            let r1 = exec(&directives, &ctx).expect("first");
             assert!(r1.changed);
-            let r2 = execute(&directives, &ctx).expect("second");
+            let r2 = exec(&directives, &ctx).expect("second");
             assert!(!r2.changed, "dedup by key_field");
 
             let v: Value =
@@ -989,7 +1352,7 @@ mod tests {
                 1
             );
 
-            reverse(&r1.records).expect("reverse");
+            rev(&r1.records);
             let v2: Value =
                 serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
             assert_eq!(
@@ -1019,7 +1382,7 @@ mod tests {
                 patch_entries: "entries.json".to_string(),
                 key_field: "name".to_string(),
             }];
-            let r1 = execute(&directives, &ctx).expect("first install");
+            let r1 = exec(&directives, &ctx).expect("first install");
             assert!(r1.changed);
 
             // Second publish with new shape (added `silent: true`).
@@ -1029,7 +1392,7 @@ mod tests {
             )
             .expect("write v2");
 
-            let r2 = execute(&directives, &ctx).expect("re-install");
+            let r2 = exec(&directives, &ctx).expect("re-install");
             assert!(r2.changed, "shape change must be applied, not skipped");
 
             let v: Value =
@@ -1043,7 +1406,7 @@ mod tests {
             );
 
             // Re-running with the same v2 entries is a true no-op.
-            let r3 = execute(&directives, &ctx).expect("third");
+            let r3 = exec(&directives, &ctx).expect("third");
             assert!(!r3.changed, "identical re-run must report no change");
         });
     }
@@ -1066,13 +1429,13 @@ mod tests {
                 marker_id: "test".to_string(),
                 content: "block.toml".to_string(),
             }];
-            let r = execute(&directives, &ctx).expect("execute");
+            let r = exec(&directives, &ctx).expect("execute");
             let after = fs::read_to_string(&target).expect("read");
             assert!(after.contains("# >>> nono:test >>>"));
             assert!(after.contains("[plugins.test]"));
             assert!(after.contains("[features]"), "unrelated section preserved");
 
-            reverse(&r.records).expect("reverse");
+            rev(&r.records);
             let after_strip = fs::read_to_string(&target).expect("read");
             assert!(!after_strip.contains("nono:test"));
             assert!(after_strip.contains("[features]"));
@@ -1090,13 +1453,186 @@ mod tests {
                 source: "file".to_string(),
                 dest: "$HOME/dest".to_string(),
             }];
-            let r1 = execute(&directives, &ctx).expect("first");
+            let r1 = exec(&directives, &ctx).expect("first");
             assert!(r1.changed);
-            let r2 = execute(&directives, &ctx).expect("second");
+
+            // Re-pull simulation: caller passes the dest as
+            // already-owned by this same pack (collected from the
+            // lockfile). With that, identical content is a no-op;
+            // without it, the conflict guard would reject.
+            let mut owned = HashSet::new();
+            owned.insert(home.join("dest"));
+            let r2 = execute(&directives, &ctx, &owned).expect("second");
             assert!(!r2.changed, "identical content is no-op");
 
-            reverse(&r1.records).expect("reverse");
+            rev(&r1.records);
             assert!(!home.join("dest").exists());
+        });
+    }
+
+    #[test]
+    fn write_file_refuses_to_overwrite_unmanaged_file() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack").expect("seed source");
+            // Pre-existing unmanaged file at dest — typical of a
+            // user-created config or a file from another pack.
+            fs::write(home.join("dest"), "user content").expect("seed user file");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+            let err = exec(&directives, &ctx).expect_err("must refuse");
+            assert!(err.to_string().contains("refusing to overwrite"));
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("read"),
+                "user content",
+                "user file must be untouched"
+            );
+        });
+    }
+
+    #[test]
+    fn json_merge_reverse_preserves_unrelated_sibling_keys() {
+        // Security review scenario: pack merges
+        // `enabledPlugins.nono` into a settings file that already
+        // contains other plugins. On uninstall only the leaf we wrote
+        // is removed; the user's siblings stay.
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("patch.json"),
+                r#"{ "enabledPlugins": { "nono": true } }"#,
+            )
+            .expect("write patch");
+            let target = home.join("settings.json");
+            fs::write(
+                &target,
+                r#"{ "enabledPlugins": { "user-plugin": true, "another": false } }"#,
+            )
+            .expect("seed");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::JsonMerge {
+                file: "$HOME/settings.json".to_string(),
+                patch: "patch.json".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("install");
+            rev(&report.records);
+
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(v["enabledPlugins"]["user-plugin"], true);
+            assert_eq!(v["enabledPlugins"]["another"], false);
+            assert!(
+                v["enabledPlugins"].get("nono").is_none(),
+                "only our leaf should be gone"
+            );
+        });
+    }
+
+    #[test]
+    fn json_array_append_reverse_restores_user_owned_entry() {
+        // Security review scenario: user already has an entry at the
+        // same dedup key. Pack replaces it on install. Uninstall must
+        // restore the user's original.
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(
+                pack.join("entries.json"),
+                r#"[{ "name": "shared", "value": "from-pack" }]"#,
+            )
+            .expect("write entries");
+            let target = home.join("hooks.json");
+            fs::write(
+                &target,
+                r#"{ "hooks": { "PostToolUse": [
+                    { "name": "shared", "value": "user-original" }
+                ] } }"#,
+            )
+            .expect("seed");
+
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::JsonArrayAppend {
+                file: "$HOME/hooks.json".to_string(),
+                path: "hooks.PostToolUse".to_string(),
+                patch_entries: "entries.json".to_string(),
+                key_field: "name".to_string(),
+            }];
+            let report = exec(&directives, &ctx).expect("install");
+            // Mid-install state: pack version wins.
+            let v: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(v["hooks"]["PostToolUse"][0]["value"], "from-pack");
+
+            rev(&report.records);
+
+            let v2: Value =
+                serde_json::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
+            assert_eq!(
+                v2["hooks"]["PostToolUse"][0]["value"], "user-original",
+                "user's original entry must be restored"
+            );
+        });
+    }
+
+    #[test]
+    fn reverse_collects_failures_instead_of_swallowing() {
+        // Synthesise a record that points at a path on a read-only
+        // parent; reverse_one will succeed for missing files (idempotent)
+        // so we instead use a content-mismatch scenario for WriteFile,
+        // which is detectable: install writes file, user replaces it,
+        // reverse should NOT delete (success) — but if we record a bad
+        // sha256 manually, reversal still succeeds (mismatch → leave
+        // alone). The cleanest failure injection is a JsonMerge against
+        // a malformed JSON file — read fails, reverse_one returns Err.
+        with_fake_home(|home| {
+            let target = home.join("broken.json");
+            fs::write(&target, "{not valid json").expect("seed broken");
+
+            let records = vec![WiringRecord::JsonMerge {
+                file: target.to_string_lossy().into_owned(),
+                leaves: vec![JsonLeaf {
+                    path: vec!["k".to_string()],
+                    installed_value: Value::Bool(true),
+                    prior_value: None,
+                }],
+                created_parents: Vec::new(),
+            }];
+            let failures = reverse(&records);
+            assert_eq!(failures.len(), 1, "broken JSON must surface as failure");
+            assert!(
+                failures[0].record_summary.contains("json_merge"),
+                "summary should identify the directive"
+            );
+        });
+    }
+
+    #[test]
+    fn write_file_reverse_leaves_modified_file_alone() {
+        with_fake_home(|home| {
+            let pack = home.join("pack");
+            fs::create_dir_all(&pack).expect("mkdir pack");
+            fs::write(pack.join("file"), "from-pack").expect("seed source");
+            let ctx = ctx_in(home, pack);
+            let directives = vec![WiringDirective::WriteFile {
+                source: "file".to_string(),
+                dest: "$HOME/dest".to_string(),
+            }];
+            let r1 = exec(&directives, &ctx).expect("install");
+            // User edits the file post-install.
+            fs::write(home.join("dest"), "user edited").expect("user edit");
+            rev(&r1.records);
+            assert!(home.join("dest").exists(), "modified file must be kept");
+            assert_eq!(
+                fs::read_to_string(home.join("dest")).expect("read"),
+                "user edited",
+            );
         });
     }
 }

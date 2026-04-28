@@ -50,7 +50,18 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         args.force,
     )?;
 
-    let install = install_package(&package_ref, &manifest, &downloads, args.init)?;
+    // Files this same pack wrote on a previous install. Passed to
+    // the wiring interpreter so re-pull can overwrite its own files
+    // (idempotent re-pull) while still refusing to clobber user- or
+    // other-pack-owned paths.
+    let pack_owned_files = pack_owned_write_file_paths(&lockfile, &package_ref);
+    let install = install_package(
+        &package_ref,
+        &manifest,
+        &downloads,
+        args.init,
+        &pack_owned_files,
+    )?;
     update_lockfile(
         &package_ref,
         &registry_url,
@@ -93,10 +104,40 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     // so we don't need to re-evaluate the pack's manifest — works
     // even if the pack has been re-published or removed from the
     // registry between install and uninstall.
+    //
+    // Failure handling (security review fix): per-record failures
+    // are surfaced rather than swallowed. Without `--force`, any
+    // failure aborts the remove with the lockfile entry intact so
+    // the user can investigate and retry. With `--force`, we log
+    // the failures and proceed — the lockfile entry is still
+    // dropped, leaving any orphaned wiring as the user's problem
+    // (typically because the user already cleaned it up by hand).
     if let Some(pkg) = locked_pkg {
         if !pkg.wiring_record.is_empty() {
-            let _ = crate::wiring::reverse(&pkg.wiring_record);
-            eprintln!("  reversed {} wiring directive(s)", pkg.wiring_record.len());
+            let failures = crate::wiring::reverse(&pkg.wiring_record);
+            let total = pkg.wiring_record.len();
+            let succeeded = total.saturating_sub(failures.len());
+            eprintln!("  reversed {succeeded}/{total} wiring directive(s)",);
+            if !failures.is_empty() {
+                for f in &failures {
+                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
+                }
+                if !args.force {
+                    return Err(NonoError::PackageInstall(format!(
+                        "remove of {} aborted — {} wiring directive(s) failed to reverse. \
+                         The lockfile entry has been preserved so you can retry. \
+                         Inspect the failures above and either resolve them and re-run, \
+                         or pass --force to drop the lockfile entry and accept any \
+                         orphaned wiring.",
+                        package_ref.key(),
+                        failures.len()
+                    )));
+                }
+                eprintln!(
+                    "  --force: dropping lockfile entry despite {} failed reversal(s)",
+                    failures.len()
+                );
+            }
         }
     }
 
@@ -116,6 +157,26 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
 
     eprintln!("Removed {}", package_ref.key());
     Ok(())
+}
+
+/// Collect the absolute paths of `WriteFile` destinations recorded
+/// against this exact pack in the lockfile. The wiring interpreter
+/// uses this to allow idempotent re-pulls (overwrite our own files)
+/// while still refusing to clobber pre-existing files written by the
+/// user or by a different pack.
+fn pack_owned_write_file_paths(
+    lockfile: &package::Lockfile,
+    package_ref: &PackageRef,
+) -> HashSet<PathBuf> {
+    let mut owned = HashSet::new();
+    if let Some(pkg) = lockfile.packages.get(&package_ref.key()) {
+        for record in &pkg.wiring_record {
+            if let crate::wiring::WiringRecord::WriteFile { dest, .. } = record {
+                owned.insert(PathBuf::from(dest));
+            }
+        }
+    }
+    owned
 }
 
 fn is_dir_empty(path: &Path) -> bool {
@@ -387,6 +448,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
+    pack_owned_files: &HashSet<PathBuf>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
         .join(".staging")
@@ -447,7 +509,7 @@ fn install_package(
             namespace: package_ref.namespace.clone(),
             pack_name: package_ref.name.clone(),
         };
-        let report = crate::wiring::execute(&manifest.wiring, &ctx)?;
+        let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
         for conflict in &report.conflicts {
             eprintln!("  warning: {conflict}");
         }

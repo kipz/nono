@@ -12,7 +12,7 @@ use nono::{
     UnixSocketCapability, UnixSocketMode,
 };
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Try to create a directory capability, warning and skipping on PathNotFound.
 /// Propagates all other errors.

@@ -61,8 +61,8 @@ impl ExecFilterHarness {
 
         let testbin = bindir.join("testbin");
         let mut f = std::fs::File::create(&testbin).expect("create testbin");
-        writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "echo {REAL_BINARY_RAN}").unwrap();
+        let _ = writeln!(f, "#!/bin/sh");
+        let _ = writeln!(f, "echo {REAL_BINARY_RAN}");
         drop(f);
         chmod_plus_x(&testbin);
 
@@ -179,7 +179,10 @@ fn ensure_nono_shim_built() {
         }
         // Locate the workspace root from the manifest dir.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace = manifest.parent().and_then(Path::parent).unwrap_or(&manifest);
+        let workspace = manifest
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(&manifest);
         let status = Command::new("cargo")
             .arg("build")
             .arg("-p")
@@ -203,9 +206,7 @@ fn ensure_nono_shim_built() {
 
 fn chmod_plus_x(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .expect("stat script")
-        .permissions();
+    let mut perms = std::fs::metadata(path).expect("stat script").permissions();
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(path, perms).expect("chmod +x");
 }
@@ -276,7 +277,8 @@ fn path_based_mediated_invocation_goes_through_shim() {
         out.combined()
     );
     assert_eq!(
-        out.exit_code, 0,
+        out.exit_code,
+        0,
         "mediated invocation should succeed; {}",
         out.combined()
     );
@@ -318,7 +320,8 @@ fn direct_path_non_mediated_invocation_succeeds() {
     // binaries even though every execve traps to the supervisor.
     let out = h.run_nono(&["sh", "-c", "/bin/ls /bin > /dev/null"]);
     assert_eq!(
-        out.exit_code, 0,
+        out.exit_code,
+        0,
         "non-mediated direct-path exec must succeed; {}",
         out.combined()
     );
@@ -332,7 +335,7 @@ fn shebang_script_pointing_at_mediated_binary_is_denied() {
     // `execve`, so the userspace shebang walker has to catch this.
     let script = h.bindir.join("evil.sh");
     let mut f = std::fs::File::create(&script).expect("create evil.sh");
-    writeln!(f, "#!{}", h.testbin.display()).unwrap();
+    let _ = writeln!(f, "#!{}", h.testbin.display());
     drop(f);
     chmod_plus_x(&script);
 
@@ -358,12 +361,12 @@ fn shebang_chain_terminates_in_deny() {
     let a = h.bindir.join("a.sh");
 
     let mut fb = std::fs::File::create(&b).expect("create b.sh");
-    writeln!(fb, "#!{}", h.testbin.display()).unwrap();
+    let _ = writeln!(fb, "#!{}", h.testbin.display());
     drop(fb);
     chmod_plus_x(&b);
 
     let mut fa = std::fs::File::create(&a).expect("create a.sh");
-    writeln!(fa, "#!{}", b.display()).unwrap();
+    let _ = writeln!(fa, "#!{}", b.display());
     drop(fa);
     chmod_plus_x(&a);
 
@@ -387,13 +390,18 @@ fn shebang_chain_with_real_interpreter_allowed() {
     let h = ExecFilterHarness::new();
     let script = h.bindir.join("normal.sh");
     let mut f = std::fs::File::create(&script).expect("create normal.sh");
-    writeln!(f, "#!/bin/sh").unwrap();
-    writeln!(f, "echo shebang_ok").unwrap();
+    let _ = writeln!(f, "#!/bin/sh");
+    let _ = writeln!(f, "echo shebang_ok");
     drop(f);
     chmod_plus_x(&script);
 
     let out = h.run_nono(&["sh", "-c", &format!("{}", script.display())]);
-    assert_eq!(out.exit_code, 0, "normal script should run; {}", out.combined());
+    assert_eq!(
+        out.exit_code,
+        0,
+        "normal script should run; {}",
+        out.combined()
+    );
     assert!(
         out.stdout.contains("shebang_ok"),
         "normal script should produce its output; {}",
@@ -402,13 +410,14 @@ fn shebang_chain_with_real_interpreter_allowed() {
 }
 
 #[test]
+#[ignore = "Phase 3 will reintroduce audit via the BPF ringbuf; \
+            seccomp-era audit emission was deleted in Phase 1"]
 fn filter_emits_audit_for_allow_unmediated() {
     let h = ExecFilterHarness::new();
     let _out = h.run_nono(&["sh", "-c", "/bin/ls /bin > /dev/null"]);
     let events = h.read_audit_events();
     let found = events.iter().any(|e| {
-        e.get("action_type").and_then(|v| v.as_str())
-            == Some("exec_filter_allow_unmediated")
+        e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_allow_unmediated")
     });
     assert!(
         found,
@@ -418,6 +427,8 @@ fn filter_emits_audit_for_allow_unmediated() {
 }
 
 #[test]
+#[ignore = "Phase 3 will reintroduce audit via the BPF ringbuf; \
+            seccomp-era audit emission was deleted in Phase 1"]
 fn filter_emits_audit_for_deny() {
     let h = ExecFilterHarness::new();
     let testbin_path = h.testbin.display().to_string();
@@ -458,14 +469,12 @@ fn filter_emits_audit_for_deny() {
 /// `args = ["alpha", "bravo", "charlie"]` (testbin's argv minus argv[0]),
 /// not the shell's `["-c", "<testbin> alpha bravo charlie"]`.
 #[test]
+#[ignore = "Phase 3 will reintroduce audit via the BPF ringbuf; \
+            seccomp-era audit emission was deleted in Phase 1"]
 fn filter_audit_args_reflect_execed_command_not_calling_shell() {
     let h = ExecFilterHarness::new();
     let testbin_path = h.testbin.display().to_string();
-    let _out = h.run_nono(&[
-        "sh",
-        "-c",
-        &format!("{} alpha bravo charlie", testbin_path),
-    ]);
+    let _out = h.run_nono(&["sh", "-c", &format!("{} alpha bravo charlie", testbin_path)]);
 
     let events = h.read_audit_events();
     let canonical = std::fs::canonicalize(&h.testbin)
@@ -500,6 +509,8 @@ fn filter_audit_args_reflect_execed_command_not_calling_shell() {
 /// event. The downstream shim emits its own completion event, and a
 /// filter-side record there would double-count.
 #[test]
+#[ignore = "Phase 3 will reintroduce audit via the BPF ringbuf; \
+            seccomp-era audit emission was deleted in Phase 1"]
 fn shim_invocation_does_not_double_emit() {
     let h = ExecFilterHarness::new();
     let _out = h.run_nono(&["sh", "-c", "testbin via-path"]);
@@ -597,11 +608,7 @@ fn agent_cannot_install_bypass_seccomp_filter() {
 fn nonexistent_path_exec_returns_kernel_errno_not_eacces() {
     let h = ExecFilterHarness::new();
     let bogus = "/nono-test-bogus-path-that-does-not-exist";
-    let out = h.run_nono(&[
-        "bash",
-        "-c",
-        &format!("{bogus} 2>&1; echo exit=$?"),
-    ]);
+    let out = h.run_nono(&["bash", "-c", &format!("{bogus} 2>&1; echo exit=$?")]);
 
     assert!(
         !out.combined().to_lowercase().contains("permission denied"),

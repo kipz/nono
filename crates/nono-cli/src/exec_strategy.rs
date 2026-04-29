@@ -217,13 +217,6 @@ pub struct ExecConfig<'a> {
     /// sends the notify fd; parent expects to receive it.
     #[cfg(target_os = "linux")]
     pub seccomp_proxy_fallback: bool,
-    /// Whether the exec filter should be installed in the agent child.
-    /// True when mediation is active (mediation.commands non-empty). The
-    /// child installs `install_seccomp_exec_filter()` and sends its
-    /// notify fd to the parent; the parent polls and classifies
-    /// execve/execveat traps via `handle_exec_notification`.
-    #[cfg(target_os = "linux")]
-    pub install_exec_filter: bool,
     /// Allow-list of environment variable names. When set, only variables
     /// matching an exact name or prefix pattern (e.g. `"AWS_*"`) are
     /// passed to the child. Nono-injected credentials always bypass this.
@@ -275,25 +268,11 @@ pub struct SupervisorConfig<'a> {
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
     /// Canonicalized real paths of mediated commands. Populated from
-    /// mediation.commands at session start. Used by the exec filter's
-    /// supervisor handler to classify trapped `execve`/`execveat`
-    /// notifications into the three buckets: shim / deny / allow. Empty
-    /// when mediation is inactive; the exec filter is then not
-    /// installed and this field is unused.
+    /// `mediation.commands` at session start; written into the BPF deny
+    /// map keyed by `(dev, ino)`. Empty when mediation is inactive (no
+    /// BPF-LSM filter is installed in that case).
     #[cfg(target_os = "linux")]
     pub exec_deny_set: Vec<std::path::PathBuf>,
-    /// Session shim directory (absolute). The exec filter allows every
-    /// path lexically under this directory (shim-routed invocations).
-    /// `None` when mediation is inactive.
-    #[cfg(target_os = "linux")]
-    pub exec_shim_dir: Option<std::path::PathBuf>,
-    /// Directory to which the exec filter should append
-    /// `FilterAuditEvent` JSONL lines. Same directory the shim's
-    /// audit events land in (`~/.nono/sessions`). `None` when
-    /// mediation is inactive; no filter events are emitted in that
-    /// case.
-    #[cfg(target_os = "linux")]
-    pub exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -305,9 +284,8 @@ fn should_install_macos_open_shim(supervisor: Option<&SupervisorConfig<'_>>) -> 
 const fn linux_child_requires_dumpable(
     capability_elevation: bool,
     seccomp_proxy_fallback: bool,
-    install_exec_filter: bool,
 ) -> bool {
-    capability_elevation || seccomp_proxy_fallback || install_exec_filter
+    capability_elevation || seccomp_proxy_fallback
 }
 
 /// Execute a command using the Direct strategy (exec, nono disappears).
@@ -434,7 +412,6 @@ pub fn execute_supervised(
     let needs_child_ipc = supervisor.is_some()
         && (config.capability_elevation
             || config.seccomp_proxy_fallback
-            || config.install_exec_filter
             || trust_interceptor.is_some());
 
     #[cfg(not(target_os = "linux"))]
@@ -633,6 +610,71 @@ pub fn execute_supervised(
     // Clear any stale forwarding target before forking.
     clear_signal_forwarding_target();
 
+    // BPF-LSM exec filter (Linux). Sole enforcement path for mediated
+    // commands. Installed PRE-fork so that:
+    //   - the BPF program is loaded and attached before the child has a
+    //     chance to `execve`, eliminating the install race.
+    //   - the per-session cgroup exists with a known id before fork; the
+    //     child writes its own pid to `cgroup.procs` as its first
+    //     post-fork action so every subsequent exec is scoped.
+    //
+    // Failure modes hard-fail the session — silent partial enforcement
+    // is worse than a loud failure. See docs/linux-exec-filter-bpf-lsm.md
+    // §"Required deployment invariants".
+    #[cfg(target_os = "linux")]
+    let pre_fork_bpf_lsm: Option<(
+        nono::sandbox::bpf_lsm::SessionCgroup,
+        nono::sandbox::bpf_lsm::ExecFilterHandle,
+    )> = {
+        let deny_paths: Option<&[std::path::PathBuf]> = supervisor
+            .map(|s| s.exec_deny_set.as_slice())
+            .filter(|s| !s.is_empty());
+        if let Some(paths) = deny_paths {
+            let cgroup = nono::sandbox::bpf_lsm::create_session_cgroup_empty().map_err(|e| {
+                nono::error::NonoError::SandboxInit(format!(
+                    "BPF-LSM exec filter required for mediation but \
+                         per-session cgroup creation failed ({e}). The broker \
+                         needs CAP_SYS_ADMIN plus CAP_DAC_OVERRIDE — install with \
+                         `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+                         /usr/bin/nono` (CAP_SYS_ADMIN alone is not enough when \
+                         the cgroup parent is root-owned: cgroup v2 mkdir checks \
+                         DAC before the cgroup-namespace privilege check)."
+                ))
+            })?;
+            let cgroup_id = cgroup.cgroup_id();
+            let filter =
+                nono::sandbox::bpf_lsm::install_exec_filter(paths, cgroup_id).map_err(|e| {
+                    let detail = match e {
+                        nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
+                            "bpf is not in /sys/kernel/security/lsm. The host kernel \
+                             must boot with lsm=...,bpf in the cmdline. See \
+                             drewmchugh/nono#3."
+                                .to_string()
+                        }
+                        other => format!(
+                            "{other}. If you expected BPF-LSM to be active, verify \
+                             CAP_BPF is in the broker's effective capability set \
+                             (e.g. `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+                             /usr/bin/nono`)."
+                        ),
+                    };
+                    nono::error::NonoError::SandboxInit(format!(
+                        "BPF-LSM exec filter required for mediation but install \
+                         failed: {detail}"
+                    ))
+                })?;
+            info!(
+                "BPF-LSM exec filter active: cgroup_id={} deny_entries={} \
+                 (sole enforcement path for mediated commands; child joins cgroup post-fork)",
+                cgroup_id,
+                paths.len()
+            );
+            Some((cgroup, filter))
+        } else {
+            None
+        }
+    };
+
     // SAFETY: fork() is safe here because we validated threading context.
     // Child will call Sandbox::apply() which allocates, but this is safe
     // because the child is single-threaded (validated above).
@@ -640,6 +682,39 @@ pub fn execute_supervised(
 
     match fork_result {
         Ok(ForkResult::Child) => {
+            // CHILD FIRST ACTION: join the per-session cgroup so every
+            // subsequent exec is scoped by the BPF-LSM filter installed
+            // pre-fork. Must happen BEFORE Sandbox::apply (Landlock
+            // would block writes to /sys/fs/cgroup) and before any
+            // execve (an unscoped exec slips past the BPF check).
+            //
+            // Fail closed: if we can't join the cgroup, the BPF-LSM
+            // filter is effectively bypassable for this child, so
+            // refuse to continue rather than run agent code with
+            // weaker enforcement than the session promised.
+            #[cfg(target_os = "linux")]
+            if let Some((ref cgroup, _)) = pre_fork_bpf_lsm {
+                if let Err(e) = cgroup.add_pid(std::process::id()) {
+                    let detail = format!(
+                        "nono: failed to join session cgroup at {}: {}\n",
+                        cgroup.path().display(),
+                        e
+                    );
+                    let msg = detail.as_bytes();
+                    // SAFETY: write/_exit are async-signal-safe and we're
+                    // in the post-fork child path where higher-level Rust
+                    // APIs are unsafe.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+            }
+
             #[cfg(target_os = "linux")]
             let mut child_caps = config.caps.clone();
             #[cfg(target_os = "linux")]
@@ -861,57 +936,9 @@ pub fn execute_supervised(
                     }
                 }
 
-                // Exec filter: install when mediation is active so the
-                // supervisor can classify trapped execve/execveat
-                // notifications into shim / deny / allow. The
-                // install function sets PR_SET_NO_NEW_PRIVS (idempotent
-                // with any sibling installs above) and returns a
-                // listener fd which we send to the parent via
-                // SCM_RIGHTS.
-                if config.install_exec_filter {
-                    if let Some(fd) = child_sock_fd {
-                        match nono::sandbox::install_seccomp_exec_filter() {
-                            Ok(exec_notify_fd) => {
-                                if let Err(e) = nono::supervisor::socket::send_fd_via_socket(
-                                    fd,
-                                    exec_notify_fd.as_raw_fd(),
-                                ) {
-                                    let detail = format!(
-                                        "nono: failed to send exec seccomp notify fd: {}\n",
-                                        e
-                                    );
-                                    let msg = detail.as_bytes();
-                                    unsafe {
-                                        libc::write(
-                                            libc::STDERR_FILENO,
-                                            msg.as_ptr().cast::<libc::c_void>(),
-                                            msg.len(),
-                                        );
-                                        libc::_exit(126);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let detail =
-                                    format!("nono: seccomp exec filter not available: {}\n", e);
-                                let msg = detail.as_bytes();
-                                unsafe {
-                                    libc::write(
-                                        libc::STDERR_FILENO,
-                                        msg.as_ptr().cast::<libc::c_void>(),
-                                        msg.len(),
-                                    );
-                                    libc::_exit(126);
-                                }
-                            }
-                        }
-                    }
-                }
-
                 if !linux_child_requires_dumpable(
                     config.capability_elevation,
                     config.seccomp_proxy_fallback,
-                    config.install_exec_filter,
                 ) {
                     use nix::sys::prctl;
 
@@ -1096,29 +1123,6 @@ pub fn execute_supervised(
                 None
             };
 
-            // On Linux: if mediation is active, the child installed an exec
-            // filter and sent us its notify fd. Receive it here so the
-            // supervisor loop can poll and classify trapped execves.
-            #[cfg(target_os = "linux")]
-            let exec_notify_fd: Option<OwnedFd> = if config.install_exec_filter {
-                if let Some(ref sup_sock) = supervisor_sock {
-                    match sup_sock.recv_fd() {
-                        Ok(fd) => {
-                            debug!("Received exec seccomp notify fd from child");
-                            Some(fd)
-                        }
-                        Err(e) => {
-                            warn!("Failed to receive exec seccomp notify fd: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
             // Set up signal forwarding.
             setup_signal_forwarding(child, pty_proxy.as_ref().map(|p| p.poll_fds().0));
             let _signal_forwarding_guard = SignalForwardingGuard;
@@ -1162,118 +1166,10 @@ pub fn execute_supervised(
                     .collect()
             };
 
-            // BPF-LSM exec filter (Linux). Defense-in-depth on top
-            // of the seccomp-unotify exec filter the child
-            // installed: the kernel-side LSM hook fires on every
-            // exec post-binfmt-resolution, so vfork-bomb-style
-            // user-memory swaps after the seccomp CONTINUE response
-            // can no longer slip a deny-set binary past us.
-            //
-            // Installed in the broker (parent) so the BPF program
-            // mediates every exec on the host. Scoped to the
-            // agent's process tree by **cgroup membership**: the
-            // broker creates a per-session cgroup, places the
-            // agent in it, and writes the cgroup id into the BPF
-            // program's scope map. Children inherit the cgroup
-            // membership on fork() and keep it across reparenting,
-            // so daemonized agent descendants are still filtered.
-            // Broker-side per-command sandboxes stay in the
-            // broker's own cgroup (we move *only* the agent into
-            // the per-session cgroup) and pass through unaffected.
-            //
-            // Falls back silently to seccomp-unotify-only if BPF-LSM
-            // is unreachable. The seccomp filter remains active in
-            // either case, so this is purely additive — never
-            // weakens the existing PR's protection. Failure modes
-            // we surface at warn level (so they're visible without
-            // RUST_LOG):
-            //
-            //   * `bpf` missing from /sys/kernel/security/lsm —
-            //     host needs the lsm=...,bpf cmdline (AMI change).
-            //   * Cgroup creation EACCES — needs CAP_SYS_ADMIN
-            //     plus write to the cgroup parent. cgroup v2 mkdir
-            //     runs DAC before the CAP_SYS_ADMIN check and
-            //     CAP_SYS_ADMIN doesn't override DAC, so a root-
-            //     owned parent also needs CAP_DAC_OVERRIDE. Use
-            //     `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep`.
-            //   * BPF load EPERM — broker lacks CAP_BPF.
+            // BPF-LSM was installed pre-fork; rebind here so its Drop
+            // fires at end-of-supervisor-scope (detach BPF + rmdir cgroup).
             #[cfg(target_os = "linux")]
-            let _bpf_lsm_handle: Option<(
-                nono::sandbox::bpf_lsm::SessionCgroup,
-                nono::sandbox::bpf_lsm::ExecFilterHandle,
-            )> = {
-                let deny_paths: Option<&[std::path::PathBuf]> =
-                    supervisor.map(|s| s.exec_deny_set.as_slice()).filter(|s| !s.is_empty());
-                if let Some(paths) = deny_paths {
-                    let agent_pid = child.as_raw() as u32;
-                    match nono::sandbox::bpf_lsm::create_session_cgroup(agent_pid) {
-                        Ok(cgroup) => {
-                            let cgroup_id = cgroup.cgroup_id();
-                            match nono::sandbox::bpf_lsm::install_exec_filter(
-                                paths, cgroup_id,
-                            ) {
-                                Ok(filter) => {
-                                    info!(
-                                        "BPF-LSM exec filter active: agent_pid={} \
-                                         cgroup_id={} deny_entries={} \
-                                         (vfork-bomb residual closed via kernel-side hook; \
-                                         daemonize residual closed via cgroup scoping)",
-                                        agent_pid,
-                                        cgroup_id,
-                                        paths.len()
-                                    );
-                                    // Drop order: filter first
-                                    // (detaches the BPF program),
-                                    // cgroup second (rmdirs the
-                                    // session cgroup once it's
-                                    // empty). Tuple Drop is in
-                                    // declaration order, so
-                                    // `(cgroup, filter)` here
-                                    // would tear down filter
-                                    // first → correct.
-                                    Some((cgroup, filter))
-                                }
-                                Err(e) => {
-                                    match e {
-                                        nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => warn!(
-                                            "BPF-LSM exec filter unavailable: bpf is not in \
-                                             /sys/kernel/security/lsm. Reboot with lsm=...,bpf \
-                                             in the kernel cmdline to close the vfork-bomb residual. \
-                                             Continuing with seccomp-unotify only."
-                                        ),
-                                        _ => warn!(
-                                            "BPF-LSM exec filter could not be installed \
-                                             ({e}); continuing with seccomp-unotify only. \
-                                             If you expected BPF-LSM to be active, verify \
-                                             CAP_BPF is in the broker's effective capability set \
-                                             (e.g. `setcap cap_bpf+ep /usr/bin/nono`)."
-                                        ),
-                                    }
-                                    // Drop the cgroup — the agent
-                                    // is in it, but with no BPF
-                                    // filter active there's no
-                                    // benefit and we don't want
-                                    // to leak the cgroup dir.
-                                    drop(cgroup);
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "BPF-LSM exec filter unavailable: per-session cgroup \
-                                 creation failed ({e}). Try `setcap cap_bpf,cap_sys_admin,\
-                                 cap_dac_override+ep /usr/bin/nono` (CAP_SYS_ADMIN alone is \
-                                 not enough when the cgroup parent is root-owned — cgroup v2 \
-                                 mkdir checks DAC first). Continuing with seccomp-unotify only."
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
+            let _bpf_lsm_handle = pre_fork_bpf_lsm;
 
             let (status, denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
@@ -1286,7 +1182,6 @@ pub fn execute_supervised(
                             config.startup_timeout,
                             seccomp_notify_fd.as_ref(),
                             proxy_notify_fd.as_ref(),
-                            exec_notify_fd.as_ref(),
                             &initial_caps,
                             trust_interceptor,
                             pty_proxy.as_mut(),
@@ -2159,7 +2054,6 @@ fn run_supervisor_loop(
     startup_timeout: Option<StartupTimeoutConfig<'_>>,
     seccomp_fd: Option<&OwnedFd>,
     proxy_seccomp_fd: Option<&OwnedFd>,
-    exec_seccomp_fd: Option<&OwnedFd>,
     initial_caps: &[supervisor_linux::InitialCapability],
     mut trust_interceptor: Option<crate::trust_intercept::TrustInterceptor>,
     mut pty: Option<&mut crate::pty_proxy::PtyProxy>,
@@ -2167,7 +2061,6 @@ fn run_supervisor_loop(
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
     let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
-    let exec_notify_raw_fd = exec_seccomp_fd.map(|fd| fd.as_raw_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
     let mut seen_request_ids = HashSet::new();
@@ -2194,15 +2087,6 @@ fn run_supervisor_loop(
             let idx = pfds.len();
             pfds.push(libc::pollfd {
                 fd: pfd,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            idx
-        });
-        let exec_notify_idx = exec_notify_raw_fd.map(|efd| {
-            let idx = pfds.len();
-            pfds.push(libc::pollfd {
-                fd: efd,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -2300,17 +2184,6 @@ fn run_supervisor_loop(
                                 &mut rate_limiter,
                             ) {
                                 debug!("Error handling proxy seccomp notification: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(exec_notify_idx) = exec_notify_idx {
-                    if pfds[exec_notify_idx].revents & libc::POLLIN != 0 {
-                        if let Some(efd) = exec_notify_raw_fd {
-                            if let Err(e) = supervisor_linux::handle_exec_notification(efd, config)
-                            {
-                                debug!("Error handling exec seccomp notification: {}", e);
                             }
                         }
                     }
@@ -3400,11 +3273,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
-        assert!(!linux_child_requires_dumpable(false, false, false));
-        assert!(linux_child_requires_dumpable(true, false, false));
-        assert!(linux_child_requires_dumpable(false, true, false));
-        assert!(linux_child_requires_dumpable(false, false, true));
-        assert!(linux_child_requires_dumpable(true, true, true));
+        assert!(!linux_child_requires_dumpable(false, false));
+        assert!(linux_child_requires_dumpable(true, false));
+        assert!(linux_child_requires_dumpable(false, true));
+        assert!(linux_child_requires_dumpable(true, true));
     }
 
     #[test]
@@ -3719,8 +3591,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3745,7 +3615,6 @@ mod tests {
                     None, // no startup timeout
                     None, // no seccomp
                     None, // no proxy seccomp
-                    None, // no exec seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay — this is what we're testing
@@ -3822,8 +3691,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3847,7 +3714,6 @@ mod tests {
                     None, // no startup timeout
                     None, // no openat seccomp
                     None, // no proxy seccomp — V4+ Landlock handles it
-                    None, // no exec seccomp
                     &[],  // no initial caps
                     None, // no trust interceptor
                     None, // no PTY relay
@@ -3901,8 +3767,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3937,8 +3801,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3971,8 +3833,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3989,8 +3849,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -4028,8 +3886,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -4170,8 +4026,6 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
         };
 
         assert!(

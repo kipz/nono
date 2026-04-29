@@ -17,15 +17,14 @@ use serde::{Deserialize, Serialize};
 /// consumers see and what we need to assert on in tests, so we expose
 /// canonical constants instead of an enum.
 pub mod reasons {
-    /// Path is a member of the deny set built from `mediation.commands`.
-    pub const DENY_SET: &str = "deny_set";
-    /// Shebang chain walker found an interpreter in the deny set.
-    pub const SHEBANG_CHAIN: &str = "shebang_chain";
-    /// Calling thread group has more than one thread. With sibling threads
-    /// the kernel's post-CONTINUE re-read of args[0] from user memory
-    /// races against any of them, so the supervisor refuses to let the
-    /// exec proceed. See `handle_exec_notification` for details.
-    pub const MULTI_THREADED_UNSAFE: &str = "multi_threaded_unsafe";
+    /// `bprm_check_security` LSM hook denied the exec because the target
+    /// inode is in the BPF deny map (defense-in-depth case; in normal
+    /// operation `file_open` denies the read first).
+    pub const EXEC_DENY: &str = "exec_deny";
+    /// `file_open` LSM hook denied the open because the target inode is
+    /// in the BPF deny map. The agent attempted to read a mediated
+    /// binary's bytes (e.g., to copy or load via the dynamic linker).
+    pub const OPEN_DENY: &str = "open_deny";
 }
 
 /// `action_type` values identifying filter-emitted audit records.
@@ -181,12 +180,12 @@ mod tests {
     }
 
     #[test]
-    fn serialize_deny_set_event_has_exit_code_126_and_reason() {
+    fn serialize_exec_deny_event_has_exit_code_126_and_reason() {
         let evt = FilterAuditEvent::deny(
             "gh".to_string(),
             vec!["auth".to_string(), "token".to_string()],
             1776973803,
-            reasons::DENY_SET,
+            reasons::EXEC_DENY,
             "/opt/homebrew/bin/gh".to_string(),
         );
         let json = serde_json::to_string(&evt).expect("serialize");
@@ -195,27 +194,25 @@ mod tests {
             json.contains("\"exit_code\":126"),
             "deny must set exit_code = 126: {json}"
         );
-        assert!(json.contains("\"reason\":\"deny_set\""));
+        assert!(json.contains("\"reason\":\"exec_deny\""));
         assert!(json.contains("\"path\":\"/opt/homebrew/bin/gh\""));
         assert!(
             !json.contains("\"interpreter_chain\""),
-            "non-shebang deny must omit interpreter_chain: {json}"
+            "deny must omit interpreter_chain: {json}"
         );
     }
 
     #[test]
-    fn serialize_shebang_chain_deny_includes_interpreter_chain() {
+    fn serialize_open_deny_event_has_exit_code_126_and_reason() {
         let evt = FilterAuditEvent::deny(
-            "evil.sh".to_string(),
+            "gh".to_string(),
             Vec::new(),
             1776973803,
-            reasons::SHEBANG_CHAIN,
-            "/tmp/evil.sh".to_string(),
-        )
-        .with_interpreter_chain(vec!["/opt/homebrew/bin/gh".to_string()]);
+            reasons::OPEN_DENY,
+            "/usr/bin/gh".to_string(),
+        );
         let json = serde_json::to_string(&evt).expect("serialize");
-        assert!(json.contains("\"reason\":\"shebang_chain\""));
-        assert!(json.contains("\"interpreter_chain\":[\"/opt/homebrew/bin/gh\"]"));
+        assert!(json.contains("\"reason\":\"open_deny\""));
         assert!(json.contains("\"exit_code\":126"));
     }
 
@@ -231,7 +228,7 @@ mod tests {
             "/usr/bin/jq".to_string(),
         );
         assert_eq!(evt.command, "jq");
-        assert!(evt.path.as_deref().unwrap().ends_with("/jq"));
+        assert!(evt.path.as_deref().expect("path is set").ends_with("/jq"));
     }
 
     #[test]
@@ -240,7 +237,7 @@ mod tests {
             "gh".to_string(),
             vec!["auth".to_string(), "token".to_string()],
             1776973803,
-            reasons::DENY_SET,
+            reasons::EXEC_DENY,
             "/opt/homebrew/bin/gh".to_string(),
         );
         let json = serde_json::to_string(&original).expect("serialize");

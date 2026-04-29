@@ -169,8 +169,8 @@ fn create_session_cgroup_roundtrip() {
     assert_ne!(id, 0, "cgroup_id should never be zero on success");
 
     let path = cgroup.path().to_path_buf();
-    let dir_meta = std::fs::metadata(&path)
-        .expect("cgroup dir should exist after successful create");
+    let dir_meta =
+        std::fs::metadata(&path).expect("cgroup dir should exist after successful create");
     assert_eq!(
         dir_meta.ino(),
         id,

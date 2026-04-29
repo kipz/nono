@@ -43,19 +43,11 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) pre_session_name: Option<String>,
     /// Latch to fill in with the sandboxed process PID once forked; shared with the mediation server.
     pub(crate) mediation_sandboxed_pid_latch: Option<Arc<OnceLock<u32>>>,
-    /// Canonicalized real paths of mediated commands. Used by the exec
-    /// filter's supervisor handler for the deny-set check. Empty when
-    /// mediation is inactive. Linux only.
+    /// Canonicalized real paths of mediated commands. Written into the
+    /// BPF-LSM deny map keyed by `(dev, ino)`. Empty when mediation is
+    /// inactive. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) exec_deny_set: Vec<std::path::PathBuf>,
-    /// Session shim directory. Used by the exec filter to recognize
-    /// shim-routed invocations. `None` when mediation is inactive.
-    #[cfg(target_os = "linux")]
-    pub(crate) exec_shim_dir: Option<std::path::PathBuf>,
-    /// Directory the exec filter appends FilterAuditEvent JSONL
-    /// lines to (shared with the shim's audit stream).
-    #[cfg(target_os = "linux")]
-    pub(crate) exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -165,11 +157,7 @@ fn create_session_runtime_state(
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     #[cfg(target_os = "linux")]
-    let (exec_deny_set, exec_shim_dir, exec_audit_log_dir) = (
-        ctx.exec_deny_set.clone(),
-        ctx.exec_shim_dir.clone(),
-        ctx.exec_audit_log_dir.clone(),
-    );
+    let exec_deny_set = ctx.exec_deny_set.clone();
     let SupervisedRuntimeContext {
         config,
         caps,
@@ -265,10 +253,6 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
         #[cfg(target_os = "linux")]
         exec_deny_set,
-        #[cfg(target_os = "linux")]
-        exec_shim_dir,
-        #[cfg(target_os = "linux")]
-        exec_audit_log_dir,
     };
 
     if !session.detached_start {

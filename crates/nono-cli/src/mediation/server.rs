@@ -266,8 +266,7 @@ async fn recv_three_fds(
     }
     let was_nonblock = (original_flags & libc::O_NONBLOCK) != 0;
     if was_nonblock {
-        let r =
-            unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags & !libc::O_NONBLOCK) };
+        let r = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags & !libc::O_NONBLOCK) };
         if r < 0 {
             return Err(std::io::Error::last_os_error());
         }

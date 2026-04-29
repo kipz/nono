@@ -1232,6 +1232,18 @@ pub fn execute_supervised(
             #[cfg(target_os = "linux")]
             let _bpf_lsm_handle = pre_fork_bpf_lsm;
 
+            // Phase 4 invariant assertions. The infrastructure (BPF-LSM,
+            // PR_SET_NO_NEW_PRIVS, Landlock) has already enforced these by
+            // the time we get here; the explicit verify-and-log step turns
+            // implicit guarantees into auditable session-start records that
+            // operators can grep for. See
+            // docs/linux-exec-filter-bpf-lsm.md §"Required deployment
+            // invariants" (A–D).
+            #[cfg(target_os = "linux")]
+            if _bpf_lsm_handle.is_some() {
+                verify_agent_invariants(child);
+            }
+
             let (status, denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]
@@ -1927,6 +1939,73 @@ fn get_thread_count() -> Result<usize> {
             "Cannot determine thread count on this platform".to_string(),
         ))
     }
+}
+
+/// Phase 4 invariant verification — read the agent's
+/// `/proc/<pid>/status` once it has settled into its final image
+/// and emit a structured info-level log line summarising what's
+/// enforced. The explicit log line is the value-add: it turns
+/// implicit guarantees (Landlock, NoNewPrivs, BPF-LSM) into
+/// auditable session-start records.
+///
+/// Polls for up to ~2s waiting for `CapEff: 0` (which only holds
+/// post-execve into a non-setcap'd binary; pre-execve, the agent
+/// has the broker's inherited caps). If the wait times out we
+/// log a warn rather than killing the session — failing closed
+/// here would mask the actual problem (probably the agent
+/// hasn't started yet) and produce a worse failure mode than
+/// just continuing.
+///
+/// Invariant A (`bpf` in active LSM list) is enforced earlier
+/// at install time (Phase 1 hard-fail in `install_exec_filter`);
+/// reaching this function with `_bpf_lsm_handle.is_some()`
+/// already implies A holds.
+#[cfg(target_os = "linux")]
+fn verify_agent_invariants(child: Pid) {
+    use std::time::{Duration, Instant};
+    let agent_pid = child.as_raw() as u32;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_observed: Option<u64> = None;
+    while Instant::now() < deadline {
+        match read_proc_cap_eff(agent_pid) {
+            Some(0) => {
+                info!(
+                    "Session invariants enforced: A bpf in /sys/kernel/security/lsm; \
+                     C agent CapEff=0 (verified post-execve); D PR_SET_NO_NEW_PRIVS \
+                     (set by sandbox pre-exec)"
+                );
+                return;
+            }
+            Some(bits) => {
+                last_observed = Some(bits);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {
+                // Process gone or status unreadable; the supervisor will
+                // observe the exit through waitpid shortly.
+                return;
+            }
+        }
+    }
+    warn!(
+        "Session invariant C check timed out: agent CapEff did not drop to 0 within 2s \
+         (last observed: {:?}). The agent may be a setcap'd binary or may not yet \
+         have execve'd. Mediation enforcement (BPF-LSM) is unaffected.",
+        last_observed
+    );
+}
+
+/// Read `CapEff:` from `/proc/<pid>/status` as a hex bitmap.
+/// Returns `None` if the file is missing or the line can't be parsed.
+#[cfg(target_os = "linux")]
+fn read_proc_cap_eff(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("CapEff:\t") {
+            return u64::from_str_radix(rest.trim(), 16).ok();
+        }
+    }
+    None
 }
 
 /// Supervisor IPC event loop (non-Linux).

@@ -161,6 +161,29 @@ mod imp {
         _open_link: Link,
     }
 
+    impl ExecFilterHandle {
+        /// Reference to the audit ring buffer map. The lifetime
+        /// is tied to `&self`, so callers must keep this handle
+        /// alive while they're using the returned ref (typically
+        /// by binding the audit reader and the handle in the
+        /// same lexical scope, with the reader declared *after*
+        /// the handle so it drops first).
+        ///
+        /// libbpf-rs's `RingBufferBuilder::build()` only borrows
+        /// the map for the duration of `build`; the resulting
+        /// `RingBuffer` does not retain a Rust-level borrow of
+        /// the map after construction. So after the reader is
+        /// built, the map ref's lifetime is effectively
+        /// irrelevant — what keeps the underlying map fd alive
+        /// is the skeleton this handle owns. The reader's Drop
+        /// must run before the handle's Drop or the kernel-side
+        /// ring buffer object is freed while polling.
+        #[must_use]
+        pub fn audit_ringbuf_map(&self) -> &dyn libbpf_rs::MapCore {
+            &self._skel.maps.audit_rb
+        }
+    }
+
     impl std::fmt::Debug for ExecFilterHandle {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("ExecFilterHandle").finish_non_exhaustive()

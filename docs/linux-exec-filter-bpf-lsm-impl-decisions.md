@@ -151,4 +151,129 @@ test wiring deferred — POCs cover the security claim.
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used` clean.
 - `cargo fmt --all -- --check` clean.
 
+## Phase 3 — BPF audit ringbuf + userspace reader
+
+**Decision: drop `bpf_d_path()` from the BPF program; resolve
+paths userspace-side via a (dev, ino) → canonical path table.**
+
+First implementation called `bpf_d_path(&file->f_path, ...)`
+directly inside `audit_reserve()`. The verifier rejected it:
+
+```
+356: (85) call bpf_d_path#147
+R1 type=scalar expected=ptr_, trusted_ptr_, rcu_ptr_
+libbpf: prog 'check_exec': failed to load: -EACCES
+```
+
+The verifier requires `bpf_d_path`'s first argument be a
+trusted/PTR_TRUSTED pointer. Field access via `&file->f_path` in
+the BPF-LSM context doesn't propagate trust (it's a scalar after
+the chain). The standard workarounds (BPF_CORE_READ into a
+stack-local then bpf_d_path) add complexity without security
+benefit.
+
+Simpler answer: emit just `(dev, ino)` from BPF. The userspace
+reader holds a HashMap<(dev, ino), PathBuf> built from the
+broker's canonicalized `mediation.commands` deny set. Deny
+events resolve to a path because the deny set is exactly what
+the BPF map keys on. Allow_unmediated bprm events (the agent
+ran some non-mediated binary) get an empty path — these are
+audit decoration only, and userspace can't reliably resolve an
+arbitrary inode to a path anyway.
+
+This sacrifices the `path` field for `allow_unmediated` events
+but preserves it for `deny` events, which is the security-
+relevant case. Documented in the BPF program comment.
+
+**Decision: tuple drop ordering for the BPF-LSM bundle is
+`(audit_reader, filter, cgroup)`.**
+
+Rust drops tuple/struct fields in declaration order. The
+correct teardown sequence is:
+1. `audit_reader` first — stops the polling thread before the
+   BPF ring buffer map is freed. (If the thread polls a freed
+   map, it segfaults / kernel oopses.)
+2. `filter` second — detaches both LSM programs.
+3. `cgroup` third — migrates leftover tasks to parent and
+   rmdirs the session cgroup.
+
+Reordering the tuple to `(audit_reader, filter, cgroup)`
+encodes this without a custom Drop impl. The previous tuple
+layout from Phase 1 was `(cgroup, filter)`; Phase 3 inserts
+audit_reader at the front. Updated all field-access patterns
+(child cgroup join, parent rebinding) accordingly.
+
+**Decision: `AuditReader::start` takes a non-static map ref.**
+
+`RingBufferBuilder::add` borrows the map for the builder's
+lifetime, but `RingBufferBuilder::build()` consumes it and
+returns a `RingBuffer<'cb>` whose only lifetime is the
+callback's. So the resulting `AuditReader` has no Rust-level
+borrow on the map after construction. Relaxing the signature
+from `&'static dyn MapCore` to `&dyn MapCore` lets the broker
+construct the reader with a borrow tied to the
+`ExecFilterHandle` (which lives in the same scope). The
+runtime invariant — keep the BPF skeleton alive while the
+poll thread is running — is enforced by tuple Drop ordering
+above.
+
+**Decision: delete `crates/nono-cli/src/mediation/filter_audit.rs`.**
+
+It was the seccomp-era audit emitter. Phase 1 deleted all
+callers; only its self-tests remained. The new audit emitter
+lives in the library at `crates/nono/src/sandbox/bpf_audit.rs`
+with its own `FilterAuditEvent` mirror — different schema
+(no `exec_filter_` prefix; no `interpreter_chain` field), so
+there's no API to unify across the boundary. Removing the CLI-
+side file avoids a stale duplicate.
+
+**Decision: keep `args` field empty in BPF-emitted records.**
+
+The design doc Phase 3 §3.2 sketches `bpf_probe_read_user_str`
+loops to walk the agent's argv array. That's possible but adds
+verifier complexity (bounded loops, kernel-only argv via
+`bprm->vma_pages` mappings, etc.). For Phase 3 the audit
+records contain `args: []` for all events; the shim's
+downstream audit (which still uses its own AuditEvent shape)
+preserves argv for shim-routed invocations. Adding argv to BPF
+records is a future-work item if operators report needing it.
+
+**Decision: schema change applied at the new emitter only.**
+
+The Phase 1 decisions log noted the schema change was
+deferred to Phase 3. Implemented here:
+- `action_type`: `"allow_unmediated"` / `"deny"` (no
+  `exec_filter_` prefix).
+- `reason`: `"exec_deny"` / `"open_deny"` on deny; absent on
+  allow.
+- `interpreter_chain`: dropped.
+
+Tests in `crates/nono-cli/tests/exec_filter.rs` updated to
+match the new strings (the audit-asserting tests are still
+`#[ignore]`'d pending integration test setcap solve).
+
+**Decision: the audit reader's `inode_to_path` HashMap is
+populated at install time, not lazily.**
+
+Built once in `exec_strategy.rs` from the same canonicalized
+deny paths the BPF loader uses. Keeps the polling thread
+free of I/O on the resolution path; resolution is a single
+HashMap lookup per record.
+
+**Validation:**
+- Smoke tests 5/5 pass.
+- Audit log emits expected events:
+  - `allow_unmediated` for non-mediated binaries (empty command/path).
+  - `deny` with `reason: "open_deny"` and resolved `path` for
+    attempted reads of mediated binaries.
+- `cargo clippy ...` clean.
+- `cargo fmt --all -- --check` clean.
+- POCs: pthread 0/600, vfork 0/600 (no regression).
+
+**Deferred from Phase 3:**
+- argv extraction in BPF (future-work; cosmetic).
+- Integration tests for audit emission (test-binary setcap
+  problem, same as Phase 2).
+
+
 

@@ -20,6 +20,11 @@ mod macos;
 // `Unsupported`.
 pub mod bpf_lsm;
 
+// Userspace audit reader for the BPF-LSM ring buffer. Linux+feature
+// only; non-Linux builds elide this module entirely.
+#[cfg(all(target_os = "linux", feature = "bpf-lsm"))]
+pub mod bpf_audit;
+
 // Re-export macOS extension functions for supervisor use
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};

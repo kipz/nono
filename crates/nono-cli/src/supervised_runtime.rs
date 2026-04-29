@@ -48,6 +48,16 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     /// inactive. Linux only.
     #[cfg(target_os = "linux")]
     pub(crate) exec_deny_set: Vec<std::path::PathBuf>,
+    /// Per-session shim directory. Used by the audit reader to
+    /// suppress BPF-emitted records for shim-routed execs (the shim
+    /// emits its own downstream record). `None` when mediation is
+    /// inactive. Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec_shim_dir: Option<std::path::PathBuf>,
+    /// Directory where the audit reader appends `audit.jsonl`.
+    /// Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -158,6 +168,8 @@ fn create_session_runtime_state(
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
     #[cfg(target_os = "linux")]
     let exec_deny_set = ctx.exec_deny_set.clone();
+    let exec_shim_dir = ctx.exec_shim_dir.clone();
+    let exec_audit_log_dir = ctx.exec_audit_log_dir.clone();
     let SupervisedRuntimeContext {
         config,
         caps,
@@ -253,6 +265,10 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         },
         #[cfg(target_os = "linux")]
         exec_deny_set,
+        #[cfg(target_os = "linux")]
+        exec_shim_dir,
+        #[cfg(target_os = "linux")]
+        exec_audit_log_dir,
     };
 
     if !session.detached_start {

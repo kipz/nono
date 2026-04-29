@@ -986,6 +986,8 @@ mod tests {
                 proxy_port,
                 proxy_bind_ports,
                 exec_deny_set: Vec::new(),
+                exec_shim_dir: None,
+                exec_audit_log_dir: None,
             }
         }
 

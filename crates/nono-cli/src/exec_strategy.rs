@@ -273,6 +273,18 @@ pub struct SupervisorConfig<'a> {
     /// BPF-LSM filter is installed in that case).
     #[cfg(target_os = "linux")]
     pub exec_deny_set: Vec<std::path::PathBuf>,
+    /// Per-session shim directory (absolute). The userspace audit
+    /// reader suppresses BPF-emitted `allow_unmediated` records whose
+    /// resolved path lives under this directory — those execs are the
+    /// shim itself, which emits its own downstream audit record on
+    /// completion. `None` when mediation is inactive (no audit either).
+    #[cfg(target_os = "linux")]
+    pub exec_shim_dir: Option<std::path::PathBuf>,
+    /// Directory where the audit reader appends `audit.jsonl`. Same
+    /// path the shim's own audit events land in. `None` when mediation
+    /// is inactive.
+    #[cfg(target_os = "linux")]
+    pub exec_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -621,10 +633,17 @@ pub fn execute_supervised(
     // Failure modes hard-fail the session — silent partial enforcement
     // is worse than a loud failure. See docs/linux-exec-filter-bpf-lsm.md
     // §"Required deployment invariants".
+    // Drop order matters: declaration order is what runs.
+    //   (audit_reader, filter, cgroup)
+    // → audit_reader stops polling first (the ringbuf map is still
+    //   alive in the filter at that point).
+    // → filter detaches the BPF programs and frees the ringbuf map.
+    // → cgroup migrates leftover tasks back to the parent and rmdirs.
     #[cfg(target_os = "linux")]
     let pre_fork_bpf_lsm: Option<(
-        nono::sandbox::bpf_lsm::SessionCgroup,
+        Option<nono::sandbox::bpf_audit::AuditReader>,
         nono::sandbox::bpf_lsm::ExecFilterHandle,
+        nono::sandbox::bpf_lsm::SessionCgroup,
     )> = {
         let deny_paths: Option<&[std::path::PathBuf]> = supervisor
             .map(|s| s.exec_deny_set.as_slice())
@@ -669,7 +688,49 @@ pub fn execute_supervised(
                 cgroup_id,
                 paths.len()
             );
-            Some((cgroup, filter))
+
+            // Spawn the audit reader if the broker provided a log
+            // directory. Records flow from the BPF ringbuf →
+            // userspace → audit.jsonl. Drop order is enforced by
+            // tuple field order at the binding site: audit_reader
+            // first → filter second → cgroup third.
+            let audit_reader = match supervisor.and_then(|s| s.exec_audit_log_dir.clone()) {
+                Some(dir) => {
+                    let shim = supervisor.and_then(|s| s.exec_shim_dir.clone());
+                    // Build the (dev, ino) → canonical path map so
+                    // the audit reader can resolve event paths.
+                    // Same canonicalize-and-stat logic the BPF
+                    // loader uses; entries that fail are skipped.
+                    use std::os::unix::fs::MetadataExt;
+                    let mut inode_to_path = std::collections::HashMap::new();
+                    for raw in paths {
+                        if let Ok(canonical) = std::fs::canonicalize(raw) {
+                            if let Ok(meta) = std::fs::metadata(&canonical) {
+                                inode_to_path.insert((meta.dev(), meta.ino()), canonical);
+                            }
+                        }
+                    }
+                    match nono::sandbox::bpf_audit::AuditReader::start(
+                        filter.audit_ringbuf_map(),
+                        dir,
+                        shim,
+                        inode_to_path,
+                    ) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            warn!(
+                                "BPF-LSM audit reader could not start ({e}); \
+                                 mediation enforcement is unaffected, but audit \
+                                 records will not be written to audit.jsonl."
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            Some((audit_reader, filter, cgroup))
         } else {
             None
         }
@@ -693,7 +754,7 @@ pub fn execute_supervised(
             // refuse to continue rather than run agent code with
             // weaker enforcement than the session promised.
             #[cfg(target_os = "linux")]
-            if let Some((ref cgroup, _)) = pre_fork_bpf_lsm {
+            if let Some((_, _, ref cgroup)) = pre_fork_bpf_lsm {
                 if let Err(e) = cgroup.add_pid(std::process::id()) {
                     let detail = format!(
                         "nono: failed to join session cgroup at {}: {}\n",
@@ -3591,6 +3652,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3691,6 +3754,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3767,6 +3832,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3801,6 +3868,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3833,6 +3902,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3849,6 +3920,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -3886,6 +3959,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -4026,6 +4101,8 @@ mod tests {
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
             exec_deny_set: Vec::new(),
+            exec_shim_dir: None,
+            exec_audit_log_dir: None,
         };
 
         assert!(

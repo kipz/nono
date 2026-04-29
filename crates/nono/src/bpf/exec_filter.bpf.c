@@ -70,6 +70,50 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+/* Audit record source. */
+#define AUDIT_SRC_BPRM      0
+#define AUDIT_SRC_FILE_OPEN 1
+
+/* Audit record verdict. */
+#define AUDIT_VERDICT_ALLOW 0
+#define AUDIT_VERDICT_DENY  1
+
+/* Audit record reason. Mirrors crates/nono-cli/src/mediation/filter_audit.rs
+ * `reasons` constants — keep in sync. */
+#define AUDIT_REASON_NONE      0
+#define AUDIT_REASON_EXEC_DENY 1
+#define AUDIT_REASON_OPEN_DENY 2
+
+/* Emitted to the ring buffer for every audit-worthy event the
+ * BPF program observes. Userspace reads, decodes, and appends to
+ * `~/.nono/sessions/audit.jsonl`. Layout is Rust-side mirrored
+ * in `crates/nono/src/sandbox/bpf_audit.rs`.
+ *
+ * Path resolution happens userspace-side: for deny events the
+ * (dev, ino) is one of the canonicalized `mediation.commands`
+ * entries the broker already knows about, and the userspace
+ * reader maps (dev, ino) → canonical path via that table. For
+ * allow_unmediated bprm events the path is left unresolved —
+ * these are audit decoration only, not security-relevant.
+ *
+ * We intentionally don't call `bpf_d_path()` from the BPF
+ * program: the verifier rejects `&bprm->file->f_path` as a
+ * non-trusted pointer in BPF-LSM context, and the simpler
+ * stack-copy workaround adds verifier complexity without
+ * security benefit since userspace can resolve the deny-set
+ * case from its own bookkeeping.
+ */
+struct audit_record {
+    __u64 ts_ns;
+    __u8  source;
+    __u8  verdict;
+    __u8  reason;
+    __u8  _pad;
+    __u32 pid;
+    __u64 dev;
+    __u64 ino;
+};
+
 /* Identity key for a binary's underlying inode. */
 struct deny_key {
     __u64 dev;
@@ -100,6 +144,14 @@ struct {
     __type(value, struct scope_config);
 } scope SEC(".maps");
 
+/* Audit ring buffer. 1 MiB sized to absorb bursts of events
+ * without backpressure; the userspace reader polls continuously
+ * and drains the buffer to disk. */
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);
+} audit_rb SEC(".maps");
+
 /* Returns 1 if current task is in (or descended from) the session
  * cgroup, else 0. Bounded loop satisfies the BPF verifier;
  * bpf_get_current_ancestor_cgroup_id returns 0 past current's
@@ -125,8 +177,10 @@ static __always_inline int in_session_cgroup(void)
     return 0;
 }
 
-/* Returns 1 if `file`'s (dev, ino) is in the deny set, else 0. */
-static __always_inline int file_in_deny_set(struct file *file)
+/* Read `file`'s (dev, ino) into `key`. Returns 1 on success, 0 on
+ * any failure to dereference. Callers that only need the deny
+ * lookup use `file_in_deny_set` for clarity. */
+static __always_inline int file_dev_ino(struct file *file, struct deny_key *key)
 {
     if (!file) {
         return 0;
@@ -135,11 +189,47 @@ static __always_inline int file_in_deny_set(struct file *file)
     if (!inode) {
         return 0;
     }
-    struct deny_key key = {};
-    key.ino = BPF_CORE_READ(inode, i_ino);
-    key.dev = BPF_CORE_READ(inode, i_sb, s_dev);
-    __u8 *val = bpf_map_lookup_elem(&deny_set, &key);
+    key->ino = BPF_CORE_READ(inode, i_ino);
+    key->dev = BPF_CORE_READ(inode, i_sb, s_dev);
+    return 1;
+}
+
+/* Returns 1 if `key`'s (dev, ino) is in the deny set, else 0. */
+static __always_inline int key_in_deny_set(const struct deny_key *key)
+{
+    __u8 *val = bpf_map_lookup_elem(&deny_set, key);
     return val ? 1 : 0;
+}
+
+/* Convenience wrapper around `file_dev_ino` + `key_in_deny_set`
+ * for hot paths that don't need the key for later use. */
+static __always_inline int file_in_deny_set(struct file *file)
+{
+    struct deny_key key = {};
+    if (!file_dev_ino(file, &key)) {
+        return 0;
+    }
+    return key_in_deny_set(&key);
+}
+
+/* Reserve a record on the ring buffer and fill in the common
+ * fields. The caller fills in source / verdict / reason before
+ * submitting. Returns NULL if the ring buffer is full —
+ * audit-side issues are not allowed to fail closed; the kernel
+ * verdict has already been applied by the time we reach here. */
+static __always_inline struct audit_record *
+audit_reserve(struct deny_key *key)
+{
+    struct audit_record *r = bpf_ringbuf_reserve(&audit_rb, sizeof(*r), 0);
+    if (!r) {
+        return NULL;
+    }
+    r->ts_ns = bpf_ktime_get_ns();
+    r->_pad = 0;
+    r->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    r->dev = key ? key->dev : 0;
+    r->ino = key ? key->ino : 0;
+    return r;
 }
 
 /* LSM hook for exec.
@@ -159,10 +249,30 @@ int BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
         return 0;
     }
     struct file *file = BPF_CORE_READ(bprm, file);
-    if (file_in_deny_set(file)) {
-        return -EACCES;
+    struct deny_key key = {};
+    int have_key = file_dev_ino(file, &key);
+    int denied = have_key && key_in_deny_set(&key);
+
+    /* Audit emit. Fire for every exec from inside the session
+     * cgroup; the userspace reader filters out shim-routed paths
+     * (which the shim audits separately) and decides whether to
+     * record `allow_unmediated` or skip. Deny path also emits
+     * and then returns -EACCES. Best-effort: a reservation
+     * failure can't fail the kernel verdict. */
+    struct audit_record *r = audit_reserve(have_key ? &key : NULL);
+    if (r) {
+        r->source = AUDIT_SRC_BPRM;
+        if (denied) {
+            r->verdict = AUDIT_VERDICT_DENY;
+            r->reason = AUDIT_REASON_EXEC_DENY;
+        } else {
+            r->verdict = AUDIT_VERDICT_ALLOW;
+            r->reason = AUDIT_REASON_NONE;
+        }
+        bpf_ringbuf_submit(r, 0);
     }
-    return 0;
+
+    return denied ? -EACCES : 0;
 }
 
 /* LSM hook for file open.
@@ -187,8 +297,22 @@ int BPF_PROG(check_file_open, struct file *file, int ret)
     if (!in_session_cgroup()) {
         return 0;
     }
-    if (file_in_deny_set(file)) {
-        return -EACCES;
+    struct deny_key key = {};
+    if (!file_dev_ino(file, &key)) {
+        return 0;
     }
-    return 0;
+    if (!key_in_deny_set(&key)) {
+        /* file_open allows are too high-volume to audit; skip. */
+        return 0;
+    }
+
+    /* Deny path: emit audit then return -EACCES. */
+    struct audit_record *r = audit_reserve(&key);
+    if (r) {
+        r->source = AUDIT_SRC_FILE_OPEN;
+        r->verdict = AUDIT_VERDICT_DENY;
+        r->reason = AUDIT_REASON_OPEN_DENY;
+        bpf_ringbuf_submit(r, 0);
+    }
+    return -EACCES;
 }

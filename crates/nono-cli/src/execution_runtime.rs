@@ -24,20 +24,35 @@ const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `~/.nono/sessions` returned by [`crate::session::sessions_dir`],
 /// matching where the shim's audit server writes), used by the
 /// supervisor's exec-filter handler to classify trapped `execve`
-/// Canonicalize the mediation deny set for the BPF-LSM filter. The BPF
-/// program keys on (dev, ino), but the loader resolves the canonical
-/// path here — `stat`-and-insert happens inside `install_exec_filter`.
+/// Canonicalize the mediation deny set for the BPF-LSM filter and
+/// extract the per-session shim directory. The BPF program keys on
+/// (dev, ino), but the loader resolves the canonical path inside
+/// `install_exec_filter`. The shim directory is plumbed through to
+/// the audit reader for record suppression.
+///
+/// Returns `(deny_set, shim_dir, audit_log_dir)`.
 #[cfg(target_os = "linux")]
-fn exec_deny_set_from_mediation(
+fn exec_filter_state_from_mediation(
     handle: Option<&crate::mediation::session::SessionHandle>,
-) -> Vec<std::path::PathBuf> {
+) -> (
+    Vec<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+    Option<std::path::PathBuf>,
+) {
     match handle {
-        Some(h) => h
-            .blocked_binaries
-            .iter()
-            .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
-            .collect(),
-        None => Vec::new(),
+        Some(h) => {
+            let deny_set: Vec<std::path::PathBuf> = h
+                .blocked_binaries
+                .iter()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                .collect();
+            // audit.jsonl lives in sessions_dir (~/.nono/sessions),
+            // matching where the shim's audit server writes its own
+            // events. Both shapes interleave in the same file.
+            let audit_log_dir = crate::session::sessions_dir().ok();
+            (deny_set, Some(h.shim_dir.clone()), audit_log_dir)
+        }
+        None => (Vec::new(), None, None),
     }
 }
 
@@ -437,7 +452,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
         exec_strategy::ExecStrategy::Supervised => {
             #[cfg(target_os = "linux")]
-            let exec_deny_set = exec_deny_set_from_mediation(mediation_handle.as_ref());
+            let (exec_deny_set, exec_shim_dir, exec_audit_log_dir) =
+                exec_filter_state_from_mediation(mediation_handle.as_ref());
 
             let exit_code = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
@@ -458,6 +474,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
                 #[cfg(target_os = "linux")]
                 exec_deny_set,
+                #[cfg(target_os = "linux")]
+                exec_shim_dir,
+                #[cfg(target_os = "linux")]
+                exec_audit_log_dir,
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

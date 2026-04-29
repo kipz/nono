@@ -416,12 +416,12 @@ fn filter_emits_audit_for_allow_unmediated() {
     let h = ExecFilterHarness::new();
     let _out = h.run_nono(&["sh", "-c", "/bin/ls /bin > /dev/null"]);
     let events = h.read_audit_events();
-    let found = events.iter().any(|e| {
-        e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_allow_unmediated")
-    });
+    let found = events
+        .iter()
+        .any(|e| e.get("action_type").and_then(|v| v.as_str()) == Some("allow_unmediated"));
     assert!(
         found,
-        "expected an exec_filter_allow_unmediated audit event; events={:?}",
+        "expected an allow_unmediated audit event; events={:?}",
         events
     );
 }
@@ -441,13 +441,13 @@ fn filter_emits_audit_for_deny() {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| testbin_path.clone());
     let matching = events.iter().find(|e| {
-        e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_deny")
+        e.get("action_type").and_then(|v| v.as_str()) == Some("deny")
             && e.get("reason").and_then(|v| v.as_str()) == Some("deny_set")
             && e.get("path").and_then(|v| v.as_str()) == Some(canonical.as_str())
     });
     assert!(
         matching.is_some(),
-        "expected an exec_filter_deny event with reason=deny_set and path={:?}; events={:?}",
+        "expected an deny event with reason=deny_set and path={:?}; events={:?}",
         canonical,
         events
     );
@@ -483,12 +483,12 @@ fn filter_audit_args_reflect_execed_command_not_calling_shell() {
     let deny_event = events
         .iter()
         .find(|e| {
-            e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_deny")
+            e.get("action_type").and_then(|v| v.as_str()) == Some("deny")
                 && e.get("path").and_then(|v| v.as_str()) == Some(canonical.as_str())
         })
         .unwrap_or_else(|| {
             panic!(
-                "expected an exec_filter_deny event for {:?}; events={:?}",
+                "expected an deny event for {:?}; events={:?}",
                 canonical, events
             )
         });
@@ -515,8 +515,8 @@ fn shim_invocation_does_not_double_emit() {
     let h = ExecFilterHarness::new();
     let _out = h.run_nono(&["sh", "-c", "testbin via-path"]);
     let events = h.read_audit_events();
-    // Count events with action_type == "exec_filter_allow_unmediated" OR
-    // "exec_filter_deny" that reference testbin. There should be zero:
+    // Count events with action_type == "allow_unmediated" OR
+    // "deny" that reference testbin. There should be zero:
     // the shim handles the PATH-based invocation and emits its own event
     // (or none for audit-only), but the filter must not emit for shim
     // paths.
@@ -525,7 +525,7 @@ fn shim_invocation_does_not_double_emit() {
         .filter(|e| {
             e.get("action_type")
                 .and_then(|v| v.as_str())
-                .map(|s| s.starts_with("exec_filter_"))
+                .map(|s| s == "deny" || s == "allow_unmediated")
                 .unwrap_or(false)
         })
         .filter(|e| {
@@ -624,7 +624,7 @@ fn nonexistent_path_exec_returns_kernel_errno_not_eacces() {
 
     let events = h.read_audit_events();
     let bogus_deny = events.iter().any(|e| {
-        e.get("action_type").and_then(|v| v.as_str()) == Some("exec_filter_deny")
+        e.get("action_type").and_then(|v| v.as_str()) == Some("deny")
             && e.get("path")
                 .and_then(|v| v.as_str())
                 .map(|p| p.contains("nono-test-bogus-path-that-does-not-exist"))

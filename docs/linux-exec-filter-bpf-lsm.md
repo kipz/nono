@@ -544,72 +544,731 @@ audit events without backpressure.
 
 ## Implementation plan
 
-Phases are sized so each leaves the tree in a buildable,
-testable state.
+This section is written for an engineer (human or AI agent)
+picking the work up cold. It captures everything you need
+to know that isn't in the rest of the doc: where things
+live in the codebase, what idioms the existing BPF-LSM code
+uses, what tribal knowledge accumulated during the
+preceding iterations, and what the verification flow looks
+like at each step. **Use TDD throughout** — every phase
+specifies tests to write *before* the implementation, so
+the test runs RED first and goes GREEN as you complete the
+work. If you cannot write a failing test for a piece of
+behavior, the behavior is probably underspecified.
+
+The five phases are sized so each leaves the tree in a
+buildable, lint-clean, test-passing state. You can stop
+between phases for review; nothing requires landing them
+together.
+
+### 0. Repository orientation
+
+Branch: **`am/linux-exec-filter-bpf-lsm`** on the
+`drewmchugh/nono` fork. Clone target: `~/dd/nono` on
+workspaces (matches the validation workspace's existing
+checkout — keep the path consistent).
+
+Crate layout:
+
+| Crate | Role | Key files for this work |
+|---|---|---|
+| `crates/nono` | Library: sandbox primitives, BPF-LSM loader | `src/sandbox/{linux.rs,bpf_lsm.rs}`, `src/bpf/{exec_filter.bpf.c,vmlinux.h}`, `build.rs`, `tests/bpf_lsm_smoke.rs` |
+| `crates/nono-cli` | CLI binary: exec strategy, supervisor loop | `src/exec_strategy.rs`, `src/exec_strategy/supervisor_linux.rs`, `src/mediation/{filter_audit.rs,shebang.rs}`, `tests/exec_filter.rs` |
+| `crates/nono-shim` | Shim binary that the agent execs | unchanged by this work |
+
+`crates/nono/src/sandbox/linux.rs` is large (~3 k lines) and
+holds *all* of the existing seccomp-unotify infrastructure:
+filter install, BPF program builders, sockaddr parsing,
+notify recv/respond primitives, the path-read helpers.
+Phase 1 deletes the exec-filter portions of this file but
+leaves the openat (capability elevation) and connect/bind
+(network proxy) portions intact — they're independent
+features.
+
+Existing BPF-LSM scaffolding:
+
+- `crates/nono/src/bpf/exec_filter.bpf.c` is the BPF C
+  source. Currently has the `bprm_check_security` program
+  with cgroup-ancestor walk and `(dev, ino)` deny check.
+- `crates/nono/src/bpf/vmlinux.h` is the vendored kernel
+  type header (3 MB; do not regenerate unless the BPF
+  program needs a new struct field).
+- `crates/nono/build.rs` invokes `libbpf-cargo`'s
+  `SkeletonBuilder` to compile the BPF C and emit a Rust
+  skeleton at `OUT_DIR/exec_filter.skel.rs`.
+- `crates/nono/src/sandbox/bpf_lsm.rs` is the loader. It
+  has `install_exec_filter(deny_paths, agent_cgroup_id)`,
+  `create_session_cgroup(agent_pid)`, `is_bpf_lsm_available()`,
+  the `ExecFilterHandle` and `SessionCgroup` RAII types,
+  and a `mod skel { include!(...); } use skel::*;` wrapper
+  that suppresses clippy lints on the libbpf-cargo-
+  generated boilerplate.
+
+The current broker integration is in
+`crates/nono-cli/src/exec_strategy.rs` around the
+post-fork parent branch (~line 1165), inside the
+`#[cfg(target_os = "linux")]` block that creates the
+session cgroup, calls `install_exec_filter`, and binds the
+result into a let-binding kept alive for the supervisor
+loop. The seccomp-unotify exec filter — the thing being
+deleted in Phase 1 — is also wired here: child sends an
+`exec_notify_fd` over the socketpair, parent receives it,
+parent's poll loop calls `handle_exec_notification` on
+each event.
+
+### 0.1 Build and validation environment
+
+A fresh workspace booted from the `am/bpf-lsm-workspace-ami`
+AMI has:
+
+- `cat /sys/kernel/security/lsm` includes `bpf`. Verify
+  before doing anything.
+- Kernel `6.8.0-1052-aws` or newer with `CONFIG_BPF_LSM=y`.
+  Verify via `grep bpf_lsm_bprm_check_security /proc/kallsyms`.
+- Standard Ubuntu user / docker container layout (see the
+  decisions log for the recon details).
+
+To build for the first time on a fresh workspace:
+
+```
+sudo apt-get install -y \
+    libdbus-1-dev libelf-dev clang build-essential pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+source $HOME/.cargo/env
+cd ~/dd/nono
+make build-release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+```
+
+Re-run `setcap` after every release build — `cargo build`
+overwrites the binary and drops file capabilities.
+
+POC sources for end-to-end validation:
+
+```
+git clone --depth 1 -b kipz/pr20-toctou-poc \
+    https://github.com/kipz/nono.git /tmp/kipz-poc
+mkdir -p /tmp/exec-filter-poc
+cp /tmp/kipz-poc/poc/{attacker.c,vfork_attacker.c,run_test.sh} \
+    /tmp/exec-filter-poc/
+chmod +x /tmp/exec-filter-poc/run_test.sh
+```
+
+Harness usage:
+
+```
+NONO=$(pwd)/target/release/nono \
+SHIM=$(pwd)/target/release/nono-shim \
+ATTEMPTS=600 \
+ATTACKER_SRC=vfork_attacker.c \
+LABEL=phase-X \
+bash /tmp/exec-filter-poc/run_test.sh
+```
+
+Set `ATTACKER_SRC=attacker.c` for the pthread variant.
+Both should report `BYPASS_COUNT=0` after every phase.
+
+### 0.2 Tribal knowledge from prior iterations
+
+Things you'd waste time rediscovering otherwise:
+
+- **`(dev, ino)` byte layout** between Rust and BPF must
+  match exactly. The Rust loader has `#[repr(C)] struct
+  DenyKey { dev: u64, ino: u64 }` and the BPF program has
+  the parallel C definition. If you change one, change the
+  other and re-run the smoke test to catch verifier
+  rejection.
+- **`MaybeUninit<OpenObject>` lifetime.** `libbpf-rs`
+  `SkelBuilder::open` borrows from caller-owned storage
+  for the BPF object. The loader uses `Box::leak` to give
+  the storage a `'static` lifetime so the
+  `ExecFilterHandle` can own the resulting skeleton. The
+  leak is bounded (one OpenObject per session) and
+  reclaimed when the broker exits.
+- **Clippy on generated code.** `libbpf-cargo` emits
+  `unwrap()` and `expect()` in its boilerplate. Wrapping
+  the `include!` in a `mod skel { ... }` with
+  `#[allow(clippy::unwrap_used)]` and
+  `#[allow(clippy::expect_used)]` suppresses lints on the
+  generated code only; hand-written code in the same file
+  remains under the project's strict deny.
+- **`bpf_get_current_ancestor_cgroup_id(level)` returns 0
+  past current's depth.** The cgroup-ancestor walk loop
+  exits early on a 0 return, so the typical-case cost is
+  `~current_depth` iterations rather than `MAX_CGROUP_DEPTH`.
+- **Cgroup `Drop` migrates procs back to parent before
+  rmdir.** The `SessionCgroup::drop` impl reads
+  `cgroup.procs`, writes each pid to the parent cgroup's
+  `cgroup.procs`, and loops up to 16 times in case forks
+  happen during the migration. Without this, `rmdir` fails
+  with `EBUSY` on a non-empty cgroup and the directory
+  leaks.
+- **`PR_SET_NO_NEW_PRIVS=1` disables file caps at exec.**
+  The agent's `pre_exec` sets this; that's why setcap'd
+  binaries the agent might place in writable directories
+  don't grant capabilities. Don't break this — it's load-
+  bearing for Invariant D.
+- **`/proc/<pid>/comm` is the kernel-resolved binary
+  basename;** `/proc/<pid>/cmdline` is the user-passed
+  argv as it stood at the time of `execve` — for shebang
+  scripts these differ (the kernel's binary is the
+  interpreter; argv[1] is the script path). The BPF
+  program sees the kernel's view via `bprm->file`; the
+  audit code sees user-passed view via `bprm->filename`.
+  Don't conflate them.
+- **`make ci` has pre-existing failures on this branch**
+  in `crates/nono-cli/tests/exec_filter.rs` and
+  `crates/nono-cli/src/mediation/{filter_audit,shebang}.rs`
+  (test code with `unwrap()`). Phase 1 deletes most of
+  these files; what remains should clear `make ci` after
+  Phase 1 lands.
 
 ### Phase 1 — drop the seccomp-unotify exec filter
 
-Remove the seccomp filter installed in the agent's
-pre-exec (`install_seccomp_exec_filter`), the supervisor
-handler (`handle_exec_notification`), the
-`multi_threaded_unsafe`/shebang-chain/shim-prefix logic,
-and the path-resolution helpers used only by it. The
-seccomp filters for `openat` (capability elevation) and
-`connect`/`bind` (network proxy) stay — different
-features.
+**Goal.** Remove all userspace exec-decision code. After
+this phase, the only enforcement path for mediated commands
+is the BPF-LSM hook on `bprm_check_security`. Any host
+without `bpf` in the active LSM stack fails session start
+loudly. Other seccomp filters (openat for capability
+elevation, connect/bind for network proxy) stay — they're
+unrelated features.
 
-After this phase the BPF-LSM hook on
-`bprm_check_security` is the only enforcement and the only
-audit source. Any host without `bpf` in the active LSM
-stack fails session start.
+#### 1.1 Tests to write FIRST (TDD red)
 
-### Phase 2 — `file_open` hook
+These tests should fail before any deletion happens — they
+encode the post-Phase-1 behavior we're implementing toward.
 
-Add the `lsm/file_open` BPF program with the same
-cgroup-ancestor scope check and deny-inode map lookup as
-the existing `bprm_check_security` program. Both share one
-map.
+In `crates/nono-cli/tests/exec_filter.rs`:
+
+- `pre_exec_does_not_install_seccomp_exec_filter` — fork a
+  child that does what the agent's pre-exec does
+  (configure caps, etc.) but verify no seccomp filter on
+  `execve` is installed. Easiest check: in the child,
+  attempt to `execve` a non-deny binary and trace the
+  syscall path; the seccomp-unotify trap should never
+  fire because the filter doesn't exist. (You can prove
+  absence of the filter via `prctl(PR_GET_SECCOMP)` or
+  by checking `/proc/<pid>/status`'s `Seccomp:` field —
+  it should still show `0` for "no seccomp" or `2` for
+  "filter mode" if other filters are installed; what
+  matters is the count of installed filters via
+  `seccomp(SECCOMP_GET_NOTIF_SIZES, ...)` doesn't list
+  an exec-trapping one).
+- `mediation_active_without_bpf_lsm_fails_loudly` —
+  mock or condition-skip on a system where `bpf` isn't in
+  `/sys/kernel/security/lsm`. Run `nono` with a profile
+  containing `mediation.commands`. Expect non-zero exit
+  with an error message naming "BPF-LSM" and
+  "lsm=...,bpf". Skip on workspaces where bpf *is* active
+  (the validation workspace).
+
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
+
+- The existing 4 smoke tests stay GREEN through this
+  phase. No new ones for Phase 1.
+
+In a new file `crates/nono-cli/tests/no_seccomp_exec.rs`
+(or alongside the existing exec_filter tests, depending on
+organization):
+
+- `seccomp_exec_filter_module_does_not_exist` — a
+  compile-time guard: `use nono::sandbox::{
+  install_seccomp_exec_filter, SYS_EXECVE, SYS_EXECVEAT };`
+  should fail to compile after deletion. Encode this as a
+  doc-test or a `compile_fail` test in a build script.
+
+#### 1.2 What to delete
+
+Code to remove (everything specific to the seccomp exec
+filter; leave the openat/proxy filters alone):
+
+- `crates/nono/src/sandbox/linux.rs`:
+  - `install_seccomp_exec_filter` function and its BPF
+    program builder.
+  - `SYS_EXECVE`, `SYS_EXECVEAT` constants (move to
+    libc-only references if anything else needs them; in
+    practice nothing will after Phase 1).
+- `crates/nono/src/sandbox/mod.rs`: drop the re-exports of
+  `install_seccomp_exec_filter`, `SYS_EXECVE`,
+  `SYS_EXECVEAT`.
+- `crates/nono-cli/src/exec_strategy.rs`:
+  - `install_exec_filter` config field on `ExecConfig`.
+  - The pre_exec child-side install code that called
+    `install_seccomp_exec_filter` and sent the fd.
+  - The parent-side `exec_notify_fd: Option<OwnedFd>`
+    receive code.
+  - The supervisor poll-loop branch that dispatched to
+    `handle_exec_notification`.
+- `crates/nono-cli/src/exec_strategy/supervisor_linux.rs`:
+  - `handle_exec_notification` function.
+  - `classify_exec_path` and its `ExecDecision` enum.
+  - `read_path_at`, `read_execve_argv_at` helpers.
+  - `count_threads`, `read_tgid` (still used by the openat
+    handler? — verify; if so, leave them). Actually
+    `read_tgid` is shared with the openat handler — keep
+    it. `count_threads` is exec-filter-only — delete.
+  - The exec_filter test module at the bottom of the file.
+- `crates/nono-cli/src/mediation/shebang.rs`: delete
+  entirely.
+- `crates/nono-cli/src/mediation/mod.rs`: drop the `pub
+  mod shebang;` declaration.
+- `crates/nono-cli/src/mediation/filter_audit.rs`: keep
+  the file but simplify per Phase 3 (or do the schema
+  change here in Phase 1; either is fine — pick one and
+  stick with it). For now: drop the obsolete `reason`
+  constants (`SHEBANG_CHAIN`, `MULTI_THREADED_UNSAFE`,
+  `POST_EXEC_DENY`, `PTRACE_SEIZE_FAILED`); keep
+  `DENY_SET` for the BPF-LSM `bprm_check_security` deny
+  case (rename to `EXEC_DENY` for clarity).
+- `crates/nono-cli/tests/exec_filter.rs`: most tests in
+  this file test seccomp-specific behavior. Delete the
+  ones that exercise multi-threaded denial, shebang
+  chains, or shim-prefix logic. Keep tests that exercise
+  the still-relevant audit shape (rewrite to use
+  `bpf_lsm_smoke`-style harness if needed).
+
+#### 1.3 What to add
+
+- `BpfLsmError::ActiveLsmRequired` variant on
+  `crates/nono/src/sandbox/bpf_lsm.rs::BpfLsmError`. The
+  loader should return this rather than the existing
+  `NotInActiveLsm` when the *broker* (not just BPF-LSM
+  diagnostics) needs to fail. They might be the same — pick
+  one consistently.
+- `crates/nono-cli/src/exec_strategy.rs`: replace the
+  current "warn-and-fall-back-on-`NotInActiveLsm`" branch
+  with `return Err(NonoError::SandboxInit(format!("BPF-LSM
+  is required for mediation but is not in the active LSM
+  stack. The host kernel must boot with lsm=...,bpf in
+  the cmdline. See drewmchugh/nono#3.")))`.
+- Same for the cgroup-create failure branch and the
+  generic `LibBpf` errors: hard-fail rather than fall
+  back.
+
+#### 1.4 Verification
+
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+cargo test -p nono --lib                  # 629+ tests pass
+cargo test -p nono --test bpf_lsm_smoke   # 4 tests pass
+sudo -E cargo test -p nono --test bpf_lsm_smoke  # 4 tests pass with caps
+make ci                                   # clean
+```
+
+End-to-end POCs (must remain 0/600 from prior validation):
+
+```
+ATTACKER_SRC=attacker.c    LABEL=phase1-pthread bash /tmp/exec-filter-poc/run_test.sh
+ATTACKER_SRC=vfork_attacker.c LABEL=phase1-vfork bash /tmp/exec-filter-poc/run_test.sh
+```
+
+#### 1.5 Acceptance criteria
+
+- All existing BPF-LSM smoke tests still pass.
+- POC results: pthread 0/600, vfork 0/600.
+- `grep -r install_seccomp_exec_filter crates/` returns
+  nothing.
+- `grep -r handle_exec_notification crates/` returns
+  nothing.
+- `grep -r SYS_EXECVE crates/` returns nothing (or only
+  in irrelevant comments).
+- `make ci` clean (or has only pre-existing failures
+  unrelated to this work — note them in the commit
+  message).
+
+#### 1.6 Commit
+
+```
+Phase 1: drop seccomp-unotify exec filter; BPF-LSM is sole enforcement
+```
+
+Reference the design doc and the decisions log in the
+body. Include `Signed-off-by:` per the project's DCO rule.
+
+### Phase 2 — `file_open` BPF-LSM hook
+
+**Goal.** Add the `file_open` LSM hook that denies the
+agent's tree from reading mediated-binary bytes. Closes
+copy-the-binary, ld-linux trick, unprivileged tmpfs, and
+shellcode bypass classes in one step.
+
+#### 2.1 Tests to write FIRST (TDD red)
+
+In `crates/nono-cli/tests/file_open_deny.rs` (new file),
+each test should:
+1. Set up a session with `mediation.commands` listing a
+   test binary that exists at a known path under the test
+   harness's tmp directory.
+2. Run an action inside the agent's session that exercises
+   the bypass.
+3. Assert the action fails with `EACCES` and the agent
+   never gets the binary's bytes.
 
 Tests:
-- session denies `cat /usr/bin/gh` from inside the agent
-  cgroup, allows it from the broker.
-- session denies `/lib/ld-linux-x86-64.so.2 /usr/bin/gh
-  ...` (the dynamic linker can't open gh).
-- session denies `cp /usr/bin/gh /tmp/copy` (the cp
-  syscall's open of `/usr/bin/gh` fails).
 
-### Phase 3 — BPF audit ring buffer
+- `cat_of_mediated_binary_from_inside_agent_fails` —
+  `bash -c "cat /path/to/mediated-binary > /tmp/copy"`.
+  Expect non-zero exit. Expect `/tmp/copy` to not contain
+  the mediated binary's bytes.
+- `cp_of_mediated_binary_from_inside_agent_fails` — same
+  but with `cp`.
+- `dynamic_linker_invocation_of_mediated_binary_fails`
+  — `bash -c "/lib/ld-linux-x86-64.so.2 /path/to/binary"`
+  (use `arch=x86_64`-conditional path; on aarch64 the
+  linker is `/lib/ld-linux-aarch64.so.1`). Expect
+  non-zero exit; expect the binary's marker output never
+  appears.
+- `cat_of_mediated_binary_from_broker_succeeds` — same
+  binary, but the cat is run *outside* the agent's
+  cgroup (e.g., directly from the test harness without a
+  nono session). Expect success. Demonstrates the scope
+  check works.
+- `cat_of_non_mediated_binary_from_inside_agent_succeeds`
+  — `bash -c "cat /bin/ls > /dev/null"`. Expect success.
+  Demonstrates the deny is targeted.
 
-Add a `BPF_MAP_TYPE_RINGBUF` to the BPF program and emit a
-record from each hook on the audit-worthy paths. Add a
-broker-side polling task that reads the ring buffer,
-classifies each record (suppress shim-routed allows),
-formats as `FilterAuditEvent`, and appends to the audit
-log.
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
 
-The schema change (drop `exec_filter_` prefix, drop
-`interpreter_chain`, new `reason` values) lands in this
-phase.
+- Add `file_open_hook_attaches` — verifies the new BPF
+  program section is present in the loaded skeleton and
+  that `attach()` succeeds.
+- Update `force_load_validates_verifier_acceptance` to
+  exercise both hooks loading.
+
+In `crates/nono-cli/tests/exec_filter.rs` (or wherever the
+audit tests live after Phase 1):
+
+- Add `audit_emits_open_deny_when_agent_reads_mediated_binary`
+  — verify a JSONL entry appears in `audit.jsonl` with
+  `action_type = "deny"`, `reason = "open_deny"`,
+  `path = <canonical>`. (May need to defer assertion to
+  Phase 3 if audit emission is per-phase ordered.)
+
+#### 2.2 BPF program changes
+
+In `crates/nono/src/bpf/exec_filter.bpf.c`, add a second
+program after the existing `bprm_check_security`:
+
+```c
+SEC("lsm/file_open")
+int BPF_PROG(check_file_open, struct file *file)
+{
+    if (!in_session_cgroup_via_ancestor_walk()) {
+        return 0;
+    }
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    struct deny_key key = {
+        .dev = BPF_CORE_READ(inode, i_sb, s_dev),
+        .ino = BPF_CORE_READ(inode, i_ino),
+    };
+    if (bpf_map_lookup_elem(&deny_set, &key)) {
+        return -EACCES;
+    }
+    return 0;
+}
+```
+
+Factor the cgroup-ancestor walk into a `static
+__always_inline` helper if the existing program inlines
+it directly — both programs need it.
+
+#### 2.3 Loader changes
+
+`crates/nono/src/sandbox/bpf_lsm.rs`:
+
+- The `ExecFilterHandle` already holds `_skel` and
+  `_link`. Add a second link field, `_open_link`, for the
+  `file_open` program's attachment. RAII teardown order
+  matters — the link drops *before* the skel does.
+- In `install_exec_filter_inner`, after the existing
+  `skel.progs.check_exec.attach()`, also call
+  `skel.progs.check_file_open.attach()` and store the
+  result. The skeleton names come from libbpf-cargo's
+  generation rule (program function name → field name on
+  `skel.progs`).
+
+#### 2.4 Verification
+
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+sudo -E cargo test -p nono --test bpf_lsm_smoke
+cargo test -p nono-cli --test file_open_deny
+```
+
+End-to-end on the validation workspace:
+
+```
+# Existing POCs still pass
+ATTACKER_SRC=attacker.c       bash /tmp/exec-filter-poc/run_test.sh
+ATTACKER_SRC=vfork_attacker.c bash /tmp/exec-filter-poc/run_test.sh
+
+# Add a copy-attack POC: bash script that
+# (a) cps mediated-binary to /tmp/copy and execs it,
+# (b) runs /lib/ld-linux mediated-binary,
+# (c) unshares user-ns, mounts tmpfs, copies bytes, execs.
+# All three must fail with EACCES at the cp/cat step
+# (i.e., the bytes never get to the writable location).
+```
+
+Author the new POCs under `/tmp/exec-filter-poc/copy_attacker.sh`
+etc. They don't need to be checked into the repo; they're
+validation artifacts on the workspace.
+
+#### 2.5 Acceptance criteria
+
+- All Phase 1 tests still pass.
+- New `file_open_deny` tests pass.
+- Smoke test confirms the new program loads and attaches.
+- Empirical: copy-attack, ld-linux trick, and tmpfs trick
+  all fail at the read step.
+
+### Phase 3 — BPF audit ring buffer + userspace reader
+
+**Goal.** Restore the audit feature lost when Phase 1
+removed the seccomp supervisor's audit-emission code.
+Audit records flow from the BPF program through a
+`BPF_MAP_TYPE_RINGBUF` to a broker-side polling task, which
+formats them and appends to `~/.nono/sessions/audit.jsonl`.
+
+#### 3.1 Tests to write FIRST (TDD red)
+
+In `crates/nono-cli/tests/audit_ringbuf.rs` (new):
+
+- `audit_emits_allow_unmediated_for_non_mediated_exec` —
+  agent execs `/bin/ls`. Expect a JSONL entry with
+  `action_type = "allow_unmediated"`, `command = "ls"`,
+  `path = "/bin/ls"`.
+- `audit_emits_deny_for_blocked_open` — agent tries to
+  `cat` a mediated binary. Expect a JSONL entry with
+  `action_type = "deny"`, `reason = "open_deny"`,
+  `exit_code = 126`.
+- `audit_does_not_emit_for_shim_invocations` — agent runs
+  the shim path (which the broker mediates normally).
+  Expect no `exec_filter`-shaped entry from the BPF
+  audit; the shim downstream emits its own normal
+  audit record.
+- `audit_does_not_emit_for_open_allows` — agent does many
+  `open` calls on non-mediated files. Expect zero
+  emissions in the kernel audit channel from those.
+- `audit_record_has_argv_for_bprm_events` — agent runs
+  `/bin/ls -la /tmp`. Expect the JSONL entry's `args` to
+  be `["-la", "/tmp"]` (argv without argv[0]).
+
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
+
+- `ringbuf_map_is_present_in_skeleton` — assert the
+  generated skeleton exposes the audit ringbuf.
+- `audit_reader_polls_without_panicking` — start a
+  reader, immediately stop, no panic.
+
+#### 3.2 BPF program changes
+
+Add a ring buffer map:
+
+```c
+struct audit_record {
+    __u64 ts_ns;            /* bpf_ktime_get_ns */
+    __u8  source;           /* 0 = bprm, 1 = file_open */
+    __u8  verdict;          /* 0 = allow_unmediated, 1 = deny */
+    __u8  reason;           /* 0 = none, 1 = exec_deny, 2 = open_deny */
+    __u8  _pad;
+    __u32 pid;
+    __u64 dev;
+    __u64 ino;
+    char  path[256];
+    /* For bprm only: argv as a single \0-separated buffer.
+     * argc inferred at userspace by counting nulls. */
+    __u32 argv_len;
+    char  argv[1024];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);  /* 1 MB */
+} audit_rb SEC(".maps");
+```
+
+In each hook, on audit-worthy paths, reserve a slot, fill
+it, submit:
+
+```c
+struct audit_record *r = bpf_ringbuf_reserve(&audit_rb,
+                                              sizeof(*r), 0);
+if (!r) return /* fall through, don't fail closed on
+                  audit-side issues */;
+r->ts_ns = bpf_ktime_get_ns();
+r->source = SOURCE_BPRM;  /* or SOURCE_FILE_OPEN */
+r->verdict = ...;
+r->reason = ...;
+r->pid = bpf_get_current_pid_tgid() >> 32;
+r->dev = key.dev;
+r->ino = key.ino;
+bpf_d_path(&file->f_path, r->path, sizeof(r->path));
+/* For bprm only: */
+bpf_probe_read_user_str(r->argv, sizeof(r->argv),
+                         BPF_CORE_READ(bprm, argv));
+bpf_ringbuf_submit(r, 0);
+```
+
+Audit-worthy paths:
+- `bprm_check_security` allow when current is in agent
+  cgroup AND path doesn't start with the shim_dir prefix
+  → `allow_unmediated`. Suppress for shim paths in
+  userspace based on the recorded `path`.
+- `bprm_check_security` deny → `exec_deny` (defense-in-
+  depth; should be rare).
+- `file_open` deny → `open_deny`.
+- `file_open` allow → **don't emit**, would be too noisy.
+
+#### 3.3 Userspace reader
+
+New file `crates/nono/src/sandbox/bpf_audit.rs`:
+
+- `pub struct AuditReader { ... }` with `start(...) -> Self`
+  that spawns a polling task on the ring buffer fd. Use
+  `libbpf-rs::RingBufferBuilder`'s callback API: register
+  a closure that decodes each record and writes to the
+  audit log.
+- The ring buffer fd lives on the loaded skeleton's
+  `maps.audit_rb`. Pass it to the reader at construction.
+- Reader holds `Arc<Mutex<File>>` for the audit log so
+  multiple ring-buffer events can be appended without
+  reopening.
+- Reader's `Drop` stops the polling task cleanly (use a
+  cancellation token / atomic bool checked in the poll
+  loop).
+
+In `crates/nono-cli/src/exec_strategy.rs`, the broker
+constructs the `AuditReader` after `install_exec_filter`
+returns and binds it into the same scope that holds the
+`ExecFilterHandle`. Drop order: reader drops first
+(stops polling), then the filter handle (detaches BPF).
+
+#### 3.4 Schema change
+
+`crates/nono-cli/src/mediation/filter_audit.rs`:
+
+- `FilterAuditEvent::action_type`: `"allow_unmediated"` |
+  `"deny"`.
+- `reason` (Option<String>): `"open_deny"` | `"exec_deny"`
+  on deny; absent on allow.
+- Drop `interpreter_chain` field entirely.
+- `exit_code: Some(126)` on deny; `None` on allow.
+- All other fields unchanged.
+
+The shim-side `AuditEvent` (in `mediation/server.rs` or
+similar) is not touched; consumers of `audit.jsonl` see
+both shapes interleaved as today.
+
+#### 3.5 Verification
+
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep target/release/nono
+cargo test -p nono-cli --test audit_ringbuf
+sudo -E cargo test -p nono --test bpf_lsm_smoke
+```
+
+Manual end-to-end:
+1. Start a session with mediation.
+2. Inside, run `ls /`, `cat /bin/ls > /dev/null`, attempt
+   to cat a mediated binary (expect EACCES).
+3. Inspect `~/.nono/sessions/audit.jsonl`. Expect
+   `allow_unmediated` entries for `ls`, `cat`. Expect a
+   `deny` entry with `reason: open_deny` for the cat
+   attempt on the mediated binary. No entry for the
+   shim-routed mediated invocation (shim emits its own
+   record, not via the BPF ring buffer).
+
+#### 3.6 Acceptance criteria
+
+- All Phase 1 + 2 tests pass.
+- New audit_ringbuf tests pass.
+- Audit log has the expected entries for a representative
+  session.
+- Audit reader survives session teardown without
+  hanging.
 
 ### Phase 4 — invariant assertions
 
-Session-start checks:
-- `CapEff` is empty on the agent post-exec.
-- `Dumpable: 0` on each per-command sandbox post-exec.
-- `bpf` is in the active LSM stack.
-- The broker successfully created the session cgroup.
+**Goal.** Every deployment invariant the design depends on
+gets a session-start verification with a clear error
+message. No silent failure modes.
 
-Each assertion logs an explicit `info!` on success or
-fails the session with a specific error code on
-violation.
+#### 4.1 Tests to write FIRST (TDD red)
 
-### Phase 5 — documentation and rollout
+In `crates/nono-cli/tests/invariants.rs` (new):
 
-This document becomes the authoritative design doc,
-replacing `docs/linux-exec-filter-plan.md`. The decisions
-log (`docs/linux-exec-filter-vfork-decisions.md`) stays as
-the historical record of how we got here. PR #20's
-description is updated to point at the new doc.
+- `agent_capeff_is_zero` — start a session, assert the
+  agent's `/proc/<pid>/status`'s `CapEff:` line is all
+  zeros.
+- `pcs_is_non_dumpable` — start a session, trigger a
+  per-command sandbox spawn, assert
+  `/proc/<pcs_pid>/status`'s `Dumpable:` is 0.
+- `session_fails_loudly_when_bpf_not_in_lsm_stack` —
+  condition-skip on workspaces that do have bpf;
+  otherwise verify nono exits with the specific error
+  message.
+
+#### 4.2 Implementation
+
+`crates/nono-cli/src/exec_strategy.rs`:
+
+- After fork + setup of agent's pre-exec, but before
+  agent runs user code, the broker reads
+  `/proc/<agent>/status` and verifies `CapEff: 0`. If
+  non-zero, log error and abort the session.
+- For per-command sandboxes: in the spawn path
+  (`crates/nono-cli/src/mediation/policy.rs:611`-ish),
+  after `exec`, read `/proc/<pcs>/status`, verify
+  `Dumpable: 0`, kill PCS and surface error if not.
+- Session-start log: emit an `info!` line listing each
+  invariant and PASS/FAIL, plus the resolved deny inodes.
+  Operators auditing the log see explicitly what was
+  enforced.
+
+#### 4.3 Acceptance criteria
+
+- All previous tests pass.
+- Invariant assertion tests pass.
+- Session-start log includes a structured invariants
+  block.
+
+### Phase 5 — promote the design doc, retire the old one
+
+**Goal.** Mechanical cleanup; no code changes.
+
+#### 5.1 Steps
+
+1. Move `docs/linux-exec-filter-bpf-lsm.md` to
+   `docs/linux-exec-filter-plan.md`, replacing the old
+   one.
+2. Move the old `docs/linux-exec-filter-plan.md` to
+   `docs/archive/linux-exec-filter-plan-seccomp-era.md`.
+3. Update `README.md` and any other docs that link the
+   old plan to point at the new path.
+4. PR description for kipz/nono#20 gets a major rewrite
+   pointing at the new design and explaining the shift.
+5. The decisions log (`docs/linux-exec-filter-vfork-
+   decisions.md`) stays in place — it's the historical
+   record, and doesn't need to be re-written. Add a final
+   entry summarizing the BPF-LSM landing.
+
+#### 5.2 Acceptance criteria
+
+- `docs/linux-exec-filter-plan.md` is the BPF-LSM doc.
+- Old seccomp-era doc archived but reachable via git
+  history.
+- PR #20 description matches what's actually being
+  shipped.
+
+## What this design does not address
 
 ## What this design does not address
 

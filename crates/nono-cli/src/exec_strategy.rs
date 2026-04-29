@@ -1190,11 +1190,12 @@ pub fn execute_supervised(
             //
             //   * `bpf` missing from /sys/kernel/security/lsm —
             //     host needs the lsm=...,bpf cmdline (AMI change).
-            //   * Cgroup creation EACCES — broker lacks
-            //     CAP_SYS_ADMIN or cgroup v2 delegation. The
-            //     install path needs setcap cap_bpf,cap_sys_admin
-            //     +ep on /usr/bin/nono, or sudo, or systemd-unit
-            //     delegation.
+            //   * Cgroup creation EACCES — needs CAP_SYS_ADMIN
+            //     plus write to the cgroup parent. cgroup v2 mkdir
+            //     runs DAC before the CAP_SYS_ADMIN check and
+            //     CAP_SYS_ADMIN doesn't override DAC, so a root-
+            //     owned parent also needs CAP_DAC_OVERRIDE. Use
+            //     `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep`.
             //   * BPF load EPERM — broker lacks CAP_BPF.
             #[cfg(target_os = "linux")]
             let _bpf_lsm_handle: Option<(
@@ -1261,10 +1262,10 @@ pub fn execute_supervised(
                         Err(e) => {
                             warn!(
                                 "BPF-LSM exec filter unavailable: per-session cgroup \
-                                 creation failed ({e}). The broker needs write access to \
-                                 its cgroup parent — typically setcap cap_sys_admin+ep \
-                                 on /usr/bin/nono, or running under a systemd unit with \
-                                 Delegate=yes. Continuing with seccomp-unotify only."
+                                 creation failed ({e}). Try `setcap cap_bpf,cap_sys_admin,\
+                                 cap_dac_override+ep /usr/bin/nono` (CAP_SYS_ADMIN alone is \
+                                 not enough when the cgroup parent is root-owned — cgroup v2 \
+                                 mkdir checks DAC first). Continuing with seccomp-unotify only."
                             );
                             None
                         }

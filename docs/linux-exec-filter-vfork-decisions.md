@@ -397,3 +397,113 @@ back to the parent cgroup (`cgroup.procs` writes one pid at a
 time, looped to handle forks during migration), then `rmdir`s
 the session cgroup. Bounded loop (16 iterations) so a runaway
 session can't pin the broker on shutdown.
+
+---
+
+### 2026-04-29 — end-to-end validation on the BPF-LSM workspace
+
+Workspace: AMI booted from `am/bpf-lsm-workspace-ami`, kernel
+`6.8.0-1052-aws`. `/sys/kernel/security/lsm` =
+`lockdown,capability,landlock,yama,apparmor,bpf` ✓.
+
+Build: `make build-release` from `am/linux-exec-filter-bpf-lsm`
+@ `c957e11` succeeds after installing `libdbus-1-dev`. No other
+system-lib gaps surface on this AMI.
+
+Smoke test (`sudo -E cargo test -p nono --test bpf_lsm_smoke -- --nocapture`):
+
+```
+test create_session_cgroup_roundtrip ... ok
+test install_with_real_binary_in_deny_set ... ok
+test force_load_validates_verifier_acceptance ... ok
+test install_exec_filter_with_empty_deny_set ... ok
+test result: ok. 4 passed; 0 failed
+```
+
+All four pass, including the cgroup-roundtrip and full
+attach-validation paths that were skipped on the prior
+workspace. So the load + attach pipeline works end-to-end on
+this kernel.
+
+#### Caps surprise: cap_dac_override is needed too
+
+`setcap cap_bpf,cap_sys_admin+ep target/release/nono` was
+not enough on this AMI. First POC run with that cap set:
+
+```
+ Attack 2 (vfork): BYPASS (49 hits) — residual confirmed ✗
+```
+
+Broker log explained why:
+
+```
+WARN BPF-LSM exec filter unavailable: per-session cgroup
+creation failed (mkdir(/sys/fs/cgroup/init/nono-session-22653)
+failed: Permission denied (os error 13) (CAP_SYS_ADMIN or
+cgroup delegation required))
+```
+
+Root cause: this AMI's parent cgroup is root-owned with mode
+`0755` and no delegation. cgroup v2 `mkdir` goes through normal
+VFS DAC checks before the cgroup-namespace `CAP_SYS_ADMIN`
+check. `CAP_SYS_ADMIN` does **not** override DAC — only
+`CAP_DAC_OVERRIDE` (or `CAP_DAC_READ_SEARCH` for read paths)
+does. So with cap_bpf+cap_sys_admin only, mkdir EACCES'd, the
+cgroup-create branch fell through to the fallback (warn-and-
+continue with seccomp-only), and the vfork-bomb residual was
+right back at the unmediated rate.
+
+Re-ran with:
+
+```
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+```
+
+Broker now logs `BPF-LSM exec filter active: agent_pid=…
+cgroup_id=… deny_entries=1 (vfork-bomb residual closed via
+kernel-side hook; daemonize residual closed via cgroup
+scoping)` at session start, and the POC results flip to
+target:
+
+```
+ Attack 1 (pthread): BLOCKED (0 hits)  — Threads>1 check working ✓
+ Attack 2 (vfork):   not observed in 600 attempts
+```
+
+Vfork run detail: 0 bypasses / 83 denied / 517 other (the
+"other" bucket is timing variance in the attacker — wrong-
+observation-point classifications, not bypasses; what matters
+is that the kernel never loaded the deny-target image, which
+is what BYPASS=0 measures).
+
+#### Action items from the validation
+
+1. Fix the broker's warn message and the smoke-test docstring
+   to recommend `cap_bpf,cap_sys_admin,cap_dac_override+ep`
+   on AMIs that don't delegate the agent's parent cgroup.
+   The current message ("typically setcap cap_sys_admin+ep")
+   is misleading — operators on this AMI will follow it and
+   silently end up on the seccomp-only path, undoing the
+   whole BPF-LSM landing.
+2. Update README/install docs with the same correction.
+3. Longer-term: consider a kernel-level cgroup delegation
+   path (systemd unit with `Delegate=yes`) so the broker can
+   create sub-cgroups without DAC override, narrowing the
+   privilege footprint.
+
+#### Validation summary
+
+| Check | Result |
+|---|---|
+| `bpf` in active LSM list | ✓ |
+| `make build-release` (after `apt install libdbus-1-dev`) | ✓ |
+| Smoke test (4 cases, sudo) | ✓ 4/4 |
+| BPF-LSM activation log at session start | ✓ (after cap_dac_override) |
+| Pthread POC, 600 attempts | ✓ 0 bypass / 600 denied |
+| Vfork POC, 600 attempts | ✓ 0 bypass / 83 denied / 517 other |
+| Vfork POC w/o cap_dac_override (sanity) | ✗ 49 bypass / 54 denied — fallback to seccomp-only confirmed |
+
+The BPF-LSM landing closes the vfork-bomb residual on this
+kernel as designed. Only blocker for shipping is the caps
+documentation correction above.

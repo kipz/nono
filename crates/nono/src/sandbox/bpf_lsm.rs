@@ -24,8 +24,11 @@
 //!   kernel cmdline parameter and cannot be changed at runtime.
 //!   The workspaces AMI ships a `/etc/default/grub.d/99-bpf-lsm.cfg`
 //!   that adds it (see dd-source `am/bpf-lsm-workspace-ami`).
-//! - `CAP_BPF` (or `CAP_SYS_ADMIN`) on the loader process. Without
-//!   it, the `bpf()` syscall fails with `EPERM` at program load.
+//! - `CAP_BPF` for the `bpf()` load, `CAP_SYS_ADMIN` for the
+//!   per-session cgroup, and `CAP_DAC_OVERRIDE` when the cgroup
+//!   parent is root-owned (cgroup v2 `mkdir` checks DAC before
+//!   `CAP_SYS_ADMIN`). Recommended:
+//!   `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep /usr/bin/nono`.
 //!
 //! On hosts without `bpf` in the active LSM stack, this loader
 //! refuses to install (returning [`BpfLsmError::NotInActiveLsm`])

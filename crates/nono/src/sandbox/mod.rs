@@ -14,6 +14,12 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+// BPF-LSM exec filter loader. Always module-visible so callers
+// can reference the API without target-cfg guards; the
+// off-Linux / feature-disabled build provides stubs that return
+// `Unsupported`.
+pub mod bpf_lsm;
+
 // Re-export macOS extension functions for supervisor use
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
@@ -33,8 +39,8 @@ pub use linux::{
     install_seccomp_exec_filter, install_seccomp_notify, install_seccomp_proxy_filter,
     notif_id_valid, probe_seccomp_block_network_support, read_notif_path, read_notif_sockaddr,
     read_open_how, recv_notif, resolve_notif_path, respond_notif_errno, validate_openat2_size,
-    OpenHow, SeccompData, SeccompNetFallback, SeccompNotif, SockaddrInfo, UnixSocketKind,
-    SYS_BIND, SYS_CONNECT, SYS_EXECVE, SYS_EXECVEAT, SYS_OPENAT, SYS_OPENAT2,
+    OpenHow, SeccompData, SeccompNetFallback, SeccompNotif, SockaddrInfo, UnixSocketKind, SYS_BIND,
+    SYS_CONNECT, SYS_EXECVE, SYS_EXECVEAT, SYS_OPENAT, SYS_OPENAT2,
 };
 
 /// Information about sandbox support on this platform

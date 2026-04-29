@@ -13,10 +13,17 @@ keywords = ["sandbox", "security", "capability", "landlock", "seatbelt"]
 categories = ["os", "api-bindings"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "bpf-lsm"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
 system-keyring = ["dep:keyring"]
+# Enables the BPF-LSM exec filter (Linux only). Compiles a BPF C
+# program at build time via libbpf-cargo and links the libbpf-rs
+# loader. Disabling this gates the loader to a runtime-error stub —
+# useful when clang isn't available in the build environment, or for
+# bisecting BPF-LSM-related regressions. The CLI's seccomp-unotify
+# exec filter remains the fallback regardless of this feature.
+bpf-lsm = ["dep:libbpf-rs"]
 
 [dependencies]
 thiserror.workspace = true
@@ -46,6 +53,11 @@ der = { version = "0.7", default-features = false }
 landlock = "0.4"
 nix = { version = "0.31.2", features = ["fs", "user"] }
 keyring = { version = "3", features = ["sync-secret-service"], optional = true }
+# BPF-LSM exec filter loader. Linux-only by construction. Optional so
+# non-Linux builds and clang-less environments don't need libbpf at
+# build time. Compiled in only when the `bpf-lsm` feature is on (the
+# default).
+libbpf-rs = { version = "0.26", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.31.2", features = ["fs", "user"] }
@@ -56,6 +68,12 @@ typify = "0.6"
 serde_json = "1"
 syn = "2"
 prettyplease = "0.2"
+
+[target.'cfg(target_os = "linux")'.build-dependencies]
+# Compiles src/bpf/exec_filter.bpf.c at build time and emits a Rust
+# skeleton module under $OUT_DIR. Only pulled in on Linux; the
+# `bpf-lsm` feature controls whether build.rs actually invokes it.
+libbpf-cargo = "0.26"
 
 [dev-dependencies]
 tempfile.workspace = true

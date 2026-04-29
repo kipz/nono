@@ -1162,6 +1162,55 @@ pub fn execute_supervised(
                     .collect()
             };
 
+            // BPF-LSM exec filter (Linux). Defense-in-depth on top
+            // of the seccomp-unotify exec filter the child
+            // installed: the kernel-side LSM hook fires on every
+            // exec post-binfmt-resolution, so vfork-bomb-style
+            // user-memory swaps after the seccomp CONTINUE response
+            // can no longer slip a deny-set binary past us.
+            //
+            // Installed in the broker (parent) so the BPF program
+            // mediates every descendant of the agent's process tree.
+            // Scoped to that tree by the agent_pid in the program's
+            // scope map; broker-side per-command sandboxes are
+            // unaffected because they aren't descendants of the
+            // agent.
+            //
+            // Falls back silently to seccomp-unotify-only if BPF-LSM
+            // isn't available (kernel without `bpf` in
+            // /sys/kernel/security/lsm, or process without
+            // CAP_BPF). The seccomp filter remains active in either
+            // case, so this is purely additive — never weakens the
+            // existing PR's protection.
+            #[cfg(target_os = "linux")]
+            let _bpf_lsm_handle: Option<nono::sandbox::bpf_lsm::ExecFilterHandle> = {
+                let deny_paths: Option<&[std::path::PathBuf]> =
+                    supervisor.map(|s| s.exec_deny_set.as_slice()).filter(|s| !s.is_empty());
+                if let Some(paths) = deny_paths {
+                    let agent_pid = child.as_raw() as u32;
+                    match nono::sandbox::bpf_lsm::install_exec_filter(paths, agent_pid) {
+                        Ok(h) => {
+                            debug!(
+                                "BPF-LSM exec filter installed: agent_pid={} deny_entries={}",
+                                agent_pid,
+                                paths.len()
+                            );
+                            Some(h)
+                        }
+                        Err(e) => {
+                            debug!(
+                                "BPF-LSM exec filter unavailable; \
+                                 continuing with seccomp-unotify only: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            };
+
             let (status, denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
                     #[cfg(target_os = "linux")]

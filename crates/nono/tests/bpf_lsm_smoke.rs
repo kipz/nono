@@ -62,7 +62,7 @@ fn install_exec_filter_with_empty_deny_set() {
         // Without `bpf` in /sys/kernel/security/lsm we can't
         // legally install_exec_filter (it would surface
         // NotInActiveLsm). Verify that's what we get.
-        let result = bpf_lsm::install_exec_filter(&[]);
+        let result = bpf_lsm::install_exec_filter(&[], std::process::id());
         assert!(
             matches!(result, Err(bpf_lsm::BpfLsmError::NotInActiveLsm)),
             "expected NotInActiveLsm without bpf in LSM stack, got: {result:?}"
@@ -77,7 +77,7 @@ fn install_exec_filter_with_empty_deny_set() {
     }
 
     // bpf is in the active LSM list — full attach test.
-    let handle = bpf_lsm::install_exec_filter(&[])
+    let handle = bpf_lsm::install_exec_filter(&[], std::process::id())
         .expect("install_exec_filter should succeed with empty deny set");
     // The handle keeps the program loaded and attached for its
     // lifetime; dropping it detaches.
@@ -108,7 +108,7 @@ fn force_load_validates_verifier_acceptance() {
         return;
     }
 
-    let result = bpf_lsm::install_exec_filter_no_lsm_check(&[]);
+    let result = bpf_lsm::install_exec_filter_no_lsm_check(&[], std::process::id());
 
     match (bpf_lsm::is_bpf_lsm_available(), result) {
         (true, Ok(_)) => {
@@ -152,6 +152,6 @@ fn install_with_real_binary_in_deny_set() {
     // Use a known-stable binary. We don't actually try to exec it
     // — this test only verifies population of the deny_set map.
     let deny = vec![std::path::PathBuf::from("/bin/true")];
-    let _handle = bpf_lsm::install_exec_filter(&deny)
+    let _handle = bpf_lsm::install_exec_filter(&deny, std::process::id())
         .expect("install with /bin/true in deny set should succeed");
 }

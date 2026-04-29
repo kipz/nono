@@ -180,11 +180,12 @@ mod imp {
     /// being enforced.
     pub fn install_exec_filter(
         deny_paths: &[std::path::PathBuf],
+        agent_pid: u32,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         if !is_bpf_lsm_available() {
             return Err(BpfLsmError::NotInActiveLsm);
         }
-        install_exec_filter_inner(deny_paths)
+        install_exec_filter_inner(deny_paths, agent_pid)
     }
 
     /// Install the filter without checking
@@ -198,12 +199,14 @@ mod imp {
     #[doc(hidden)]
     pub fn install_exec_filter_no_lsm_check(
         deny_paths: &[std::path::PathBuf],
+        agent_pid: u32,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
-        install_exec_filter_inner(deny_paths)
+        install_exec_filter_inner(deny_paths, agent_pid)
     }
 
     fn install_exec_filter_inner(
         deny_paths: &[std::path::PathBuf],
+        agent_pid: u32,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         // Canonicalize-and-stat the deny paths first so we surface
         // any I/O errors before touching the kernel. Map entries
@@ -261,6 +264,22 @@ mod imp {
                 unsafe { std::mem::transmute(*entry) };
             map.update(&key_bytes, std::slice::from_ref(&one), MapFlags::ANY)?;
         }
+
+        // Populate the scope map. The BPF program reads this and
+        // walks each task's parent chain looking for `agent_pid`;
+        // tasks not in the agent's tree (broker children, user
+        // shells outside nono, system services) skip the deny
+        // check entirely. Setting `agent_pid = 0` here means
+        // "no scoping yet" and causes the program to allow every
+        // exec — useful while the broker is mid-setup.
+        let scope_map = &skel.maps.scope;
+        let scope_key: u32 = 0;
+        let scope_val: [u8; 4] = agent_pid.to_ne_bytes();
+        scope_map.update(
+            &scope_key.to_ne_bytes(),
+            &scope_val,
+            MapFlags::ANY,
+        )?;
 
         // Attach to bprm_check_security. With `bpf` in the active
         // LSM list, the program now mediates every exec on the
@@ -351,6 +370,7 @@ mod imp {
 
     pub fn install_exec_filter(
         _deny_paths: &[std::path::PathBuf],
+        _agent_pid: u32,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }
@@ -358,6 +378,7 @@ mod imp {
     #[doc(hidden)]
     pub fn install_exec_filter_no_lsm_check(
         _deny_paths: &[std::path::PathBuf],
+        _agent_pid: u32,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }

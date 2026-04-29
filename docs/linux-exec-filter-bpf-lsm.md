@@ -1270,18 +1270,6 @@ In `crates/nono-cli/tests/invariants.rs` (new):
 
 ## What this design does not address
 
-## What this design does not address
-
-- **Capability-based mediation.** An agent that can compile
-  arbitrary code can reimplement what a mediated binary
-  does. Closing that requires syscall-level capability
-  filtering, which is a different feature with a different
-  deployment shape.
-- **Multi-tenant hosts.** The cgroup scope check assumes one
-  agent's process tree per session. Concurrent sessions on
-  the same host work (each gets its own cgroup) but a
-  multi-tenant container shared by multiple agents would
-  need additional design work to scope per-agent.
 - **macOS.** This document covers Linux only; the macOS
   Seatbelt-based implementation is in a separate design.
 

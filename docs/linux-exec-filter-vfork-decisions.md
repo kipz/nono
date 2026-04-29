@@ -507,3 +507,52 @@ is what BYPASS=0 measures).
 The BPF-LSM landing closes the vfork-bomb residual on this
 kernel as designed. Only blocker for shipping is the caps
 documentation correction above.
+
+---
+
+### 2026-04-29 — closed sub-cgroup-escape via ancestry walk
+
+After the cgroup-membership scoping landed in `c957e11`, a deeper
+threat-model review surfaced one more bypass class: the agent
+**creating a child cgroup of the session cgroup and moving into
+it**. Mechanism:
+
+- `mkdir /sys/fs/cgroup/.../nono-session-X` runs with the
+  broker's uid (bits) even when the broker has CAP_SYS_ADMIN as
+  a *capability* — capabilities don't change uid. So the session
+  cgroup directory is bits-owned.
+- The agent (also bits) can therefore `mkdir
+  /sys/fs/cgroup/.../nono-session-X/sub` and `echo $$ >
+  sub/cgroup.procs` to move itself into a child cgroup.
+- `bpf_get_current_cgroup_id()` for a task in `sub` returns
+  sub's id, ≠ the session cgroup id. The equality check in the
+  earlier program let the agent through; deny check skipped.
+
+The agent **can't** escape upward (parent cgroups are root-
+owned, kernel rejects writes to their `cgroup.procs`), so we
+just need the BPF program to detect "current is a descendant of
+the session cgroup" instead of "current *is* the session
+cgroup".
+
+Fix: replaced the equality check with a bounded ancestor walk
+via `bpf_get_current_ancestor_cgroup_id(level)`. Iterate level
+0 (root) to level 63 (deeper than any realistic cgroup tree),
+return early on hit; the helper returns 0 once `level >
+current's depth` so the typical-case cost is roughly current's
+cgroup depth, not 64 iterations. Verifier accepts the loop
+(unrolled). Smoke tests still pass.
+
+Why this also subsumes any thought of using `cgroup.max.depth=0`
+to prevent sub-cgroup creation: the `max.depth` control file
+inherits ownership from the cgroup directory, so it'd also be
+bits-owned, and the agent could just lift the limit by writing
+to it. The ancestry walk closes the bypass at the BPF layer
+where cgroup parentage is **kernel-tracked** and can't be lied
+about.
+
+Other related bypasses that the ancestry walk closes
+incidentally:
+- Writing `max.descendants` higher to bypass a count limit —
+  irrelevant, no count limit anymore.
+- Modifying any other control file inside the session cgroup —
+  irrelevant, cgroup parentage isn't file-mutable.

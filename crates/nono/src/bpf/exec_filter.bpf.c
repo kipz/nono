@@ -21,20 +21,28 @@
  * The LSM hook is global once attached: every exec on the host is
  * fed through this program. Without scoping, the broker's own
  * per-command sandbox spawns (which legitimately exec mediated
- * binaries) would be denied. We scope by **cgroup membership**:
- * the broker creates a per-session cgroup at session start, places
- * the agent in it (children inherit on fork), and writes the
- * cgroup id into the program's scope map. The hook calls
- * `bpf_get_current_cgroup_id()` and only applies the deny check
- * when current is in the agent's cgroup; broker-side per-command
- * sandboxes stay in the broker's cgroup and pass through.
+ * binaries) would be denied. We scope by **cgroup ancestry**: the
+ * broker creates a per-session cgroup at session start, places the
+ * agent in it (children inherit on fork), and writes the cgroup id
+ * into the program's scope map. The hook walks current's cgroup
+ * ancestor chain via `bpf_get_current_ancestor_cgroup_id()` and
+ * applies the deny check whenever the session cgroup id appears at
+ * any level above current.
  *
  * Cgroup membership is structural, not parental: it's inherited on
  * fork() and unaffected by reparenting. A task that double-forks
  * and gets reparented to init (or to the broker as
  * PR_SET_CHILD_SUBREAPER) keeps its agent-cgroup membership and
- * still trips the filter — closes the daemonize bypass that an
- * earlier parent-chain-walk version had.
+ * still trips the filter — closes the daemonize bypass.
+ *
+ * Ancestry (not equality) is what closes the sub-cgroup-escape
+ * bypass: the agent owns the session cgroup directory (mkdir runs
+ * with the broker's uid even when the broker has CAP_SYS_ADMIN),
+ * so the agent could `mkdir nono-session-X/sub` and move into it
+ * to get a different `bpf_get_current_cgroup_id()`. The ancestor
+ * walk catches that — the session cgroup is still in the chain.
+ * The agent can't escape *upward* because all parent cgroups are
+ * root-owned and the kernel rejects writes to their `cgroup.procs`.
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -47,6 +55,17 @@
  * are typically a handful (gh, ddtool, kubectl, ...); 256 leaves
  * generous headroom and bounds map memory. */
 #define MAX_DENY_ENTRIES 256
+
+/* Maximum cgroup-tree depth the scope ancestor-walk will descend
+ * into. Real cgroup trees are usually 4–8 levels (one or two
+ * slices, a unit, a session). 64 is a generous cap that's well
+ * inside BPF's instruction-count budget after unrolling, and
+ * survives an attacker who creates `mkdir`-spam children of the
+ * session cgroup. The walker exits early as soon as
+ * bpf_get_current_ancestor_cgroup_id returns 0 (level beyond
+ * current's depth), so the typical-case cost is ~current_depth
+ * iterations, not 64. */
+#define MAX_CGROUP_DEPTH 64
 
 char LICENSE[] SEC("license") = "GPL";
 
@@ -105,14 +124,34 @@ int BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
     }
 
     /* Scope: only execs from inside the agent's per-session cgroup
-     * are subject to the deny check. */
+     * (or any descendant of it) are subject to the deny check. */
     __u32 zero = 0;
     struct scope_config *cfg = bpf_map_lookup_elem(&scope, &zero);
     if (!cfg || cfg->agent_cgroup_id == 0) {
         return 0;
     }
-    __u64 current_cgroup_id = bpf_get_current_cgroup_id();
-    if (current_cgroup_id != cfg->agent_cgroup_id) {
+
+    /* Walk current's cgroup-ancestor chain looking for the
+     * session cgroup id. Levels are root-down: level 0 is the
+     * root cgroup, level == current's depth is current itself,
+     * deeper levels return 0. Iterate until we find the session
+     * cgroup or run off the end. Bounded loop because the BPF
+     * verifier rejects unbounded loops. */
+    __u64 agent_cgid = cfg->agent_cgroup_id;
+    __u8 in_scope = 0;
+    #pragma unroll
+    for (int level = 0; level < MAX_CGROUP_DEPTH; level++) {
+        __u64 ancestor_cgid = bpf_get_current_ancestor_cgroup_id(level);
+        if (ancestor_cgid == 0) {
+            /* Past current's depth — no further ancestors. */
+            break;
+        }
+        if (ancestor_cgid == agent_cgid) {
+            in_scope = 1;
+            break;
+        }
+    }
+    if (!in_scope) {
         return 0;
     }
 

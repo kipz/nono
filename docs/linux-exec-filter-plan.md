@@ -1,932 +1,1276 @@
-# Linux exec filter for mediation
+# Linux exec filter: command mediation via BPF-LSM
 
 ## Summary
 
-Add a `seccomp-unotify` filter that traps `execve` and `execveat` in the agent's
-process tree, so that every attempt to run a program is visible to the broker.
-Use it to close the full-path exec bypass: on Linux, the agent can invoke the
-real binary of a mediated command directly (e.g. `/home/user/.local/bin/gh`)
-and never touch the shim farm, because Landlock cannot deny a specific file
-inside an allowed directory. The filter makes the broker the choke point for
-every `execve`, forces invocations of mediated binaries to go through the shim,
-and also covers shebang-based bypasses that the kernel handles internally
-without issuing a second `execve`.
+Mediate command execution on Linux by attaching a BPF-LSM
+program to the kernel's `bprm_check_security` and `file_open`
+hooks. The program is scoped to the agent's process tree by
+cgroup membership and gates two things:
 
-The feature is additive: no changes to the shim, the broker's mediation
-dispatch, per-command sandboxes, or the Landlock policy. All of the `seccomp-unotify`
-infrastructure the filter relies on already exists in the fork for unrelated
-features (capability elevation, network proxy fallback), so this work composes
-with that plumbing rather than introducing new primitives.
+- **Exec of a mediated binary.** Via `bprm_check_security`,
+  which fires after the kernel has resolved the binary the
+  call will actually load. Returning `-EACCES` from the BPF
+  program atomically aborts the syscall.
+- **Read of a mediated binary's bytes.** Via `file_open`, which
+  fires on every file open in the agent's tree. Denying these
+  reads prevents the agent from copying a mediated binary's
+  contents anywhere it could later run from.
 
-## Problem
+A small ring buffer carries audit records to a userspace
+reader that appends them to the existing
+`~/.nono/sessions/audit.jsonl` log.
 
-### How mediation's shim farm is supposed to work
+This design supersedes a previous seccomp-unotify-based
+approach. The seccomp design had two structural weaknesses:
+the decision point was in userspace (the broker reading
+the path from `/proc/<tid>/mem` and responding to the
+kernel), which exposed a TOCTOU race a sibling thread
+sharing the trapped task's memory map could exploit; and
+seccomp can only intercept syscalls, so indirect-execution
+paths that load a binary's code without going through
+`execve` (e.g., the dynamic linker invoked directly on the
+binary) were invisible. Both weaknesses are addressed here
+by moving the decision into the kernel and hooking at LSM
+points that fire on the kernel-resolved file rather than on
+syscall arguments.
 
-When `nono run --profile X.json -- claude` starts, the broker (unsandboxed
-parent) creates `/tmp/nono-session-<pid>/shims/` and populates it with symlinks
-named after real commands (`ddtool`, `gh`, `git`, ...) all pointing at the
-`nono-shim` binary. That directory is prepended to the agent's `PATH`. When
-the agent's bash runs `ddtool auth token foo`, PATH lookup finds the shim
-first, execs it; the shim opens a Unix-socket connection to the broker; the
-broker applies the command's mediation rule (`respond`, `capture`, `approve`,
-or `passthrough`) and returns a result to the shim, which returns it to the
-agent. For capture-style rules, the broker runs the real binary in a tight
-per-command sandbox out-of-band, stashes the sensitive output under a random
-`nono_<hex>` handle, and returns the handle — the agent never holds raw
-secrets.
+## How it works at a glance
 
-The mediation architecture is intended to be a complete choke point: every
-invocation of a sensitive command goes through the broker.
+A side-by-side of the per-event flows makes the shift
+concrete.
 
-### The bypass
-
-That choke point depends on the agent's bash doing PATH lookup. Bash skips
-PATH lookup when the command contains a `/` — it just execs the literal path
-given. So an agent can bypass the shim with:
+**Previous design — broker decides per event:**
 
 ```
-/home/user/.local/bin/gh auth token
+Agent calls execve("/usr/bin/gh")
+   ↓
+Kernel seccomp filter triggers, suspends the calling thread
+   ↓
+Kernel notifies the broker via the seccomp listener fd
+   ↓
+Broker reads path from /proc/<tid>/mem, classifies, and
+responds (CONTINUE or errno) through the listener fd
+   ↓
+Kernel resumes the syscall with the broker's verdict
 ```
 
-On macOS, Seatbelt can be configured to deny reads of that specific file even
-though its enclosing directory is readable; direct-path exec of a mediated
-binary fails at the read step. On Linux, Landlock's only primitive is a
-directory-level allow (`LANDLOCK_ACCESS_FS_EXECUTE` on a `PathBeneath` rule).
-There is no carve-out operation. If `~/.local/bin` is exec-granted (and it has
-to be, because the agent legitimately needs to run lots of tools there), every
-file under it is exec-granted, including the ones we've shimmed. The kernel
-happily execs the real binary; the shim is never involved; the broker never
-learns the invocation happened.
+Every `execve` in the agent's tree round-trips through
+userspace. The broker is the decision-maker. Between
+classification and the kernel's eventual action, a sibling
+thread can mutate the path the kernel re-reads — that's the
+TOCTOU race.
 
-### Why this is a general problem, not a one-binary problem
+**Current design — kernel decides from a pre-loaded map:**
 
-The bypass applies uniformly to every entry in `mediation.commands`. Whether
-the consequence is severe depends on what the bypassed binary does inside the
-outer agent sandbox:
+```
+Agent calls execve("/usr/bin/gh")
+   ↓
+Kernel resolves bprm->file (the actual binary it will load)
+   ↓
+Kernel reaches bprm_check_security LSM hook
+   ↓
+BPF program (in the kernel) reads (dev, ino) from
+bprm->file, looks it up in the deny map, returns 0 or
+-EACCES
+   ↓
+Kernel acts on the BPF program's return immediately
+```
 
-- For binaries whose sensitive action is a filesystem read that the outer
-  Landlock already denies (e.g., `ddtool` reading `~/.password-store`,
-  `gh` reading `~/.config/gh`), the direct-path invocation reaches the binary
-  but fails at its sensitive operation. Bypass fizzles.
-- For binaries whose sensitive action isn't gated by the outer Landlock — most
-  notably `AF_UNIX connect()` to a privileged daemon socket, which Landlock ABI
-  v4 does not filter — the bypass succeeds end-to-end.
+The decision happens in the kernel against state the agent
+can't mutate (the kernel-resolved `bprm->file`), in the
+same kernel function call as the action. No userspace
+round-trip on the hot path. No race.
 
-This design solves the general problem: make the shim unavoidable for every mediated 
-binary, regardless of the binary's semantics.
+The broker still has a role, but it's all setup and
+observation — never enforcement:
 
-## Goals
+- **Setup, once at session start:** stat each
+  `mediation.commands` entry, populate the BPF deny map
+  with the resulting `(dev, ino)` pairs, create the
+  per-session cgroup and place the agent in it, write the
+  cgroup id into the BPF scope map, attach the BPF program
+  to the LSM hooks. After this, the broker doesn't touch
+  the deny path again for the rest of the session.
+- **Observation, in the background:** a polling task
+  reads from a BPF ring buffer where the program emits an
+  audit record on each event worth logging. The reader
+  formats records as `FilterAuditEvent` JSON and appends
+  to the existing audit log. This is purely after-the-fact
+  reporting; the kernel's decision has already been
+  applied by the time the audit reader sees it.
+- **Other supervisor duties unchanged:** the broker
+  continues to handle the shim IPC for routed commands
+  (`capture` / `respond` / `approve`), per-command
+  sandbox spawns, the mediation socket, etc. None of
+  those features are affected by this work.
 
-- Close the full-path exec bypass for every entry in `mediation.commands`.
-- Close the shebang bypass (script files whose `#!` line names a mediated
-  binary, which the kernel follows internally without issuing a second
-  `execve`).
-- Preserve the current audit stream as a superset: shim events continue to
-  emit as they do today, and the filter adds records for direct-path
-  invocations (allowed and denied) that currently produce no audit
-  anywhere. Net coverage is strictly greater than today's; existing
-  consumers see unchanged events for shim-routed invocations.
-- Be additive to the existing fork. No changes to the shim, the broker's
-  mediation dispatch, per-command sandboxes, or the Landlock policy.
+### Why BPF-LSM specifically
 
-## Non-goals
+Three options were considered:
 
-- Landlock ABI v5/v6 features (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET` etc.).
-  Require kernel ≥ 6.10 / 6.12; workspace fleet is on 6.8.
+- **Plain seccomp filter (no userspace handler).** BPF runs
+  in the kernel and can return ALLOW/DENY/errno based on
+  syscall register values. Cannot dereference user pointers
+  to read the path. Useless for path- or inode-based
+  decisions.
+- **Seccomp-unotify (BPF + userspace handler).** The
+  approach we're moving away from. Decision happens in
+  userspace; sees user-memory pointers; subject to TOCTOU.
+  Only intercepts syscalls; can't see kernel-resolved
+  state like the binary the kernel actually loads after
+  binfmt resolution.
+- **BPF-LSM.** BPF runs in the kernel at LSM hook points,
+  which fire on semantic kernel events with kernel-resolved
+  arguments. Decision is in-kernel, atomic, and against
+  state the user can't mutate.
+
+BPF-LSM wins on both axes the seccomp approach failed:
+moves the decision out of userspace (closing the TOCTOU
+race) and hooks at points that see the kernel's view of
+what's about to happen (closing the indirect-execution
+bypasses where the agent loads code without traversing
+`execve`).
+
+## Problem statement
+
+The mediation feature wants every invocation of a configured
+sensitive command (e.g., `gh`, `ddtool`) by the agent to flow
+through nono's shim infrastructure, where the broker can
+decide whether to capture, rewrite, approve, or deny it.
+Bypasses break the security guarantee of the entire
+mediation system.
+
+The bypass classes the kernel-side design must close:
+
+1. **Direct path bypass.** Agent invokes the mediated binary
+   by absolute path (`/usr/bin/gh ...`) instead of through
+   the shim'd PATH lookup. The shim is never involved.
+2. **TOCTOU on user-memory paths.** A multithreaded process
+   sharing memory with the trapped task swaps the path
+   buffer between the supervisor's classification and the
+   kernel's actual exec, substituting a denied path the
+   supervisor approved. (Includes the vfork-bomb variant
+   where the swap thread is in the parent of a vfork
+   child.)
+3. **Copy the binary.** The agent reads the mediated binary's
+   bytes and writes them to a path the operator hasn't
+   listed (e.g., `/tmp/my-gh`). The copy has a different
+   inode but the same code, so it can do everything the
+   original could.
+4. **Indirect load via the dynamic linker.** The agent
+   invokes the dynamic linker directly with the mediated
+   binary as its argument (`/lib/ld-linux-x86-64.so.2
+   /usr/bin/gh ...`). The kernel only execs the dynamic
+   linker; the linker loads the mediated binary into memory
+   itself, never going through `execve`.
+5. **Unprivileged tmpfs.** The agent enters a user namespace,
+   mounts tmpfs (which it can do unprivilegedly), copies the
+   mediated binary's bytes to the tmpfs, and execs the copy
+   from there. Same as (3) but with a fresh `dev` as well as
+   inode.
+6. **Shellcode.** The agent reads the mediated binary's
+   bytes, copies them into anonymous memory, marks the page
+   `PROT_EXEC`, and jumps to it. No file involvement at
+   exec time.
+
+All six are real on Ubuntu's 6.8 HWE kernel and exploitable
+under the agent's threat model below.
 
 ## Threat model
 
-The filter defends against a prompt-injected or misbehaving agent that:
+The agent **can**:
 
-- Has shell access inside its sandbox.
-- Can read and write files inside its allowed workspace directories.
-- Can compile and run code (compilers are present on the workspace).
-- Does not have privileges outside the sandbox; cannot install kernel modules
-  or modify kernel state.
+- Read any world-readable file on the host. Mediated binaries
+  live in canonical locations (`/usr/bin/gh`, etc.) with mode
+  0755; they are world-readable.
+- Write to its workspace, `/tmp`, and any path Landlock
+  permits write on.
+- Compile and execute arbitrary code (compilers and the
+  toolchain are available).
+- Create unprivileged user namespaces and mount filesystems
+  inside them.
+- Do anything else POSIX permits an unprivileged user holding
+  no capabilities.
 
-The filter does **not** defend against an attacker who:
+The agent **cannot**:
 
-- Has already gained a concurrent code-execution primitive that can issue raw
-  syscalls and race seccomp-notify's post-CONTINUE re-read. This is an
-  explicit residual, documented below.
-- Controls the broker itself. The filter is a mediation primitive; the broker
-  is part of the trust base, as it is today.
+- Modify root-owned files outside Landlock-allowed write
+  paths. Mediated binaries are root-owned and outside the
+  agent's write set.
+- Hold capabilities in its effective set after `execve` —
+  the broker sets `PR_SET_NO_NEW_PRIVS=1` on the agent's
+  pre-exec, which disables setcap'd file capabilities on
+  any binary the agent execs.
+- ptrace-attach a process owned by the same user that has
+  been marked non-dumpable.
+- Forge cryptographic-strength content equivalence.
 
 ## Design
 
-### Mechanism: seccomp-unotify on `execve` and `execveat`
+### One mechanism, two hooks
 
-**What seccomp-unotify is.** seccomp is a Linux feature that runs a small
-kernel-evaluated program (a BPF filter) on every syscall a process makes. The
-filter can allow the syscall, kill the process, return an errno, or — the
-mode we use — pause the thread and deliver a notification to a supervisor
-process holding a listener file descriptor. The supervisor reads the child's
-memory to examine the arguments and tells the kernel how to respond.
+The kernel's LSM framework runs registered checks at well-
+defined points in syscall paths. Two of those points cover
+every way the agent could reach a mediated binary's code:
 
-**Why trap these two syscalls.** They are the only syscalls that launch a new
-program image. Every libc `exec*` function, every shell invocation, every
-language runtime's subprocess primitive compiles down to one or the other.
-Trapping them catches every exec attempt; trapping other syscalls would not
-close the bypass we are targeting.
+- **`bprm_check_security`** fires inside `do_execve` after
+  the kernel has resolved the target binary into a
+  `struct linux_binprm`. By that point, `bprm->file` is the
+  `struct file *` the kernel will actually load, with all
+  symlinks followed and binfmt resolution (e.g., shebang
+  scripts redirected to their interpreter) complete.
+  Returning a negative errno from the LSM aborts the exec
+  before any user code in the new image runs.
+- **`file_open`** fires inside `do_filp_open` for every
+  successful path resolution that yields a file descriptor.
+  Every `open`, `openat`, exec-time `open_exec`, and the
+  open phase of `mmap` flows through it.
 
-**Where the filter is installed.** In the agent child, after the existing
-Landlock `restrict_self`, before the agent's own `execve`. The existing
-capability-elevation code path installs its openat filter at the same point
-(see `crates/nono-cli/src/exec_strategy.rs` around the pre_exec closure). Our
-filter goes alongside.
+A single BPF program keyed on `(dev, ino)` consults a deny
+map at both points. At `bprm_check_security` the check
+prevents direct execs of mediated binaries (closes the
+direct-path bypass). At `file_open` the check prevents the
+agent from reading mediated-binary bytes at all, which
+closes the copy-the-binary, indirect-load-via-dynamic-
+linker, unprivileged-tmpfs, and shellcode bypasses in one
+step: each requires reading the mediated binary's bytes
+through some `open` call that fires the hook.
 
-**Compatibility with existing filters.** The fork already installs seccomp-unotify
-filters for two features: capability elevation (traps `openat`/`openat2`) and
-the network proxy fallback (traps `connect`/`bind`). Multiple seccomp filters
-can coexist in a single process; the kernel evaluates them in installation
-order and takes the strongest response. Our filter, being narrow (only two
-syscalls), does not interact with the other two's syscall sets. The BPF
-programs of both existing filters were read to confirm they `RET_ALLOW` for
-syscalls outside their trap set; findings are documented in Phase 0 below.
+The TOCTOU race that motivated moving away from
+seccomp-unotify is structurally absent here. Both hooks see
+the kernel's resolved `struct file *`, not a user-memory
+pointer; there is no value the agent can swap mid-decision.
 
-**`PR_SET_NO_NEW_PRIVS` is already set.** The kernel requires either
-`CAP_SYS_ADMIN` or `NO_NEW_PRIVS` before an unprivileged process may install a
-seccomp filter. `install_seccomp_notify` in `crates/nono/src/sandbox/linux.rs`
-already calls `prctl(PR_SET_NO_NEW_PRIVS, 1, ...)`. The flag is one-way and
-inherited across `fork`/`exec`, so every descendant of the agent is subject to
-the filter, and nothing can disable the filter or install a replacement.
+### Identity model: `(dev, ino)`
 
-### Three-way classification in the supervisor
+The deny map is keyed by `(dev, ino)` of the mediated
+binary's underlying inode. At session start the broker
+canonicalizes each `mediation.commands` entry, `stat`s it,
+and inserts the resulting pair into the BPF map.
 
-For each trapped `execve`/`execveat`, the supervisor classifies the target
-path into exactly one of three buckets:
+Inode identity automatically catches:
 
-1. **`allow_shim`**: the resolved path lexically sits under the session's shim
-   directory (`/tmp/nono-session-<broker-pid>/shims/`). This is the intended
-   shim route; allow the exec to proceed so the shim can take over.
-2. **`deny`**: the canonical path is a member of the deny set, which is
-   derived implicitly at session start from the canonical real paths of every
-   entry in `mediation.commands`, regardless of action type (`respond`,
-   `capture`, `approve`, or `passthrough`). Deny with `EACCES`.
-3. **`allow_unmediated`**: anything else. The agent is permitted to run this
-   binary freely; the supervisor lets the exec proceed.
+- **Hardlinks.** A hardlink shares the underlying inode of
+  the original. Same `(dev, ino)`. Caught.
+- **Bind mounts.** Bind mounts expose the same inode through
+  a different path. Caught.
 
-**Check order.** Shim-prefix check first (against the pre-canonical resolved
-path), then deny check (against the canonical path), then fall through to
-allow. Shim-first keeps the happy path fast and unambiguous; it also avoids a
-pathological case where a shim path might collide with a deny-set entry after
-canonicalization.
+It does *not* catch separately-installed copies of a
+mediated binary at different inodes (e.g., `/usr/bin/gh`
+*and* `/usr/local/bin/gh` as distinct files). Listing every
+relevant path in `mediation.commands` is the operator's
+responsibility, exactly as it was for the seccomp-era
+deny set. The runtime path doesn't need to discover copies
+on the host because the agent cannot create new copies (the
+`file_open` hook denies the read).
 
-**Why the deny set is derived implicitly.** `mediation.commands` already
-enumerates every command the profile author wants mediated; adding a parallel
-`deny_exec` field would be redundant and easy to forget to sync. The broker
-already resolves each command's real path at session start (it uses those
-paths to exec the binary inside per-command sandboxes), so the same resolution
-produces the deny set as a side effect with no additional profile surface.
+This is why content-based identity (hashing the binary's
+bytes) is not part of the design. Content-hashing was the
+right answer when runtime copies were possible. With
+`file_open` denying the read, the agent has no way to put
+the mediated binary's bytes anywhere new, so the inode
+present at session start is the only identity that matters
+at runtime.
 
-### Canonicalization rules
+### Scoping: per-session cgroup with ancestor walk
 
-**Deny set canonicalization.** Each `mediation.commands` entry's real path is
-canonicalized once at session start (`std::fs::canonicalize`, which follows
-symlinks and normalizes `..`/`//`). The canonical form is stored in a set for
-O(1) lookup.
+The LSM hook is global once attached: it runs on every exec
+and every file open *on the host*, not just in the agent's
+process tree. Without a scope check the BPF program would
+deny mediated-binary reads system-wide, breaking the
+broker's own per-command sandbox spawns (which legitimately
+exec mediated binaries on the agent's behalf) and any
+non-agent process the operator runs.
 
-**Notification path canonicalization.** At trap time, the supervisor:
+The broker creates a per-session cgroup at session start
+and places the agent in it. Children inherit the cgroup
+membership on `fork()`. Two properties of cgroup v2 make
+this the right scope primitive:
 
-1. Reads the raw path string from the child's memory via `/proc/<tid>/mem` at
-   the pointer address provided by the BPF filter.
-2. Resolves dirfd and cwd semantics to produce an absolute resolved path (see
-   execveat variants below).
-3. Canonicalizes the resolved path for the deny-set check.
+- **Inherited on fork, unaffected by reparenting.** A
+  process that double-forks and gets reparented to init or
+  the broker (which is `PR_SET_CHILD_SUBREAPER`) keeps its
+  cgroup membership. This is what makes cgroup scoping
+  robust against the daemonize bypass that would defeat any
+  parent-chain-based identity.
+- **Bounded by file ownership.** The agent can move into a
+  destination cgroup only if it has write access to that
+  cgroup's `cgroup.procs`. All cgroups outside the
+  per-session subtree are root-owned; the agent cannot
+  escape upward.
 
-**Shim-prefix check uses the pre-canonical resolved path.** This is a
-deliberate split. The shim directory contains symlinks to the `nono-shim`
-binary; canonicalizing `/tmp/nono-session-<pid>/shims/ddtool` follows the
-symlink to the shim binary's real path, which is no longer under the shim
-directory. Checking the pre-canonical path preserves the shim-prefix match.
-Security-wise this is fine: files under the shim directory were put there by
-the broker and are trusted by construction.
+The agent *can* create child cgroups *inside* the session
+cgroup (the session cgroup directory is owned by the broker
+process's uid because `mkdir` runs with that uid even when
+`CAP_SYS_ADMIN` is held as a capability). To handle this the
+BPF program walks the calling task's cgroup ancestor chain
+rather than checking only the immediate cgroup id. If the
+session cgroup id appears anywhere among the ancestors, the
+task is in the session subtree and the deny check applies.
+The agent gains nothing by sub-nesting: the session cgroup
+is still in their ancestor chain.
 
-**Failure handling.** Path resolution and canonicalization failures
-(nonexistent path, permission error on a component) respond `CONTINUE`
-and emit no audit event. The kernel re-runs its own resolution after
-`CONTINUE` and returns the native errno (typically `ENOENT`, sometimes
-`EACCES` / `ELOOP` / `ENAMETOOLONG` / `EISDIR` / `ENOTDIR`).
-Synthesizing `EACCES` here would corrupt PATH-walking shells: glibc's
-`execvp` treats `EACCES` as sticky and `ENOENT` as "try the next PATH
-entry," so turning PATH-miss `ENOENT`s into `EACCES`es would break
-every command bash finds later on PATH after a miss. Every `bash -c
-'<cmd>'` invocation walks PATH and routinely hits nonexistent
-candidates before its real one.
-
-### Shebang handling
-
-The bypass extends past `execve`'s direct path argument: when `execve` is
-called on a file whose first bytes are `#!/interpreter`, the Linux kernel
-replaces the process image with the interpreter internally, without issuing a
-second `execve` syscall. Our filter sees the script's path but not the
-interpreter. An agent can write a script whose `#!` line names a mediated
-binary and exec the script to reach the binary unobserved.
-
-**In-handler shebang read.** After a path has been canonicalized and placed
-into `allow_unmediated`, the supervisor opens the canonical target and reads
-the first 256 bytes (matching the kernel's `BINPRM_BUF_SIZE` constant from
-`include/linux/binfmts.h`). If the file starts with `#!`, it parses the
-interpreter path (the token up to the first whitespace or newline after
-`#!`), canonicalizes it, and checks the result against the deny set. If the
-interpreter is in the deny set, flip the decision to `deny`. The walker is
-not run on `allow_shim` decisions: the shim binary is a known ELF executable,
-never a script, so opening and reading it on every PATH-routed mediated
-invocation is pure overhead.
-
-**Recursion up to a named bound.** The Linux kernel chains shebangs up to
-`BINPRM_MAX_RECURSION` levels (currently 5, defined in
-`include/linux/binfmts.h`). If we checked only the first shebang level, an
-agent could chain scripts (`script1.sh` → `#!/tmp/script2.sh`, `script2.sh` →
-`#!/home/user/.local/bin/ddtool`) and slip through. The handler recurses the
-check up to a `MAX_SHEBANG_RECURSION` constant, set to 8 for margin above the
-kernel's current value. The kernel limit is a compile-time constant not
-exposed to userspace; the margin absorbs a kernel bump without immediately
-opening a hole. A unit test asserts that `MAX_SHEBANG_RECURSION` is at least
-as large as the kernel value we believe to be in effect, so a future kernel
-bump is noticed.
-
-**What we do not have to chase.** Shebangs that name a real interpreter
-(`#!/bin/bash`, `#!/usr/bin/env python`) don't need special handling. The
-kernel loads the interpreter internally; the interpreter then performs its
-own `execve` for any subcommand it wants to run, and those `execve`s trap our
-filter normally. Only the direct chain of script-to-script-to-mediated-binary
-shebangs is invisible to normal filter coverage; that's the chain we recurse
-to catch.
-
-**ELF `.interp` section.** In principle the agent could write an ELF binary
-whose dynamic-linker interpreter names a mediated binary. In practice the
-interpreter has to be a dynamic linker format (`/lib64/ld-linux-x86-64.so.2`),
-and none of the binaries under mediation are dynamic linkers. Out of scope;
-not pursued unless the mediation list grows to include linker-shaped binaries.
-
-### TOCTOU mitigation: refuse multi-threaded execve
-
-**The race.** seccomp-unotify traps only the thread that made the
-syscall; sibling threads in the same process continue to run. If the
-supervisor responds CONTINUE (allow), the kernel re-reads the pathname
-from the child's memory before actually performing the exec. A
-cooperating sibling thread can modify the pathname buffer between our
-check and the kernel's re-read, substituting a deny-set path the
-supervisor already approved. (An earlier draft of this plan attempted
-to mitigate via a "double-read", a second supervisor read of the same
-address immediately before responding. However, the kernel's
-post-CONTINUE re-read window is microseconds and can be hit by any
-cooperating swap thread regardless of how tightly we re-read before
-responding. The double-read was removed as ineffective.)
-
-**Mitigation.** At the start of `handle_exec_notification`, the
-supervisor reads `/proc/<tgid>/status`'s `Threads:` field. If `> 1`,
-respond `EACCES` immediately with `reason: multi_threaded_unsafe` and
-emit a filter audit event. If unreadable, fail closed (deny).
-
-When `Threads == 1`, the trapped thread is the only thread in its tgid,
-and seccomp-unotify has paused it in the kernel for the duration of our
-handler. No user code in the agent process can run while we hold the
-notification, so the user-memory pathname buffer at `args[0]` cannot
-mutate between our read and the kernel's post-CONTINUE re-read. This
-makes the per-classify path stable structurally, not statistically.
-
-The check itself is not racable: a new thread can only be created by
-`clone(CLONE_THREAD, ...)` from an existing thread in the tgid, and
-the only thread in the tgid is paused waiting for our response. So
-`Threads == 1` at our check stays `1` until we reply.
-
-**Why this is acceptable in practice.** The check denies any execve
-issued from a process that has more than one live thread at trap
-time. In normal Linux software this is essentially never the path
-real subprocess primitives take:
-
-- `fork() + execve()`: classic POSIX. `fork()` copies only the calling
-  thread, so the child starts with `Threads == 1`. ✅
-- `vfork() + execve()` (used by glibc's `posix_spawn` fast path on
-  Linux): the vfork child is its own tgid with `Threads == 1`. ✅
-- `posix_spawn`, libuv's `child_process.spawn`, JVM's
-  `ProcessBuilder.start`, Go's `exec.Command`, Python's `subprocess`,
-  Ruby's `Process.spawn`, bash/zsh/fish/sh, Bun.spawn,
-  Deno.Command: all dispatch to one of the three patterns above. ✅
-- The agent itself (Claude, Codex, Bun, etc.) is multi-threaded, but
-  it doesn't call `execve` directly — it forks first.
-
-What the check denies is `pthread_create() + execve()` from the same
-process. This is structurally pointless in legitimate code: `execve`
-unilaterally kills sibling threads anyway, so spawning a thread before
-calling `execve` accomplishes nothing for the calling program. The
-demonstrated use case is exactly the POC: spawn a swap thread, then
-race the kernel's post-CONTINUE re-read.
-
-The vfork-bomb edge case (multi-threaded parent vforks a
-single-threaded child whose execve traps while the parent's siblings
-race shared memory) remains and is documented in the Trade-offs
-section below.
+Cgroup namespace virtualization (`unshare(CLONE_NEWCGROUP)`)
+doesn't affect this — `bpf_get_current_ancestor_cgroup_id`
+returns the kernel's view, not the namespaced view.
 
 ### Audit
 
-**Scope — what the filter emits and what it does not.** The filter's audit
-events are complementary to the existing shim-emitted events, not a
-replacement. For each of the three classifications:
+Mediation events are visible to operators through
+`~/.nono/sessions/audit.jsonl`. The BPF program emits an
+audit record into a `BPF_MAP_TYPE_RINGBUF` for every event
+worth logging:
 
-- **`allow_shim` — no filter event.** The shim downstream from this decision
-  emits the existing-format audit event itself, after the command completes,
-  with the real `exit_code` and (when relevant) `action_type`. Having the
-  filter also emit at trap time would double-count every shim invocation.
-  The filter stays silent and lets the shim's existing path do its job.
-- **`allow_unmediated` — filter emits.** These are direct-path invocations
-  that bypass the shim entirely (e.g., `/bin/ls`, `/usr/bin/jq`). Today they
-  produce no audit record anywhere on either macOS or Linux. The filter is
-  the only observer.
-- **`deny` — filter emits.** The command never runs, so no shim event will
-  follow. Only the filter records it.
+- A non-shim `bprm_check_security` allow that wasn't shim-
+  routed (`allow_unmediated` — agent ran some non-mediated
+  binary directly).
+- A `bprm_check_security` deny (defense-in-depth case; this
+  hook only ever sees a deny inode if `file_open` somehow
+  let the open through, which shouldn't happen in normal
+  operation).
+- A `file_open` deny (the agent attempted to read a mediated
+  binary).
 
-**Net coverage.** Existing shim events are unchanged. Previously-invisible
-direct-path invocations (allowed and denied) now produce filter events.
-Result: a strict superset of current audit coverage, without
-double-counting.
+The supervisor runs a polling task on the ring buffer fd
+that reads each record and appends a JSONL line to
+`audit.jsonl`. The output schema is identical in shape to
+the existing filter audit format:
 
-**Record shape.** Filter events are conceptually a distinct class from
-shim events — kernel-trap decisions vs post-execution completions — and
-use their own struct, `FilterAuditEvent`. The existing shim `AuditEvent`
-is untouched; shim events continue to emit as they do today. Both event
-shapes land in the same `~/.nono/sessions/audit.jsonl`, distinguished by
-the `action_type` field (shim events use `"capture"` / `"respond"` /
-`"approve"` or omit it for audit-only; filter events use values prefixed
-with `exec_filter_`). Downstream consumers that already dispatch on
-`action_type` extend with two new prefixes; consumers that ignore
-`action_type` see additional events with a slightly different field
-shape.
-
-`FilterAuditEvent` fields:
-
-- `command` (`String`): basename of the canonical target. E.g., `"gh"`
-  for a direct-path exec of `/opt/homebrew/bin/gh`; for shebang-chain
-  denies, the basename of the script the agent tried to exec.
-- `args` (`Vec<String>`): argv without argv[0], same semantics as the
-  shim's audit events.
-- `ts` (`u64`): unix seconds, same type as the shim's.
-- `action_type` (`String`, required): either
-  `"exec_filter_allow_unmediated"` or `"exec_filter_deny"`. Unlike the
-  shim's `Option<String>`, this is always present on filter events — the
-  discriminator is load-bearing.
-- `exit_code` (`Option<i32>`): `Some(126)` on `exec_filter_deny`,
-  matching the existing mediation-denied convention at
-  `crates/nono-cli/src/mediation/policy.rs:169`
-  (`exit_code: 126` for "command invoked cannot execute"). `None` on
-  `exec_filter_allow_unmediated`: the command ran, but the supervisor
-  responded CONTINUE at trap time and does not track the process to
-  completion, so no exit code is observable from the filter's vantage
-  point. Serialized with `skip_serializing_if = "Option::is_none"` so
-  absence is represented by field omission, not `null`.
-- `reason` (`Option<String>`): present only on `exec_filter_deny`. One
-  of `"deny_set"`, `"shebang_chain"`, `"multi_threaded_unsafe"`.
-  Absent on allow events.
-- `path` (`Option<String>`): canonical resolved path of the target.
-  Present on `deny_set` and `shebang_chain` denies and on
-  `allow_unmediated` events. Empty (or absent) on
-  `multi_threaded_unsafe` denies because the early-deny path runs
-  before path read+canonicalize. Absent on shim events.
-- `interpreter_chain` (`Option<Vec<String>>`): only on shebang-driven
-  denies, the list of interpreter paths the filter chased (outermost
-  first). Absent otherwise.
-
-Explicitly not included on `FilterAuditEvent`: `pid` / `tid` / `syscall`
-(forensic detail with no current consumer; additive later if needed).
-
-Examples:
-
-```json
-{"command":"jq","args":["-r",".items[]"],"ts":1776973803,"action_type":"exec_filter_allow_unmediated","path":"/usr/bin/jq"}
+```rust
+struct FilterAuditEvent {
+    command: String,           // basename of the resolved binary
+    args: Vec<String>,         // argv without argv[0], when available
+    ts: u64,                   // unix seconds
+    action_type: String,       // "allow_unmediated" | "deny"
+    exit_code: Option<i32>,    // Some(126) on deny, None on allow
+    reason: Option<String>,    // "open_deny" | "exec_deny" — only on deny
+    path: Option<String>,      // canonical resolved path of the binary
+}
 ```
 
-```json
-{"command":"gh","args":["auth","token"],"ts":1776973803,"action_type":"exec_filter_deny","exit_code":126,"reason":"deny_set","path":"/opt/homebrew/bin/gh"}
-```
+Compared to the previous seccomp-era schema this drops the
+`exec_filter_` prefix on `action_type` (the prefix named the
+implementation, not the event), drops the
+`interpreter_chain` field (no longer relevant — the kernel
+resolves shebang chains internally and the BPF program
+sees the actually-loaded binary directly), and drops the
+obsolete `reason` values that named seccomp-specific
+mechanisms (`multi_threaded_unsafe`, `shebang_chain`,
+`post_exec_deny`, `ptrace_seize_failed`). Consumers
+dispatching on `action_type` continue to work after a
+substring change.
 
-```json
-{"command":"evil.sh","args":[],"ts":1776973803,"action_type":"exec_filter_deny","exit_code":126,"reason":"shebang_chain","path":"/tmp/evil.sh","interpreter_chain":["/opt/homebrew/bin/gh"]}
-```
+What's intentionally **not** audited:
 
-**Writer.** Filter events are emitted by the supervisor in-process (no
-shim socket round-trip) and written to the same `audit.jsonl` file the
-shim already writes to. A new helper function serializes
-`FilterAuditEvent` and appends a line; no new file, no new socket, no
-new rotation logic. The existing `append_audit_log` helper in
-`crates/nono-cli/src/mediation/server.rs` is typed on the shim's
-`AuditEvent` and won't be reused directly, but the file-open / append /
-mode-0600 pattern is copied for the filter writer.
+- `file_open` allows. These fire on every file open in the
+  agent's tree — too high-volume to audit, and they don't
+  represent a security event.
+- Shim-routed exec allows. The shim emits its own audit
+  record downstream (`capture` / `respond` / `approve`)
+  when the command completes; a kernel-side record would
+  double-count. The userspace reader detects shim
+  invocations by checking whether `bprm->filename` (the
+  path the user passed to `execve`) starts with the
+  per-session shim directory prefix and suppresses the
+  emit.
 
-**Volume expectation.** Volume is bounded by the number of direct-path
-exec attempts plus denials — a small minority of total execs on a normal
-developer session. A `bzl build` that uses only PATH-based invocations of
-compilers and shells produces zero filter events; every execve still
-produces a shim event as today. Direct-path-heavy workloads (e.g. an
-agent scripted to full-path every command) would produce more filter
-events, but those are exactly the events we want to record.
+### Required deployment invariants
 
-### `execveat` variants
+The design's correctness reduces to four invariants. Each
+is enforced by existing code or AMI configuration; each is
+verifiable at session start, with the supervisor surfacing
+a clear error if any fails. There are no silent failure
+modes.
 
-`execveat(dirfd, pathname, argv, envp, flags)` has four resolution cases. All
-four are handled by reusing helpers already present in the fork for the
-equivalent `openat`/`openat2` dirfd resolution:
+**A. `bpf` is in the active LSM stack.** `bprm_check_security`
+and `file_open` only invoke BPF programs when the LSM
+framework has `bpf` registered. The LSM stack is fixed at
+kernel boot from the `lsm=` cmdline parameter; verifiable
+via `/sys/kernel/security/lsm`. The workspaces AMI ships a
+grub.d drop-in that sets `lsm=...,bpf`. If the host doesn't
+have it (e.g., AMI rollout incomplete), the broker fails
+session start with an explicit error pointing at the AMI
+update — no silent fallback to a known-incomplete
+mechanism.
 
-1. **Absolute pathname.** `args[1]` is an absolute C string; ignore `dirfd`.
-   Canonicalize the path as given.
-2. **Relative pathname, `dirfd == AT_FDCWD`.** Resolve the relative path
-   against `/proc/<tid>/cwd` (a kernel-maintained symlink to the thread's
-   current working directory).
-3. **Relative pathname, `dirfd` is a real fd.** Resolve the relative path
-   against `/proc/<tid>/fd/<dirfd>` (a kernel-maintained symlink to whatever
-   file or directory the fd points at).
-4. **`AT_EMPTY_PATH` flag and empty pathname.** The target is whatever
-   `/proc/<tid>/fd/<dirfd>` points at directly. No pathname parsing required.
+**B. The broker holds `cap_bpf`, `cap_sys_admin`, and
+`cap_dac_override`.** Required for: loading the BPF program
+(`cap_bpf`); creating the per-session cgroup, which is a
+namespace-privileged operation (`cap_sys_admin`); and
+passing the VFS DAC check on the cgroup-parent directory
+when the parent is root-owned (`cap_dac_override` — the
+cgroup `mkdir` goes through normal VFS permission checks
+before the cgroup-namespace privilege check, and
+`cap_sys_admin` does not subsume DAC). The deployment
+configures these via `setcap cap_bpf,cap_sys_admin,
+cap_dac_override+ep /usr/bin/nono` at install time.
 
-Helpers `read_notif_path`, `resolve_notif_path`, and the `/proc/<tid>/fd/*`
-resolution already exist (`crates/nono-cli/src/exec_strategy/supervisor_linux.rs`
-uses them today for openat dirfd resolution). Case 4 is the only one that
-isn't already expressed in existing code paths, and it's a few lines.
+**C. Per-command-sandbox processes are non-dumpable.** The
+broker's per-command sandboxes legitimately read mediated
+binaries — that's their whole purpose. After exec, gh's
+bytes are in the PCS process's address space. If the PCS
+were dumpable, the agent could `ptrace`-attach (same uid +
+dumpable suffices for `ptrace_may_access` under the
+workspace's `kernel.yama.ptrace_scope=1`) and recover the
+bytes from `/proc/<pcs>/mem`. Dumpability is preserved
+across `execve` only when `PR_SET_NO_NEW_PRIVS=1` is set
+before the exec. Already enforced by nono's per-command
+sandbox setup; the broker also asserts `Dumpable: 0` post-
+exec at PCS spawn and fails the session if the assertion
+doesn't hold.
 
-### Profile schema
+**D. The agent runs with empty effective capabilities.** The
+broker sets `PR_SET_NO_NEW_PRIVS=1` on the agent's pre-exec.
+This disables file capabilities at the agent's `execve`,
+which prevents the agent from gaining `CAP_SYS_ADMIN` (or
+any other capability) by execing a setcap'd binary it
+placed in a writable directory. Without this invariant
+the agent could escape the cgroup scope check via
+`unshare(CLONE_NEWCGROUP)` with sufficient privilege.
+Already in place; the agent's session-start log line
+includes `CapEff: 0` from `/proc/self/status` as an
+explicit assertion.
 
-**No new explicit field.** The deny set is derived implicitly at session start
-from the canonical real paths of `mediation.commands` entries. Profile
-authors declare which commands are mediated; the filter inherits that set.
+If any of A–D doesn't hold, the design has a documented
+failure mode that the supervisor's startup-time assertion
+makes visible. Operators see the failure; the session
+either refuses to start or runs with the specific
+invariant violated. There is no silent partial enforcement.
 
-**Feature activation.** The filter is only installed when
-`mediation.commands` is non-empty (i.e., the deny set has at least one
-entry). Plain `nono run` sessions without mediation install no
-additional seccomp filter. Profiles that set only `mediation.env.block`
-(env-stripping with no mediated commands) also do not install the
-filter: the deny set would be empty, every execve would classify as
-`allow_unmediated`, and the supervisor would emit an audit event for
-every program the agent runs — overhead and audit noise for no
-security benefit.
+### Edge cases
 
-## Trade-offs and residuals
+This subsection enumerates non-obvious paths to "the agent
+runs the mediated binary's code" and traces each through
+the design.
 
-### Multi-threaded execve restriction
+**Hardlink to mediated binary.** Same `(dev, ino)`. Either
+hook fires for either path. Closed.
 
-The mitigation in "TOCTOU mitigation" denies execve entirely from any
-process whose tgid has more than one live thread at trap time. This
-preserves POSIX execve semantics for every legitimate subprocess
-primitive (fork+exec, vfork+exec, posix_spawn, language-runtime
-shell-out — they all dispatch to a single-threaded child) but is
-incompatible with the rare pattern of `pthread_create() + execve()`
-from the same process. Programs that genuinely need that pattern would
-have to refactor to fork-first; in the agent's normal workload no such
-program is expected. If a real-world false-positive surfaces, the
-options are: (a) add a per-binary opt-out in the profile, (b) build a
-narrower mitigation (e.g., ptrace-freeze siblings just for the trap
-duration). We default to the strict deny because the typical security
-benefit is structural — single-threaded callers are race-free by
-construction — and because the closest alternative (ptrace-freeze)
-carries significant cost:
+**Bind mount of the mediated binary at a different path.**
+Bind mounts share inode through the mountpoint. Either
+hook fires. Closed.
 
-- **Performance**: per-exec cost would grow from microseconds to
-  milliseconds as the number of
-  `PTRACE_SEIZE`/`PTRACE_INTERRUPT`/`waitpid`/`PTRACE_DETACH`
-  syscalls scales with thread count.
-- **Tracer exclusivity**: a `ptrace`-traced process cannot be
-  simultaneously traced by another tool (gdb, strace, perf in some
-  modes), which matters on a developer workspace where debugging is a
-  normal workflow.
-- **Bug surface**: ptrace's interaction with signal-stops,
-  group-stops, and `clone3` is famously subtle; every existing
-  seccomp-notify supervisor in production (Docker, Firefox, Chromium
-  renderer, systemd-nspawn) has deliberately chosen not to combine
-  ptrace with seccomp-notify for this reason.
+**`fexecve` / `execveat` with `O_PATH` fd /
+`/proc/self/fd/N`.** All resolve to the same `bprm->file`
+inode. Closed.
 
-### vfork-bomb residual
+**Read via `splice` from an open fd.** Requires the open in
+the first place; `file_open` denies it. Closed.
 
-A multi-threaded parent that calls `vfork()` (or
-`clone(CLONE_VM, !CLONE_THREAD)`) produces a child with `Threads == 1`
-that shares the parent's memory map. Sibling threads in the parent can
-write the path buffer in shared memory while the child is in the execve
-trap, bypassing the multi-threaded check (which only sees the child's
-tgid). Not closed in v1.
+**Read from another process's memory via `/proc/<pid>/mem`.**
+Requires `ptrace_may_access`, which requires the tracee
+to be dumpable. The broker (`PR_SET_DUMPABLE=0`),
+per-command sandboxes (Invariant C), and the shim
+(`nono-shim` — agent doesn't typically read its memory but
+shim doesn't have mediated binary mapped anyway) are all
+non-dumpable. Closed.
 
-This is the default subprocess-spawn path for Go (`syscall.ForkExec`
-unconditionally sets `CLONE_VFORK | CLONE_VM`) and for glibc
-`posix_spawn` ≥ 2.24, so any in-band fix at the seccomp-unotify layer
-denies the bypass and legitimate Go / glibc spawns alike. The
-structural fix is to move exec mediation to a BPF LSM program at
-`bprm_check_security`: the kernel has already copied the pathname to
-`bprm->filename` and resolved `bprm->file` before the hook fires, so
-the user-memory race does not exist there. Tracked as v2; out of scope
-for this PR (requires `CONFIG_BPF_LSM=y` and `CAP_SYS_ADMIN`-class
-privilege to load the LSM program).
+**Execute via the dynamic linker.** Kernel execs the
+linker; the linker calls `open` on the mediated binary;
+`file_open` denies. Closed.
+
+**Execute via a custom ELF interpreter (PT_INTERP).** The
+custom interpreter has to read the mediated binary's
+bytes from somewhere. Either the kernel does it during
+`binfmt_elf` setup (which sets `bprm->file` to whatever
+the interpreter resolves and fires `bprm_check_security`)
+or the userland interpreter calls `open` (which fires
+`file_open`). Closed.
+
+**Mount an overlay over the mediated binary's path.**
+Requires source bytes for the overlay. Reading the
+mediated binary fires `file_open`. Closed.
+
+**`io_uring` `IORING_OP_OPENAT`.** Goes through the same
+VFS path; `security_file_open` fires. Closed.
+
+**Read via the kernel's pagecache through `/proc/kcore` or
+similar.** Requires `CAP_SYS_RAWIO`, which the agent
+doesn't have (Invariant D). Closed.
+
+**Network-side: agent downloads the mediated binary's
+bytes from outside the host.** Out of scope for exec
+mediation; this is a different threat (network-policy
+gap) and a different layer.
+
+**Capability-equivalent: agent reimplements the mediated
+binary's logic from scratch.** Not in scope. The exec
+filter mediates *identity* of binaries that run; it does
+not mediate behavior. An agent that can compile arbitrary
+code can in principle replicate any binary's externally
+observable behavior. Mediating *that* requires a
+syscall-level capability filter, not an exec filter.
 
 ### Performance
 
-Every `execve` in the agent's process tree round-trips to the broker-side
-supervisor. Round-trip cost is on the order of microseconds. Heavy build
-workloads (e.g., `bzl build` forking tens of thousands of subprocesses) add at
-most a low-hundreds-of-milliseconds overhead across a full build — not
-perceptible relative to the builds' own runtime. No fast-path optimization
-(e.g., BPF pre-filtering on path prefix) is attempted in v1.
+Per `bprm_check_security` invocation: cgroup-ancestor walk
+(~32 ancestor lookups in the worst case, ~8 in practice) +
+one map lookup. Roughly 200–400 ns. `bprm_check_security`
+fires once per `execve`; a build with 10 000 forks pays
+2–4 ms total. Imperceptible.
 
-### Audit volume
+Per `file_open` invocation: cgroup-ancestor walk + one map
+lookup. Same ~200–400 ns. `file_open` fires on every file
+open in the agent's tree, so this is the higher-volume
+hook. A typical agent task with 1 000 file opens per tick
+adds 200–400 µs per tick. Still imperceptible.
 
-Filter events are emitted only on `allow_unmediated` and `deny`
-decisions; `allow_shim` invocations continue to produce their single
-existing shim event and no filter event. The filter therefore adds
-volume proportional to direct-path and denied execs rather than to total
-exec activity. A session using only PATH-based invocations (the normal
-case for most developer workloads, including `bzl build`) adds zero
-filter events on top of existing shim events. A session using
-direct-path invocations or triggering denies adds one filter event per
-such invocation. If filter-event volume becomes a concern in practice,
-the `allow_unmediated` bucket is amenable to sampling or per-binary
-rollup; neither is proposed for v1.
+Pre-warm at session start: `stat` each `mediation.commands`
+entry, populate the BPF map. Roughly one syscall per entry,
+microseconds. The agent's `pre_exec` wait absorbs this; it
+does not appear as latency to the agent's actual work.
 
-### Upstream fit
+Memory: BPF deny map is ~20 bytes per entry; mediation
+profiles list a handful of commands; total <1 KB. Ring
+buffer is 64 KiB by default; sized to hold a burst of
+audit events without backpressure.
 
-The feature is additive, gated on `mediation.commands` being non-empty, and
-reuses existing seccomp-unotify infrastructure. It does not change any public
-CLI surface or profile schema field. We expect this to be mergeable into
-`kipz/nono` upstream; the Datadog team's fallback is to carry the feature
-downstream, though upstream fit is the preferred outcome.
+## Deployment requirements
 
-## Platform requirements
-
-- **Kernel ≥ 5.19** for `SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV` (already
-  used by the existing filters; not an additional requirement). Older kernels
-  are supported via the existing fallback path.
-- **seccomp user notification** (kernel ≥ 5.0). Same infrastructure the fork
-  already uses.
-- **`PR_SET_NO_NEW_PRIVS`** (kernel ≥ 3.5). Already set by the existing
-  filter-install path.
-
-No Landlock ABI bump is required; the filter works on Landlock ABI v4 and
-above. It also works on systems with no Landlock at all, though such systems
-lose the broader sandboxing nono provides.
+- **Kernel.** Ubuntu 22.04 HWE 6.8 or newer with
+  `CONFIG_BPF_LSM=y`. Verifiable via
+  `grep bpf_lsm_bprm_check_security /proc/kallsyms`.
+- **Active LSM stack.** `lsm=...,bpf` in the kernel cmdline.
+  Verifiable via `cat /sys/kernel/security/lsm`.
+- **Broker capabilities.** `setcap
+  cap_bpf,cap_sys_admin,cap_dac_override+ep /usr/bin/nono`
+  applied at install time. The broker drops what it
+  doesn't need post-cgroup-create.
+- **Profile.** `mediation.commands` lists every canonical
+  path of every mediated binary on the host. Deployments
+  with multiple installed copies of the same binary list
+  all of them (this matched the seccomp-era deny set
+  requirement).
 
 ## Implementation plan
 
-### Phase 0 (completed): verified assumptions
+This section is written for an engineer (human or AI agent)
+picking the work up cold. It captures everything you need
+to know that isn't in the rest of the doc: where things
+live in the codebase, what idioms the existing BPF-LSM code
+uses, what tribal knowledge accumulated during the
+preceding iterations, and what the verification flow looks
+like at each step. **Use TDD throughout** — every phase
+specifies tests to write *before* the implementation, so
+the test runs RED first and goes GREEN as you complete the
+work. If you cannot write a failing test for a piece of
+behavior, the behavior is probably underspecified.
 
-The three assumptions the design rests on were verified by reading the fork's
-code on the `release` branch before writing the rest of this plan. Line
-numbers below are provided so reviewers can reproduce the verification
-without re-doing the investigation.
+The five phases are sized so each leaves the tree in a
+buildable, lint-clean, test-passing state. You can stop
+between phases for review; nothing requires landing them
+together.
 
-1. **Filter composition — verified.** Both existing seccomp-unotify filters
-   `RET_ALLOW` syscalls outside their trap set, so a third filter trapping
-   `execve`/`execveat` composes cleanly without restructuring the others.
-   - `install_seccomp_notify` in `crates/nono/src/sandbox/linux.rs:892`:
-     BPF program traps `SYS_openat` / `SYS_openat2` at instructions 1–2 and
-     falls through to `SECCOMP_RET_ALLOW` at instruction 3 for every other
-     syscall, including `execve` / `execveat`.
-   - `build_seccomp_proxy_filter` in `crates/nono/src/sandbox/linux.rs:1620`:
-     BPF program dispatches on `SYS_SOCKET` / `SYS_CONNECT` / `SYS_BIND` /
-     `SYS_SOCKETPAIR` / `SYS_IO_URING_SETUP` at instructions 1–5; syscalls
-     outside that set fall through to `SECCOMP_RET_ALLOW` at instruction 6.
+### 0. Repository orientation
 
-2. **SCM_RIGHTS fd transfer — verified.** Each listener fd is sent as a
-   separate, ordered `send_fd_via_socket` / `recv_fd` pair on the supervisor
-   socket; the protocol is not packet-structured. Adding a third listener
-   fd is purely additive.
-   - Child-side sends: `crates/nono-cli/src/exec_strategy.rs:793` (openat
-     filter fd, gated on `config.capability_elevation`);
-     `crates/nono-cli/src/exec_strategy.rs:853` (proxy filter fd, gated on
-     `config.seccomp_proxy_fallback`).
-   - Parent-side receives: `crates/nono-cli/src/exec_strategy.rs:1036`
-     (openat fd); `crates/nono-cli/src/exec_strategy.rs:1059` (proxy fd).
-   - The Linux supervisor loop at
-     `crates/nono-cli/src/exec_strategy.rs:1870` builds its `pollfd`
-     vector dynamically from `Option<&OwnedFd>` parameters (`seccomp_fd`,
-     `proxy_seccomp_fd`) and dispatches by index. A third
-     `exec_notify_fd: Option<&OwnedFd>` parameter slots into the same
-     pattern without restructuring the loop.
+Branch: **`am/linux-exec-filter-bpf-lsm`** on the
+`drewmchugh/nono` fork. Clone target: `~/dd/nono` on
+workspaces (matches the validation workspace's existing
+checkout — keep the path consistent).
 
-3. **Per-command sandbox inheritance — verified.** Per-command sandboxes
-   are forked from the broker process, not from the agent, and therefore
-   do not inherit the agent's seccomp exec filter. The broker can freely
-   exec real mediated binaries inside per-command sandboxes without
-   triggering our filter.
-   - `crates/nono-cli/src/mediation/policy.rs:611` runs
-     `tokio::task::spawn_blocking(...)` inside the broker process; inside
-     that closure, `Command::new(&real_path).spawn()` at `policy.rs:734`
-     forks the per-command child from the broker. The broker is the
-     unsandboxed parent and has no seccomp filter installed on itself.
-   - The per-command sandbox is applied via a `pre_exec` closure at
-     `policy.rs:725` that calls `nono::Sandbox::apply(&caps)` with a fresh
-     capability set (Landlock on Linux, Seatbelt on macOS). No seccomp
-     filter is installed in this closure.
-   - The agent child is a separate, earlier fork from the broker (at the
-     `exec_strategy` fork point). The exec filter is installed only in
-     the agent's `pre_exec` and is scoped to the agent's process tree by
-     normal filter inheritance.
+Crate layout:
 
-### Phase 1: write the test suite (RED before implementation)
+| Crate | Role | Key files for this work |
+|---|---|---|
+| `crates/nono` | Library: sandbox primitives, BPF-LSM loader | `src/sandbox/{linux.rs,bpf_lsm.rs}`, `src/bpf/{exec_filter.bpf.c,vmlinux.h}`, `build.rs`, `tests/bpf_lsm_smoke.rs` |
+| `crates/nono-cli` | CLI binary: exec strategy, supervisor loop | `src/exec_strategy.rs`, `src/exec_strategy/supervisor_linux.rs`, `src/mediation/{filter_audit.rs,shebang.rs}`, `tests/exec_filter.rs` |
+| `crates/nono-shim` | Shim binary that the agent execs | unchanged by this work |
 
-Before writing any filter code, commit a test suite that describes the
-feature's behavior from the outside. Every test in this phase is RED
-against today's binary. Later phases flip them GREEN in deliberate order;
-each phase below names which tests it closes, so progress is measurable
-against a concrete target.
+`crates/nono/src/sandbox/linux.rs` is large (~3 k lines) and
+holds *all* of the existing seccomp-unotify infrastructure:
+filter install, BPF program builders, sockaddr parsing,
+notify recv/respond primitives, the path-read helpers.
+Phase 1 deletes the exec-filter portions of this file but
+leaves the openat (capability elevation) and connect/bind
+(network proxy) portions intact — they're independent
+features.
 
-**Integration tests.** Land in a new integration-test file
-(suggested: `crates/nono-cli/tests/exec_filter.rs`) and share a minimal
-fixture:
+Existing BPF-LSM scaffolding:
 
-- A test binary at `tests/fixtures/exec_filter/testbin` — an executable
-  shell script that prints the marker `REAL_BINARY_RAN`.
-- A test profile that extends `claude-code` and lists `testbin` in
-  `mediation.commands` with a `respond` rule returning `MEDIATED_RESPONSE`
-  on stdout.
-- Helpers: `run_nono_with(profile, cmd, args)` returning
-  `(stdout, stderr, exit_code)`, and `read_audit_events(session_pid)`
-  parsing the session's `audit.jsonl` into a `Vec<serde_json::Value>`.
+- `crates/nono/src/bpf/exec_filter.bpf.c` is the BPF C
+  source. Currently has the `bprm_check_security` program
+  with cgroup-ancestor walk and `(dev, ino)` deny check.
+- `crates/nono/src/bpf/vmlinux.h` is the vendored kernel
+  type header (3 MB; do not regenerate unless the BPF
+  program needs a new struct field).
+- `crates/nono/build.rs` invokes `libbpf-cargo`'s
+  `SkeletonBuilder` to compile the BPF C and emit a Rust
+  skeleton at `OUT_DIR/exec_filter.skel.rs`.
+- `crates/nono/src/sandbox/bpf_lsm.rs` is the loader. It
+  has `install_exec_filter(deny_paths, agent_cgroup_id)`,
+  `create_session_cgroup(agent_pid)`, `is_bpf_lsm_available()`,
+  the `ExecFilterHandle` and `SessionCgroup` RAII types,
+  and a `mod skel { include!(...); } use skel::*;` wrapper
+  that suppresses clippy lints on the libbpf-cargo-
+  generated boilerplate.
 
-Integration tests:
+The current broker integration is in
+`crates/nono-cli/src/exec_strategy.rs` around the
+post-fork parent branch (~line 1165), inside the
+`#[cfg(target_os = "linux")]` block that creates the
+session cgroup, calls `install_exec_filter`, and binds the
+result into a let-binding kept alive for the supervisor
+loop. The seccomp-unotify exec filter — the thing being
+deleted in Phase 1 — is also wired here: child sends an
+`exec_notify_fd` over the socketpair, parent receives it,
+parent's poll loop calls `handle_exec_notification` on
+each event.
 
-1. `path_based_mediated_invocation_goes_through_shim` — invoke `testbin
-   arg` via `PATH`. Expect stdout `MEDIATED_RESPONSE`. Regression guard;
-   stays GREEN throughout.
-2. `direct_path_mediated_invocation_is_denied` — invoke
-   `/absolute/path/to/testbin arg` directly. Expect non-zero exit,
-   `"permission denied"` on stderr, `REAL_BINARY_RAN` absent from stdout.
-   **Core test.**
-3. `direct_path_non_mediated_invocation_succeeds` — invoke `/bin/ls /`
-   directly. Expect exit 0.
-4. `shebang_script_pointing_at_mediated_binary_is_denied` — write
-   `/tmp/evil.sh` with first line `#!/absolute/path/to/testbin`. Exec it.
-   Expect non-zero exit; `REAL_BINARY_RAN` absent.
-5. `shebang_chain_terminates_in_deny` — `/tmp/a.sh` starts `#!/tmp/b.sh`;
-   `/tmp/b.sh` starts `#!/absolute/path/to/testbin`. Exec `/tmp/a.sh`.
-   Expect non-zero exit.
-6. `shebang_chain_with_real_interpreter_allowed` — `/tmp/normal.sh` starts
-   `#!/bin/bash` followed by `echo hi`. Exec it. Expect stdout `hi`.
-   Guards against over-aggressive shebang denial.
-7. `filter_emits_audit_for_allow_unmediated` — direct-path `/bin/ls /`;
-   audit file contains an event with
-   `action_type == "exec_filter_allow_unmediated"`. The `exit_code:
-   None` → field-omission behavior is covered by `FilterAuditEvent`'s
-   serialization unit tests, not asserted again here.
-8. `filter_emits_audit_for_deny` — direct-path testbin; audit file
-   contains an event with `action_type == "exec_filter_deny"`,
-   `exit_code == 126`, `reason == "deny_set"`, `path ==` canonical real
-   path of testbin.
-9. `shim_invocation_does_not_double_emit` — PATH-invoke testbin; audit
-   file contains exactly one event for this invocation and no event whose
-   `action_type` starts with `exec_filter_`. Regression guard against
-   later emitting filter events on `allow_shim`.
-10. `filter_composes_with_capability_elevation` — profile enables
-    capability elevation (openat filter) in addition to mediation; tests 1
-    and 2 still behave as above.
-11. `agent_cannot_install_bypass_seccomp_filter` — from inside the
-    sandbox, a `seccomp(SECCOMP_SET_MODE_FILTER, ...)` install attempt
-    fails. Validates the `PR_SET_NO_NEW_PRIVS` + existing-filter
-    guarantee.
-12. `filter_audit_args_reflect_execed_command_not_calling_shell` — when
-    `bash -c '<testbin> alpha bravo charlie'` exec's testbin, the deny
-    audit event records `args = ["alpha", "bravo", "charlie"]` (the
-    target's argv minus argv[0]), not the shell's `["-c", ...]`. Guards
-    that we read argv from the syscall, not `/proc/<tid>/cmdline`.
-13. `nonexistent_path_exec_returns_kernel_errno_not_eacces` — exec of a
-    nonexistent absolute path surfaces the kernel's native ENOENT-class
-    error to bash, not `EACCES`, and emits no audit event. Guards
-    against synthesizing `EACCES` on resolution failure (which would
-    break PATH-walking shells).
+### 0.1 Build and validation environment
 
-`execveat` is implemented and exercised through `classify_exec_path`
-unit tests and the shared path-resolution helpers, but not through
-dedicated integration tests: every Rust/shell exec primitive available
-to a test compiles down to `execve`, so testing `execveat` would need
-a small harness binary that calls the raw syscall. That harness
-isn't in scope for v1; if `execveat`-specific bugs emerge they will be
-addressed alongside the helper.
+A fresh workspace booted from the `am/bpf-lsm-workspace-ami`
+AMI has:
 
-**Unit tests.** Land alongside the modules they cover; write module
-skeletons with `todo!()` bodies so the tests compile.
+- `cat /sys/kernel/security/lsm` includes `bpf`. Verify
+  before doing anything.
+- Kernel `6.8.0-1052-aws` or newer with `CONFIG_BPF_LSM=y`.
+  Verify via `grep bpf_lsm_bprm_check_security /proc/kallsyms`.
+- Standard Ubuntu user / docker container layout (see the
+  decisions log for the recon details).
 
-- `parse_shebang(bytes)` table-driven:
-  - `b"#!/bin/bash\n"` → `Some("/bin/bash")`.
-  - `b"#!/usr/bin/env python\n"` → `Some("/usr/bin/env")`.
-  - `b"not a shebang"` → `None`.
-  - `b"#!"` alone → `None`.
-  - `b"#!/long/interpreter"` followed by 256+ bytes without a newline →
-    truncation behavior matches kernel (explicit decision in the test).
-- `MAX_SHEBANG_RECURSION` sanity: `assert!(MAX_SHEBANG_RECURSION >= 5)`
-  with a comment pointing at `include/linux/binfmts.h`'s
-  `BINPRM_MAX_RECURSION`. Failing this test is the CI signal that the
-  kernel bumped its value and our margin needs reconsideration.
-- `check_shebang_chain` termination: mock reader that returns
-  `"#!/self\n"` forever; function returns at `MAX_SHEBANG_RECURSION`
-  without stack-overflowing.
-- Deny-set canonical lookup: hits on canonical path, hits via symlink that
-  resolves into the set, misses, nonexistent paths.
-- BPF program structure for the exec filter: static assertion that the
-  instruction sequence traps `SYS_execve` and `SYS_execveat` and falls
-  through to `RET_ALLOW` for every other syscall. Pattern mirrors the
-  existing openat and proxy filter tests at `linux.rs:2786`.
-- `FilterAuditEvent` serialization: construct, serialize to JSON, parse
-  back; verify field presence/absence per schema (`exit_code` present as
-  `126` on deny, absent on allow_unmediated; `reason` present only on
-  deny; `interpreter_chain` present only on shebang denies; `command` is
-  the basename of `path`; `action_type` always present).
+To build for the first time on a fresh workspace:
 
-**Stubs written alongside the tests so the crate compiles.** Each stub is
-a real function/type signature with a `todo!()` body that will be filled
-in during a later phase.
+```
+sudo apt-get install -y \
+    libdbus-1-dev libelf-dev clang build-essential pkg-config
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+source $HOME/.cargo/env
+cd ~/dd/nono
+make build-release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+```
 
-- New module `crates/nono-cli/src/mediation/shebang.rs`:
-  - `pub const MAX_SHEBANG_RECURSION: usize = 8;`
-  - `pub fn parse_shebang(bytes: &[u8]) -> Option<&str>`
-  - `pub enum ShebangResult { NotScript, Deny(Vec<PathBuf>) }`
-  - `pub fn check_shebang_chain(path: &Path, depth: usize, deny_set: &DenySet) -> ShebangResult`
+Re-run `setcap` after every release build — `cargo build`
+overwrites the binary and drops file capabilities.
+
+POC sources for end-to-end validation:
+
+```
+git clone --depth 1 -b kipz/pr20-toctou-poc \
+    https://github.com/kipz/nono.git /tmp/kipz-poc
+mkdir -p /tmp/exec-filter-poc
+cp /tmp/kipz-poc/poc/{attacker.c,vfork_attacker.c,run_test.sh} \
+    /tmp/exec-filter-poc/
+chmod +x /tmp/exec-filter-poc/run_test.sh
+```
+
+Harness usage:
+
+```
+NONO=$(pwd)/target/release/nono \
+SHIM=$(pwd)/target/release/nono-shim \
+ATTEMPTS=600 \
+ATTACKER_SRC=vfork_attacker.c \
+LABEL=phase-X \
+bash /tmp/exec-filter-poc/run_test.sh
+```
+
+Set `ATTACKER_SRC=attacker.c` for the pthread variant.
+Both should report `BYPASS_COUNT=0` after every phase.
+
+### 0.2 Tribal knowledge from prior iterations
+
+Things you'd waste time rediscovering otherwise:
+
+- **`(dev, ino)` byte layout** between Rust and BPF must
+  match exactly. The Rust loader has `#[repr(C)] struct
+  DenyKey { dev: u64, ino: u64 }` and the BPF program has
+  the parallel C definition. If you change one, change the
+  other and re-run the smoke test to catch verifier
+  rejection.
+- **`MaybeUninit<OpenObject>` lifetime.** `libbpf-rs`
+  `SkelBuilder::open` borrows from caller-owned storage
+  for the BPF object. The loader uses `Box::leak` to give
+  the storage a `'static` lifetime so the
+  `ExecFilterHandle` can own the resulting skeleton. The
+  leak is bounded (one OpenObject per session) and
+  reclaimed when the broker exits.
+- **Clippy on generated code.** `libbpf-cargo` emits
+  `unwrap()` and `expect()` in its boilerplate. Wrapping
+  the `include!` in a `mod skel { ... }` with
+  `#[allow(clippy::unwrap_used)]` and
+  `#[allow(clippy::expect_used)]` suppresses lints on the
+  generated code only; hand-written code in the same file
+  remains under the project's strict deny.
+- **`bpf_get_current_ancestor_cgroup_id(level)` returns 0
+  past current's depth.** The cgroup-ancestor walk loop
+  exits early on a 0 return, so the typical-case cost is
+  `~current_depth` iterations rather than `MAX_CGROUP_DEPTH`.
+- **Cgroup `Drop` migrates procs back to parent before
+  rmdir.** The `SessionCgroup::drop` impl reads
+  `cgroup.procs`, writes each pid to the parent cgroup's
+  `cgroup.procs`, and loops up to 16 times in case forks
+  happen during the migration. Without this, `rmdir` fails
+  with `EBUSY` on a non-empty cgroup and the directory
+  leaks.
+- **`PR_SET_NO_NEW_PRIVS=1` disables file caps at exec.**
+  The agent's `pre_exec` sets this; that's why setcap'd
+  binaries the agent might place in writable directories
+  don't grant capabilities. Don't break this — it's load-
+  bearing for Invariant D.
+- **`/proc/<pid>/comm` is the kernel-resolved binary
+  basename;** `/proc/<pid>/cmdline` is the user-passed
+  argv as it stood at the time of `execve` — for shebang
+  scripts these differ (the kernel's binary is the
+  interpreter; argv[1] is the script path). The BPF
+  program sees the kernel's view via `bprm->file`; the
+  audit code sees user-passed view via `bprm->filename`.
+  Don't conflate them.
+- **`make ci` has pre-existing failures on this branch**
+  in `crates/nono-cli/tests/exec_filter.rs` and
+  `crates/nono-cli/src/mediation/{filter_audit,shebang}.rs`
+  (test code with `unwrap()`). Phase 1 deletes most of
+  these files; what remains should clear `make ci` after
+  Phase 1 lands.
+
+### Phase 1 — drop the seccomp-unotify exec filter
+
+**Goal.** Remove all userspace exec-decision code. After
+this phase, the only enforcement path for mediated commands
+is the BPF-LSM hook on `bprm_check_security`. Any host
+without `bpf` in the active LSM stack fails session start
+loudly. Other seccomp filters (openat for capability
+elevation, connect/bind for network proxy) stay — they're
+unrelated features.
+
+#### 1.1 Tests to write FIRST (TDD red)
+
+These tests should fail before any deletion happens — they
+encode the post-Phase-1 behavior we're implementing toward.
+
+In `crates/nono-cli/tests/exec_filter.rs`:
+
+- `pre_exec_does_not_install_seccomp_exec_filter` — fork a
+  child that does what the agent's pre-exec does
+  (configure caps, etc.) but verify no seccomp filter on
+  `execve` is installed. Easiest check: in the child,
+  attempt to `execve` a non-deny binary and trace the
+  syscall path; the seccomp-unotify trap should never
+  fire because the filter doesn't exist. (You can prove
+  absence of the filter via `prctl(PR_GET_SECCOMP)` or
+  by checking `/proc/<pid>/status`'s `Seccomp:` field —
+  it should still show `0` for "no seccomp" or `2` for
+  "filter mode" if other filters are installed; what
+  matters is the count of installed filters via
+  `seccomp(SECCOMP_GET_NOTIF_SIZES, ...)` doesn't list
+  an exec-trapping one).
+- `mediation_active_without_bpf_lsm_fails_loudly` —
+  mock or condition-skip on a system where `bpf` isn't in
+  `/sys/kernel/security/lsm`. Run `nono` with a profile
+  containing `mediation.commands`. Expect non-zero exit
+  with an error message naming "BPF-LSM" and
+  "lsm=...,bpf". Skip on workspaces where bpf *is* active
+  (the validation workspace).
+
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
+
+- The existing 4 smoke tests stay GREEN through this
+  phase. No new ones for Phase 1.
+
+In a new file `crates/nono-cli/tests/no_seccomp_exec.rs`
+(or alongside the existing exec_filter tests, depending on
+organization):
+
+- `seccomp_exec_filter_module_does_not_exist` — a
+  compile-time guard: `use nono::sandbox::{
+  install_seccomp_exec_filter, SYS_EXECVE, SYS_EXECVEAT };`
+  should fail to compile after deletion. Encode this as a
+  doc-test or a `compile_fail` test in a build script.
+
+#### 1.2 What to delete
+
+Code to remove (everything specific to the seccomp exec
+filter; leave the openat/proxy filters alone):
+
 - `crates/nono/src/sandbox/linux.rs`:
-  - `pub fn install_seccomp_exec_filter() -> Result<OwnedFd>`
-- `FilterAuditEvent` struct (new type) in the mediation audit module,
-  with fields per the Audit design section above. `todo!()`-returning
-  constructor helpers if convenient, or just plain struct literal
-  construction at call sites.
+  - `install_seccomp_exec_filter` function and its BPF
+    program builder.
+  - `SYS_EXECVE`, `SYS_EXECVEAT` constants (move to
+    libc-only references if anything else needs them; in
+    practice nothing will after Phase 1).
+- `crates/nono/src/sandbox/mod.rs`: drop the re-exports of
+  `install_seccomp_exec_filter`, `SYS_EXECVE`,
+  `SYS_EXECVEAT`.
+- `crates/nono-cli/src/exec_strategy.rs`:
+  - `install_exec_filter` config field on `ExecConfig`.
+  - The pre_exec child-side install code that called
+    `install_seccomp_exec_filter` and sent the fd.
+  - The parent-side `exec_notify_fd: Option<OwnedFd>`
+    receive code.
+  - The supervisor poll-loop branch that dispatched to
+    `handle_exec_notification`.
+- `crates/nono-cli/src/exec_strategy/supervisor_linux.rs`:
+  - `handle_exec_notification` function.
+  - `classify_exec_path` and its `ExecDecision` enum.
+  - `read_path_at`, `read_execve_argv_at` helpers.
+  - `count_threads`, `read_tgid` (still used by the openat
+    handler? — verify; if so, leave them). Actually
+    `read_tgid` is shared with the openat handler — keep
+    it. `count_threads` is exec-filter-only — delete.
+  - The exec_filter test module at the bottom of the file.
+- `crates/nono-cli/src/mediation/shebang.rs`: delete
+  entirely.
+- `crates/nono-cli/src/mediation/mod.rs`: drop the `pub
+  mod shebang;` declaration.
+- `crates/nono-cli/src/mediation/filter_audit.rs`: keep
+  the file but simplify per Phase 3 (or do the schema
+  change here in Phase 1; either is fine — pick one and
+  stick with it). For now: drop the obsolete `reason`
+  constants (`SHEBANG_CHAIN`, `MULTI_THREADED_UNSAFE`,
+  `POST_EXEC_DENY`, `PTRACE_SEIZE_FAILED`); keep
+  `DENY_SET` for the BPF-LSM `bprm_check_security` deny
+  case (rename to `EXEC_DENY` for clarity).
+- `crates/nono-cli/tests/exec_filter.rs`: most tests in
+  this file test seccomp-specific behavior. Delete the
+  ones that exercise multi-threaded denial, shebang
+  chains, or shim-prefix logic. Keep tests that exercise
+  the still-relevant audit shape (rewrite to use
+  `bpf_lsm_smoke`-style harness if needed).
 
-After this phase, `cargo test` compiles cleanly; every integration test
-fails at runtime because the binary has no filter; every unit test that
-references a `todo!()` stub fails at runtime with a panic. The suite is
-RED in a legible way — test names describe the feature's behavior, and
-the panics / failures give a concrete punch-list for the phases below.
+#### 1.3 What to add
 
-### Phase 2: BPF filter and fd plumbing
+- `BpfLsmError::ActiveLsmRequired` variant on
+  `crates/nono/src/sandbox/bpf_lsm.rs::BpfLsmError`. The
+  loader should return this rather than the existing
+  `NotInActiveLsm` when the *broker* (not just BPF-LSM
+  diagnostics) needs to fail. They might be the same — pick
+  one consistently.
+- `crates/nono-cli/src/exec_strategy.rs`: replace the
+  current "warn-and-fall-back-on-`NotInActiveLsm`" branch
+  with `return Err(NonoError::SandboxInit(format!("BPF-LSM
+  is required for mediation but is not in the active LSM
+  stack. The host kernel must boot with lsm=...,bpf in
+  the cmdline. See drewmchugh/nono#3.")))`.
+- Same for the cgroup-create failure branch and the
+  generic `LibBpf` errors: hard-fail rather than fall
+  back.
 
-Add `install_seccomp_exec_filter() -> Result<OwnedFd>` to
-`crates/nono/src/sandbox/linux.rs`, mirroring the shape of
-`install_seccomp_proxy_filter`:
+#### 1.4 Verification
 
-- BPF program: two `JEQ` instructions for `SYS_execve` and `SYS_execveat`;
-  everything else `RET_ALLOW`; matches `RET_USER_NOTIF`.
-- Install as a separate filter (not merged with the existing openat or proxy
-  filters), so the three filters compose independently and each has its own
-  listener fd.
-- Export from `crates/nono/src/sandbox/mod.rs` alongside the existing
-  primitives.
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+cargo test -p nono --lib                  # 629+ tests pass
+cargo test -p nono --test bpf_lsm_smoke   # 4 tests pass
+sudo -E cargo test -p nono --test bpf_lsm_smoke  # 4 tests pass with caps
+make ci                                   # clean
+```
 
-Extend the child-side install site in
-`crates/nono-cli/src/exec_strategy.rs` to call the new install function when
-the session's profile has `mediation.commands` non-empty. Send the new
-listener fd to the parent via the existing SCM_RIGHTS transfer, adding one
-more slot to the protocol. Gate all of this behind the same mediation-active
-check.
+End-to-end POCs (must remain 0/600 from prior validation):
 
-**Tests flipped GREEN by this phase:** none by itself. Installing the BPF
-filter without a handler leaves every trapped `execve` blocked forever
-(the kernel queues a notification; nothing ever responds). This phase is
-a prerequisite for Phase 3 and is not independently deployable. Phase 2
-lands together with Phase 3 from a reviewability standpoint; they're
-numbered separately only to keep the code diffs digestible.
+```
+ATTACKER_SRC=attacker.c    LABEL=phase1-pthread bash /tmp/exec-filter-poc/run_test.sh
+ATTACKER_SRC=vfork_attacker.c LABEL=phase1-vfork bash /tmp/exec-filter-poc/run_test.sh
+```
 
-### Phase 3: supervisor handler + three-way classification
+#### 1.5 Acceptance criteria
 
-Add `handle_exec_notification` in
-`crates/nono-cli/src/exec_strategy/supervisor_linux.rs`, mirroring the shape
-of the existing openat handler:
+- All existing BPF-LSM smoke tests still pass.
+- POC results: pthread 0/600, vfork 0/600.
+- `grep -r install_seccomp_exec_filter crates/` returns
+  nothing.
+- `grep -r handle_exec_notification crates/` returns
+  nothing.
+- `grep -r SYS_EXECVE crates/` returns nothing (or only
+  in irrelevant comments).
+- `make ci` clean (or has only pre-existing failures
+  unrelated to this work — note them in the commit
+  message).
 
-- `recv_notif` on the exec listener fd.
-- Extract path arguments per syscall:
-  - `SYS_execve`: path from `args[0]`.
-  - `SYS_execveat`: path from `args[1]`, dirfd from `args[0]`, flags from
-    `args[4]`. Dispatch the four variants (absolute, `AT_FDCWD`-relative,
-    real-dirfd-relative, `AT_EMPTY_PATH`).
-- Liveness check via `notif_id_valid` twice — once after the path read
-  and dirfd resolution, once before responding. Matches the openat
-  handler's existing pattern; catches notifications that became
-  invalid because the child was killed.
-- Resolve the raw path into an absolute resolved path via existing
-  `resolve_notif_path` helpers and (for the `AT_EMPTY_PATH` case) direct
-  `/proc/<tid>/fd/<dirfd>` readlink.
-- Shim-prefix check on the pre-canonical resolved path.
-- Otherwise canonicalize and check against the deny set.
-- Respond with `continue_notif` for allow decisions and
-  `respond_notif_errno(EACCES)` for deny.
+#### 1.6 Commit
 
-Extend the supervisor's `poll`/event-loop in the same file to poll the new
-listener fd in addition to the existing openat and proxy fds. Dispatch by fd,
-not by syscall number.
+```
+Phase 1: drop seccomp-unotify exec filter; BPF-LSM is sole enforcement
+```
 
-Build the deny set at session start from the resolved real paths of
-`mediation.commands`, canonicalize each, and make it accessible to the
-handler.
+Reference the design doc and the decisions log in the
+body. Include `Signed-off-by:` per the project's DCO rule.
 
-**Tests flipped GREEN by this phase:** 2, 3, 6, 10, 11. Test 1 was
-already GREEN. Tests 4, 5, 7, 8, 9 remain RED (awaiting shebang
-handling and audit integration). After Phase 3, the direct-path exec
-bypass is closed for simple direct invocations and `execveat` variants.
+### Phase 2 — `file_open` BPF-LSM hook
 
-### Phase 4: shebang handling
+**Goal.** Add the `file_open` LSM hook that denies the
+agent's tree from reading mediated-binary bytes. Closes
+copy-the-binary, ld-linux trick, unprivileged tmpfs, and
+shellcode bypass classes in one step.
 
-Replace the `todo!()` in `check_shebang_chain` (and `parse_shebang`) with
-the real implementation:
+#### 2.1 Tests to write FIRST (TDD red)
 
-- In the handler, after a decision of `allow_unmediated` (the shim is
-  never a script): open the canonical target, read the first 256
-  bytes, check for `#!`, parse the interpreter token up to the first
-  whitespace.
-- Canonicalize the interpreter; check against the deny set. On hit, flip
-  the decision to `deny` with reason `shebang_chain` and record the
-  interpreter chain for the audit record.
-- Otherwise recurse into the interpreter's file with `depth + 1`;
-  terminate at `MAX_SHEBANG_RECURSION` with `ShebangResult::NotScript`
-  (safe default: accept the outer decision so far).
+In `crates/nono-cli/tests/file_open_deny.rs` (new file),
+each test should:
+1. Set up a session with `mediation.commands` listing a
+   test binary that exists at a known path under the test
+   harness's tmp directory.
+2. Run an action inside the agent's session that exercises
+   the bypass.
+3. Assert the action fails with `EACCES` and the agent
+   never gets the binary's bytes.
 
-**Tests flipped GREEN by this phase:** 4, 5. The `check_shebang_chain`
-termination and `parse_shebang` unit tests also flip GREEN.
+Tests:
 
-### Phase 5: refuse multi-threaded execve
+- `cat_of_mediated_binary_from_inside_agent_fails` —
+  `bash -c "cat /path/to/mediated-binary > /tmp/copy"`.
+  Expect non-zero exit. Expect `/tmp/copy` to not contain
+  the mediated binary's bytes.
+- `cp_of_mediated_binary_from_inside_agent_fails` — same
+  but with `cp`.
+- `dynamic_linker_invocation_of_mediated_binary_fails`
+  — `bash -c "/lib/ld-linux-x86-64.so.2 /path/to/binary"`
+  (use `arch=x86_64`-conditional path; on aarch64 the
+  linker is `/lib/ld-linux-aarch64.so.1`). Expect
+  non-zero exit; expect the binary's marker output never
+  appears.
+- `cat_of_mediated_binary_from_broker_succeeds` — same
+  binary, but the cat is run *outside* the agent's
+  cgroup (e.g., directly from the test harness without a
+  nono session). Expect success. Demonstrates the scope
+  check works.
+- `cat_of_non_mediated_binary_from_inside_agent_succeeds`
+  — `bash -c "cat /bin/ls > /dev/null"`. Expect success.
+  Demonstrates the deny is targeted.
 
-At the top of `handle_exec_notification`, after `recv_notif` and
-syscall-arg extraction:
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
 
-- Read the trapped TID's TGID via the existing `read_tgid()` helper.
-- Read `/proc/<tgid>/status`, parse the `Threads:` line.
-- If `Threads > 1`, respond `EACCES` immediately, emit a deny audit
-  event with reason `multi_threaded_unsafe`, and return.
-- If the status file is unreadable, fail closed (deny).
-- Otherwise (`Threads == 1`), proceed with the rest of the handler.
+- Add `file_open_hook_attaches` — verifies the new BPF
+  program section is present in the loaded skeleton and
+  that `attach()` succeeds.
+- Update `force_load_validates_verifier_acceptance` to
+  exercise both hooks loading.
 
-This replaces the earlier "double-read" mitigation. A reviewer's POC
-on PR #20 showed the double-read did not meaningfully reduce
-bypass rate against a multi-threaded buffer-swap attacker (~3% per
-attempt on x86_64 even with both `allow_shim` and `allow_unmediated`
-covered): the kernel's post-CONTINUE re-read window is microseconds
-and a sibling thread can simply hold the swap pattern through any
-finite number of supervisor reads. The only structural fix is to
-ensure no sibling thread can run during the trap, which is what
-denying multi-threaded execve achieves.
+In `crates/nono-cli/tests/exec_filter.rs` (or wherever the
+audit tests live after Phase 1):
 
-**Tests flipped GREEN by this phase:** none in the Phase 1 list (the
-multi-threaded race wasn't represented there). Validation is via the
-external POC at PR #20 comment 4337852261, which goes from
-demonstrably exploitable (8/300 bypasses without the check) to
-provably blocked (0/600 bypasses with the check).
+- Add `audit_emits_open_deny_when_agent_reads_mediated_binary`
+  — verify a JSONL entry appears in `audit.jsonl` with
+  `action_type = "deny"`, `reason = "open_deny"`,
+  `path = <canonical>`. (May need to defer assertion to
+  Phase 3 if audit emission is per-phase ordered.)
 
-### Phase 6: audit integration
+#### 2.2 BPF program changes
 
-Emit a `FilterAuditEvent` on `allow_unmediated` and `deny` decisions,
-serializing it as JSONL to the same `~/.nono/sessions/audit.jsonl` file
-the shim already writes to. Skip emission on `allow_shim` — the shim
-downstream emits its own `AuditEvent` when the command completes, and a
-filter-side record there would double-count. A new helper function in
-the mediation audit module handles the append; no new file, no new
-socket, no rotation changes. Populate fields per the Audit design
-section above: `exit_code = Some(126)` on deny, `exit_code = None` on
-allow_unmediated (matches existing `policy.rs:169` convention for
-denied mediation), `reason` populated only on deny, `path` populated on
-every filter event, `interpreter_chain` populated only on shebang-driven
-denies.
+In `crates/nono/src/bpf/exec_filter.bpf.c`, add a second
+program after the existing `bprm_check_security`:
 
-**Tests flipped GREEN by this phase:** 7, 8. Test 9 was already GREEN
-because no filter events existed; it stays GREEN because we deliberately
-skip emission on `allow_shim`. After this phase, all 13 tests in the
-Phase 1 suite are GREEN and the feature is complete.
+```c
+SEC("lsm/file_open")
+int BPF_PROG(check_file_open, struct file *file)
+{
+    if (!in_session_cgroup_via_ancestor_walk()) {
+        return 0;
+    }
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    struct deny_key key = {
+        .dev = BPF_CORE_READ(inode, i_sb, s_dev),
+        .ino = BPF_CORE_READ(inode, i_ino),
+    };
+    if (bpf_map_lookup_elem(&deny_set, &key)) {
+        return -EACCES;
+    }
+    return 0;
+}
+```
 
-### Phase 7: documentation and PR
+Factor the cgroup-ancestor walk into a `static
+__always_inline` helper if the existing program inlines
+it directly — both programs need it.
 
-- Update `CHANGELOG.md`.
-- PR description summarizes this plan, links to it, and calls out the
-  mechanical verification done in Phase 0 (with line numbers) so reviewers can
-  confirm the design's assumptions without re-doing the investigation.
+#### 2.3 Loader changes
 
-## Rollout
+`crates/nono/src/sandbox/bpf_lsm.rs`:
 
-The feature is session-local and opt-in via the profile's `mediation.commands`.
-Profiles that don't use mediation are unaffected. Profiles that use mediation
-today will automatically pick up the exec filter once merged and upgraded.
-There is no runtime toggle and no migration; the filter is either installed
-for a given session or not, based on whether mediation is active.
+- The `ExecFilterHandle` already holds `_skel` and
+  `_link`. Add a second link field, `_open_link`, for the
+  `file_open` program's attachment. RAII teardown order
+  matters — the link drops *before* the skel does.
+- In `install_exec_filter_inner`, after the existing
+  `skel.progs.check_exec.attach()`, also call
+  `skel.progs.check_file_open.attach()` and store the
+  result. The skeleton names come from libbpf-cargo's
+  generation rule (program function name → field name on
+  `skel.progs`).
 
-For the Datadog workspaces distribution specifically (out of scope for this
-PR but relevant to rollout timing): the Linux shadowfax profile enables
-mediation by default, so the feature activates as soon as the nono binary
-shipped by the workspaces AMI picks up this change. That rollout is governed
-by the separate workspaces-side distribution mechanism (`update-tool` or
-equivalent) and does not affect this PR's scope.
+#### 2.4 Verification
 
-## Out of scope
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+    target/release/nono
+sudo -E cargo test -p nono --test bpf_lsm_smoke
+cargo test -p nono-cli --test file_open_deny
+```
 
-- Landlock ABI v5/v6 features.
-- vfork-bomb closure (multi-threaded parent vforks single-threaded
-  child that execs while parent's siblings race the shared MM). See
-  the "vfork-bomb residual" section in Trade-offs.
-- Fast-path BPF optimizations for the allow bucket. Not needed pending
-  measurement.
+End-to-end on the validation workspace:
+
+```
+# Existing POCs still pass
+ATTACKER_SRC=attacker.c       bash /tmp/exec-filter-poc/run_test.sh
+ATTACKER_SRC=vfork_attacker.c bash /tmp/exec-filter-poc/run_test.sh
+
+# Add a copy-attack POC: bash script that
+# (a) cps mediated-binary to /tmp/copy and execs it,
+# (b) runs /lib/ld-linux mediated-binary,
+# (c) unshares user-ns, mounts tmpfs, copies bytes, execs.
+# All three must fail with EACCES at the cp/cat step
+# (i.e., the bytes never get to the writable location).
+```
+
+Author the new POCs under `/tmp/exec-filter-poc/copy_attacker.sh`
+etc. They don't need to be checked into the repo; they're
+validation artifacts on the workspace.
+
+#### 2.5 Acceptance criteria
+
+- All Phase 1 tests still pass.
+- New `file_open_deny` tests pass.
+- Smoke test confirms the new program loads and attaches.
+- Empirical: copy-attack, ld-linux trick, and tmpfs trick
+  all fail at the read step.
+
+### Phase 3 — BPF audit ring buffer + userspace reader
+
+**Goal.** Restore the audit feature lost when Phase 1
+removed the seccomp supervisor's audit-emission code.
+Audit records flow from the BPF program through a
+`BPF_MAP_TYPE_RINGBUF` to a broker-side polling task, which
+formats them and appends to `~/.nono/sessions/audit.jsonl`.
+
+#### 3.1 Tests to write FIRST (TDD red)
+
+In `crates/nono-cli/tests/audit_ringbuf.rs` (new):
+
+- `audit_emits_allow_unmediated_for_non_mediated_exec` —
+  agent execs `/bin/ls`. Expect a JSONL entry with
+  `action_type = "allow_unmediated"`, `command = "ls"`,
+  `path = "/bin/ls"`.
+- `audit_emits_deny_for_blocked_open` — agent tries to
+  `cat` a mediated binary. Expect a JSONL entry with
+  `action_type = "deny"`, `reason = "open_deny"`,
+  `exit_code = 126`.
+- `audit_does_not_emit_for_shim_invocations` — agent runs
+  the shim path (which the broker mediates normally).
+  Expect no `exec_filter`-shaped entry from the BPF
+  audit; the shim downstream emits its own normal
+  audit record.
+- `audit_does_not_emit_for_open_allows` — agent does many
+  `open` calls on non-mediated files. Expect zero
+  emissions in the kernel audit channel from those.
+- `audit_record_has_argv_for_bprm_events` — agent runs
+  `/bin/ls -la /tmp`. Expect the JSONL entry's `args` to
+  be `["-la", "/tmp"]` (argv without argv[0]).
+
+In `crates/nono/tests/bpf_lsm_smoke.rs`:
+
+- `ringbuf_map_is_present_in_skeleton` — assert the
+  generated skeleton exposes the audit ringbuf.
+- `audit_reader_polls_without_panicking` — start a
+  reader, immediately stop, no panic.
+
+#### 3.2 BPF program changes
+
+Add a ring buffer map:
+
+```c
+struct audit_record {
+    __u64 ts_ns;            /* bpf_ktime_get_ns */
+    __u8  source;           /* 0 = bprm, 1 = file_open */
+    __u8  verdict;          /* 0 = allow_unmediated, 1 = deny */
+    __u8  reason;           /* 0 = none, 1 = exec_deny, 2 = open_deny */
+    __u8  _pad;
+    __u32 pid;
+    __u64 dev;
+    __u64 ino;
+    char  path[256];
+    /* For bprm only: argv as a single \0-separated buffer.
+     * argc inferred at userspace by counting nulls. */
+    __u32 argv_len;
+    char  argv[1024];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 20);  /* 1 MB */
+} audit_rb SEC(".maps");
+```
+
+In each hook, on audit-worthy paths, reserve a slot, fill
+it, submit:
+
+```c
+struct audit_record *r = bpf_ringbuf_reserve(&audit_rb,
+                                              sizeof(*r), 0);
+if (!r) return /* fall through, don't fail closed on
+                  audit-side issues */;
+r->ts_ns = bpf_ktime_get_ns();
+r->source = SOURCE_BPRM;  /* or SOURCE_FILE_OPEN */
+r->verdict = ...;
+r->reason = ...;
+r->pid = bpf_get_current_pid_tgid() >> 32;
+r->dev = key.dev;
+r->ino = key.ino;
+bpf_d_path(&file->f_path, r->path, sizeof(r->path));
+/* For bprm only: */
+bpf_probe_read_user_str(r->argv, sizeof(r->argv),
+                         BPF_CORE_READ(bprm, argv));
+bpf_ringbuf_submit(r, 0);
+```
+
+Audit-worthy paths:
+- `bprm_check_security` allow when current is in agent
+  cgroup AND path doesn't start with the shim_dir prefix
+  → `allow_unmediated`. Suppress for shim paths in
+  userspace based on the recorded `path`.
+- `bprm_check_security` deny → `exec_deny` (defense-in-
+  depth; should be rare).
+- `file_open` deny → `open_deny`.
+- `file_open` allow → **don't emit**, would be too noisy.
+
+#### 3.3 Userspace reader
+
+New file `crates/nono/src/sandbox/bpf_audit.rs`:
+
+- `pub struct AuditReader { ... }` with `start(...) -> Self`
+  that spawns a polling task on the ring buffer fd. Use
+  `libbpf-rs::RingBufferBuilder`'s callback API: register
+  a closure that decodes each record and writes to the
+  audit log.
+- The ring buffer fd lives on the loaded skeleton's
+  `maps.audit_rb`. Pass it to the reader at construction.
+- Reader holds `Arc<Mutex<File>>` for the audit log so
+  multiple ring-buffer events can be appended without
+  reopening.
+- Reader's `Drop` stops the polling task cleanly (use a
+  cancellation token / atomic bool checked in the poll
+  loop).
+
+In `crates/nono-cli/src/exec_strategy.rs`, the broker
+constructs the `AuditReader` after `install_exec_filter`
+returns and binds it into the same scope that holds the
+`ExecFilterHandle`. Drop order: reader drops first
+(stops polling), then the filter handle (detaches BPF).
+
+#### 3.4 Schema change
+
+`crates/nono-cli/src/mediation/filter_audit.rs`:
+
+- `FilterAuditEvent::action_type`: `"allow_unmediated"` |
+  `"deny"`.
+- `reason` (Option<String>): `"open_deny"` | `"exec_deny"`
+  on deny; absent on allow.
+- Drop `interpreter_chain` field entirely.
+- `exit_code: Some(126)` on deny; `None` on allow.
+- All other fields unchanged.
+
+The shim-side `AuditEvent` (in `mediation/server.rs` or
+similar) is not touched; consumers of `audit.jsonl` see
+both shapes interleaved as today.
+
+#### 3.5 Verification
+
+```
+cargo build -p nono-cli --release
+sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep target/release/nono
+cargo test -p nono-cli --test audit_ringbuf
+sudo -E cargo test -p nono --test bpf_lsm_smoke
+```
+
+Manual end-to-end:
+1. Start a session with mediation.
+2. Inside, run `ls /`, `cat /bin/ls > /dev/null`, attempt
+   to cat a mediated binary (expect EACCES).
+3. Inspect `~/.nono/sessions/audit.jsonl`. Expect
+   `allow_unmediated` entries for `ls`, `cat`. Expect a
+   `deny` entry with `reason: open_deny` for the cat
+   attempt on the mediated binary. No entry for the
+   shim-routed mediated invocation (shim emits its own
+   record, not via the BPF ring buffer).
+
+#### 3.6 Acceptance criteria
+
+- All Phase 1 + 2 tests pass.
+- New audit_ringbuf tests pass.
+- Audit log has the expected entries for a representative
+  session.
+- Audit reader survives session teardown without
+  hanging.
+
+### Phase 4 — invariant assertions
+
+**Goal.** Every deployment invariant the design depends on
+gets a session-start verification with a clear error
+message. No silent failure modes.
+
+#### 4.1 Tests to write FIRST (TDD red)
+
+In `crates/nono-cli/tests/invariants.rs` (new):
+
+- `agent_capeff_is_zero` — start a session, assert the
+  agent's `/proc/<pid>/status`'s `CapEff:` line is all
+  zeros.
+- `pcs_is_non_dumpable` — start a session, trigger a
+  per-command sandbox spawn, assert
+  `/proc/<pcs_pid>/status`'s `Dumpable:` is 0.
+- `session_fails_loudly_when_bpf_not_in_lsm_stack` —
+  condition-skip on workspaces that do have bpf;
+  otherwise verify nono exits with the specific error
+  message.
+
+#### 4.2 Implementation
+
+`crates/nono-cli/src/exec_strategy.rs`:
+
+- After fork + setup of agent's pre-exec, but before
+  agent runs user code, the broker reads
+  `/proc/<agent>/status` and verifies `CapEff: 0`. If
+  non-zero, log error and abort the session.
+- For per-command sandboxes: in the spawn path
+  (`crates/nono-cli/src/mediation/policy.rs:611`-ish),
+  after `exec`, read `/proc/<pcs>/status`, verify
+  `Dumpable: 0`, kill PCS and surface error if not.
+- Session-start log: emit an `info!` line listing each
+  invariant and PASS/FAIL, plus the resolved deny inodes.
+  Operators auditing the log see explicitly what was
+  enforced.
+
+#### 4.3 Acceptance criteria
+
+- All previous tests pass.
+- Invariant assertion tests pass.
+- Session-start log includes a structured invariants
+  block.
+
+### Phase 5 — doc reorg (done)
+
+This file *is* the new `docs/linux-exec-filter-plan.md`. The
+old seccomp-era plan lives at
+`docs/archive/linux-exec-filter-plan-seccomp-era.md`.
+
+The autonomous-session decisions log lives alongside this file
+at `docs/linux-exec-filter-bpf-lsm-impl-decisions.md`; the
+older vfork-iteration decisions log at
+`docs/linux-exec-filter-vfork-decisions.md` chronicles the
+iterations that didn't land.
+
+## What this design does not address
+
+- **macOS.** This document covers Linux only; the macOS
+  Seatbelt-based implementation is in a separate design.
 
 ## References
 
-- [kipz/nono PR #17](https://github.com/kipz/nono/pull/17) (Linux porting fixes — prerequisite for building this
-  work on Linux).
-- `Documentation/userspace-api/seccomp_filter.rst` (kernel doc on seccomp
-  user notification).
-- `Documentation/userspace-api/landlock.rst` (kernel doc on Landlock ABI
-  versions and what each adds).
-- `include/linux/binfmts.h` (`BINPRM_BUF_SIZE`, `BINPRM_MAX_RECURSION`).
-- `crates/nono/src/sandbox/linux.rs`: `install_seccomp_notify`,
-  `install_seccomp_proxy_filter`, `recv_notif`, `deny_notif`,
-  `continue_notif`, `respond_notif_errno`, `notif_id_valid`,
-  `read_notif_path`, `resolve_notif_path`.
-- `crates/nono-cli/src/exec_strategy/supervisor_linux.rs`:
-  `handle_seccomp_notification` (openat handler template for the new exec
-  handler).
-- `crates/nono-cli/src/mediation/session.rs`: universal audit shim creation
-  (current audit scope we are matching).
-- `crates/nono-shim/src/main.rs`: shim audit-event emission
-  (`send_audit_event`).
+- Decisions log:
+  `docs/linux-exec-filter-vfork-decisions.md` — chronicles
+  the seccomp-unotify iterations, the userspace ptrace
+  experiments that didn't work, and the migration to
+  BPF-LSM.
+- Workspace AMI change:
+  dd-source `am/bpf-lsm-workspace-ami` — adds
+  `lsm=...,bpf` to the kernel cmdline.
+- Kernel docs:
+  `Documentation/bpf/bpf_lsm.rst`,
+  `Documentation/userspace-api/cgroup-v2.rst`,
+  `include/linux/binfmts.h`.
+- Mediation profile schema:
+  `crates/nono/schema/capability-manifest.schema.json`
+  (`mediation.commands`).

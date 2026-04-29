@@ -639,3 +639,28 @@ test above confirms the kernel side of that.
 | Sub-cgroup escape, ce07a3b (equality) | ✗ bypass — REAL_BINARY_RAN |
 | Sub-cgroup escape, b9f2675 (ancestor walk) | ✓ denied — exit 126 |
 | File caps disabled inside session (NoNewPrivs) | ✓ — sub-cgroup escape needs an out-of-session privilege source |
+
+---
+
+### 2026-04-29 — BPF-LSM landing summary
+
+The 5-phase BPF-LSM implementation plan in
+`docs/linux-exec-filter-plan.md` (this file's neighbour, formerly
+`linux-exec-filter-bpf-lsm.md`) has landed:
+
+- **Phase 1** (commit `ab34ebb`): seccomp-unotify exec filter
+  removed; BPF-LSM is the sole enforcement path. Pre-fork install
+  + post-fork child cgroup join close the install race.
+- **Phase 2** (`583e62a`): added the `lsm/file_open` hook to
+  close read-time bypasses (cp / ld-linux / tmpfs / shellcode).
+- **Phase 3** (`3ef00f5`): BPF ringbuf + userspace `AuditReader`
+  restore the `audit.jsonl` audit trail; schema dropped the
+  `exec_filter_` prefix.
+- **Phase 4** (`dba56bc`): session-start invariant log line +
+  post-execve `CapEff=0` poll-and-verify.
+- **Phase 5** (this commit): doc reorg.
+
+Decisions made during the implementation are in
+`docs/linux-exec-filter-bpf-lsm-impl-decisions.md`. Earlier
+seccomp-era iterations (vfork residual, ptrace experiments)
+remain in this file as the historical record.

@@ -1,7 +1,7 @@
 # BPF-LSM implementation: autonomous-session decisions log
 
 Decisions made while working through the 5-phase plan in
-`docs/linux-exec-filter-bpf-lsm.md` without user-in-the-loop.
+`docs/linux-exec-filter-plan.md` without user-in-the-loop.
 Each entry: what I decided, why, and the alternative I rejected.
 
 ## Session ground rules

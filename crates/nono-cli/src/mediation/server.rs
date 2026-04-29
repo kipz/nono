@@ -5,8 +5,9 @@
 //! dispatched to `policy::apply`, and the framed JSON response is written back.
 //!
 //! Protocol (same as nono-shim):
-//!   Request:  u32 big-endian length || JSON payload
-//!   Response: u32 big-endian length || JSON payload
+//!   1. Request:  u32 big-endian length || JSON payload
+//!   2. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg
+//!   3. Response: u32 big-endian length || JSON payload
 
 use super::admin::AdminModeStatus;
 use super::approval::ApprovalGate;
@@ -15,7 +16,7 @@ use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
 use super::{AuditEvent, SessionAuditInfo};
 use nix::libc;
-use std::os::unix::io::{AsRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -244,18 +245,21 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Receive three SCM_RIGHTS messages — stdin, stdout, stderr — from the shim.
+/// Receive stdin, stdout, and stderr from the shim in a single `recvmsg` call.
 ///
-/// The shim sends each fd accompanied by a one-byte payload (the SCM_RIGHTS
-/// convention). We temporarily switch the underlying fd to blocking mode so
-/// `recvmsg` waits for the messages inside `spawn_blocking` rather than
-/// busy-looping on EAGAIN.
+/// The shim sends all three fds as one SCM_RIGHTS control message accompanied
+/// by a one-byte payload.  Receiving them together matches the single
+/// `sendmsg` the shim uses, and avoids the macOS-specific EMSGSIZE failure
+/// that occurred when three separate `sendmsg` calls were used.
+///
+/// We temporarily switch the underlying fd to blocking mode so `recvmsg`
+/// waits inside `spawn_blocking` rather than returning EAGAIN.
 async fn recv_three_fds(
     stream: &tokio::net::UnixStream,
 ) -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
     let raw_fd = stream.as_raw_fd();
 
-    // Switch to blocking mode for the duration of the recvmsg calls.
+    // Switch to blocking mode for the duration of the recvmsg call.
     let original_flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL, 0) };
     if original_flags < 0 {
         return Err(std::io::Error::last_os_error());
@@ -269,11 +273,80 @@ async fn recv_three_fds(
         }
     }
 
-    let recv_result = tokio::task::spawn_blocking(move || {
-        let stdin_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
-        let stdout_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
-        let stderr_fd = nono::supervisor::socket::recv_fd_via_socket(raw_fd)?;
-        Ok::<_, nono::NonoError>((stdin_fd, stdout_fd, stderr_fd))
+    let recv_result = tokio::task::spawn_blocking(move || -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+        let fd_size = std::mem::size_of::<RawFd>();
+        let n: usize = 3;
+        let payload_len = n * fd_size;
+
+        let mut data = [0u8; 1];
+        let mut iov = libc::iovec {
+            iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
+            iov_len: data.len(),
+        };
+        // SAFETY: pure size calculations.
+        let cmsg_space = unsafe { libc::CMSG_SPACE(payload_len as u32) } as usize;
+        let cmsg_len = unsafe { libc::CMSG_LEN(payload_len as u32) } as usize;
+
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+        // SAFETY: msghdr is plain old data and will be fully initialized below.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+        msg.msg_controllen = cmsg_space as _;
+
+        // SAFETY: raw_fd is a valid blocking socket; msg references live buffers.
+        let received = unsafe { libc::recvmsg(raw_fd, &mut msg, 0) };
+        if received < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if received == 0 {
+            return Err(std::io::Error::other(
+                "socket closed while waiting for stdio fds",
+            ));
+        }
+        if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
+            return Err(std::io::Error::other(
+                "ancillary data truncated receiving stdio fds",
+            ));
+        }
+
+        // SAFETY: msg references cmsg_buf which is still live here.
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
+        if cmsg.is_null() {
+            return Err(std::io::Error::other("no control message for stdio fds"));
+        }
+        // SAFETY: cmsg was returned by libc and points into cmsg_buf.
+        let header = unsafe { &*cmsg };
+        if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
+            return Err(std::io::Error::other("unexpected control message type for stdio fds"));
+        }
+        if (header.cmsg_len as usize) < cmsg_len {
+            return Err(std::io::Error::other("SCM_RIGHTS message too small for 3 fds"));
+        }
+
+        let mut fds = [-1i32; 3];
+        // SAFETY: CMSG_DATA points at the fd payload for this header.
+        unsafe {
+            for i in 0..n {
+                std::ptr::copy_nonoverlapping(
+                    libc::CMSG_DATA(cmsg).add(i * fd_size),
+                    (&mut fds[i] as *mut RawFd).cast::<u8>(),
+                    fd_size,
+                );
+            }
+        }
+        if fds.iter().any(|&fd| fd < 0) {
+            return Err(std::io::Error::other("received invalid fd in stdio fds"));
+        }
+        // SAFETY: fds were just received via SCM_RIGHTS and validated above.
+        Ok(unsafe {
+            (
+                OwnedFd::from_raw_fd(fds[0]),
+                OwnedFd::from_raw_fd(fds[1]),
+                OwnedFd::from_raw_fd(fds[2]),
+            )
+        })
     })
     .await;
 
@@ -284,7 +357,7 @@ async fn recv_three_fds(
 
     match recv_result {
         Ok(Ok(fds)) => Ok(fds),
-        Ok(Err(e)) => Err(std::io::Error::other(e.to_string())),
+        Ok(Err(e)) => Err(e),
         Err(e) => Err(std::io::Error::other(format!(
             "spawn_blocking join error: {}",
             e

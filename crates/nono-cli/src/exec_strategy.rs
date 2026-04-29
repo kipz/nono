@@ -1190,19 +1190,36 @@ pub fn execute_supervised(
                     let agent_pid = child.as_raw() as u32;
                     match nono::sandbox::bpf_lsm::install_exec_filter(paths, agent_pid) {
                         Ok(h) => {
-                            debug!(
-                                "BPF-LSM exec filter installed: agent_pid={} deny_entries={}",
+                            info!(
+                                "BPF-LSM exec filter active: agent_pid={} deny_entries={} \
+                                 (vfork-bomb residual closed via kernel-side hook)",
                                 agent_pid,
                                 paths.len()
                             );
                             Some(h)
                         }
                         Err(e) => {
-                            debug!(
-                                "BPF-LSM exec filter unavailable; \
-                                 continuing with seccomp-unotify only: {}",
-                                e
-                            );
+                            // The seccomp-unotify exec filter from the
+                            // child's pre_exec is still active, so this
+                            // is a degradation, not a security regression
+                            // — but the vfork-bomb residual is open until
+                            // BPF-LSM is reachable. Surface the reason at
+                            // warn so it's visible without RUST_LOG.
+                            match e {
+                                nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => warn!(
+                                    "BPF-LSM exec filter unavailable: bpf is not in \
+                                     /sys/kernel/security/lsm. Reboot with lsm=...,bpf \
+                                     in the kernel cmdline to close the vfork-bomb residual. \
+                                     Continuing with seccomp-unotify only."
+                                ),
+                                _ => warn!(
+                                    "BPF-LSM exec filter could not be installed \
+                                     ({e}); continuing with seccomp-unotify only. \
+                                     If you expected BPF-LSM to be active, verify \
+                                     CAP_BPF is in the broker's effective capability set \
+                                     (e.g. `setcap cap_bpf+ep /usr/bin/nono`)."
+                                ),
+                            }
                             None
                         }
                     }

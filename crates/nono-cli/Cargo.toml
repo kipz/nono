@@ -31,11 +31,16 @@ name = "nono"
 path = "src/main.rs"
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "bpf-lsm"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Disable this for headless/container environments without libdbus.
 # Controls keyring for nono-cli, nono, and nono-proxy in one flag.
 system-keyring = ["dep:keyring", "nono/system-keyring", "nono-proxy/system-keyring"]
+# Enables the BPF-LSM exec filter on Linux. Compiles the BPF C
+# program at build time (requires clang) and links libbpf-rs.
+# Disable for clang-less build environments; the seccomp-unotify
+# exec filter remains the fallback.
+bpf-lsm = ["nono/bpf-lsm"]
 # Enables test-only trust root overrides used by the integration harness.
 test-trust-overrides = []
 

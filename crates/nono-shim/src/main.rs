@@ -67,31 +67,29 @@ struct AuditEvent {
     command_pid: u32,
 }
 
-/// Buffer capacity for SCM_RIGHTS ancillary data — matches the value used in
-/// the nono crate's supervisor::socket helpers.
-const SCM_RIGHTS_BUFFER_CAPACITY: usize = 64;
-
-/// Send a single file descriptor over a Unix stream socket via SCM_RIGHTS.
+/// Send stdin, stdout, and stderr as a single SCM_RIGHTS message.
 ///
-/// Inlined from `nono::supervisor::socket::send_fd_via_socket` so the shim's
-/// dependency footprint stays minimal.
-fn send_fd_via_socket(sock_fd: RawFd, fd: RawFd) -> std::io::Result<()> {
+/// Batching all three fds into one `sendmsg` call avoids a macOS-specific
+/// failure where sending multiple SCM_RIGHTS messages sequentially returns
+/// EMSGSIZE when the socket receive buffer already holds a large JSON request
+/// (as happens when `git` is invoked from within `gh`'s execution sandbox).
+///
+/// Inlined from the nono crate so the shim's dependency footprint stays minimal.
+fn send_stdio_fds(sock_fd: RawFd, stdin: RawFd, stdout: RawFd, stderr: RawFd) -> std::io::Result<()> {
+    let fds = [stdin, stdout, stderr];
+    let fd_size = std::mem::size_of::<RawFd>();
+    let payload_len = fds.len() * fd_size;
+
     let mut data = [0u8; 1];
     let mut iov = libc::iovec {
         iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
         iov_len: data.len(),
     };
     // SAFETY: `CMSG_SPACE` and `CMSG_LEN` are pure libc size calculations.
-    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
-    let expected_cmsg_len = unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) } as usize;
+    let cmsg_space = unsafe { libc::CMSG_SPACE(payload_len as u32) } as usize;
+    let cmsg_len = unsafe { libc::CMSG_LEN(payload_len as u32) };
 
-    if cmsg_space > SCM_RIGHTS_BUFFER_CAPACITY {
-        return Err(std::io::Error::other(
-            "Unexpected ancillary buffer size for SCM_RIGHTS send",
-        ));
-    }
-
-    let mut cmsg_buf = [0u8; SCM_RIGHTS_BUFFER_CAPACITY];
+    let mut cmsg_buf = vec![0u8; cmsg_space];
     // SAFETY: `msghdr` is plain old data and will be fully initialized below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov as *mut libc::iovec;
@@ -99,7 +97,7 @@ fn send_fd_via_socket(sock_fd: RawFd, fd: RawFd) -> std::io::Result<()> {
     msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
     msg.msg_controllen = cmsg_space as _;
 
-    // SAFETY: `msg` references `cmsg_buf`, which is large enough for one header.
+    // SAFETY: `msg` references `cmsg_buf`, which is large enough for the header.
     let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
     if cmsg.is_null() {
         return Err(std::io::Error::other(
@@ -107,19 +105,21 @@ fn send_fd_via_socket(sock_fd: RawFd, fd: RawFd) -> std::io::Result<()> {
         ));
     }
 
-    // SAFETY: `cmsg` points into `cmsg_buf`, which is sized for exactly one fd payload.
+    // SAFETY: `cmsg` points into `cmsg_buf`, sized for the header + 3 fd payloads.
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = expected_cmsg_len as _;
-        std::ptr::copy_nonoverlapping(
-            (&fd as *const RawFd).cast::<u8>(),
-            libc::CMSG_DATA(cmsg),
-            std::mem::size_of::<RawFd>(),
-        );
+        (*cmsg).cmsg_len = cmsg_len as _;
+        for (i, &fd) in fds.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(
+                (&fd as *const RawFd).cast::<u8>(),
+                libc::CMSG_DATA(cmsg).add(i * fd_size),
+                fd_size,
+            );
+        }
     }
 
-    // SAFETY: `sock_fd` is a valid Unix socket and `msg` points to live stack buffers.
+    // SAFETY: `sock_fd` is a valid Unix socket and `msg` points to live buffers.
     let sent = unsafe { libc::sendmsg(sock_fd, &msg, 0) };
     if sent < 0 {
         return Err(std::io::Error::last_os_error());
@@ -225,15 +225,12 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         return 127;
     }
 
-    // Pass stdin/stdout/stderr fds over SCM_RIGHTS so the server can stream
-    // binary data directly to/from the real binary in passthrough cases.
-    // Order matches the server's recv: stdin, stdout, stderr.
+    // Pass stdin/stdout/stderr as a single SCM_RIGHTS message so the server
+    // can wire them directly to the real binary in passthrough cases.
     let sock_fd = stream.as_raw_fd();
-    for fd in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-        if let Err(e) = send_fd_via_socket(sock_fd, fd) {
-            eprintln!("nono-shim: failed to send fd {}: {}", fd, e);
-            return 127;
-        }
+    if let Err(e) = send_stdio_fds(sock_fd, libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO) {
+        eprintln!("nono-shim: failed to send stdio fds: {}", e);
+        return 127;
     }
 
     // Read length-prefixed response

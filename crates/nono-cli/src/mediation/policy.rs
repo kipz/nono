@@ -23,10 +23,9 @@ use zeroize::Zeroizing;
 
 /// Request forwarded from the shim binary to the mediation server.
 ///
-/// The shim sends this JSON request followed by three SCM_RIGHTS messages
-/// carrying its stdin/stdout/stderr fds (in that order). The fds are received
-/// out-of-band by the server and threaded into `apply` — they are not part of
-/// this struct.
+/// The shim sends this JSON request followed by a single SCM_RIGHTS message
+/// carrying stdin/stdout/stderr fds together. The fds are received out-of-band
+/// by the server and threaded into `apply` — they are not part of this struct.
 #[derive(Debug, Default, Deserialize)]
 pub struct ShimRequest {
     pub command: String,

@@ -62,7 +62,7 @@ fn install_exec_filter_with_empty_deny_set() {
         // Without `bpf` in /sys/kernel/security/lsm we can't
         // legally install_exec_filter (it would surface
         // NotInActiveLsm). Verify that's what we get.
-        let result = bpf_lsm::install_exec_filter(&[], std::process::id());
+        let result = bpf_lsm::install_exec_filter(&[], 0u64);
         assert!(
             matches!(result, Err(bpf_lsm::BpfLsmError::NotInActiveLsm)),
             "expected NotInActiveLsm without bpf in LSM stack, got: {result:?}"
@@ -77,7 +77,7 @@ fn install_exec_filter_with_empty_deny_set() {
     }
 
     // bpf is in the active LSM list — full attach test.
-    let handle = bpf_lsm::install_exec_filter(&[], std::process::id())
+    let handle = bpf_lsm::install_exec_filter(&[], 0u64)
         .expect("install_exec_filter should succeed with empty deny set");
     // The handle keeps the program loaded and attached for its
     // lifetime; dropping it detaches.
@@ -108,7 +108,7 @@ fn force_load_validates_verifier_acceptance() {
         return;
     }
 
-    let result = bpf_lsm::install_exec_filter_no_lsm_check(&[], std::process::id());
+    let result = bpf_lsm::install_exec_filter_no_lsm_check(&[], 0u64);
 
     match (bpf_lsm::is_bpf_lsm_available(), result) {
         (true, Ok(_)) => {
@@ -135,6 +135,56 @@ fn force_load_validates_verifier_acceptance() {
     }
 }
 
+/// Verify per-session cgroup creation:
+/// - Succeeds when the calling process has write access to its
+///   cgroup (CAP_SYS_ADMIN, root, or cgroup v2 delegation).
+/// - Returns a stable, non-zero cgroup_id that matches the
+///   cgroup directory's inode.
+/// - Cleans up on Drop.
+///
+/// Skipped without write access — that's the production-relevant
+/// failure mode we surface as a warn-level log line at session
+/// start.
+#[test]
+fn create_session_cgroup_roundtrip() {
+    use std::os::unix::fs::MetadataExt;
+
+    let agent_pid = std::process::id();
+    let cgroup = match bpf_lsm::create_session_cgroup(agent_pid) {
+        Ok(c) => c,
+        Err(bpf_lsm::CgroupError::CreateCgroup { error, .. })
+            if error.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            eprintln!(
+                "skipping: cgroup creation requires CAP_SYS_ADMIN or cgroup \
+                 v2 delegation. Re-run with sudo, or `setcap \
+                 cap_sys_admin+ep $(which cargo-test-bin)`."
+            );
+            return;
+        }
+        Err(e) => panic!("unexpected create_session_cgroup error: {e}"),
+    };
+
+    let id = cgroup.cgroup_id();
+    assert_ne!(id, 0, "cgroup_id should never be zero on success");
+
+    let path = cgroup.path().to_path_buf();
+    let dir_meta = std::fs::metadata(&path)
+        .expect("cgroup dir should exist after successful create");
+    assert_eq!(
+        dir_meta.ino(),
+        id,
+        "SessionCgroup::cgroup_id() must equal the dir inode (cgroup v2 contract)"
+    );
+
+    drop(cgroup);
+    assert!(
+        !path.exists(),
+        "SessionCgroup::drop() should rmdir the cgroup directory: {} still present",
+        path.display()
+    );
+}
+
 #[test]
 fn install_with_real_binary_in_deny_set() {
     if !have_cap_bpf() {
@@ -152,6 +202,6 @@ fn install_with_real_binary_in_deny_set() {
     // Use a known-stable binary. We don't actually try to exec it
     // — this test only verifies population of the deny_set map.
     let deny = vec![std::path::PathBuf::from("/bin/true")];
-    let _handle = bpf_lsm::install_exec_filter(&deny, std::process::id())
+    let _handle = bpf_lsm::install_exec_filter(&deny, 0u64)
         .expect("install with /bin/true in deny set should succeed");
 }

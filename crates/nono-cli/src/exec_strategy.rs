@@ -1170,56 +1170,102 @@ pub fn execute_supervised(
             // can no longer slip a deny-set binary past us.
             //
             // Installed in the broker (parent) so the BPF program
-            // mediates every descendant of the agent's process tree.
-            // Scoped to that tree by the agent_pid in the program's
-            // scope map; broker-side per-command sandboxes are
-            // unaffected because they aren't descendants of the
-            // agent.
+            // mediates every exec on the host. Scoped to the
+            // agent's process tree by **cgroup membership**: the
+            // broker creates a per-session cgroup, places the
+            // agent in it, and writes the cgroup id into the BPF
+            // program's scope map. Children inherit the cgroup
+            // membership on fork() and keep it across reparenting,
+            // so daemonized agent descendants are still filtered.
+            // Broker-side per-command sandboxes stay in the
+            // broker's own cgroup (we move *only* the agent into
+            // the per-session cgroup) and pass through unaffected.
             //
             // Falls back silently to seccomp-unotify-only if BPF-LSM
-            // isn't available (kernel without `bpf` in
-            // /sys/kernel/security/lsm, or process without
-            // CAP_BPF). The seccomp filter remains active in either
-            // case, so this is purely additive — never weakens the
-            // existing PR's protection.
+            // is unreachable. The seccomp filter remains active in
+            // either case, so this is purely additive — never
+            // weakens the existing PR's protection. Failure modes
+            // we surface at warn level (so they're visible without
+            // RUST_LOG):
+            //
+            //   * `bpf` missing from /sys/kernel/security/lsm —
+            //     host needs the lsm=...,bpf cmdline (AMI change).
+            //   * Cgroup creation EACCES — broker lacks
+            //     CAP_SYS_ADMIN or cgroup v2 delegation. The
+            //     install path needs setcap cap_bpf,cap_sys_admin
+            //     +ep on /usr/bin/nono, or sudo, or systemd-unit
+            //     delegation.
+            //   * BPF load EPERM — broker lacks CAP_BPF.
             #[cfg(target_os = "linux")]
-            let _bpf_lsm_handle: Option<nono::sandbox::bpf_lsm::ExecFilterHandle> = {
+            let _bpf_lsm_handle: Option<(
+                nono::sandbox::bpf_lsm::SessionCgroup,
+                nono::sandbox::bpf_lsm::ExecFilterHandle,
+            )> = {
                 let deny_paths: Option<&[std::path::PathBuf]> =
                     supervisor.map(|s| s.exec_deny_set.as_slice()).filter(|s| !s.is_empty());
                 if let Some(paths) = deny_paths {
                     let agent_pid = child.as_raw() as u32;
-                    match nono::sandbox::bpf_lsm::install_exec_filter(paths, agent_pid) {
-                        Ok(h) => {
-                            info!(
-                                "BPF-LSM exec filter active: agent_pid={} deny_entries={} \
-                                 (vfork-bomb residual closed via kernel-side hook)",
-                                agent_pid,
-                                paths.len()
-                            );
-                            Some(h)
+                    match nono::sandbox::bpf_lsm::create_session_cgroup(agent_pid) {
+                        Ok(cgroup) => {
+                            let cgroup_id = cgroup.cgroup_id();
+                            match nono::sandbox::bpf_lsm::install_exec_filter(
+                                paths, cgroup_id,
+                            ) {
+                                Ok(filter) => {
+                                    info!(
+                                        "BPF-LSM exec filter active: agent_pid={} \
+                                         cgroup_id={} deny_entries={} \
+                                         (vfork-bomb residual closed via kernel-side hook; \
+                                         daemonize residual closed via cgroup scoping)",
+                                        agent_pid,
+                                        cgroup_id,
+                                        paths.len()
+                                    );
+                                    // Drop order: filter first
+                                    // (detaches the BPF program),
+                                    // cgroup second (rmdirs the
+                                    // session cgroup once it's
+                                    // empty). Tuple Drop is in
+                                    // declaration order, so
+                                    // `(cgroup, filter)` here
+                                    // would tear down filter
+                                    // first → correct.
+                                    Some((cgroup, filter))
+                                }
+                                Err(e) => {
+                                    match e {
+                                        nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => warn!(
+                                            "BPF-LSM exec filter unavailable: bpf is not in \
+                                             /sys/kernel/security/lsm. Reboot with lsm=...,bpf \
+                                             in the kernel cmdline to close the vfork-bomb residual. \
+                                             Continuing with seccomp-unotify only."
+                                        ),
+                                        _ => warn!(
+                                            "BPF-LSM exec filter could not be installed \
+                                             ({e}); continuing with seccomp-unotify only. \
+                                             If you expected BPF-LSM to be active, verify \
+                                             CAP_BPF is in the broker's effective capability set \
+                                             (e.g. `setcap cap_bpf+ep /usr/bin/nono`)."
+                                        ),
+                                    }
+                                    // Drop the cgroup — the agent
+                                    // is in it, but with no BPF
+                                    // filter active there's no
+                                    // benefit and we don't want
+                                    // to leak the cgroup dir.
+                                    drop(cgroup);
+                                    None
+                                }
+                            }
                         }
                         Err(e) => {
-                            // The seccomp-unotify exec filter from the
-                            // child's pre_exec is still active, so this
-                            // is a degradation, not a security regression
-                            // — but the vfork-bomb residual is open until
-                            // BPF-LSM is reachable. Surface the reason at
-                            // warn so it's visible without RUST_LOG.
-                            match e {
-                                nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => warn!(
-                                    "BPF-LSM exec filter unavailable: bpf is not in \
-                                     /sys/kernel/security/lsm. Reboot with lsm=...,bpf \
-                                     in the kernel cmdline to close the vfork-bomb residual. \
-                                     Continuing with seccomp-unotify only."
-                                ),
-                                _ => warn!(
-                                    "BPF-LSM exec filter could not be installed \
-                                     ({e}); continuing with seccomp-unotify only. \
-                                     If you expected BPF-LSM to be active, verify \
-                                     CAP_BPF is in the broker's effective capability set \
-                                     (e.g. `setcap cap_bpf+ep /usr/bin/nono`)."
-                                ),
-                            }
+                            warn!(
+                                "BPF-LSM exec filter unavailable: per-session cgroup \
+                                 creation failed ({e}). The broker needs write access to \
+                                 its cgroup parent — typically setcap cap_sys_admin+ep \
+                                 on /usr/bin/nono, or running under a systemd unit with \
+                                 Delegate=yes. Continuing with seccomp-unotify only."
+                            );
                             None
                         }
                     }

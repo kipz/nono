@@ -340,3 +340,60 @@ from the userspace-iteration debugging — Phase 7 didn't remove
 it) and inspect what `/proc/<tid>/exe` and AT_EXECFN looked like
 at the bypass moment.
 
+
+---
+
+### 2026-04-29 — closed daemonize residual via cgroup-based scoping
+
+The first BPF-LSM cut (commits `bdcfce0`–`6896e63`) scoped the
+deny check by walking each task's `real_parent` chain looking
+for the agent's pid. That left a real bypass: an agent
+descendant that double-forks and reparents to the broker
+(which is `PR_SET_CHILD_SUBREAPER`) severs the chain to the
+agent, and the daemonized grandchild can then exec a deny-set
+binary unfiltered. Same severity as the vfork-bomb the BPF-LSM
+work was supposed to close — wrong to ship that way.
+
+Switched scoping from parent-chain walk to **cgroup
+membership**. The broker creates a per-session cgroup
+(`/sys/fs/cgroup/<self>/nono-session-<broker-pid>`) at session
+start, places the agent in it via `cgroup.procs`, and writes the
+cgroup's id (cgroup directory inode in v2) into the BPF
+program's scope map. The hook now calls
+`bpf_get_current_cgroup_id()` and only applies the deny check
+when current is in the agent's cgroup.
+
+Why this closes daemonize: cgroup membership is **inherited on
+fork()** and **unaffected by reparenting**. A daemonized
+grandchild stays in the agent's cgroup regardless of who its
+parent currently is, so the BPF check still fires.
+
+Implementation:
+- `crates/nono/src/bpf/exec_filter.bpf.c`: replaced
+  `has_ancestor_pid` with a single
+  `bpf_get_current_cgroup_id()` call against the scope map.
+- `crates/nono/src/sandbox/bpf_lsm.rs`: new
+  `SessionCgroup` RAII type and `create_session_cgroup(pid)`
+  helper. `install_exec_filter` signature changed:
+  `(deny_paths, agent_cgroup_id: u64)` instead of
+  `(deny_paths, agent_pid: u32)`.
+- `crates/nono-cli/src/exec_strategy.rs`: broker integration
+  creates the cgroup before installing the filter, holds both
+  handles for the lifetime of the supervisor loop, drops them
+  in the right order on session end.
+- Smoke test gains a `create_session_cgroup_roundtrip` case
+  that creates + verifies + removes a real cgroup (skipped
+  cleanly when run without CAP_SYS_ADMIN).
+
+Privilege impact: cgroup creation requires write access to the
+parent cgroup. On the workspace's `/init` cgroup (root-owned,
+no delegation), this needs `CAP_SYS_ADMIN`. So the deployment
+story now requires `setcap cap_bpf,cap_sys_admin+ep
+/usr/bin/nono` (or running via sudo). Documented in the warn
+log emitted on cgroup-create failure.
+
+Cleanup: `SessionCgroup`'s `Drop` impl migrates remaining tasks
+back to the parent cgroup (`cgroup.procs` writes one pid at a
+time, looped to handle forks during migration), then `rmdir`s
+the session cgroup. Bounded loop (16 iterations) so a runaway
+session can't pin the broker on shutdown.

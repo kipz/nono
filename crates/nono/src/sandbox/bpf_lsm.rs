@@ -180,12 +180,12 @@ mod imp {
     /// being enforced.
     pub fn install_exec_filter(
         deny_paths: &[std::path::PathBuf],
-        agent_pid: u32,
+        agent_cgroup_id: u64,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         if !is_bpf_lsm_available() {
             return Err(BpfLsmError::NotInActiveLsm);
         }
-        install_exec_filter_inner(deny_paths, agent_pid)
+        install_exec_filter_inner(deny_paths, agent_cgroup_id)
     }
 
     /// Install the filter without checking
@@ -199,14 +199,14 @@ mod imp {
     #[doc(hidden)]
     pub fn install_exec_filter_no_lsm_check(
         deny_paths: &[std::path::PathBuf],
-        agent_pid: u32,
+        agent_cgroup_id: u64,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
-        install_exec_filter_inner(deny_paths, agent_pid)
+        install_exec_filter_inner(deny_paths, agent_cgroup_id)
     }
 
     fn install_exec_filter_inner(
         deny_paths: &[std::path::PathBuf],
-        agent_pid: u32,
+        agent_cgroup_id: u64,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         // Canonicalize-and-stat the deny paths first so we surface
         // any I/O errors before touching the kernel. Map entries
@@ -266,15 +266,19 @@ mod imp {
         }
 
         // Populate the scope map. The BPF program reads this and
-        // walks each task's parent chain looking for `agent_pid`;
-        // tasks not in the agent's tree (broker children, user
-        // shells outside nono, system services) skip the deny
-        // check entirely. Setting `agent_pid = 0` here means
-        // "no scoping yet" and causes the program to allow every
-        // exec — useful while the broker is mid-setup.
+        // checks `bpf_get_current_cgroup_id()` against
+        // `agent_cgroup_id`; only tasks in the agent's per-session
+        // cgroup are subject to the deny check. Cgroup membership
+        // is inherited on fork() and unaffected by reparenting, so
+        // daemonized agent descendants stay in the agent cgroup
+        // and are still filtered. Broker-side per-command sandboxes
+        // and unrelated host processes stay in different cgroups
+        // and pass through. Setting `agent_cgroup_id = 0` here
+        // means "no scoping yet" and causes the program to allow
+        // every exec — useful while the broker is mid-setup.
         let scope_map = &skel.maps.scope;
         let scope_key: u32 = 0;
-        let scope_val: [u8; 4] = agent_pid.to_ne_bytes();
+        let scope_val: [u8; 8] = agent_cgroup_id.to_ne_bytes();
         scope_map.update(
             &scope_key.to_ne_bytes(),
             &scope_val,
@@ -303,6 +307,236 @@ mod imp {
             .iter()
             .filter(|p| std::fs::canonicalize(p).is_ok())
             .count()
+    }
+
+    /// Per-session cgroup that scopes the BPF-LSM filter to the
+    /// agent's process tree. Created by [`create_session_cgroup`];
+    /// dropped on Drop, which unconditionally `rmdir`s the cgroup
+    /// directory (best-effort — empty cgroups remove cleanly,
+    /// non-empty fail with EBUSY which is logged and ignored). The
+    /// caller is responsible for ensuring the cgroup is empty by
+    /// the time it's dropped (typically: agent and all descendants
+    /// have exited).
+    #[derive(Debug)]
+    pub struct SessionCgroup {
+        path: std::path::PathBuf,
+        cgroup_id: u64,
+    }
+
+    impl SessionCgroup {
+        /// Numeric cgroup id (cgroup directory inode in v2). This
+        /// is what `bpf_get_current_cgroup_id()` returns inside the
+        /// BPF program, and what gets written into the scope map.
+        #[must_use]
+        pub fn cgroup_id(&self) -> u64 {
+            self.cgroup_id
+        }
+
+        /// Filesystem path of the cgroup directory (`/sys/fs/cgroup/...`).
+        /// Exposed for diagnostics; production callers should not
+        /// poke at this directly.
+        #[must_use]
+        pub fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for SessionCgroup {
+        fn drop(&mut self) {
+            // cgroup v2 won't let us rmdir a non-empty cgroup
+            // (EBUSY). Best-effort: read cgroup.procs and migrate
+            // each pid back to the parent cgroup so the directory
+            // can be removed. Bounded loop because forks can
+            // populate the cgroup between our read and the
+            // migrate, and we don't want a runaway here on a
+            // misbehaving session.
+            let parent = match self.path.parent() {
+                Some(p) => p.to_path_buf(),
+                None => return,
+            };
+            let parent_procs = parent.join("cgroup.procs");
+            let our_procs = self.path.join("cgroup.procs");
+            for _ in 0..16 {
+                let pids: Vec<String> = match std::fs::read_to_string(&our_procs) {
+                    Ok(s) => s.lines().map(String::from).filter(|l| !l.is_empty()).collect(),
+                    Err(_) => break,
+                };
+                if pids.is_empty() {
+                    break;
+                }
+                for pid in pids {
+                    // Writes to cgroup.procs accept one pid per
+                    // call. Most failures here are ESRCH (the
+                    // task has since exited) — also fine, the
+                    // empty cgroup is what we want.
+                    let _ = std::fs::write(&parent_procs, format!("{}\n", pid));
+                }
+            }
+            // Empty cgroups remove cleanly. Anything left at this
+            // point is a real bug worth a debug log but not worth
+            // panicking — the cgroup directory will be cleaned
+            // up on host reboot in the worst case.
+            if let Err(e) = std::fs::remove_dir(&self.path) {
+                tracing::debug!(
+                    "SessionCgroup::drop: rmdir({}) failed: {} \
+                     (cgroup may have lingering tasks)",
+                    self.path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    /// Errors specific to per-session cgroup creation.
+    #[derive(Debug)]
+    pub enum CgroupError {
+        /// `/proc/self/cgroup` couldn't be read or didn't have the
+        /// expected single-entry cgroup-v2 line. Possibly running
+        /// on a kernel without cgroup-v2 unified hierarchy, or in
+        /// a container with a non-standard cgroup mount.
+        ReadProcSelfCgroup(std::io::Error),
+        /// `/proc/self/cgroup`'s output wasn't recognisable cgroup
+        /// v2 (single line of the form `0::/path`). Most commonly
+        /// this means the system is on cgroup v1.
+        UnrecognisedCgroupFormat(String),
+        /// `mkdir` of the per-session cgroup directory failed.
+        /// Usually `EACCES` because the parent cgroup is
+        /// root-owned and the calling process has no
+        /// `CAP_SYS_ADMIN`. The deployment story for nono with
+        /// BPF-LSM requires either running as root, having
+        /// `cap_sys_admin+ep` set on the binary, or running under
+        /// a systemd unit with `Delegate=yes` so the user gets a
+        /// writable cgroup.
+        CreateCgroup {
+            path: std::path::PathBuf,
+            error: std::io::Error,
+        },
+        /// Writing the agent's pid to `cgroup.procs` failed.
+        AddProcToCgroup {
+            path: std::path::PathBuf,
+            error: std::io::Error,
+        },
+        /// `stat` on the cgroup directory failed (used to derive
+        /// the cgroup_id from the directory inode).
+        StatCgroup {
+            path: std::path::PathBuf,
+            error: std::io::Error,
+        },
+    }
+
+    impl std::fmt::Display for CgroupError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ReadProcSelfCgroup(e) => {
+                    write!(f, "could not read /proc/self/cgroup: {e}")
+                }
+                Self::UnrecognisedCgroupFormat(s) => {
+                    write!(f, "unrecognised /proc/self/cgroup format: {s:?}")
+                }
+                Self::CreateCgroup { path, error } => {
+                    write!(f, "mkdir({}) failed: {} \
+                              (CAP_SYS_ADMIN or cgroup delegation required)",
+                           path.display(), error)
+                }
+                Self::AddProcToCgroup { path, error } => {
+                    write!(f, "write to {}/cgroup.procs failed: {}",
+                           path.display(), error)
+                }
+                Self::StatCgroup { path, error } => {
+                    write!(f, "stat({}) failed: {}", path.display(), error)
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for CgroupError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::ReadProcSelfCgroup(e) => Some(e),
+                Self::CreateCgroup { error, .. }
+                | Self::AddProcToCgroup { error, .. }
+                | Self::StatCgroup { error, .. } => Some(error),
+                Self::UnrecognisedCgroupFormat(_) => None,
+            }
+        }
+    }
+
+    /// Create a per-session cgroup as a child of the calling
+    /// process's current cgroup, place `agent_pid` in it, and
+    /// return the [`SessionCgroup`] handle plus the cgroup id the
+    /// BPF program needs.
+    ///
+    /// Naming: the cgroup directory is named
+    /// `nono-session-<broker-pid>` so concurrent nono sessions on
+    /// the same host don't collide.
+    ///
+    /// On success, `agent_pid`'s task is moved into the new
+    /// cgroup; all of its future children inherit the cgroup
+    /// membership, which is what makes the BPF scope check robust
+    /// to fork() / reparenting / setsid() / setpgid() — none of
+    /// those change cgroup membership in cgroup v2.
+    ///
+    /// Caveats:
+    /// - Requires write access to the parent cgroup directory.
+    ///   On systemd-managed systems, the user typically has this
+    ///   under `user.slice/user-<uid>.slice/...` if delegation is
+    ///   set up. On bare /init (Docker default), the parent
+    ///   cgroup is root-owned and CAP_SYS_ADMIN is needed.
+    /// - The `agent_pid` task must already exist; if it has
+    ///   exited, the write to `cgroup.procs` fails with `ESRCH`.
+    pub fn create_session_cgroup(agent_pid: u32) -> Result<SessionCgroup, CgroupError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let proc_self = std::fs::read_to_string("/proc/self/cgroup")
+            .map_err(CgroupError::ReadProcSelfCgroup)?;
+        // cgroup v2 produces a single line of the form
+        // "0::/some/path". Anything else (multi-line or different
+        // prefix) is v1 or otherwise unrecognised.
+        let parent_path = proc_self
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("0::"))
+            .map(str::trim)
+            .ok_or_else(|| CgroupError::UnrecognisedCgroupFormat(proc_self.clone()))?;
+        let cgroup_root = std::path::PathBuf::from("/sys/fs/cgroup");
+        // Strip leading slash from parent_path so .join doesn't
+        // discard cgroup_root.
+        let parent_dir = if parent_path == "/" {
+            cgroup_root
+        } else {
+            cgroup_root.join(parent_path.trim_start_matches('/'))
+        };
+        let session_dir =
+            parent_dir.join(format!("nono-session-{}", std::process::id()));
+
+        std::fs::create_dir(&session_dir).map_err(|e| CgroupError::CreateCgroup {
+            path: session_dir.clone(),
+            error: e,
+        })?;
+
+        // Move the agent into the new cgroup. cgroup.procs takes a
+        // single pid per write; writing the tgid moves the whole
+        // process tree (all threads). Children fork()ed after this
+        // point inherit the cgroup automatically.
+        let procs_path = session_dir.join("cgroup.procs");
+        std::fs::write(&procs_path, format!("{}\n", agent_pid))
+            .map_err(|e| CgroupError::AddProcToCgroup {
+                path: session_dir.clone(),
+                error: e,
+            })?;
+
+        let meta = std::fs::metadata(&session_dir).map_err(|e| CgroupError::StatCgroup {
+            path: session_dir.clone(),
+            error: e,
+        })?;
+        // In cgroup v2 the cgroup_id is the directory's inode —
+        // bpf_get_current_cgroup_id() returns that same value.
+        let cgroup_id = meta.ino();
+
+        Ok(SessionCgroup {
+            path: session_dir,
+            cgroup_id,
+        })
     }
 
     #[cfg(test)]
@@ -370,7 +604,7 @@ mod imp {
 
     pub fn install_exec_filter(
         _deny_paths: &[std::path::PathBuf],
-        _agent_pid: u32,
+        _agent_cgroup_id: u64,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }
@@ -378,13 +612,50 @@ mod imp {
     #[doc(hidden)]
     pub fn install_exec_filter_no_lsm_check(
         _deny_paths: &[std::path::PathBuf],
-        _agent_pid: u32,
+        _agent_cgroup_id: u64,
     ) -> Result<ExecFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }
 
     pub fn deny_entry_count(_deny_paths: &[std::path::PathBuf]) -> usize {
         0
+    }
+
+    /// Stub for non-Linux. Same shape as the real one so callers
+    /// don't need cfg-gates around the type.
+    #[derive(Debug)]
+    pub struct SessionCgroup;
+
+    impl SessionCgroup {
+        #[must_use]
+        pub fn cgroup_id(&self) -> u64 {
+            0
+        }
+
+        #[must_use]
+        pub fn path(&self) -> &std::path::Path {
+            std::path::Path::new("")
+        }
+    }
+
+    /// Stub error type for non-Linux. The variants list is empty
+    /// (this is unreachable) but the type exists for cfg
+    /// symmetry.
+    #[derive(Debug)]
+    pub enum CgroupError {
+        Unsupported,
+    }
+
+    impl std::fmt::Display for CgroupError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "cgroup-based scoping is not supported on this platform")
+        }
+    }
+
+    impl std::error::Error for CgroupError {}
+
+    pub fn create_session_cgroup(_agent_pid: u32) -> Result<SessionCgroup, CgroupError> {
+        Err(CgroupError::Unsupported)
     }
 }
 

@@ -556,3 +556,86 @@ incidentally:
   irrelevant, no count limit anymore.
 - Modifying any other control file inside the session cgroup —
   irrelevant, cgroup parentage isn't file-mutable.
+
+---
+
+### 2026-04-29 — b9f2675 validation on the BPF-LSM workspace
+
+Same workspace (`am/bpf-lsm-workspace-ami`, kernel 6.8.0-1052-aws,
+`bpf` in active LSM list, `setcap cap_bpf,cap_sys_admin,
+cap_dac_override+ep`).
+
+#### Vfork POC re-run on b9f2675
+
+```
+Attack 1 (pthread): BLOCKED 0/600
+Attack 2 (vfork):   BLOCKED 0/600 (118 denied, 482 other/error)
+```
+
+The ancestor-walk version doesn't regress the vfork case — the
+session cgroup still appears at level N for the agent's own
+processes, so the deny check still fires.
+
+#### Sub-cgroup-escape POC
+
+`/tmp/exec-filter-poc/sub_cgroup_root_attacker.sh` mkdirs a
+child of the session cgroup, moves a privileged shell into it,
+and execs the deny target. Run from `sudo` (which has
+CAP_SYS_ADMIN on the cgroup namespace) against a long-lived
+session backgrounded with `--profile profile.json -- sleep 30`.
+
+| BPF program | Outcome |
+|---|---|
+| ce07a3b (equality only, `current == session`) | **BYPASS**: `REAL_BINARY_RAN` printed, exit 0 |
+| b9f2675 (ancestor walk) | **DENIED**: `/bin/sh: bad interpreter: Permission denied`, exit 126 |
+
+Procedure: revert `crates/nono/src/bpf/exec_filter.bpf.c` to
+`ce07a3b`, `make build-release`, re-setcap, run POC. Restore
+to `b9f2675`, rebuild, re-setcap, re-run POC. Both directions
+behaved as designed; the BPF program is the only difference.
+
+#### Caveat: NoNewPrivs guts the unprivileged-agent variant of
+this attack on the standard session config
+
+Initial attempt: a setcap'd C attacker (`cap_sys_admin+ep` on
+the binary) launched as the *agent*, not via sudo. That failed
+with EACCES at the mkdir step:
+
+```
+CapInh: 0000…  CapPrm: 0000…  CapEff: 0000…
+NoNewPrivs: 1
+mkdir /sys/fs/cgroup/init/nono-session-XXXXX/sub-escape
+  failed: Permission denied
+```
+
+The session sets `PR_SET_NO_NEW_PRIVS=1` on the agent, which
+disables file capabilities at execve — so an agent that
+mounts a setcap'd binary it placed in a writable directory
+gains nothing. With `CapEff=0` the cgroup-namespace
+`CAP_SYS_ADMIN` check on `cgroup_mkdir` rejects the mkdir.
+
+Combined with `nsdelegate` on the host's cgroup mount (DAC on
+the session-cgroup directory is bits:dog 0700, but
+`nsdelegate` still requires CAP_SYS_ADMIN over the cgroup
+namespace for unprivileged delegation), the practical
+sub-cgroup-escape on this AMI requires one of:
+- The agent already has CAP_SYS_ADMIN in CapEff (e.g., a
+  containerized agent with bumped caps for legitimate
+  reasons, or a root agent).
+- The agent enters a delegated cgroup namespace and runs as
+  pseudo-root in it.
+
+So the b9f2675 fix is defense-in-depth on the *standard*
+workspace config, and a primary defense on configs where the
+agent has any of the privileges above. Either way the
+ancestor-walk closes the BPF-side leak, and the empirical
+test above confirms the kernel side of that.
+
+#### Validation summary
+
+| Check | Result |
+|---|---|
+| Vfork POC, 600 attempts, b9f2675 | ✓ 0 bypass / 118 denied |
+| Sub-cgroup escape, ce07a3b (equality) | ✗ bypass — REAL_BINARY_RAN |
+| Sub-cgroup escape, b9f2675 (ancestor walk) | ✓ denied — exit 126 |
+| File caps disabled inside session (NoNewPrivs) | ✓ — sub-cgroup escape needs an out-of-session privilege source |

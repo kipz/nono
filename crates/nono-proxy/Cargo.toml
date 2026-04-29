@@ -42,6 +42,10 @@ tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1"
 
+# X.509 cert generation for the per-session TLS-intercept CA
+# (Layer 1 of the OAuth-capture design; see 2026-04-27-capture-anthropic-auth.md).
+rcgen = "0.14"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }

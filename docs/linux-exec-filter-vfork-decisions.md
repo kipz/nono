@@ -240,3 +240,103 @@ parent's threads can no longer write to AT_EXECFN's storage.
   Adds a few hundred ms of supervisor stall on these (rare) cases;
   acceptable.
 
+
+---
+
+### 2026-04-29 — BPF-LSM implementation landed (Phases 7 + 8)
+
+Phase 7 (`bdcfce0`): library scaffold.
+- BPF C program at `crates/nono/src/bpf/exec_filter.bpf.c`.
+- libbpf-cargo build pipeline in `crates/nono/build.rs`.
+- Loader API in `crates/nono/src/sandbox/bpf_lsm.rs`:
+  `is_bpf_lsm_available()`, `install_exec_filter(deny_paths,
+  agent_pid)`, RAII `ExecFilterHandle`.
+- Smoke test at `crates/nono/tests/bpf_lsm_smoke.rs`. Validates
+  load + verifier path on every `cargo test`. Attach validation
+  is gated on `bpf` being in the active LSM stack.
+
+Phase 8 (`9dc64fb` + `6896e63`): broker integration.
+- Broker installs the BPF-LSM filter immediately after `fork()`,
+  scoped to the agent's process tree by writing the agent's pid
+  into the program's scope map.
+- Falls back silently to seccomp-unotify-only when BPF-LSM is
+  unreachable. Emits a warn-level log line distinguishing
+  `NotInActiveLsm` (reboot needed) from other errors (CAP_BPF
+  needed).
+- nono-cli's `bpf-lsm` Cargo feature propagates to nono; both
+  default-on for Linux.
+
+What's been validated locally (workspace without `bpf` in active
+LSM list):
+- BPF program compiles, passes verifier.
+- Loader returns `NotInActiveLsm` on this kernel as expected.
+- Smoke test forces past the LSM-list check and confirms the
+  load+attach pipeline succeeds at the kernel level.
+- Existing seccomp filter still active (vfork POC bypass count
+  unchanged at 1/10 — the vfork residual continues to leak on
+  this kernel until the AMI rolls out).
+
+Pending end-to-end validation, queued for the new workspace
+booted from `am/bpf-lsm-workspace-ami` (dd-source):
+- `cat /sys/kernel/security/lsm` includes `bpf`.
+- `setcap cap_bpf+ep /usr/bin/nono` (or run via sudo) for the
+  BPF program load.
+- Smoke test runs the full attach path:
+  `sudo -E cargo test -p nono --test bpf_lsm_smoke`.
+- vfork POC: `ATTACKER_SRC=vfork_attacker.c ATTEMPTS=600
+  bash run_test.sh` — target 0/600.
+- pthread POC: same but ATTACKER_SRC=attacker.c — must remain
+  0/N (multi-threaded check still active).
+
+## Testing procedure on the new workspace
+
+Once the new workspace boots from the AMI with `bpf` in the
+active LSM list:
+
+```bash
+# 1. Verify kernel cmdline picked up the change.
+cat /proc/cmdline | grep -o 'lsm=[^ ]*'
+# expect: lsm=lockdown,capability,landlock,yama,apparmor,bpf
+
+cat /sys/kernel/security/lsm
+# expect: lockdown,capability,landlock,yama,apparmor,bpf
+
+# 2. Pull the nono branch.
+cd ~/go/src/github.com/DataDog/nono
+git fetch drewmchugh am/linux-exec-filter
+git checkout drewmchugh/am/linux-exec-filter
+
+# 3. Build.
+make build-cli
+
+# 4. Give the binary CAP_BPF (one-time, requires root).
+sudo setcap cap_bpf+ep target/release/nono
+
+# 5. Run smoke test (full attach path now reachable).
+cargo test -p nono --test bpf_lsm_smoke -- --nocapture
+# expect: 3 passed, including the attach test.
+
+# 6. Run vfork POC.
+NONO=$(pwd)/target/release/nono \
+    SHIM=$(pwd)/target/release/nono-shim \
+    ATTEMPTS=600 \
+    ATTACKER_SRC=vfork_attacker.c \
+    LABEL=bpf-lsm-vfork \
+    bash /tmp/exec-filter-poc/run_test.sh
+# target: BYPASS_COUNT=0
+
+# 7. Run pthread POC (regression check).
+ATTACKER_SRC=attacker.c LABEL=bpf-lsm-pthread \
+    NONO=$(pwd)/target/release/nono \
+    SHIM=$(pwd)/target/release/nono-shim \
+    ATTEMPTS=600 \
+    bash /tmp/exec-filter-poc/run_test.sh
+# target: BYPASS_COUNT=0 (multi-threaded check still active)
+```
+
+If step 6 hits BYPASS_COUNT > 0, debug with the
+`NONO_EXEC_FILTER_DEBUG_LOG=/tmp/dbg.log` env var (carried over
+from the userspace-iteration debugging — Phase 7 didn't remove
+it) and inspect what `/proc/<tid>/exe` and AT_EXECFN looked like
+at the bypass moment.
+

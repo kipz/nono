@@ -165,6 +165,40 @@ fn trajectory_hook_emits_conformant_stream() {
         );
     }
 
+    // Privacy: input_prompt events must not carry the user's prompt text.
+    for p in &prompts {
+        assert!(
+            p.get("content").is_none(),
+            "input_prompt must not carry `content`: {p}",
+        );
+        assert!(
+            p.get("prompt").is_none(),
+            "input_prompt must not carry `prompt`: {p}",
+        );
+    }
+
+    // Privacy: tool_use(post) events must not carry an output_summary field.
+    for tu in &tool_uses {
+        if tu["phase"] == "post" {
+            assert!(
+                tu.get("output_summary").is_none(),
+                "tool_use(post) must not carry `output_summary`: {tu}",
+            );
+        }
+    }
+
+    // Privacy (end-to-end): the prompt strings fed in must not appear anywhere
+    // in the JSONL on disk. Catches accidental leakage via any field.
+    let raw = std::fs::read_to_string(&out).expect("read trajectory file");
+    for needle in ["list the repo", "now rm it"] {
+        assert!(
+            !raw.contains(needle),
+            "user prompt text {:?} leaked into trajectory file:\n{}",
+            needle,
+            raw,
+        );
+    }
+
     // Last event is session_end and has exit_reason.
     let last = lines.last().expect("non-empty");
     assert_eq!(last["event_type"], "session_end");

@@ -14,6 +14,13 @@
 # Deliberate non-conformance (see docs/2026-04-23-adopt-trajectory-spec.md §6):
 # this first pass emits 5 of 8 event types; Stop/SubagentStop/PreCompact are
 # follow-ups.
+#
+# Privacy: this hook deliberately strips two content fields that "standard"
+# capture would otherwise carry, to avoid logging user-typed natural language
+# or per-tool output to disk:
+#   - input_prompt.content (the user's prompt) is NOT emitted.
+#   - tool_use(post).output_summary is NOT emitted.
+# Tool-call args (tool_use(pre).input) and structural metadata stay.
 
 set -u
 
@@ -127,13 +134,10 @@ case "$event_name" in
     UserPromptSubmit)
         # Each new user prompt starts a new turn. Bump first so this prompt and
         # any tool_use events Claude emits while responding share the same turn_id.
+        # The prompt text itself is not captured — see privacy note in header.
         turn=$((turn + 1))
         printf '%s' "$turn" > "$turn_file"
-        prompt=$(printf '%s' "$payload" | jq -r '.prompt // ""')
-        extra=$(jq -nc \
-            --argjson tid "$turn" \
-            --arg content "$prompt" \
-            '{turn_id: $tid, content: $content}')
+        extra=$(jq -nc --argjson tid "$turn" '{turn_id: $tid}')
         emit input_prompt "$extra"
         ;;
 
@@ -172,23 +176,13 @@ case "$event_name" in
             elif (.tool_response.error? // .tool_result.error? // null) != null then false
             elif (.tool_response.is_error? // false) == true then false
             else true end')
-        # output_summary at standard capture: short structural summary only,
-        # never raw output (spec I11 forbids `output` at standard level).
-        exit_code=$(printf '%s' "$payload" | jq -c '.tool_response.exit_code? // .tool_result.exit_code? // null')
-        summary_obj=$(jq -nc \
-            --argjson ec "$exit_code" \
-            --argjson succ "$success" \
-            '{
-                success: $succ,
-                exit_code: (if $ec == null then null else $ec end)
-            } | del(..|nulls)')
+        # output_summary intentionally omitted — see privacy note in header.
         extra=$(jq -nc \
             --argjson tid "$turn" \
             --arg tuid "$tuid" \
             --arg tn "$tool" \
             --argjson succ "$success" \
-            --argjson summary "$summary_obj" \
-            '{turn_id: $tid, tool_use_id: $tuid, tool_name: $tn, phase: "post", success: $succ, output_summary: ($summary | tojson)}')
+            '{turn_id: $tid, tool_use_id: $tuid, tool_name: $tn, phase: "post", success: $succ}')
         emit tool_use "$extra"
         rm -f "$pending_tool_file" 2>/dev/null || true
         ;;

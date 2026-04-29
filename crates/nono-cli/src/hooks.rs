@@ -340,5 +340,19 @@ mod tests {
             !script.contains("output: .tool_response.output"),
             "trajectory hook must not emit raw output at standard capture"
         );
+        // Privacy: prompt content must not be threaded into a `content` field.
+        assert!(
+            !script.contains("content: $content"),
+            "trajectory hook must not emit user prompt as input_prompt.content"
+        );
+        assert!(
+            !script.contains(r#"--arg content "$prompt""#),
+            "trajectory hook must not extract prompt text into a content arg"
+        );
+        // Privacy: tool_use(post) must not emit output_summary.
+        assert!(
+            !script.contains("output_summary:"),
+            "trajectory hook must not emit output_summary on tool_use(post)"
+        );
     }
 }

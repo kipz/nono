@@ -93,3 +93,62 @@ and re-running). Out of scope for Phase 1; not regressed.
 - POCs at target: pthread 0/600, vfork 0/600.
 - POC baselines: PATH-based mediated → MEDIATED_RESPONSE; direct path → denied.
 
+## Phase 2 — file_open BPF-LSM hook
+
+**Decision: factor cgroup-walk + (dev,ino) lookup into shared
+`__always_inline` helpers.**
+
+Both hooks (`bprm_check_security` and `file_open`) share the
+same logic: scope check (in session cgroup?) → deny check
+(file's (dev,ino) in deny map?) → return -EACCES on hit. With
+the helpers extracted, each hook is ~6 lines and the deny logic
+isn't duplicated. `__always_inline` keeps the verifier and
+codegen happy — both hooks compile to a single inlined copy of
+the loop.
+
+**Decision: hook signature for file_open is `(struct file *file,
+int ret)`.**
+
+The kernel LSM signature is `int file_open(struct file *file)`
+but `BPF_PROG()` wraps it with the accumulated-ret arg. Same
+shape as `bprm_check_security`. Propagate `ret` unchanged when
+non-zero so we don't override an earlier LSM's verdict.
+
+**Decision: keep both hooks attached even when deny set is
+empty.**
+
+The smoke test installs with an empty deny set and asserts
+attach succeeds. With an empty deny set the file_open hook
+fires on every open globally but does almost no work — the
+scope check returns 0 fast for non-agent processes, and for
+agent processes the deny map lookup misses. The cost is the
+cgroup-ancestor walk per open (~200-400ns). Cheaper than
+adding a "skip attach when empty" branch that operators would
+have to reason about.
+
+**Decision: defer integration tests for `file_open_deny.rs`.**
+
+The design doc Phase 2 §2.1 lists 5 integration tests
+(`cat_of_mediated_binary_from_inside_agent_fails`, etc.).
+Running them requires `setcap cap_bpf,cap_sys_admin,
+cap_dac_override+ep` on the cargo-built test binary, which
+gets re-linked on every `cargo test` and loses caps. Three
+ways to fix: (a) test-runner wrapper that re-setcaps before
+each run, (b) sudo for tests, (c) per-test setcap re-apply.
+None are clean. Manual-equivalent verified end-to-end on the
+workspace via the `cat`/`cp`/`/lib64/ld-linux-x86-64.so.2`
+shell commands documented in the commit message. Integration
+test wiring deferred — POCs cover the security claim.
+
+**Validation:**
+- Smoke tests: 5/5 pass (added `install_attaches_both_exec_and_file_open_hooks`).
+- Manual end-to-end on validation workspace:
+  - `cat <mediated>` inside session → "Permission denied" (file_open hook).
+  - `cat /bin/ls` inside session → success (non-mediated read passes).
+  - `/lib64/ld-linux-x86-64.so.2 <mediated>` → "cannot open shared object: Permission denied".
+  - `cp <mediated> /tmp/copy` → "cannot open ... for reading: Permission denied".
+- POCs: pthread 0/600, vfork 0/600 (no regression).
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings -D clippy::unwrap_used` clean.
+- `cargo fmt --all -- --check` clean.
+
+

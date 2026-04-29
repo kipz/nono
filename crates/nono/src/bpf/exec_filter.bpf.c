@@ -1,48 +1,52 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * exec_filter.bpf.c - BPF-LSM exec filter for nono mediation.
+ * exec_filter.bpf.c - BPF-LSM exec + open filter for nono mediation.
  *
- * Closes the seccomp-unotify TOCTOU bypass on the mediation shim by
- * mediating exec inside the kernel via the bprm_check_security LSM
- * hook. The hook fires after the kernel has resolved the binary
- * (`bprm->file` is the file the kernel will actually load) and
- * before exec is committed; returning -EACCES atomically aborts the
- * syscall, with no race against any user-memory pointer the agent
- * controlled.
+ * Two LSM hooks consult a single (dev, ino) deny map and a shared
+ * cgroup-ancestor scope check:
  *
- * The deny set is keyed by (dev, ino) instead of path. The
- * supervisor populates it at session start by stat()ing each
- * canonical real path of `mediation.commands`. Matching by inode
- * also covers hardlinks of a deny-set binary that the agent might
- * create at non-deny-set paths to evade a path-based check.
+ *   bprm_check_security  Fires after the kernel has resolved the
+ *                        binary the call will actually load
+ *                        (`bprm->file`). Returning -EACCES atomically
+ *                        aborts the exec syscall, with no race
+ *                        against any user-memory pointer the agent
+ *                        controlled. Closes direct-path mediated-
+ *                        binary execs.
+ *
+ *   file_open            Fires on every successful path resolution
+ *                        that yields a file descriptor. Denying open
+ *                        of a deny-set inode prevents the agent from
+ *                        reading the mediated binary's bytes at all,
+ *                        which closes copy-the-binary, dynamic-linker
+ *                        trick, unprivileged-tmpfs, and shellcode
+ *                        bypasses in one step (each of those needs
+ *                        an open of the mediated binary somewhere).
+ *
+ * Identity model: (dev, ino) of the underlying inode. Userspace
+ * stat()s each canonical real path in `mediation.commands` and
+ * inserts the result. Inode identity catches hardlinks of a
+ * mediated binary at non-deny-set paths automatically.
  *
  * Per-session scoping
  * -------------------
- * The LSM hook is global once attached: every exec on the host is
- * fed through this program. Without scoping, the broker's own
- * per-command sandbox spawns (which legitimately exec mediated
- * binaries) would be denied. We scope by **cgroup ancestry**: the
- * broker creates a per-session cgroup at session start, places the
- * agent in it (children inherit on fork), and writes the cgroup id
- * into the program's scope map. The hook walks current's cgroup
- * ancestor chain via `bpf_get_current_ancestor_cgroup_id()` and
- * applies the deny check whenever the session cgroup id appears at
- * any level above current.
+ * The LSM hooks are global once attached: every exec/open on the
+ * host is fed through the program. Without scoping, mediated-
+ * binary access would be denied system-wide, breaking the broker's
+ * own per-command sandbox spawns and any non-agent process the
+ * operator runs.
  *
- * Cgroup membership is structural, not parental: it's inherited on
- * fork() and unaffected by reparenting. A task that double-forks
- * and gets reparented to init (or to the broker as
- * PR_SET_CHILD_SUBREAPER) keeps its agent-cgroup membership and
- * still trips the filter — closes the daemonize bypass.
+ * Scope by cgroup ancestry: the broker creates a per-session
+ * cgroup, the agent joins it post-fork (children inherit on
+ * fork), and the cgroup id is written into the program's scope
+ * map. Each hook walks current's cgroup ancestor chain looking
+ * for the session cgroup id; if found, the deny check applies.
  *
- * Ancestry (not equality) is what closes the sub-cgroup-escape
- * bypass: the agent owns the session cgroup directory (mkdir runs
- * with the broker's uid even when the broker has CAP_SYS_ADMIN),
- * so the agent could `mkdir nono-session-X/sub` and move into it
- * to get a different `bpf_get_current_cgroup_id()`. The ancestor
- * walk catches that — the session cgroup is still in the chain.
- * The agent can't escape *upward* because all parent cgroups are
- * root-owned and the kernel rejects writes to their `cgroup.procs`.
+ * Cgroup membership is structural, not parental: it's inherited
+ * on fork() and unaffected by reparenting (closes the daemonize
+ * bypass). Using ancestry rather than equality also closes the
+ * sub-cgroup-escape: an agent that mkdirs a child cgroup of the
+ * session and moves into it still has the session cgroup in its
+ * ancestor chain.
  */
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -57,14 +61,11 @@
 #define MAX_DENY_ENTRIES 256
 
 /* Maximum cgroup-tree depth the scope ancestor-walk will descend
- * into. Real cgroup trees are usually 4–8 levels (one or two
- * slices, a unit, a session). 64 is a generous cap that's well
- * inside BPF's instruction-count budget after unrolling, and
- * survives an attacker who creates `mkdir`-spam children of the
- * session cgroup. The walker exits early as soon as
- * bpf_get_current_ancestor_cgroup_id returns 0 (level beyond
- * current's depth), so the typical-case cost is ~current_depth
- * iterations, not 64. */
+ * into. Real cgroup trees are usually 4–8 levels. 64 is a generous
+ * cap inside BPF's instruction-count budget. The walker exits
+ * early when bpf_get_current_ancestor_cgroup_id returns 0 (level
+ * beyond current's depth), so typical-case cost is ~current_depth
+ * iterations. */
 #define MAX_CGROUP_DEPTH 64
 
 char LICENSE[] SEC("license") = "GPL";
@@ -76,8 +77,7 @@ struct deny_key {
 };
 
 /* Deny set map. Userspace inserts one entry per mediated command
- * canonical path; value is `1` (presence is what matters, the byte
- * is just a non-zero marker). */
+ * canonical path; value is `1` (presence is what matters). */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_DENY_ENTRIES);
@@ -85,13 +85,10 @@ struct {
     __type(value, __u8);
 } deny_set SEC(".maps");
 
-/* Single-entry config map carrying the agent's cgroup id. The
- * broker writes this immediately after creating the per-session
- * cgroup and adding the agent to it, before signalling the agent
- * to proceed past its pre-exec sync point. A cgroup_id of 0
- * signals "not configured" and causes the program to allow every
- * exec — fail-open is deliberate during setup, so we never deny
- * exec on the not-yet-initialised path. */
+/* Single-entry config map carrying the agent's cgroup id. A value
+ * of 0 means "not configured" and causes the program to allow
+ * every event — fail-open is deliberate during setup, so we never
+ * deny on the not-yet-initialised path. */
 struct scope_config {
     __u64 agent_cgroup_id;
 };
@@ -103,76 +100,95 @@ struct {
     __type(value, struct scope_config);
 } scope SEC(".maps");
 
+/* Returns 1 if current task is in (or descended from) the session
+ * cgroup, else 0. Bounded loop satisfies the BPF verifier;
+ * bpf_get_current_ancestor_cgroup_id returns 0 past current's
+ * depth so the loop exits early in practice. */
+static __always_inline int in_session_cgroup(void)
+{
+    __u32 zero = 0;
+    struct scope_config *cfg = bpf_map_lookup_elem(&scope, &zero);
+    if (!cfg || cfg->agent_cgroup_id == 0) {
+        return 0;
+    }
+    __u64 agent_cgid = cfg->agent_cgroup_id;
+    #pragma unroll
+    for (int level = 0; level < MAX_CGROUP_DEPTH; level++) {
+        __u64 ancestor_cgid = bpf_get_current_ancestor_cgroup_id(level);
+        if (ancestor_cgid == 0) {
+            break;
+        }
+        if (ancestor_cgid == agent_cgid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Returns 1 if `file`'s (dev, ino) is in the deny set, else 0. */
+static __always_inline int file_in_deny_set(struct file *file)
+{
+    if (!file) {
+        return 0;
+    }
+    struct inode *inode = BPF_CORE_READ(file, f_inode);
+    if (!inode) {
+        return 0;
+    }
+    struct deny_key key = {};
+    key.ino = BPF_CORE_READ(inode, i_ino);
+    key.dev = BPF_CORE_READ(inode, i_sb, s_dev);
+    __u8 *val = bpf_map_lookup_elem(&deny_set, &key);
+    return val ? 1 : 0;
+}
+
 /* LSM hook for exec.
  *
- * Signature: int bprm_check_security(struct linux_binprm *bprm)
- * — `ret` is the accumulated return value from earlier LSMs in the
- * stack; with `lsm=...,bpf` (bpf last) `ret == 0` means every prior
- * LSM allowed the exec.
- *
  * Returning a negative errno aborts the exec with that errno;
- * returning 0 lets the kernel proceed. We propagate `ret` for any
+ * returning 0 lets the kernel proceed. Propagate `ret` for any
  * non-zero value other than our own deny so we don't override an
  * earlier LSM's verdict.
  */
 SEC("lsm/bprm_check_security")
 int BPF_PROG(check_exec, struct linux_binprm *bprm, int ret)
 {
-    /* If a prior LSM has already denied, propagate. */
     if (ret != 0) {
         return ret;
     }
-
-    /* Scope: only execs from inside the agent's per-session cgroup
-     * (or any descendant of it) are subject to the deny check. */
-    __u32 zero = 0;
-    struct scope_config *cfg = bpf_map_lookup_elem(&scope, &zero);
-    if (!cfg || cfg->agent_cgroup_id == 0) {
+    if (!in_session_cgroup()) {
         return 0;
     }
-
-    /* Walk current's cgroup-ancestor chain looking for the
-     * session cgroup id. Levels are root-down: level 0 is the
-     * root cgroup, level == current's depth is current itself,
-     * deeper levels return 0. Iterate until we find the session
-     * cgroup or run off the end. Bounded loop because the BPF
-     * verifier rejects unbounded loops. */
-    __u64 agent_cgid = cfg->agent_cgroup_id;
-    __u8 in_scope = 0;
-    #pragma unroll
-    for (int level = 0; level < MAX_CGROUP_DEPTH; level++) {
-        __u64 ancestor_cgid = bpf_get_current_ancestor_cgroup_id(level);
-        if (ancestor_cgid == 0) {
-            /* Past current's depth — no further ancestors. */
-            break;
-        }
-        if (ancestor_cgid == agent_cgid) {
-            in_scope = 1;
-            break;
-        }
-    }
-    if (!in_scope) {
-        return 0;
-    }
-
     struct file *file = BPF_CORE_READ(bprm, file);
-    if (!file) {
-        return 0;
-    }
-
-    struct inode *inode = BPF_CORE_READ(file, f_inode);
-    if (!inode) {
-        return 0;
-    }
-
-    struct deny_key key = {};
-    key.ino = BPF_CORE_READ(inode, i_ino);
-    key.dev = BPF_CORE_READ(inode, i_sb, s_dev);
-
-    __u8 *val = bpf_map_lookup_elem(&deny_set, &key);
-    if (val) {
+    if (file_in_deny_set(file)) {
         return -EACCES;
     }
+    return 0;
+}
 
+/* LSM hook for file open.
+ *
+ * Fires inside `do_filp_open` for every successful path resolution
+ * that yields a file descriptor — every `open`, `openat`,
+ * `openat2`, exec-time `open_exec`, and the open phase of `mmap`
+ * (when MAP_PRIVATE/MAP_SHARED) flow through it. Denying reads of
+ * deny-set inodes cuts off every code path the agent could use to
+ * get the mediated binary's bytes into its address space.
+ *
+ * `ret` is the accumulated return value from earlier LSMs in the
+ * stack. Propagate any non-zero ret unchanged (don't override a
+ * prior LSM's verdict).
+ */
+SEC("lsm/file_open")
+int BPF_PROG(check_file_open, struct file *file, int ret)
+{
+    if (ret != 0) {
+        return ret;
+    }
+    if (!in_session_cgroup()) {
+        return 0;
+    }
+    if (file_in_deny_set(file)) {
+        return -EACCES;
+    }
     return 0;
 }

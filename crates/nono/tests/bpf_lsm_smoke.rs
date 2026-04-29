@@ -205,3 +205,31 @@ fn install_with_real_binary_in_deny_set() {
     let _handle = bpf_lsm::install_exec_filter(&deny, 0u64)
         .expect("install with /bin/true in deny set should succeed");
 }
+
+/// Phase 2 — verify both LSM hooks attach. The handle holds two
+/// links (`bprm_check_security` + `file_open`); construction
+/// returning Ok proves the verifier accepted both programs and
+/// the kernel attached both. Without the `file_open` hook the
+/// agent could read mediated-binary bytes and re-exec a copy at
+/// a non-deny-set path; this test guards the attach step that
+/// closes that bypass class.
+#[test]
+fn install_attaches_both_exec_and_file_open_hooks() {
+    if !have_cap_bpf() {
+        eprintln!(
+            "skipping: needs CAP_BPF or CAP_SYS_ADMIN. \
+             Re-run with `sudo -E cargo test -p nono --test bpf_lsm_smoke`."
+        );
+        return;
+    }
+    if !bpf_lsm::is_bpf_lsm_available() {
+        eprintln!("skipping: bpf is not in /sys/kernel/security/lsm");
+        return;
+    }
+    let handle = bpf_lsm::install_exec_filter(&[], 0u64)
+        .expect("install with empty deny set should succeed");
+    // The `Debug` impl is finite, so this compiles only if the
+    // handle exists. Drop teardown detaches both links.
+    let _ = format!("{handle:?}");
+    drop(handle);
+}

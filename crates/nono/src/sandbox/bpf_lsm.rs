@@ -147,16 +147,18 @@ mod imp {
         }
     }
 
-    /// Live BPF-LSM exec filter. Holds the loaded BPF object and
-    /// the attached link; dropping the handle detaches the program
-    /// and frees the kernel-side resources.
+    /// Live BPF-LSM exec/open filter. Holds the loaded BPF object
+    /// and the attached links; dropping the handle detaches the
+    /// programs and frees the kernel-side resources.
     pub struct ExecFilterHandle {
-        // The skeleton owns the BPF object; we hold both it and the
-        // attach link so RAII tears them down in the right order
-        // (link first, object second — libbpf-rs's Drop handles
-        // ordering when these are stored as separate fields).
+        // The skeleton owns the BPF object; we hold both it and
+        // the attach links so RAII tears them down in the right
+        // order (links first, object second — libbpf-rs's Drop
+        // handles ordering when these are stored as separate
+        // fields).
         _skel: ExecFilterSkel<'static>,
-        _link: Link,
+        _exec_link: Link,
+        _open_link: Link,
     }
 
     impl std::fmt::Debug for ExecFilterHandle {
@@ -285,17 +287,24 @@ mod imp {
         let scope_val: [u8; 8] = agent_cgroup_id.to_ne_bytes();
         scope_map.update(&scope_key.to_ne_bytes(), &scope_val, MapFlags::ANY)?;
 
-        // Attach to bprm_check_security. With `bpf` in the active
-        // LSM list, the program now mediates every exec on the
-        // host (subject to the deny_set membership check). On
-        // hosts without `bpf` in the LSM list we'd never reach
+        // Attach both LSM hooks. With `bpf` in the active LSM
+        // list, the programs now mediate every exec and every
+        // open on the host (subject to the cgroup-scope check).
+        // On hosts without `bpf` in the LSM list we'd never reach
         // here — the early `is_bpf_lsm_available` check returned
         // NotInActiveLsm.
-        let link = skel.progs.check_exec.attach()?;
+        //
+        // bprm_check_security closes direct-path execs of mediated
+        // binaries. file_open closes the agent reading the binary
+        // bytes through any other path (cp /usr/bin/gh /tmp/copy,
+        // /lib/ld-linux mediated-bin, mmap copy, ...).
+        let exec_link = skel.progs.check_exec.attach()?;
+        let open_link = skel.progs.check_file_open.attach()?;
 
         Ok(ExecFilterHandle {
             _skel: skel,
-            _link: link,
+            _exec_link: exec_link,
+            _open_link: open_link,
         })
     }
 

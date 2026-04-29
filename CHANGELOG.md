@@ -11,6 +11,8 @@
 
 ### Features
 
+- *(claude)* Detect and remove pre-0.43 inbuilt hook leftovers (`~/.claude/hooks/nono-hook.sh` and matching `settings.json::hooks` entry) on first
+   claude pack install/resolve, with a confirmation prompt and a per-item summary
 - *(profile, migration)* Move codex, claude-code to registry pack
 
 

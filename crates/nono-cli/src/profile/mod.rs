@@ -1547,13 +1547,51 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
             "Loading pack-store profile from: {}",
             profile_path.display()
         );
-        return finalize_profile(load_from_file(&profile_path)?).map(Some);
+        let profile = finalize_profile(load_from_file(&profile_path)?)?;
+        // If we just resolved through `always-further/claude`, also offer
+        // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
+        // where users `nono pull always-further/claude` directly,
+        // bypassing the post-pull cleanup hook in `migration::check_and_run`.
+        // Idempotent: silent no-op when no legacy artifacts exist, so safe
+        // to fire on every claude resolution.
+        if is_always_further_claude_pack(&profile_path) {
+            crate::legacy_cleanup::check_and_offer_cleanup()?;
+        }
+        return Ok(Some(profile));
     }
     if let Some(profile) = builtin::get_builtin(name_or_path) {
         tracing::info!("Using built-in profile: {}", name_or_path);
         return Ok(Some(profile));
     }
     Ok(None)
+}
+
+/// True when `profile_path` lives inside `<package_store>/always-further/claude/`.
+/// Used to gate legacy-cleanup invocation on the canonical claude pack
+/// rather than any pack that happens to publish a profile named `claude`
+/// or `claude-code`.
+fn is_always_further_claude_pack(profile_path: &Path) -> bool {
+    let Ok(store) = crate::package::package_store_dir() else {
+        return false;
+    };
+    profile_path_is_in_pack(profile_path, &store, "always-further", "claude")
+}
+
+/// Pure path-component matcher: does `profile_path` live under
+/// `<store>/<ns>/<name>/...`? Split out of `is_always_further_claude_pack`
+/// so it can be tested without touching `XDG_CONFIG_HOME` / `HOME`.
+fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &str) -> bool {
+    let Ok(rel) = profile_path.strip_prefix(store) else {
+        return false;
+    };
+    let mut components = rel.components();
+    matches!(
+        (components.next(), components.next()),
+        (
+            Some(std::path::Component::Normal(got_ns)),
+            Some(std::path::Component::Normal(got_name)),
+        ) if got_ns == ns && got_name == name
+    )
 }
 
 /// Scan installed packs for a profile artifact whose `install_as` matches
@@ -2419,6 +2457,47 @@ pub fn list_pack_store_profiles() -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn profile_path_is_in_pack_matches_canonical_layout() {
+        let store = Path::new("/store");
+        let claude_profile = Path::new("/store/always-further/claude/profile/claude.json");
+        assert!(profile_path_is_in_pack(
+            claude_profile,
+            store,
+            "always-further",
+            "claude"
+        ));
+
+        // Different namespace must not match — guards against a third-
+        // party pack that publishes a `claude` profile triggering
+        // legacy cleanup.
+        let third_party = Path::new("/store/some-other/claude/profile/claude.json");
+        assert!(!profile_path_is_in_pack(
+            third_party,
+            store,
+            "always-further",
+            "claude"
+        ));
+
+        // Different pack name in the same namespace must not match.
+        let codex = Path::new("/store/always-further/codex/profile/codex.json");
+        assert!(!profile_path_is_in_pack(
+            codex,
+            store,
+            "always-further",
+            "claude"
+        ));
+
+        // Path outside the store entirely must not match.
+        let outside = Path::new("/elsewhere/always-further/claude/profile.json");
+        assert!(!profile_path_is_in_pack(
+            outside,
+            store,
+            "always-further",
+            "claude"
+        ));
+    }
 
     #[test]
     fn test_valid_profile_names() {

@@ -62,9 +62,12 @@ fn policy_show_alias() {
 
 #[test]
 fn policy_diff_alias() {
+    // Both profiles must be embedded so the test doesn't depend on a
+    // registry pack being installed. `claude-code` was used here
+    // before it was moved to the always-further/claude pack.
     let (ok_old, stdout_old, stderr_old) =
-        run(&["policy", "diff", "default", "claude-code", "--json"]);
-    let (ok_new, stdout_new, _) = run(&["profile", "diff", "default", "claude-code", "--json"]);
+        run(&["policy", "diff", "default", "node-dev", "--json"]);
+    let (ok_new, stdout_new, _) = run(&["profile", "diff", "default", "node-dev", "--json"]);
     assert!(ok_old && ok_new);
     assert_deprecation_warning(&stderr_old, "diff", "diff");
     assert_eq!(stdout_old, stdout_new);

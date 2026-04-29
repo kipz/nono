@@ -1,14 +1,26 @@
 //! Pack manifest, lockfile, and local store helpers.
 
 use crate::profile;
+use crate::wiring::{WiringDirective, WiringRecord};
 use chrono::Utc;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-pub const LOCKFILE_VERSION: u32 = 1;
+/// Bumped to 4 with the second-pass security-review changes:
+/// WriteFile re-pulls now verify the on-disk hash before overwriting
+/// (no clobber of user edits); re-pulls reverse the prior wiring
+/// record set before applying the new one (so prior_value always
+/// tracks the user's original, not a previous pack-written value);
+/// JsonArrayAppend records the installed entry so reverse can leave
+/// user-edited entries alone. Bumped to 3 with the first-pass review
+/// (schema for prior values + parent tracking + failure surface).
+/// Bumped to 2 with the move from agent-specific wiring code to
+/// declarative directives. No back-compat — reading an older
+/// lockfile fails the parse, the user re-pulls.
+pub const LOCKFILE_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageRef {
@@ -28,8 +40,6 @@ impl PackageRef {
 pub struct PackageManifest {
     pub schema_version: u32,
     pub name: String,
-    #[serde(default = "default_pack_type")]
-    pub pack_type: PackType,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -40,27 +50,25 @@ pub struct PackageManifest {
     pub min_nono_version: Option<String>,
     #[serde(default)]
     pub artifacts: Vec<ArtifactEntry>,
+    /// Declarative install-time wiring. Executed by
+    /// `crate::wiring::execute` after artifacts are staged into the
+    /// pack store. Vocabulary is a closed set of agent-agnostic
+    /// directives — see `wiring::WiringDirective` for the full list.
+    /// Empty for packs that only ship a profile + files (no
+    /// agent-specific install steps).
+    #[serde(default)]
+    pub wiring: Vec<WiringDirective>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PackType {
-    Agent,
-    Policy,
-}
-
-impl PackType {
+impl PackageManifest {
+    /// True if this manifest declares at least one Profile artifact —
+    /// i.e. the pack is usable with `--profile`.
     #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Agent => "agent pack",
-            Self::Policy => "policy pack",
-        }
+    pub fn has_profile_artifact(&self) -> bool {
+        self.artifacts
+            .iter()
+            .any(|a| a.artifact_type == ArtifactType::Profile)
     }
-}
-
-fn default_pack_type() -> PackType {
-    PackType::Agent
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,26 +79,27 @@ pub struct ArtifactEntry {
     #[serde(default)]
     pub install_as: Option<String>,
     #[serde(default)]
-    pub target: Option<String>,
-    #[serde(default)]
-    pub install_dir: Option<String>,
-    #[serde(default)]
     pub placement: Option<String>,
     #[serde(default)]
-    pub merge_strategy: Option<String>,
-    #[serde(default)]
     pub prefix: Option<String>,
+    /// Additional names that resolve to this same artifact. Currently
+    /// only meaningful for `Profile` artifacts: each alias is accepted
+    /// by `--profile` and routes to the file installed under
+    /// `install_as`. Lets a pack rename its canonical profile name
+    /// (e.g. `claude-code` → `claude`) without breaking commands users
+    /// already have in their shell history. The pack only stores the
+    /// content once — aliases never produce extra files on disk.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactType {
     Profile,
-    Hook,
     Instruction,
     TrustPolicy,
     Groups,
-    Script,
     Plugin,
 }
 
@@ -111,6 +120,13 @@ pub struct LockedPackage {
     pub provenance: Option<PackageProvenance>,
     #[serde(default)]
     pub artifacts: BTreeMap<String, LockedArtifact>,
+    /// What the wiring interpreter actually did at install time.
+    /// `nono remove` replays this list in reverse to undo the
+    /// install — the original directive list isn't re-evaluated, so
+    /// removal works even if the pack has been re-published or
+    /// removed from the registry between install and uninstall.
+    #[serde(default)]
+    pub wiring_record: Vec<WiringRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,10 +145,6 @@ pub struct LockedArtifact {
     pub sha256: String,
     #[serde(rename = "type")]
     pub artifact_type: ArtifactType,
-    /// External path where this artifact was installed (outside the package store).
-    /// Used by `nono remove` to clean up files placed via `install_dir`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_path: Option<String>,
 }
 
 impl Default for LockedPackage {
@@ -142,6 +154,7 @@ impl Default for LockedPackage {
             installed_at: Utc::now().to_rfc3339(),
             provenance: None,
             artifacts: BTreeMap::new(),
+            wiring_record: Vec::new(),
         }
     }
 }
@@ -159,6 +172,35 @@ pub struct PackageSearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageSearchResponse {
     pub packages: Vec<PackageSearchResult>,
+}
+
+/// One pack that ships a given profile name (the `install_as` of a
+/// profile artifact in its manifest). Returned by
+/// `GET /api/v1/profiles/<name>/providers`. Used by the migration
+/// prompt to discover which pack to offer when a user runs
+/// `--profile <formerly-builtin-name>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileProvider {
+    pub namespace: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Short user-visible summary of what the pack installs. Renders
+    /// in the migration prompt's "Installs" row.
+    #[serde(default)]
+    pub installs_summary: Option<String>,
+}
+
+impl ProfileProvider {
+    #[must_use]
+    pub fn pack_ref(&self) -> String {
+        format!("{}/{}", self.namespace, self.name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileProvidersResponse {
+    pub providers: Vec<ProfileProvider>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,10 +294,6 @@ pub fn package_groups_path(namespace: &str, name: &str) -> Result<PathBuf> {
     Ok(package_install_dir(namespace, name)?.join("groups.json"))
 }
 
-pub fn profiles_dir() -> Result<PathBuf> {
-    Ok(nono_config_dir()?.join("profiles"))
-}
-
 pub fn lockfile_path() -> Result<PathBuf> {
     Ok(package_store_dir()?.join("lockfile.json"))
 }
@@ -299,25 +337,6 @@ pub fn remove_package_from_lockfile(package_ref: &PackageRef) -> Result<bool> {
         write_lockfile(&lockfile)?;
     }
     Ok(removed)
-}
-
-pub fn profile_link_path(profile_name: &str) -> Result<PathBuf> {
-    Ok(profiles_dir()?.join(format!("{profile_name}.json")))
-}
-
-pub fn is_profile_symlink_into_package_store(profile_name: &str) -> Option<PathBuf> {
-    let link_path = profile_link_path(profile_name).ok()?;
-    if !link_path.exists() {
-        return None;
-    }
-
-    let target = fs::canonicalize(&link_path).ok()?;
-    let store = fs::canonicalize(package_store_dir().ok()?).ok()?;
-    if target.starts_with(&store) {
-        target.parent().map(Path::to_path_buf)
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

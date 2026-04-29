@@ -178,6 +178,14 @@ pub enum NonoError {
     // I/O errors
     #[error("I/O error: {0}")]
     Io(std::io::Error),
+
+    /// User-initiated clean stop. The CLI's main error handler renders
+    /// this without the `ERROR` log line and `nono:` prefix — the call
+    /// site has already printed whatever the user needs to see. Exit
+    /// code is still non-zero (the run did not complete) but the output
+    /// reads as an intentional cancellation, not a fault.
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 /// Result type alias for nono operations

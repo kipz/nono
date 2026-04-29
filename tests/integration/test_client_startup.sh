@@ -141,6 +141,22 @@ expect_success "install Claude Code npm package" \
 echo ""
 echo "--- Claude Code Startup ---"
 
+# The `claude` profile now ships as a registry pack
+# (always-further/claude). The client-startup smoke test exercises
+# the integration when both Claude Code AND the pack are installed.
+# In CI environments without the pack pulled, skip the pack-dependent
+# subtests cleanly rather than hit the migration prompt (which can't
+# be answered non-interactively and would fail the suite).
+PACK_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nono/packages/always-further/claude"
+if [[ ! -f "$PACK_DIR/package.json" ]]; then
+    skip_test "nono run starts Claude Code successfully" \
+        "always-further/claude pack not installed (run 'nono pull always-further/claude' first)"
+    skip_test "nono wrap starts Claude Code successfully" \
+        "always-further/claude pack not installed"
+    print_summary
+    exit 0
+fi
+
 CLAUDE_VERSION=$(client_env claude --version)
 CLAUDE_VERSION=$(capture_last_nonempty_line "$CLAUDE_VERSION")
 
@@ -148,9 +164,9 @@ version_match_test "plain claude reports pinned version" "$CLAUDE_VERSION" \
     client_env claude --version
 
 version_match_test "nono run starts Claude Code successfully" "$CLAUDE_VERSION" \
-    client_env "$NONO_BIN" run --profile claude-code --allow-cwd --allow-net -- claude --version
+    client_env "$NONO_BIN" run --profile claude --allow-cwd --allow-net -- claude --version
 
 version_match_test "nono wrap starts Claude Code successfully" "$CLAUDE_VERSION" \
-    client_env "$NONO_BIN" wrap --profile claude-code --allow-cwd --allow-net -- claude --version
+    client_env "$NONO_BIN" wrap --profile claude --allow-cwd --allow-net -- claude --version
 
 print_summary

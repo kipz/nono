@@ -21,50 +21,12 @@ mod tests {
     use crate::profile::WorkdirAccess;
 
     #[test]
-    fn test_get_builtin_claude_code() {
-        let profile = get_builtin("claude-code").expect("Profile not found");
-        assert_eq!(profile.meta.name, "claude-code");
-        assert!(!profile.network.block); // network allowed
-        assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
-        assert!(!profile.security.groups.is_empty());
-        assert!(profile
-            .security
-            .groups
-            .contains(&"deny_credentials".to_string()));
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.cache/claude".to_string()));
-        assert!(profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/.claude.lock".to_string()));
-    }
-
-    #[test]
-    fn test_get_builtin_claude_no_kc() {
-        let profile = get_builtin("claude-no-kc").expect("Profile not found");
-        assert_eq!(profile.meta.name, "claude-no-kc");
-        assert!(!profile.network.block);
-        assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_linux".to_string()));
-        assert!(!profile
-            .security
-            .groups
-            .contains(&"claude_code_macos".to_string()));
-        assert!(profile.policy.add_allow_readwrite.is_empty());
-        assert!(profile.policy.override_deny.is_empty());
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.cache/claude".to_string()));
-        assert!(profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/.claude.lock".to_string()));
+    fn test_claude_code_no_longer_inbuilt() {
+        // Removed in v0.43.0: claude-code is now shipped via the registry pack
+        // `always-further/claude` and resolved through the user-profile
+        // symlink, not the embedded policy.json.
+        assert!(get_builtin("claude-code").is_none());
+        assert!(get_builtin("claude-no-kc").is_none());
     }
 
     #[test]
@@ -77,78 +39,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_builtin_claude_code_uses_platform_groups_for_os_paths() {
-        let profile = get_builtin("claude-code").expect("Profile not found");
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_linux".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"vscode_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"vscode_linux".to_string()));
-        assert!(!profile
-            .filesystem
-            .read
-            .contains(&"$HOME/.local/share/claude".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
-        assert_eq!(
-            profile.policy.add_allow_readwrite,
-            vec!["$HOME/Library/Keychains".to_string()]
-        );
-        assert_eq!(
-            profile.policy.override_deny,
-            vec!["$HOME/Library/Keychains".to_string()]
-        );
-        assert!(profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/.claude.lock".to_string()));
-    }
-
-    #[test]
-    fn test_get_builtin_claude_no_kc_does_not_relax_keychain_denies() {
-        let profile = get_builtin("claude-no-kc").expect("Profile not found");
-        assert!(!profile
-            .security
-            .groups
-            .contains(&"claude_code_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_linux".to_string()));
-        assert!(!profile
-            .filesystem
-            .read
-            .contains(&"$HOME/.local/share/claude".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
-        assert!(profile.policy.add_allow_readwrite.is_empty());
-        assert!(profile.policy.override_deny.is_empty());
-    }
-
-    #[test]
     fn test_get_builtin_openclaw() {
         let profile = get_builtin("openclaw").expect("Profile not found");
         assert_eq!(profile.meta.name, "openclaw");
@@ -157,36 +47,6 @@ mod tests {
             .filesystem
             .allow
             .contains(&"$HOME/.openclaw".to_string()));
-    }
-
-    #[test]
-    fn test_get_builtin_codex() {
-        let profile = get_builtin("codex").expect("Profile not found");
-        assert_eq!(profile.meta.name, "codex");
-        assert_eq!(profile.workdir.access, WorkdirAccess::ReadWrite);
-        assert!(profile.interactive);
-        assert!(profile
-            .filesystem
-            .allow
-            .contains(&"$HOME/.codex".to_string()));
-        assert!(profile.security.groups.contains(&"codex_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"node_runtime".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"rust_runtime".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"python_runtime".to_string()));
-        assert!(profile.security.groups.contains(&"nix_runtime".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"unlink_protection".to_string()));
     }
 
     #[test]
@@ -236,31 +96,33 @@ mod tests {
         let profiles = list_builtin();
         assert!(profiles.contains(&"default".to_string()));
         assert!(profiles.contains(&"linux-host-compat".to_string()));
-        assert!(profiles.contains(&"claude-code".to_string()));
-        assert!(profiles.contains(&"claude-no-kc".to_string()));
-        assert!(profiles.contains(&"codex".to_string()));
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"opencode".to_string()));
         assert!(profiles.contains(&"swival".to_string()));
+        // Profiles that ship via registry packs instead of as built-ins:
+        //   claude-code → always-further/claude (removed v0.43.0)
+        //   codex       → always-further/codex  (removed v0.43.0)
+        assert!(!profiles.contains(&"claude-code".to_string()));
+        assert!(!profiles.contains(&"claude-no-kc".to_string()));
+        assert!(!profiles.contains(&"codex".to_string()));
     }
 
     #[test]
     fn test_profile_group_merging() {
-        let profile = get_builtin("claude-code").expect("Profile not found");
-        // Should have default profile groups
+        // Use opencode as a representative inbuilt profile that extends
+        // `default` and adds its own groups (codex moved to a registry pack
+        // in v0.43.0 alongside claude-code).
+        let profile = get_builtin("opencode").expect("Profile not found");
+        // Should have default profile groups (inherited via extends).
         assert!(profile
             .security
             .groups
             .contains(&"deny_credentials".to_string()));
-        // Should have profile-specific groups
+        // Should have profile-specific groups.
         assert!(profile
             .security
             .groups
             .contains(&"node_runtime".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"rust_runtime".to_string()));
         assert!(profile
             .security
             .groups
@@ -347,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_linux_interactive_profiles_include_sysfs_but_not_runtime_state_or_temp() {
-        for name in ["claude-code", "codex", "opencode", "swival"] {
+        for name in ["opencode", "swival"] {
             let profile = get_builtin(name).expect("Profile not found");
             assert!(
                 !profile

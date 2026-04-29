@@ -124,6 +124,10 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
             NonoErrorCode::ErrConfigParse
         }
         nono::NonoError::NetworkFilterUnsupported { .. } => NonoErrorCode::ErrUnsupportedPlatform,
+        // CLI-only user-cancellation marker. Library callers shouldn't
+        // see it through the FFI in normal use, but if they do, surface
+        // as an invalid-arg style error code rather than a real fault.
+        nono::NonoError::Cancelled(_) => NonoErrorCode::ErrInvalidArg,
     }
 }
 

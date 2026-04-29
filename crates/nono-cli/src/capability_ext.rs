@@ -1800,16 +1800,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn test_from_profile_workdir_deny_env_extends_claude_code() {
+    fn test_from_profile_workdir_deny_env_with_extends() {
         let workdir = tempdir().expect("workdir");
         std::fs::write(workdir.path().join(".env"), "SECRET=test").expect("write .env");
 
+        // Synthetic profile that extends `default` (no fixed-path filesystem
+        // grants) and applies a policy.add_deny_access for the workdir's .env.
         let profile_path = workdir.path().join("deny-env.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": "claude-code",
-                "meta": { "name": "claude-code-deny-env" },
+                "extends": "default",
+                "meta": { "name": "deny-env-test" },
+                "workdir": { "access": "readwrite" },
                 "policy": {
                     "add_deny_access": ["$WORKDIR/.env"]
                 }
@@ -2012,8 +2015,24 @@ mod tests {
 
     #[test]
     fn test_from_profile_with_groups() {
-        let profile = crate::profile::load_profile("claude-code")
-            .expect("Failed to load claude-code profile");
+        // Synthetic profile: extends `default` (so it inherits deny groups
+        // and dangerous_commands) plus its own groups. We avoid depending on
+        // a built-in's filesystem layout because the test process may not
+        // have access to the paths that built-ins reference (e.g. ~/.codex).
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("groups-test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "extends": "default",
+                "meta": { "name": "groups-test" },
+                "security": {
+                    "groups": ["node_runtime", "rust_runtime", "unlink_protection"]
+                }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
 
         let workdir = tempdir().expect("Failed to create temp dir");
         let args = sandbox_args();
@@ -2150,8 +2169,18 @@ mod tests {
 
     #[test]
     fn test_from_profile_allow_net_overrides_proxy_mode() {
-        let profile = crate::profile::load_profile("claude-code")
-            .expect("Failed to load claude-code profile");
+        let dir = tempdir().expect("tmpdir");
+        let profile_path = dir.path().join("allow-net-test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{
+                "extends": "default",
+                "meta": { "name": "allow-net-test" },
+                "network": { "block": true }
+            }"#,
+        )
+        .expect("write profile");
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
         let workdir = tempdir().expect("workdir");
         let args = SandboxArgs {
             allow_net: true,

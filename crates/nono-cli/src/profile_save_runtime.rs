@@ -27,7 +27,20 @@ struct PatchGrant {
     override_deny: bool,
 }
 
+/// Env var that suppresses the "save denied paths as user profile?"
+/// prompt entirely. Set by integration tests and CI runs that have an
+/// openable `/dev/tty` (so `terminal_prompts_available` would otherwise
+/// return true) but no human to answer. Mirrors the `NONO_NO_MIGRATE`
+/// escape hatch on the migration prompt.
+const ENV_NO_SAVE_PROMPT: &str = "NONO_NO_SAVE_PROMPT";
+
 pub(crate) fn terminal_prompts_available() -> bool {
+    if matches!(
+        std::env::var(ENV_NO_SAVE_PROMPT).ok().as_deref(),
+        Some("1" | "true" | "yes")
+    ) {
+        return false;
+    }
     std::io::stdin().is_terminal()
         || std::io::stderr().is_terminal()
         || std::fs::File::open("/dev/tty").is_ok()
@@ -865,9 +878,9 @@ mod tests {
             ),
         ]);
 
-        // `claude-code` is a known built-in; writing to that user path would
+        // `codex` is a known built-in; writing to that user path would
         // shadow it.
-        assert!(would_shadow_builtin("claude-code"));
+        assert!(would_shadow_builtin("opencode"));
         // Names that don't exist as built-ins are fine.
         assert!(!would_shadow_builtin("my-unique-saved-profile"));
     }
@@ -887,15 +900,15 @@ mod tests {
 
         // Pre-create a user override of a built-in. A subsequent save to the
         // same name is an update, not a new shadow, and must be allowed.
-        let path = profile::get_user_profile_path("claude-code").expect("profile path");
+        let path = profile::get_user_profile_path("opencode").expect("profile path");
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(
             &path,
-            "{\"meta\":{\"name\":\"claude-code\",\"version\":\"1.0.0\"}}\n",
+            "{\"meta\":{\"name\":\"codex\",\"version\":\"1.0.0\"}}\n",
         )
         .expect("write");
 
-        assert!(!would_shadow_builtin("claude-code"));
+        assert!(!would_shadow_builtin("opencode"));
     }
 
     #[test]

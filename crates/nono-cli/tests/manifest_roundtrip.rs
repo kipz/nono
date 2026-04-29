@@ -20,10 +20,10 @@ fn nono_bin() -> Command {
 
 #[test]
 fn manifest_includes_group_deny_paths() {
-    // The claude-code profile includes deny_credentials group which denies ~/.ssh, ~/.gnupg, etc.
+    // The node-dev profile includes deny_credentials group which denies ~/.ssh, ~/.gnupg, etc.
     // The exported manifest must include these deny paths.
     let output = nono_bin()
-        .args(["policy", "show", "claude-code", "--format", "manifest"])
+        .args(["policy", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -122,7 +122,7 @@ fn manifest_override_deny_removes_deny_from_export() {
 fn manifest_includes_group_blocked_commands() {
     // Profiles with the dangerous_commands group should export blocked commands.
     let output = nono_bin()
-        .args(["policy", "show", "claude-code", "--format", "manifest"])
+        .args(["policy", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -152,7 +152,7 @@ fn manifest_includes_group_blocked_commands() {
 fn manifest_includes_group_allow_paths() {
     // Profiles with system_read_* groups should include system read paths as grants.
     let output = nono_bin()
-        .args(["policy", "show", "claude-code", "--format", "manifest"])
+        .args(["policy", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 

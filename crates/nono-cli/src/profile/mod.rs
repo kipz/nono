@@ -1377,20 +1377,6 @@ pub fn is_user_override(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Return the package directory that owns a profile symlink, if any.
-///
-/// A package-managed profile appears in `~/.config/nono/profiles/` as a symlink
-/// into the package store. This helper resolves that relationship so package
-/// hooks and other assets can be located relative to the installed package.
-#[allow(dead_code)]
-pub fn get_package_for_profile(name: &str) -> Option<PathBuf> {
-    if !is_valid_profile_name(name) {
-        return None;
-    }
-
-    crate::package::is_profile_symlink_into_package_store(name)
-}
-
 /// Load a profile's raw (unresolved) extends target names.
 ///
 /// Returns `Some(base_names)` if the profile declares `extends`, `None` otherwise.
@@ -1416,6 +1402,14 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
         }
     }
 
+    // Pack-store: any installed pack that declares a profile artifact with
+    // matching `install_as`.
+    if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+        return parse_profile_file(&profile_path)
+            .ok()
+            .and_then(|p| p.extends);
+    }
+
     // Built-in profile
     if let Ok(policy) = crate::policy::load_embedded_policy() {
         if let Some(def) = policy.profiles.get(name_or_path) {
@@ -1432,42 +1426,205 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// treated as a direct file path. Otherwise it is resolved as a profile name.
 ///
 /// Name loading precedence:
-/// 1. User profiles from ~/.config/nono/profiles/<name>.json (allows customization)
-/// 2. Built-in profiles (compiled into binary, fallback)
+/// 1. User profiles from `~/.config/nono/profiles/<name>.json` — never written
+///    by nono. Users (and Claude's "Option B" guidance) own this directory.
+/// 2. Pack-store scan — any installed pack with a profile artifact whose
+///    `install_as` matches the requested name. Self-heals Claude Code plugin
+///    wiring (symlink + `enabledPlugins`) on every successful resolution.
+/// 3. Built-in profiles (compiled into binary).
+/// 4. Auto-pull prompt for the registry pack `always-further/claude` when
+///    the requested profile is `claude-code` (or inherits from it).
 pub fn load_profile(name_or_path: &str) -> Result<Profile> {
-    // Registry reference (namespace/name) — detect before the file path check
-    // since the `/` would otherwise be treated as a path separator.
+    // Enable the chain-aware migration prompt for the duration of this
+    // call: if `extends` resolution hits a pack-provided base that isn't
+    // installed (e.g. user profile that `extends: ["claude-code"]`),
+    // `load_base_profile_raw` will run `migration::check_and_run` rather
+    // than failing with "base profile not found". The flag is restored
+    // on exit so nested `load_profile_no_migrate` calls stay quiet.
+    with_missing_base_prompt(true, || {
+        if let Some(profile) = load_profile_inner(name_or_path)? {
+            return Ok(profile);
+        }
+
+        // Top-level miss: ask whether to install the pack that provides
+        // the requested name (or the chain it would inherit through).
+        let outcome = crate::migration::check_and_run(name_or_path)?;
+        match outcome {
+            crate::migration::MigrationOutcome::Migrated => {
+                // Pull completed AND the wiring interpreter ran during
+                // install — no extra "wire" pass needed here. Just
+                // re-resolve through the pack-store branch and load.
+                if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+                    tracing::info!(
+                        "Loading pack-store profile from: {}",
+                        profile_path.display()
+                    );
+                    return finalize_profile(load_from_file(&profile_path)?);
+                }
+                Err(NonoError::ProfileNotFound(format!(
+                    "{name_or_path}\n  the registry pack pulled but did not install \
+                     the expected profile artifact"
+                )))
+            }
+            crate::migration::MigrationOutcome::Skipped => {
+                // The migration prompt has already printed a friendly
+                // stderr hint (decline / non-TTY / NO_MIGRATE). Surface
+                // the cancellation so main.rs exits cleanly without an
+                // ERROR log line or duplicated "Profile not found"
+                // framing — declining a prompt isn't a fault.
+                Err(NonoError::Cancelled(format!(
+                    "install of `{name_or_path}` declined"
+                )))
+            }
+            crate::migration::MigrationOutcome::NotApplicable => {
+                Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+            }
+        }
+    })
+}
+
+/// Same precedence as `load_profile` but never triggers the auto-pull
+/// migration prompt — neither for the top-level miss nor for missing
+/// `extends:` bases. Inspection commands (`profile show`, `profile diff`,
+/// `profile validate`) use this so reading what's there never surprises
+/// the user with a network operation.
+pub fn load_profile_no_migrate(name_or_path: &str) -> Result<Profile> {
+    with_missing_base_prompt(false, || {
+        if let Some(profile) = load_profile_inner(name_or_path)? {
+            return Ok(profile);
+        }
+        Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+    })
+}
+
+// Per-call flag that controls whether `load_base_profile_raw` may prompt
+// the user (via `migration::check_and_run`) when an `extends:` base is
+// missing AND the missing name maps to a registry pack. Thread-local so
+// nested calls don't bleed flags into each other; `with_missing_base_prompt`
+// always restores the previous value on exit.
+thread_local! {
+    static PROMPT_ON_MISSING_BASE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn with_missing_base_prompt<R>(enable: bool, f: impl FnOnce() -> R) -> R {
+    let prev = PROMPT_ON_MISSING_BASE.with(|c| c.replace(enable));
+    let result = f();
+    PROMPT_ON_MISSING_BASE.with(|c| c.set(prev));
+    result
+}
+
+#[inline]
+fn missing_base_prompt_enabled() -> bool {
+    PROMPT_ON_MISSING_BASE.with(std::cell::Cell::get)
+}
+
+/// Steps 1–3 of profile resolution (user dir → pack store → built-in).
+/// Returns `Ok(Some(profile))` on a hit, `Ok(None)` if all sources miss,
+/// and `Err(_)` on validation/IO failures. Shared between `load_profile`
+/// (which then runs the migration prompt) and `load_profile_no_migrate`
+/// (which surfaces a not-found error directly).
+fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
-        return load_registry_profile(name_or_path);
+        return load_registry_profile(name_or_path).map(Some);
     }
-
-    // Direct file path: contains separator or ends with .json
     if name_or_path.contains('/') || name_or_path.ends_with(".json") {
-        return load_profile_from_path(Path::new(name_or_path));
+        return load_profile_from_path(Path::new(name_or_path)).map(Some);
     }
-
-    // Validate profile name (alphanumeric + hyphen only)
     if !is_valid_profile_name(name_or_path) {
         return Err(NonoError::ProfileParse(format!(
             "Invalid profile name '{}': must be alphanumeric with hyphens only",
             name_or_path
         )));
     }
-
-    // 1. Check user profiles first (allows overriding built-ins)
     let profile_path = get_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
-        return finalize_profile(load_from_file(&profile_path)?);
+        return finalize_profile(load_from_file(&profile_path)?).map(Some);
     }
-
-    // 2. Fall back to built-in profiles
+    if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+        tracing::info!(
+            "Loading pack-store profile from: {}",
+            profile_path.display()
+        );
+        return finalize_profile(load_from_file(&profile_path)?).map(Some);
+    }
     if let Some(profile) = builtin::get_builtin(name_or_path) {
         tracing::info!("Using built-in profile: {}", name_or_path);
-        return Ok(profile);
+        return Ok(Some(profile));
     }
+    Ok(None)
+}
 
-    Err(NonoError::ProfileNotFound(name_or_path.to_string()))
+/// Scan installed packs for a profile artifact whose `install_as` matches
+/// the requested name. Returns the path to the profile JSON inside the
+/// package store, or `None` if no pack provides it. Multiple matches are
+/// resolved by returning the first (alphabetical by `<namespace>/<name>`)
+/// — collisions are rare and the resolver is best-effort; the operator
+/// can pin via the user profile dir if needed.
+pub(crate) fn find_pack_store_profile(name: &str) -> Option<PathBuf> {
+    let store = crate::package::package_store_dir().ok()?;
+    if !store.exists() {
+        return None;
+    }
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    let ns_entries = std::fs::read_dir(&store).ok()?;
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let pack_entries = match std::fs::read_dir(&ns_path) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for pack_entry in pack_entries.flatten() {
+            let pack_path = pack_entry.path();
+            if !pack_path.is_dir() {
+                continue;
+            }
+            let manifest_path = pack_path.join("package.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let manifest_str = match std::fs::read_to_string(&manifest_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let manifest: crate::package::PackageManifest =
+                match serde_json::from_str(&manifest_str) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+            for artifact in &manifest.artifacts {
+                if artifact.artifact_type != crate::package::ArtifactType::Profile {
+                    continue;
+                }
+                let install_as = match artifact.install_as.as_deref() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let matches_canonical = install_as == name;
+                let matches_alias = artifact.aliases.iter().any(|a| a == name);
+                if !matches_canonical && !matches_alias {
+                    continue;
+                }
+                let profile_file = pack_path
+                    .join("profiles")
+                    .join(format!("{install_as}.json"));
+                if profile_file.exists() {
+                    let key = format!(
+                        "{}/{}",
+                        ns_entry.file_name().to_string_lossy(),
+                        pack_entry.file_name().to_string_lossy()
+                    );
+                    matches.push((key, profile_file));
+                }
+            }
+        }
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0));
+    matches.into_iter().next().map(|(_, p)| p)
 }
 
 /// Returns true if the string looks like a registry package reference
@@ -1523,12 +1680,11 @@ fn load_registry_profile(name_or_path: &str) -> Result<Profile> {
             ))
         })?;
 
-    if manifest.pack_type != crate::package::PackType::Policy {
+    if !manifest.has_profile_artifact() {
         return Err(NonoError::ProfileParse(format!(
-            "'{}' is a {} — only policy packs can be used with --profile.\n\
+            "pack '{}' has no profile artifact and cannot be used with --profile.\n\
              Use 'nono pull {}' to install it instead.",
             package_ref.key(),
-            manifest.pack_type.label(),
             package_ref.key()
         )));
     }
@@ -1733,9 +1889,22 @@ fn resolve_extends(child: Profile, visited: &mut Vec<String>, depth: usize) -> R
 
 /// Load a base profile by name WITHOUT applying implicit default-group merging.
 ///
-/// Checks user profiles first, then built-in profiles. Built-in profiles
-/// are loaded as raw profile definitions so inheritance can resolve before
-/// implicit default groups are merged.
+/// Checks user profiles, then installed packs, then built-in profiles.
+/// Built-in profiles are loaded as raw profile definitions so inheritance
+/// can resolve before implicit default groups are merged. The pack-store
+/// branch lets a user profile do `"extends": "claude-code"` and pick up
+/// the pack-shipped profile transparently — same precedence as
+/// `load_profile`.
+///
+/// If all three resolvers miss AND the requested name is in
+/// `migration::PACK_PROVIDED_PROFILES` AND we were entered via
+/// `load_profile` (not `load_profile_no_migrate`), prompt the user to
+/// install the providing pack, then retry the pack-store lookup once.
+/// This handles the v0.42 → v0.43 upgrade case where a user profile
+/// `extends: ["claude-code"]` and the inbuilt `claude-code` is gone:
+/// instead of an inscrutable "base profile not found" error, the user
+/// sees the same install prompt that `--profile claude-code` would
+/// produce, with the chain still resolving cleanly on accept.
 fn load_base_profile_raw(name: &str) -> Result<Profile> {
     if !is_valid_profile_name(name) {
         return Err(NonoError::ProfileInheritance(format!(
@@ -1744,16 +1913,51 @@ fn load_base_profile_raw(name: &str) -> Result<Profile> {
         )));
     }
 
-    // 1. Check user profiles first
+    // 1. User profiles take precedence.
     let profile_path = get_user_profile_path(name)?;
     if profile_path.exists() {
         return parse_profile_file(&profile_path);
     }
 
-    // 2. Fall back to built-in profile from embedded policy
+    // 2. Pack-store: any installed pack with a matching `install_as`.
+    if let Some(profile_path) = find_pack_store_profile(name) {
+        return parse_profile_file(&profile_path);
+    }
+
+    // 3. Built-in profile from embedded policy.
     let policy = crate::policy::load_embedded_policy()?;
     if let Some(def) = policy.profiles.get(name) {
         return Ok(def.to_raw_profile());
+    }
+
+    // 4. Pack-provided rescue: when we were entered through
+    //    `load_profile` (the explicit usage path) AND the missing
+    //    base name has at least one pack provider in the registry,
+    //    prompt to install. Inspection commands flow through
+    //    `load_profile_no_migrate`, which leaves the prompt flag off
+    //    so this branch stays dormant for them.
+    //
+    //    The lookup is registry-side — no in-tree table of "name →
+    //    pack". `migration::check_and_run` returns NotApplicable
+    //    when the registry returns no providers (or is unreachable).
+    if missing_base_prompt_enabled() {
+        let outcome = crate::migration::check_and_run(name)?;
+        match outcome {
+            crate::migration::MigrationOutcome::Migrated => {
+                if let Some(profile_path) = find_pack_store_profile(name) {
+                    return parse_profile_file(&profile_path);
+                }
+            }
+            crate::migration::MigrationOutcome::Skipped => {
+                // Hint already printed by `check_and_run`. Surface a
+                // cancellation so main.rs exits cleanly without re-
+                // logging this as a fatal "inheritance error".
+                return Err(NonoError::Cancelled(format!(
+                    "install of `{name}` declined"
+                )));
+            }
+            crate::migration::MigrationOutcome::NotApplicable => {}
+        }
     }
 
     Err(NonoError::ProfileInheritance(format!(
@@ -2133,8 +2337,81 @@ pub fn list_profiles() -> Vec<String> {
         }
     }
 
+    // Add pack-store profiles — names exposed by installed packs via
+    // `install_as`. Without this, `--profile claude-code` works (the
+    // resolver finds it) but `nono profile list` doesn't surface it,
+    // confusing users who expect a one-stop catalogue.
+    for (name, _pack_ref) in list_pack_store_profiles() {
+        if !profiles.contains(&name) {
+            profiles.push(name);
+        }
+    }
+
     profiles.sort();
     profiles
+}
+
+/// Scan the package store for every profile artifact, returning
+/// `(install_as_name, "<namespace>/<pack>")` pairs. Stable ordering by
+/// pack ref so callers get a deterministic catalogue.
+#[must_use]
+pub fn list_pack_store_profiles() -> Vec<(String, String)> {
+    let store = match crate::package::package_store_dir() {
+        Ok(s) if s.exists() => s,
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Ok(ns_entries) = fs::read_dir(&store) else {
+        return out;
+    };
+    for ns_entry in ns_entries.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let Ok(pack_entries) = fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for pack_entry in pack_entries.flatten() {
+            let pack_path = pack_entry.path();
+            if !pack_path.is_dir() {
+                continue;
+            }
+            let manifest_path = pack_path.join("package.json");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let Ok(manifest_str) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest): std::result::Result<crate::package::PackageManifest, _> =
+                serde_json::from_str(&manifest_str)
+            else {
+                continue;
+            };
+            let pack_ref = format!(
+                "{}/{}",
+                ns_entry.file_name().to_string_lossy(),
+                pack_entry.file_name().to_string_lossy()
+            );
+            for artifact in &manifest.artifacts {
+                if artifact.artifact_type != crate::package::ArtifactType::Profile {
+                    continue;
+                }
+                if let Some(name) = artifact.install_as.as_deref() {
+                    let install_path = pack_path.join("profiles").join(format!("{name}.json"));
+                    if install_path.exists() {
+                        out.push((name.to_string(), pack_ref.clone()));
+                        for alias in &artifact.aliases {
+                            out.push((alias.clone(), pack_ref.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 #[cfg(test)]
@@ -2274,8 +2551,8 @@ mod tests {
 
     #[test]
     fn test_load_builtin_profile() {
-        let profile = load_profile("claude-code").expect("Failed to load profile");
-        assert_eq!(profile.meta.name, "claude-code");
+        let profile = load_profile("opencode").expect("Failed to load profile");
+        assert_eq!(profile.meta.name, "opencode");
         assert!(!profile.network.block); // network allowed by default
     }
 
@@ -2323,10 +2600,12 @@ mod tests {
     #[test]
     fn test_list_profiles() {
         let profiles = list_profiles();
-        assert!(profiles.contains(&"claude-code".to_string()));
-        assert!(profiles.contains(&"codex".to_string()));
         assert!(profiles.contains(&"openclaw".to_string()));
         assert!(profiles.contains(&"opencode".to_string()));
+        // claude-code and codex were removed from the inbuilt profiles in
+        // v0.43.0; they ship via registry packs.
+        assert!(!profiles.contains(&"claude-code".to_string()));
+        assert!(!profiles.contains(&"codex".to_string()));
     }
 
     #[test]
@@ -3852,7 +4131,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": "claude-code",
+                "extends": "opencode",
                 "meta": { "name": "ext-test" },
                 "filesystem": { "allow": ["/tmp/ext-test"] }
             }"#,
@@ -3861,10 +4140,10 @@ mod tests {
 
         let profile = load_from_file(&profile_path).expect("load extended profile");
         assert_eq!(profile.meta.name, "ext-test");
-        // Should inherit claude-code's filesystem paths
+        // Should inherit codex's filesystem paths
         assert!(
             profile.filesystem.allow.len() > 1,
-            "Expected inherited paths from claude-code, got: {:?}",
+            "Expected inherited paths from codex, got: {:?}",
             profile.filesystem.allow
         );
         assert!(profile
@@ -3921,15 +4200,15 @@ mod tests {
 
     #[test]
     fn test_extends_chain_three_levels() {
-        // Test A -> B -> claude-code (built-in)
+        // Test A -> B -> codex (built-in)
         let dir = tempdir().expect("tmpdir");
 
-        // B extends claude-code
+        // B extends codex
         let b_path = dir.path().join("b.json");
         std::fs::write(
             &b_path,
             r#"{
-                "extends": "claude-code",
+                "extends": "opencode",
                 "meta": { "name": "b-profile" },
                 "filesystem": { "allow": ["/b/path"] }
             }"#,
@@ -4509,9 +4788,9 @@ mod tests {
 
     #[test]
     fn test_extends_duplicate_base_deduplicates() {
-        // extends: ["claude-code", "claude-code"] — duplicate is silently skipped
+        // extends: ["opencode", "opencode"] — duplicate is silently skipped
         let profile = Profile {
-            extends: Some(vec!["claude-code".to_string(), "claude-code".to_string()]),
+            extends: Some(vec!["opencode".to_string(), "opencode".to_string()]),
             ..Default::default()
         };
 
@@ -4555,7 +4834,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": ["claude-code", "opencode"],
+                "extends": ["opencode", "opencode"],
                 "meta": { "name": "shared-base-test" }
             }"#,
         )
@@ -4726,12 +5005,12 @@ mod tests {
     #[test]
     fn test_extends_can_clear_inherited_network_profile_with_null() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let profile_path = dir.path().join("claude-code-netopen.json");
+        let profile_path = dir.path().join("codex-netopen.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "meta": { "name": "claude-code-netopen" },
-                "extends": "claude-code",
+                "meta": { "name": "codex-netopen" },
+                "extends": "opencode",
                 "network": { "network_profile": null }
             }"#,
         )
@@ -4745,8 +5024,8 @@ mod tests {
                 .filesystem
                 .allow
                 .iter()
-                .any(|path| path == "$HOME/.claude"),
-            "expected filesystem grants from claude-code to still be inherited",
+                .any(|path| path == "$HOME/.opencode"),
+            "expected filesystem grants from opencode to still be inherited",
         );
     }
 

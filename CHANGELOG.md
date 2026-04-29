@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.44.0] - 2026-04-29
+
+### Bug Fixes
+
+- *(package)* Harden re-pulls against user edits
+
+- *(wiring)* Harden install and uninstall wiring
+
+
+### Features
+
+- *(profile, migration)* Move codex, claude-code to registry pack
+
+
+### Miscellaneous
+
+- *(ci)* Improve ci stability and profile test coverage
+
+
+### Refactoring
+
+- *(wiring)* Simplify string expansion
+
 ## [0.43.1] - 2026-04-29
 
 ### Bug Fixes

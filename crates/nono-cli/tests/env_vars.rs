@@ -93,14 +93,14 @@ fn legacy_env_nono_net_block_still_works() {
 #[test]
 fn env_nono_profile() {
     let output = nono_bin()
-        .env("NONO_PROFILE", "claude-code")
+        .env("NONO_PROFILE", "node-dev")
         .args(["run", "--dry-run", "--allow-cwd", "echo"])
         .output()
         .expect("failed to run nono");
 
     assert!(
         output.status.success(),
-        "NONO_PROFILE=claude-code should be accepted, stderr: {}",
+        "NONO_PROFILE=node-dev should be accepted, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -108,7 +108,7 @@ fn env_nono_profile() {
 #[test]
 fn env_nono_network_profile() {
     let output = nono_bin()
-        .env("NONO_NETWORK_PROFILE", "claude-code")
+        .env("NONO_NETWORK_PROFILE", "node-dev")
         .args(["run", "--allow", "/tmp", "--dry-run", "echo"])
         .output()
         .expect("failed to run nono");
@@ -129,7 +129,7 @@ fn cli_flag_overrides_env_var() {
         .args([
             "run",
             "--profile",
-            "claude-code",
+            "node-dev",
             "--dry-run",
             "--allow-cwd",
             "echo",

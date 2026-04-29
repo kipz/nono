@@ -64,6 +64,13 @@ mkdir -p "$TEST_ENV_DIR/trust-config" "$TEST_ENV_DIR/trust-keystore"
 export NONO_TRUST_TEST_USER_POLICY_PATH="$TEST_ENV_DIR/trust-config/trust-policy.json"
 export NONO_TRUST_TEST_KEYSTORE_DIR="$TEST_ENV_DIR/trust-keystore"
 export NONO_NO_UPDATE_CHECK=1
+# Suppress the migration prompt (--profile <pack-name> when the pack
+# isn't installed) and the "save denied paths as user profile?"
+# prompt. Both can fire mid-suite — the migration prompt for any
+# `--profile` referencing a registry pack, the save prompt on any
+# command that hits a denial. Neither is answerable in CI.
+export NONO_NO_MIGRATE=1
+export NONO_NO_SAVE_PROMPT=1
 
 # Audit is on by default, so every test invocation that does not pass
 # --no-audit writes a session under ~/.nono/audit/ (and ~/.nono/rollbacks/
@@ -142,6 +149,7 @@ SUITES=(
     "test_policy_queries.sh:Policy Queries"
     "test_shell.sh:Shell"
     "test_profiles.sh:Profiles"
+    "test_pack_resolution.sh:Pack Resolution"
     "test_client_startup.sh:Client Startup"
     "test_silent_output.sh:Silent Output"
     "test_env_sanitization.sh:Env Sanitization"

@@ -431,7 +431,10 @@ pub fn verify_bundle_subject_name(bundle: &Bundle, expected_path: &Path) -> Resu
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
 
-    if subject_name != expected_name.as_ref() {
+    // Compare via &str directly. Going through `expected_name.as_ref()`
+    // is ambiguous now that another transitive dep brings in an
+    // additional `AsRef` impl for `Cow<'_, str>` (rustc can't pick).
+    if subject_name.as_str() != &*expected_name {
         return Err(NonoError::TrustVerification {
             path: expected_path.display().to_string(),
             reason: format!(

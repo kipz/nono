@@ -339,45 +339,127 @@ nono run --profile claude-code --allow-domain custom-api.example.com -- claude
 
 See [Security Profiles](/cli/features/profiles-groups) for details on profile format and precedence rules.
 
-## Automatic Hook Integration
+## Automatic Pack Install and Plugin Wiring
 
-When you first run `nono run --profile claude-code`, nono automatically installs a hook that helps Claude understand sandbox restrictions. You'll see:
+As of v0.43, the `claude-code` profile is no longer compiled into the CLI. It's distributed as a signed registry pack at `always-further/claude` along with a Claude Code plugin that provides sandbox-aware diagnostics.
+
+The first time you run `nono run --profile claude-code -- claude`, nono prompts to install the pack:
 
 ```
-Installing claude-code hook to ~/.claude/hooks/nono-hook.sh
+  ⊕  Install always-further/claude?
+
+     The `claude-code` profile is provided by this registry pack.
+
+     Publisher    always-further GitHub organisation
+     Provenance   Sigstore cryptographic supply chain (verified on pull)
+     Installs     sandbox profile + Claude Code plugin
+
+  Continue? [Y/n]
 ```
 
-This hook:
-1. **Detects sandbox errors** - When Claude's file operations fail due to sandbox restrictions
-2. **Injects context** - Tells Claude exactly which paths are allowed and blocked
-3. **Provides guidance** - Instructs Claude to suggest restarting with `--allow` flags instead of attempting workarounds
+Press `Y` (or just Enter). nono pulls the pack, verifies its Sigstore provenance, and prints a summary that ties the release artifacts back to the source repository.
 
-nono also adds a section to `~/.claude/CLAUDE.md` with upfront sandbox instructions, so Claude understands the security boundaries before encountering errors.
+### What "Pull" Actually Does
 
-<Note>
-The hook installation is idempotent - it only installs once and updates automatically when nono is upgraded. The hook only activates when running inside a nono sandbox (detected via `$NONO_CAP_FILE`).
-</Note>
+After verification, nono installs the pack to `~/.config/nono/packages/always-further/claude/` and wires it into Claude Code as a single-plugin marketplace:
 
-### What Claude Sees on Errors
+| What | Where |
+|------|-------|
+| Pack files (profile, plugin manifest, hooks, skills) | `~/.config/nono/packages/always-further/claude/` |
+| Marketplace manifest (synthesised by nono) | `~/.claude/plugins/marketplaces/always-further/.claude-plugin/marketplace.json` |
+| Plugin source (symlink → pack dir) | `~/.claude/plugins/marketplaces/always-further/plugins/nono` |
+| Cache pointer (symlink → pack dir) | `~/.claude/plugins/cache/always-further/nono/<version>` |
+| Marketplace registry entry | `~/.claude/plugins/known_marketplaces.json` |
+| Plugin install record | `~/.claude/plugins/installed_plugins.json` |
+| Enabled-plugins toggle | `~/.claude/settings.json::enabledPlugins["nono@always-further"]` |
 
-When Claude attempts to access a blocked path, instead of just seeing "Operation not permitted", the hook injects:
+The pack store is the single source of truth — every Claude-side path is a symlink or registry entry pointing at it. Re-pulling the pack updates the contents in place; deleting the pack via `nono remove always-further/claude` unwires every Claude-side entry too.
+
+### Subsequent Runs
+
+Once installed, `nono run --profile claude-code -- claude` runs silently — no prompt. nono's profile resolver finds `claude-code` in the pack store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
+
+### Skipping or Automating the Prompt
+
+| Environment | Behaviour |
+|-------------|-----------|
+| Interactive TTY | Prompt fires; press Enter or `Y` to install. |
+| `NONO_AUTO_MIGRATE=1` | Prompt skipped; pull runs immediately. Useful for CI/scripted setup. |
+| `NONO_NO_MIGRATE=1` | Pull blocked; nono exits cleanly with a hint pointing at `nono pull always-further/claude`. |
+| Non-TTY (no env override) | Same as `NONO_NO_MIGRATE=1` — nono exits cleanly with a hint. |
+
+### User Profiles That Extend `claude-code`
+
+If you have a custom profile under `~/.config/nono/profiles/` that does `"extends": "claude-code"`, nono's chain-aware resolver detects the missing base and triggers the same install prompt. You don't need to migrate your existing profiles — they keep working after the upgrade.
+
+```json
+{
+  "extends": "claude-code",
+  "meta": { "name": "claude-with-docs", "version": "1.0.0" },
+  "filesystem": { "read": ["$HOME/Documents"] }
+}
+```
+
+The first time you run `nono run --profile claude-with-docs`, the prompt fires for `always-further/claude`. After accept, the profile resolves cleanly via the pack-installed `claude-code` base.
+
+## Hook-Driven Sandbox Diagnostics
+
+The pack's Claude Code plugin registers two hooks via `hooks/hooks.json`:
+
+- `PostToolUseFailure` — fires when a Read/Write/Edit/Bash tool call hits a sandbox denial. Injects an `additionalContext` block that tells Claude this is a nono sandbox boundary (not macOS TCC, not a Unix permissions issue), lists the currently-allowed paths, and instructs Claude to run `nono why` for the precise diagnosis and present the user with two options.
+- `PostToolUse` for Bash — same idea, scoped to Bash output that contains a permission-denial signature.
+
+### What Claude Sees on a Sandbox Denial
+
+When Claude attempts a blocked path, the hook injects roughly:
 
 ```
 [NONO SANDBOX - PERMISSION DENIED]
 
-STOP. Do not try alternative approaches. This is a hard security boundary.
+This is a nono sandbox denial, not macOS TCC or a Unix permissions issue.
 
-You are running inside the nono security sandbox. The operation you just
-attempted is PERMANENTLY BLOCKED for this session.
-
-ALLOWED PATHS (everything else is blocked):
+Allowed paths:
   /Users/you/project (readwrite)
   /Users/you/.claude (readwrite)
 Network: allowed
 
-REQUIRED ACTION:
-Tell the user they must EXIT this Claude session and restart with:
-  nono run --allow /path/to/needed -- claude
+Run `nono why --path <blocked-path> --op read` to diagnose, then present the user with two options:
+
+  Option A (quick fix): exit and restart with the path allowed:
+    nono run --allow /path/to/needed -- claude
+
+  Option B (persistent fix): write a nono profile. Run `nono profile guide` for the schema, then save a profile JSON at ~/.config/nono/profiles/<name>.json. Start sessions with:
+    nono run --profile <name> -- claude
 ```
 
-This prevents Claude from wasting time on workarounds that cannot succeed.
+Claude follows the instructions: it runs `nono why` (you'll be prompted to approve the first time — see [Pre-approving Diagnostic Commands](#pre-approving-diagnostic-commands) below), reads the diagnosis, and presents the user with both options.
+
+### Pre-approving Diagnostic Commands
+
+The hook tells Claude to run `nono why <path>` for diagnosis and `nono profile guide` if the user picks Option B. Claude prompts for approval the first time it runs each — there are two ways to skip those prompts in future sessions:
+
+1. **Per-session, on first prompt.** Pick "Yes, and don't ask again for: nono why \*". Claude saves the rule in your project-local settings.
+2. **Globally, by editing your settings file.** Add the patterns to `~/.claude/settings.json::permissions.allow`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(nono why *)",
+      "Bash(nono profile guide)",
+      "Bash(nono profile validate *)",
+      "Bash(nono profile show *)"
+    ]
+  }
+}
+```
+
+These commands are read-only diagnostics — none of them modify state — so it's reasonable to pre-approve them globally. Profile creation in Option B uses Claude's built-in Edit tool, which has its own per-path permission model.
+
+### Removing the Pack
+
+```bash
+nono remove always-further/claude
+```
+
+This removes the pack store directory, the marketplace dir, the cache subtree, the entries in `known_marketplaces.json` / `installed_plugins.json`, and the `enabledPlugins["nono@always-further"]` toggle. Claude Code's view of the world is restored to what it was before the install. Re-running `nono run --profile claude-code` will prompt to re-install.

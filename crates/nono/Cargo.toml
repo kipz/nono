@@ -1,6 +1,6 @@
 [package]
 name = "nono"
-version = "0.43.1"
+version = "0.44.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
@@ -37,8 +37,16 @@ libc = "0.2"
 # Keychain access (optional: requires libdbus on Linux)
 keyring = { version = "3", optional = true }
 
-# Sigstore bundle verification
+# Sigstore bundle verification.
+# `sigstore-trust-root` is pinned to 0.6.3 because 0.6.5 made
+# `TufSigningConfig::production()` async without bumping major,
+# breaking sigstore-sign 0.6.3 (which the sigstore-verify graph pulls
+# transitively even though we don't use it directly). We don't depend
+# on sigstore-sign or sigstore-trust-root in our own code; this pin
+# exists purely to keep the resolver on a coherent 0.6.3-era set
+# until the upstream API churn settles.
 sigstore-verify = { version = "0.6", default-features = false }
+sigstore-trust-root = "=0.6.3"
 x509-cert = { version = "0.2", default-features = false }
 der = { version = "0.7", default-features = false }
 

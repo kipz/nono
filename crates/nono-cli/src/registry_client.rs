@@ -56,6 +56,20 @@ impl RegistryClient {
         Ok(response.packages)
     }
 
+    /// Look up which packs (if any) ship a profile with the given
+    /// `install_as` name. Used by the migration prompt to discover
+    /// which pack to offer when `--profile <name>` misses every local
+    /// resolver. Returns `Ok(vec![])` if the registry has no providers
+    /// for that name.
+    pub fn fetch_profile_providers(
+        &self,
+        profile_name: &str,
+    ) -> Result<Vec<crate::package::ProfileProvider>> {
+        let response: crate::package::ProfileProvidersResponse =
+            self.get_json(&format!("/api/v1/profiles/{profile_name}/providers"))?;
+        Ok(response.providers)
+    }
+
     pub fn download_bundle(&self, url: &str) -> Result<String> {
         let resolved_url = self.resolve_url(url);
         let mut response = self

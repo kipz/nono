@@ -19,11 +19,11 @@ mod credential_runtime;
 mod deprecated_policy;
 mod exec_strategy;
 mod execution_runtime;
-mod hooks;
 mod instruction_deny;
 mod launch_runtime;
 mod learn;
 mod learn_runtime;
+mod migration;
 mod network_policy;
 mod open_url_runtime;
 mod output;
@@ -37,6 +37,7 @@ mod profile_save_runtime;
 mod protected_paths;
 mod proxy_runtime;
 mod pty_proxy;
+mod pull_ui;
 mod query_ext;
 mod registry_client;
 mod rollback_commands;
@@ -61,6 +62,7 @@ mod trust_keystore;
 mod trust_scan;
 mod update_check;
 mod why_runtime;
+mod wiring;
 
 #[cfg(test)]
 mod test_env;
@@ -96,6 +98,15 @@ fn main() {
     print_deprecation_warnings(&command_blocking_warnings, cli.silent);
 
     if let Err(e) = run_cli(cli) {
+        // User-initiated stops (declined prompt, non-TTY without
+        // NONO_AUTO_MIGRATE) are surfaced as `NonoError::Cancelled`.
+        // Their stderr message has already been printed at the call
+        // site — exit non-zero but skip the ERROR log and the
+        // duplicated `nono:` prefix so the output reads as an
+        // intentional stop, not a fault.
+        if matches!(e, nono::NonoError::Cancelled(_)) {
+            std::process::exit(1);
+        }
         error!("{}", e);
         eprintln!("nono: {}", e);
         std::process::exit(1);

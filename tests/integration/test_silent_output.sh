@@ -43,17 +43,23 @@ expect_output_empty() {
     return 1
 }
 
+# node-dev is an embedded profile that lists `$HOME/Library/pnpm` —
+# a macOS-only path that's reliably absent on Linux CI runners and
+# gives us a stable "missing-path" warning to assert against under
+# `-v`. The previous version used `claude-code` and asserted on a
+# macOS Keychain path; that profile now ships as a registry pack so
+# the assertion no longer applies in this suite.
 expect_output_empty \
-    "claude-code dry-run hides missing profile warnings by default" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd --dry-run -- echo ok
+    "node-dev dry-run hides missing profile warnings by default" \
+    "$NONO_BIN" run --profile node-dev --allow-cwd --dry-run -- echo ok
 
 expect_output_contains \
-    "claude-code dry-run shows missing profile warnings with -v" \
-    "Profile file '\$HOME/Library/Keychains/login.keychain-db' does not exist, skipping" \
-    "$NONO_BIN" run -v --profile claude-code --allow-cwd --dry-run -- echo ok
+    "node-dev dry-run shows missing profile warnings with -v" \
+    "Profile path '\$HOME/Library/pnpm' does not exist, skipping" \
+    "$NONO_BIN" run -v --profile node-dev --allow-cwd --dry-run -- echo ok
 
 expect_output_empty \
     "silent dry-run suppresses tracing warnings and CLI status output" \
-    "$NONO_BIN" run --profile claude-code --allow-cwd --silent --dry-run -- echo ok
+    "$NONO_BIN" run --profile node-dev --allow-cwd --silent --dry-run -- echo ok
 
 print_summary

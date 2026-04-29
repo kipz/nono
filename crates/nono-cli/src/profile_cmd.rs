@@ -71,12 +71,12 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
         )));
     }
 
-    // Validate --extends target exists
+    // Validate --extends target exists in any of the three sources the
+    // resolver knows about (user dir, pack store, built-in).
     if let Some(ref base) = args.extends {
         if !profile_exists(base) {
-            return Err(NonoError::ProfileParse(format!(
-                "Base profile '{}' not found (built-in or user profile)",
-                base
+            return Err(NonoError::ProfileParse(extends_target_not_found_message(
+                base,
             )));
         }
     }
@@ -280,17 +280,32 @@ fn build_skeleton(args: &ProfileInitArgs) -> serde_json::Value {
     serde_json::Value::Object(root)
 }
 
-/// Check if a profile exists (built-in or user).
+/// Check if a profile exists (built-in, user, or pack-provided).
+///
+/// Mirrors the resolver in `profile::load_profile_inner`: user dir →
+/// pack-store → built-in. Without the pack-store check, formerly-builtin
+/// profiles that have moved to registry packs (claude-code, codex)
+/// would falsely fail `nono profile init --extends <name>` validation
+/// even when `nono profile show <name>` resolves them fine.
 fn profile_exists(name: &str) -> bool {
-    // Check built-in profiles
     if profile::builtin::get_builtin(name).is_some() {
         return true;
     }
-    // Check user profiles
     if let Ok(path) = profile::get_user_profile_path(name) {
-        return path.exists();
+        if path.exists() {
+            return true;
+        }
     }
-    false
+    profile::find_pack_store_profile(name).is_some()
+}
+
+/// Update the validation error so users know all three sources were
+/// considered. Used by `cmd_init`'s `--extends` check.
+fn extends_target_not_found_message(name: &str) -> String {
+    format!(
+        "Base profile '{name}' not found (built-in, user, or installed pack). \
+         If it's provided by a registry pack, run `nono pull <namespace>/<pack>` first."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -615,12 +630,19 @@ fn expand_paths_json(paths: &[String]) -> serde_json::Value {
 /// report the real source accurately.
 fn profile_source(name: &str) -> &'static str {
     let builtin_names = profile::builtin::list_builtin();
+    let is_pack = profile::list_pack_store_profiles()
+        .iter()
+        .any(|(n, _)| n == name);
     if profile::is_user_override(name) {
-        if builtin_names.contains(&name.to_string()) {
+        if is_pack {
+            "user (overrides pack)"
+        } else if builtin_names.contains(&name.to_string()) {
             "user (overrides built-in)"
         } else {
             "user"
         }
+    } else if is_pack {
+        "pack"
     } else if builtin_names.contains(&name.to_string()) {
         "built-in"
     } else {
@@ -631,15 +653,28 @@ fn profile_source(name: &str) -> &'static str {
 pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     let builtin_names = profile::builtin::list_builtin();
     let all_names = profile::list_profiles();
+    // (install_as -> pack ref) for the catalogue. Used to bucket pack
+    // profiles under their own section and surface the providing pack.
+    let pack_profiles: std::collections::HashMap<String, String> =
+        profile::list_pack_store_profiles().into_iter().collect();
 
     let mut builtin_profiles: Vec<(String, Result<Profile>)> = Vec::new();
     let mut user_profiles: Vec<(String, Result<Profile>)> = Vec::new();
+    let mut pack_entries: Vec<(String, String, Result<Profile>)> = Vec::new();
 
     for name in &all_names {
-        let p = profile::load_profile(name);
-        // Categorize by actual source: user overrides of built-in names
-        // go under user section to make shadowing visible.
-        if builtin_names.contains(name) && !profile::is_user_override(name) {
+        // Use the no-migrate loader so listing never triggers an
+        // install prompt for pack-provided profiles whose pack happens
+        // to be installed via the resolver self-heal path.
+        let p = profile::load_profile_no_migrate(name);
+        // Categorize by actual source. Precedence: user override > pack
+        // store > built-in. User overrides of either built-in or pack
+        // names go under user section to make shadowing visible.
+        if profile::is_user_override(name) {
+            user_profiles.push((name.clone(), p));
+        } else if let Some(pack_ref) = pack_profiles.get(name) {
+            pack_entries.push((name.clone(), pack_ref.clone(), p));
+        } else if builtin_names.contains(name) {
             builtin_profiles.push((name.clone(), p));
         } else {
             user_profiles.push((name.clone(), p));
@@ -650,16 +685,19 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let format_entry = |name: &str, result: &Result<Profile>| {
             let source = profile_source(name);
             let extends = profile::load_profile_extends(name).unwrap_or_default();
+            let pack = pack_profiles.get(name).cloned();
             match result {
                 Ok(p) => serde_json::json!({
                     "name": name,
                     "source": source,
+                    "pack": pack,
                     "description": p.meta.description.as_deref().unwrap_or(""),
                     "extends": extends,
                 }),
                 Err(e) => serde_json::json!({
                     "name": name,
                     "source": source,
+                    "pack": pack,
                     "error": format!("{}", e),
                 }),
             }
@@ -668,6 +706,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         let arr: Vec<serde_json::Value> = builtin_profiles
             .iter()
             .map(|(n, p)| format_entry(n, p))
+            .chain(pack_entries.iter().map(|(n, _, p)| format_entry(n, p)))
             .chain(user_profiles.iter().map(|(n, p)| format_entry(n, p)))
             .collect();
         println!("{}", to_json(&serde_json::Value::Array(arr))?);
@@ -675,7 +714,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     }
 
     let t = theme::current();
-    let total = builtin_profiles.len() + user_profiles.len();
+    let total = builtin_profiles.len() + pack_entries.len() + user_profiles.len();
     println!("{}: {} profiles", prefix(), total);
 
     if !builtin_profiles.is_empty() {
@@ -683,6 +722,14 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
         println!("  {}", theme::fg("Built-in:", t.subtext).bold());
         for (name, result) in &builtin_profiles {
             print_profile_line(name, result, t);
+        }
+    }
+
+    if !pack_entries.is_empty() {
+        println!();
+        println!("  {}", theme::fg("Packs:", t.subtext).bold());
+        for (name, pack_ref, result) in &pack_entries {
+            print_pack_profile_line(name, pack_ref, result, t);
         }
     }
 
@@ -698,6 +745,30 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Like `print_profile_line` but appends the providing pack ref so the
+/// user sees `claude-code  Anthropic Claude Code …  always-further/claude`.
+fn print_pack_profile_line(name: &str, pack_ref: &str, result: &Result<Profile>, t: &theme::Theme) {
+    match result {
+        Ok(p) => {
+            let desc = p.meta.description.as_deref().unwrap_or("").to_string();
+            let pack_label = format!("from {pack_ref}");
+            println!(
+                "    {:<16} {:<42} {}",
+                theme::fg(name, t.text).bold(),
+                theme::fg(&desc, t.subtext),
+                theme::fg(&pack_label, t.overlay),
+            );
+        }
+        Err(e) => {
+            println!(
+                "    {:<16} {}",
+                theme::fg(name, t.text).bold(),
+                theme::fg(&format!("[error: {}]", e), t.red),
+            );
+        }
+    }
 }
 
 fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
@@ -730,7 +801,7 @@ fn print_profile_line(name: &str, result: &Result<Profile>, t: &theme::Theme) {
 
 pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
     let raw_extends = profile::load_profile_extends(&args.profile);
-    let profile = profile::load_profile(&args.profile)?;
+    let profile = profile::load_profile_no_migrate(&args.profile)?;
 
     if matches!(args.format, Some(crate::cli::ProfileShowFormat::Manifest)) {
         let workdir = std::env::current_dir().map_err(|e| {
@@ -1158,8 +1229,8 @@ fn profile_to_json(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
-    let p1 = profile::load_profile(&args.profile1)?;
-    let p2 = profile::load_profile(&args.profile2)?;
+    let p1 = profile::load_profile_no_migrate(&args.profile1)?;
+    let p2 = profile::load_profile_no_migrate(&args.profile2)?;
 
     if args.json {
         let val = diff_to_json(&args.profile1, &args.profile2, &p1, &p2);
@@ -2069,13 +2140,50 @@ fn classify_profile_error(e: &NonoError) -> &'static str {
     }
 }
 
+/// Resolve a `nono profile validate` target into a filesystem path.
+///
+/// Clap parses the positional argument as a `PathBuf`, so a user who
+/// types `nono profile validate claude-docs` arrives here with the bare
+/// name. We mirror the same precedence as `--profile`: the literal path
+/// wins if it exists, otherwise look up the user profile dir, then the
+/// installed pack store, then the `.json` form of the bare name. If
+/// nothing matches, return the original input so the existing
+/// not-found error path produces a readable message.
+fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
+    if input.exists() {
+        return input.to_path_buf();
+    }
+    let Some(name) = input.to_str() else {
+        return input.to_path_buf();
+    };
+    if name.contains('/') || name.ends_with(".json") {
+        return input.to_path_buf();
+    }
+    if let Ok(p) = profile::get_user_profile_path(name) {
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(p) = profile::find_pack_store_profile(name) {
+        return p;
+    }
+    input.to_path_buf()
+}
+
 pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     let pol = policy::load_embedded_policy()?;
     let mut errors: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
+    // Resolve the input. Clap parses any bare token as a `PathBuf`, so a
+    // user typing `nono profile validate claude-docs` lands here with
+    // `args.file = PathBuf::from("claude-docs")`. If that doesn't exist as
+    // a file, treat it as a profile name and look it up the same way
+    // `--profile` does.
+    let target_path = resolve_validate_target(&args.file);
+
     // Step 1: Load profile (parse JSON + resolve inheritance)
-    let profile = match profile::load_profile_from_path(&args.file) {
+    let profile = match profile::load_profile_from_path(&target_path) {
         Ok(p) => Some(p),
         Err(e) => {
             let label = classify_profile_error(&e);
@@ -2121,7 +2229,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
 
     if args.json {
         let val = serde_json::json!({
-            "file": args.file.display().to_string(),
+            "file": target_path.display().to_string(),
             "valid": errors.is_empty(),
             "errors": errors,
             "warnings": warnings,
@@ -2137,7 +2245,7 @@ pub(crate) fn cmd_validate(args: ProfileValidateArgs) -> Result<()> {
     println!(
         "{}: validating {}",
         prefix(),
-        theme::fg(&args.file.display().to_string(), t.text)
+        theme::fg(&target_path.display().to_string(), t.text)
     );
     println!();
 
@@ -2891,28 +2999,27 @@ mod tests {
             "expected 'default' in profiles"
         );
         assert!(
-            profiles.contains(&"claude-code".to_string()),
-            "expected 'claude-code' in profiles"
+            profiles.contains(&"opencode".to_string()),
+            "expected 'codex' in profiles"
         );
     }
 
     #[test]
     fn test_show_resolves_inheritance() {
-        let profile =
-            profile::load_profile("claude-code").expect("claude-code profile should load");
+        let profile = profile::load_profile("opencode").expect("opencode profile should load");
         assert!(
             !profile.security.groups.is_empty(),
-            "claude-code should have security groups"
+            "codex should have security groups"
         );
-        // claude-code extends default, so it should have default's base groups
+        // codex extends default, so it should have default's base groups
         let has_deny = profile.security.groups.iter().any(|g| g.contains("deny"));
-        assert!(has_deny, "claude-code should inherit deny groups");
+        assert!(has_deny, "codex should inherit deny groups");
     }
 
     #[test]
     fn test_diff_shows_differences() {
         let p1 = profile::load_profile("default").expect("default should load");
-        let p2 = profile::load_profile("claude-code").expect("claude-code should load");
+        let p2 = profile::load_profile("opencode").expect("opencode should load");
 
         let g1: BTreeSet<&str> = p1.security.groups.iter().map(|s| s.as_str()).collect();
         let g2: BTreeSet<&str> = p2.security.groups.iter().map(|s| s.as_str()).collect();
@@ -2920,7 +3027,7 @@ mod tests {
         let added: BTreeSet<&&str> = g2.difference(&g1).collect();
         assert!(
             !added.is_empty(),
-            "claude-code should have additional groups over default"
+            "codex should have additional groups over default"
         );
     }
 

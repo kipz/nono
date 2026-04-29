@@ -1448,45 +1448,18 @@ mod tests {
     }
 
     #[test]
-    fn test_embedded_claude_code_profile_uses_platform_groups_for_os_paths() {
+    fn test_embedded_claude_code_profile_was_removed() {
+        // Removed in v0.43.0: claude-code now ships via the registry pack
+        // `always-further/claude`. The platform GROUPS it referenced
+        // (claude_code_macos / claude_code_linux) remain so the pack profile
+        // can resolve them by name.
         let policy = load_embedded_policy().expect("embedded policy");
-        let profile = policy
-            .profiles
-            .get("claude-code")
-            .expect("claude-code profile missing");
-
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"claude_code_linux".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"vscode_macos".to_string()));
-        assert!(profile
-            .security
-            .groups
-            .contains(&"vscode_linux".to_string()));
-        assert!(!profile
-            .filesystem
-            .read
-            .contains(&"$HOME/.local/share/claude".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/login.keychain-db".to_string()));
-        assert!(!profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/Library/Keychains/metadata.keychain-db".to_string()));
-        assert!(profile
-            .filesystem
-            .allow_file
-            .contains(&"$HOME/.claude.lock".to_string()));
+        assert!(
+            !policy.profiles.contains_key("claude-code"),
+            "claude-code profile must not be in the embedded policy.json"
+        );
+        assert!(policy.groups.contains_key("claude_code_macos"));
+        assert!(policy.groups.contains_key("claude_code_linux"));
     }
 
     #[test]

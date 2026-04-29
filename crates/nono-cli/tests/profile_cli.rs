@@ -61,13 +61,15 @@ fn test_list_output() {
 
     assert!(output.status.success(), "expected exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("claude-code"),
-        "expected claude-code in profiles list, got:\n{stdout}"
-    );
+    // Use two profiles that are still embedded after the
+    // claude/codex move to registry packs.
     assert!(
         stdout.contains("default"),
         "expected default in profiles list, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("node-dev"),
+        "expected node-dev in profiles list, got:\n{stdout}"
     );
 }
 
@@ -105,7 +107,7 @@ fn test_show_profile_json() {
 #[test]
 fn test_diff_output() {
     let output = nono_bin()
-        .args(["profile", "diff", "default", "claude-code"])
+        .args(["profile", "diff", "default", "node-dev"])
         .output()
         .expect("failed to run nono");
 
@@ -213,9 +215,12 @@ fn test_show_format_manifest_default_profile() {
 }
 
 #[test]
-fn test_show_format_manifest_claude_code_profile() {
+fn test_show_format_manifest_node_dev_profile() {
+    // node-dev is an embedded profile with non-empty filesystem grants,
+    // standing in for the claude-code coverage that moved to the
+    // always-further/claude registry pack.
     let output = nono_bin()
-        .args(["profile", "show", "claude-code", "--format", "manifest"])
+        .args(["profile", "show", "node-dev", "--format", "manifest"])
         .output()
         .expect("failed to run nono");
 
@@ -228,17 +233,16 @@ fn test_show_format_manifest_claude_code_profile() {
     let val: serde_json::Value =
         serde_json::from_str(&stdout).expect("expected valid JSON manifest");
     assert_eq!(val.get("version").and_then(|v| v.as_str()), Some("0.1.0"));
-    // claude-code profile has filesystem grants
     assert!(
         val.get("filesystem").is_some(),
-        "claude-code manifest should have filesystem grants"
+        "node-dev manifest should have filesystem grants"
     );
     let grants = val["filesystem"]["grants"]
         .as_array()
         .expect("grants array");
     assert!(
         !grants.is_empty(),
-        "claude-code should have at least one filesystem grant"
+        "node-dev should have at least one filesystem grant"
     );
 }
 

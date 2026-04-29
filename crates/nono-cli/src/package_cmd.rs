@@ -28,7 +28,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
     if let Some(existing) = lockfile.packages.get(&package_ref.key()) {
         if existing.version == pull.version && !args.force {
             eprintln!(
-                "{} is already up to date at {}",
+                "  {} is already at {} (use --force to reinstall)",
                 package_ref.key(),
                 pull.version
             );
@@ -36,7 +36,10 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         }
     }
 
-    let downloads = download_and_verify_artifacts(&client, &package_ref, &pull)?;
+    let printer = crate::pull_ui::ProgressPrinter::new(&pull);
+    printer.header(&package_ref);
+
+    let downloads = download_and_verify_artifacts(&client, &package_ref, &pull, Some(&printer))?;
     let manifest = load_manifest(&downloads.artifacts)?;
     validate_manifest(&manifest)?;
 
@@ -47,25 +50,71 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         args.force,
     )?;
 
-    let install = install_package(&package_ref, &manifest, &downloads, args.init)?;
+    // Re-pull semantics (security review fix): if this pack is
+    // already installed, reverse its prior wiring records first so
+    // the new install captures `prior_value` against the user's true
+    // pre-install state — not against a previous pack-written value.
+    // This also handles the case where the new manifest dropped
+    // directives the old one had: their reversal happens here, since
+    // the new install won't touch them.
+    //
+    // If reversal fails for any record, abort the re-pull (do not
+    // proceed to apply the new directives). The lockfile entry stays
+    // intact so the user can investigate.
+    if let Some(prior_pkg) = lockfile.packages.get(&package_ref.key()) {
+        if !prior_pkg.wiring_record.is_empty() {
+            let failures = crate::wiring::reverse(&prior_pkg.wiring_record);
+            if !failures.is_empty() {
+                for f in &failures {
+                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
+                }
+                return Err(NonoError::PackageInstall(format!(
+                    "re-pull of {} aborted — {} prior wiring directive(s) failed to reverse. \
+                     Resolve the failures above (or `nono remove --force` first) before retrying.",
+                    package_ref.key(),
+                    failures.len()
+                )));
+            }
+        }
+    }
+
+    // Files this same pack wrote on a previous install — empty after
+    // the reverse above succeeded (we tore down everything). Kept
+    // around as a safety net: if reverse left anything behind, the
+    // wiring interpreter can still verify it owns + matches before
+    // overwriting.
+    let pack_owned_files = pack_owned_write_file_paths(&lockfile, &package_ref);
+    let install = install_package(
+        &package_ref,
+        &manifest,
+        &downloads,
+        args.init,
+        &pack_owned_files,
+    )?;
     update_lockfile(
         &package_ref,
         &registry_url,
         &pull,
         &signer_identity,
         &downloads.artifacts,
-        &install.external_paths,
+        &install.wiring_record,
     )?;
 
-    print_pull_summary(&package_ref, &manifest, &pull, &install);
+    let install_dir = package::package_install_dir(&package_ref.namespace, &package_ref.name)?;
+    crate::pull_ui::render_summary(
+        &package_ref,
+        &pull,
+        &install_dir,
+        install.installed_artifacts,
+        install.copied_to_project,
+    );
+
     Ok(())
 }
 
 pub fn run_remove(args: RemoveArgs) -> Result<()> {
     let package_ref = package::parse_package_ref(&args.package_ref)?;
 
-    // Read lockfile before deleting anything — we need external paths and
-    // hook artifact info for cleanup.
     let lockfile = package::read_lockfile()?;
     let locked_pkg = lockfile.packages.get(&package_ref.key());
 
@@ -79,24 +128,46 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
         )));
     }
 
-    // Remove externally placed files tracked in the lockfile.
+    // Reverse the wiring directives the pack ran at install time.
+    // Records live in the lockfile (`LockedPackage::wiring_record`)
+    // so we don't need to re-evaluate the pack's manifest — works
+    // even if the pack has been re-published or removed from the
+    // registry between install and uninstall.
+    //
+    // Failure handling (security review fix): per-record failures
+    // are surfaced rather than swallowed. Without `--force`, any
+    // failure aborts the remove with the lockfile entry intact so
+    // the user can investigate and retry. With `--force`, we log
+    // the failures and proceed — the lockfile entry is still
+    // dropped, leaving any orphaned wiring as the user's problem
+    // (typically because the user already cleaned it up by hand).
     if let Some(pkg) = locked_pkg {
-        remove_external_artifacts(pkg);
-        // Unregister hooks from target app settings.
-        unregister_package_hooks(&package_ref, &install_dir);
-    }
-
-    // Remove profile symlinks.
-    let profile_link = package::profile_link_path(&package_ref.name)?;
-    if profile_link.exists()
-        && package::is_profile_symlink_into_package_store(&package_ref.name).is_some()
-    {
-        fs::remove_file(&profile_link).map_err(NonoError::Io)?;
-    }
-
-    // Also check for other profile symlinks from the manifest.
-    if install_dir.exists() {
-        remove_all_profile_symlinks_for_package(&install_dir)?;
+        if !pkg.wiring_record.is_empty() {
+            let failures = crate::wiring::reverse(&pkg.wiring_record);
+            let total = pkg.wiring_record.len();
+            let succeeded = total.saturating_sub(failures.len());
+            eprintln!("  reversed {succeeded}/{total} wiring directive(s)",);
+            if !failures.is_empty() {
+                for f in &failures {
+                    eprintln!("    failed: {} — {}", f.record_summary, f.error);
+                }
+                if !args.force {
+                    return Err(NonoError::PackageInstall(format!(
+                        "remove of {} aborted — {} wiring directive(s) failed to reverse. \
+                         The lockfile entry has been preserved so you can retry. \
+                         Inspect the failures above and either resolve them and re-run, \
+                         or pass --force to drop the lockfile entry and accept any \
+                         orphaned wiring.",
+                        package_ref.key(),
+                        failures.len()
+                    )));
+                }
+                eprintln!(
+                    "  --force: dropping lockfile entry despite {} failed reversal(s)",
+                    failures.len()
+                );
+            }
+        }
     }
 
     // Remove the package store directory.
@@ -117,157 +188,26 @@ pub fn run_remove(args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Remove files that were installed outside the package store via install_dir.
-fn remove_external_artifacts(pkg: &LockedPackage) {
-    for (name, artifact) in &pkg.artifacts {
-        if artifact.artifact_type == ArtifactType::Hook {
-            tracing::info!(
-                "Retaining shared hook script for {} at {:?}",
-                name,
-                artifact.installed_path
-            );
-            continue;
-        }
-        if let Some(installed_path) = &artifact.installed_path {
-            let path = Path::new(installed_path);
-            if path.exists() {
-                if let Err(e) = fs::remove_file(path) {
-                    tracing::warn!("Failed to remove external artifact {}: {}", name, e);
-                } else {
-                    tracing::info!("Removed {}", installed_path);
-                }
+/// Collect the absolute paths and prior SHA-256 of `WriteFile`
+/// destinations recorded against this exact pack in the lockfile.
+/// The wiring interpreter uses both pieces to allow idempotent
+/// re-pulls — only when the on-disk content still matches the
+/// recorded hash (i.e. the user hasn't edited the file since we
+/// wrote it). A user edit OR a path not in this map causes the
+/// re-pull to refuse rather than silently clobber.
+fn pack_owned_write_file_paths(
+    lockfile: &package::Lockfile,
+    package_ref: &PackageRef,
+) -> HashMap<PathBuf, String> {
+    let mut owned = HashMap::new();
+    if let Some(pkg) = lockfile.packages.get(&package_ref.key()) {
+        for record in &pkg.wiring_record {
+            if let crate::wiring::WiringRecord::WriteFile { dest, sha256 } = record {
+                owned.insert(PathBuf::from(dest), sha256.clone());
             }
         }
     }
-}
-
-/// Attempt to unregister hooks from target app settings files.
-///
-/// Reads the package's stored manifest to find hook artifacts with target info,
-/// then removes the corresponding entries from the target app's settings.
-fn unregister_package_hooks(package_ref: &PackageRef, install_dir: &Path) {
-    let manifest_path = install_dir.join("package.json");
-    if !manifest_path.exists() {
-        return;
-    }
-
-    let manifest: PackageManifest = match fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-    {
-        Some(m) => m,
-        None => return,
-    };
-
-    for artifact in &manifest.artifacts {
-        if artifact.artifact_type != ArtifactType::Hook {
-            continue;
-        }
-
-        let target = artifact.target.as_deref().unwrap_or(&package_ref.name);
-
-        match target {
-            "claude-code" => {
-                if let Err(e) = unregister_claude_code_hook(&artifact.path) {
-                    tracing::warn!("Failed to unregister Claude Code hook: {}", e);
-                }
-            }
-            _ => {
-                tracing::debug!("No unregistration logic for hook target '{}'", target);
-            }
-        }
-    }
-}
-
-/// Remove a hook entry from Claude Code's ~/.claude/settings.json.
-fn unregister_claude_code_hook(script_filename: &str) -> Result<()> {
-    let home = xdg_home::home_dir().ok_or(NonoError::HomeNotFound)?;
-    let settings_path = home.join(".claude").join("settings.json");
-    if !settings_path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&settings_path).map_err(|e| NonoError::ConfigRead {
-        path: settings_path.clone(),
-        source: e,
-    })?;
-
-    let mut settings: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| NonoError::ConfigParse(format!("failed to parse settings.json: {e}")))?;
-
-    let fname = file_name(script_filename).unwrap_or(script_filename);
-    let hook_command = format!("$HOME/.claude/hooks/{fname}");
-
-    let modified = remove_hook_command_from_settings(&mut settings, &hook_command);
-    if modified {
-        let json = serde_json::to_string_pretty(&settings)
-            .map_err(|e| NonoError::ConfigParse(format!("failed to serialize settings: {e}")))?;
-        fs::write(&settings_path, json).map_err(NonoError::Io)?;
-        tracing::info!("Unregistered hook from {}", settings_path.display());
-    }
-
-    Ok(())
-}
-
-/// Walk through settings.hooks.* arrays and remove entries whose command
-/// matches the given hook_command. Returns true if anything was removed.
-fn remove_hook_command_from_settings(settings: &mut serde_json::Value, hook_command: &str) -> bool {
-    let hooks = match settings.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-        Some(h) => h,
-        None => return false,
-    };
-
-    let mut modified = false;
-    for (_event, entries) in hooks.iter_mut() {
-        if let Some(arr) = entries.as_array_mut() {
-            let before = arr.len();
-            arr.retain(|entry| {
-                if let Some(hook_arr) = entry.get("hooks").and_then(|v| v.as_array()) {
-                    !hook_arr.iter().any(|h| {
-                        h.get("command")
-                            .and_then(|c| c.as_str())
-                            .map(|c| c == hook_command)
-                            .unwrap_or(false)
-                    })
-                } else {
-                    true
-                }
-            });
-            if arr.len() != before {
-                modified = true;
-            }
-        }
-    }
-
-    modified
-}
-
-/// Find all profile symlinks in the global profiles dir that point into
-/// the given package install directory and remove them.
-fn remove_all_profile_symlinks_for_package(install_dir: &Path) -> Result<()> {
-    let profiles_dir = package::profiles_dir()?;
-    if !profiles_dir.exists() {
-        return Ok(());
-    }
-
-    let entries = fs::read_dir(&profiles_dir).map_err(NonoError::Io)?;
-    for entry in entries {
-        let entry = entry.map_err(NonoError::Io)?;
-        let path = entry.path();
-        if let Ok(target) = fs::read_link(&path) {
-            // Resolve to absolute for comparison.
-            let resolved = if target.is_absolute() {
-                target
-            } else {
-                profiles_dir.join(&target)
-            };
-            if resolved.starts_with(install_dir) {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-
-    Ok(())
+    owned
 }
 
 fn is_dir_empty(path: &Path) -> bool {
@@ -367,8 +307,9 @@ struct VerifiedDownloads {
 struct InstallSummary {
     installed_artifacts: usize,
     copied_to_project: usize,
-    /// Maps artifact filename -> external installed path (if install_dir was used).
-    external_paths: HashMap<String, PathBuf>,
+    /// Records produced by the wiring interpreter, persisted into the
+    /// lockfile so `nono remove` can reverse them.
+    wiring_record: Vec<crate::wiring::WiringRecord>,
 }
 
 fn validate_pull_response(package_ref: &PackageRef, pull: &PullResponse) -> Result<()> {
@@ -412,6 +353,7 @@ fn download_and_verify_artifacts(
     client: &RegistryClient,
     package_ref: &PackageRef,
     pull: &PullResponse,
+    printer: Option<&crate::pull_ui::ProgressPrinter>,
 ) -> Result<VerifiedDownloads> {
     let trusted_root = nono::trust::load_production_trusted_root()?;
     let policy = nono::trust::VerificationPolicy::default();
@@ -474,6 +416,11 @@ fn download_and_verify_artifacts(
             });
         }
 
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if let Some(p) = printer {
+            p.finished(&artifact.filename, bytes);
+        }
+
         downloads.push(DownloadedArtifact {
             filename: artifact.filename.clone(),
             path,
@@ -532,6 +479,7 @@ fn install_package(
     manifest: &PackageManifest,
     downloads: &VerifiedDownloads,
     init: bool,
+    pack_owned_files: &HashMap<PathBuf, String>,
 ) -> Result<InstallSummary> {
     let staging_parent = package::package_store_dir()?
         .join(".staging")
@@ -550,7 +498,6 @@ fn install_package(
     write_supporting_artifacts(&staging_root, downloads)?;
 
     let mut copied_to_project = 0usize;
-    let mut external_paths: HashMap<String, PathBuf> = HashMap::new();
     for artifact in &manifest.artifacts {
         let downloaded = downloaded_by_name
             .get(artifact.path.as_str())
@@ -560,11 +507,7 @@ fn install_package(
                     artifact.path
                 ))
             })?;
-        if let Some(ext_path) =
-            install_manifest_artifact(&staging_root, artifact, &downloaded.path)?
-        {
-            external_paths.insert(artifact.path.clone(), ext_path);
-        }
+        install_manifest_artifact(&staging_root, artifact, &downloaded.path)?;
         if init
             && artifact.artifact_type == ArtifactType::Instruction
             && artifact.placement.as_deref() == Some("project")
@@ -584,12 +527,30 @@ fn install_package(
     fs::rename(&staging_root, &final_root).map_err(NonoError::Io)?;
     tempdir.close().map_err(NonoError::Io)?;
 
-    create_profile_symlinks(package_ref, manifest)?;
+    // Run the pack's declarative wiring directives. The CLI knows
+    // nothing about specific agents (Claude Code, Codex, …); it just
+    // executes the closed vocabulary the pack supplies as data. The
+    // returned records go into the lockfile so `nono remove` can
+    // reverse them deterministically.
+    let wiring_record = if manifest.wiring.is_empty() {
+        Vec::new()
+    } else {
+        let ctx = crate::wiring::WiringContext {
+            pack_dir: final_root.clone(),
+            namespace: package_ref.namespace.clone(),
+            pack_name: package_ref.name.clone(),
+        };
+        let report = crate::wiring::execute(&manifest.wiring, &ctx, pack_owned_files)?;
+        for conflict in &report.conflicts {
+            eprintln!("  warning: {conflict}");
+        }
+        report.records
+    };
 
     Ok(InstallSummary {
         installed_artifacts: manifest.artifacts.len(),
         copied_to_project,
-        external_paths,
+        wiring_record,
     })
 }
 
@@ -629,16 +590,16 @@ fn write_supporting_artifacts(staging_root: &Path, downloads: &VerifiedDownloads
     Ok(())
 }
 
-/// Install an artifact into the package staging directory and optionally to an
-/// external `install_dir` path declared in the manifest. Returns the external
-/// path if one was written, so callers can record it in the lockfile.
+/// Install an artifact into the package staging directory based on its
+/// declared type. All artifacts land inside the pack store; the wiring
+/// interpreter (run after install) is responsible for any agent-facing
+/// placement (symlinks, JSON merges, TOML blocks).
 fn install_manifest_artifact(
     staging_root: &Path,
     artifact: &ArtifactEntry,
     source_path: &Path,
-) -> Result<Option<PathBuf>> {
-    // Write into the package store (staging root) based on type.
-    let store_path = match artifact.artifact_type {
+) -> Result<()> {
+    match artifact.artifact_type {
         ArtifactType::Profile => {
             let install_name = artifact.install_as.as_deref().ok_or_else(|| {
                 NonoError::PackageInstall(format!(
@@ -652,27 +613,18 @@ fn install_manifest_artifact(
                 .join(format!("{install_name}.json"));
             copy_path(source_path, &path)?;
             parse_json::<crate::profile::Profile>(&path)?;
-            path
-        }
-        ArtifactType::Hook => {
-            let path = staging_root.join("hooks").join(file_name(&artifact.path)?);
-            copy_path(source_path, &path)?;
-            ensure_executable(&path)?;
-            path
         }
         ArtifactType::Instruction => {
             let path = staging_root
                 .join("instructions")
                 .join(file_name(&artifact.path)?);
             copy_path(source_path, &path)?;
-            path
         }
         ArtifactType::TrustPolicy => {
             let path = staging_root.join("trust-policy.json");
             copy_path(source_path, &path)?;
             let content = fs::read_to_string(&path).map_err(NonoError::Io)?;
             nono::trust::load_policy_from_str(&content)?;
-            path
         }
         ArtifactType::Groups => {
             let prefix = artifact.prefix.as_deref().ok_or_else(|| {
@@ -685,15 +637,6 @@ fn install_manifest_artifact(
             copy_path(source_path, &path)?;
             let bytes = fs::read(&path).map_err(NonoError::Io)?;
             validate_groups(&bytes, prefix)?;
-            path
-        }
-        ArtifactType::Script => {
-            let path = staging_root
-                .join("scripts")
-                .join(file_name(&artifact.path)?);
-            copy_path(source_path, &path)?;
-            ensure_executable(&path)?;
-            path
         }
         ArtifactType::Plugin => {
             validate_relative_path(&artifact.path)?;
@@ -702,52 +645,10 @@ fn install_manifest_artifact(
             if artifact.path.contains("/bin/") || artifact.path.ends_with(".sh") {
                 ensure_executable(&path)?;
             }
-            path
         }
-    };
+    }
 
-    // If the manifest declares an install_dir, also place the file there.
-    let external_path = if let Some(install_dir) = &artifact.install_dir {
-        let expanded = expand_tilde(install_dir)?;
-        if !expanded.is_absolute() {
-            return Err(NonoError::PackageInstall(format!(
-                "install_dir must be an absolute path, got '{install_dir}'"
-            )));
-        }
-        let dest_name = artifact
-            .install_as
-            .as_deref()
-            .map(|n| -> Result<String> {
-                validate_safe_name(n, "install_as")?;
-                // For profiles, install_as is already just the name
-                Ok(if artifact.artifact_type == ArtifactType::Profile {
-                    format!("{n}.json")
-                } else {
-                    n.to_string()
-                })
-            })
-            .transpose()?
-            .unwrap_or_else(|| {
-                store_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("artifact")
-                    .to_string()
-            });
-        let dest = expanded.join(&dest_name);
-        copy_path(source_path, &dest)?;
-        if matches!(
-            artifact.artifact_type,
-            ArtifactType::Hook | ArtifactType::Script
-        ) {
-            ensure_executable(&dest)?;
-        }
-        Some(dest)
-    } else {
-        None
-    };
-
-    Ok(external_path)
+    Ok(())
 }
 
 fn copy_instruction_to_project(artifact: &ArtifactEntry, source_path: &Path) -> Result<()> {
@@ -757,46 +658,6 @@ fn copy_instruction_to_project(artifact: &ArtifactEntry, source_path: &Path) -> 
         return Ok(());
     }
     copy_path(source_path, &path)
-}
-
-fn create_profile_symlinks(package_ref: &PackageRef, manifest: &PackageManifest) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-
-        fs::create_dir_all(package::profiles_dir()?).map_err(NonoError::Io)?;
-        for artifact in &manifest.artifacts {
-            if artifact.artifact_type != ArtifactType::Profile {
-                continue;
-            }
-
-            let install_name = artifact.install_as.as_deref().ok_or_else(|| {
-                NonoError::PackageInstall(format!(
-                    "profile artifact '{}' is missing install_as",
-                    artifact.path
-                ))
-            })?;
-            validate_safe_name(install_name, "install_as")?;
-            let link_path = package::profile_link_path(install_name)?;
-            let target = package::package_install_dir(&package_ref.namespace, &package_ref.name)?
-                .join("profiles")
-                .join(format!("{install_name}.json"));
-
-            if link_path.exists() {
-                if package::is_profile_symlink_into_package_store(install_name).is_none() {
-                    return Err(NonoError::PackageInstall(format!(
-                        "profile '{}' already exists and is not package-managed",
-                        install_name
-                    )));
-                }
-                fs::remove_file(&link_path).map_err(NonoError::Io)?;
-            }
-
-            symlink(&target, &link_path).map_err(NonoError::Io)?;
-        }
-    }
-
-    Ok(())
 }
 
 fn validate_groups(bytes: &[u8], prefix: &str) -> Result<()> {
@@ -828,7 +689,7 @@ fn update_lockfile(
     pull: &PullResponse,
     signer_identity: &str,
     downloads: &[DownloadedArtifact],
-    external_paths: &HashMap<String, PathBuf>,
+    wiring_record: &[crate::wiring::WiringRecord],
 ) -> Result<()> {
     let mut lockfile = package::read_lockfile()?;
     lockfile.lockfile_version = package::LOCKFILE_VERSION;
@@ -838,15 +699,11 @@ fn update_lockfile(
         .iter()
         .filter(|artifact| artifact.filename != "package.json")
         .map(|artifact| {
-            let installed_path = external_paths
-                .get(&artifact.filename)
-                .map(|p| p.to_string_lossy().into_owned());
             (
                 artifact.filename.clone(),
                 LockedArtifact {
                     sha256: artifact.sha256_digest.clone(),
                     artifact_type: infer_artifact_type(&artifact.filename),
-                    installed_path,
                 },
             )
         })
@@ -870,41 +727,11 @@ fn update_lockfile(
                     .unwrap_or_else(|| Utc::now().to_rfc3339()),
             }),
             artifacts,
+            wiring_record: wiring_record.to_vec(),
         },
     );
 
     package::write_lockfile(&lockfile)
-}
-
-fn print_pull_summary(
-    package_ref: &PackageRef,
-    manifest: &PackageManifest,
-    pull: &PullResponse,
-    install: &InstallSummary,
-) {
-    eprintln!(
-        "Pulled {} {}@{}",
-        manifest.pack_type.label(),
-        package_ref.key(),
-        pull.version
-    );
-    eprintln!("  Signer: {}", pull.provenance.signer_identity);
-    eprintln!("  Repository: {}", pull.provenance.repository);
-    eprintln!("  Workflow: {}", pull.provenance.workflow);
-    eprintln!(
-        "  Scan: {}",
-        if pull.scan_passed { "passed" } else { "failed" }
-    );
-    eprintln!("  Installed {} artifact(s)", install.installed_artifacts);
-    for (artifact_name, ext_path) in &install.external_paths {
-        eprintln!("    {} -> {}", artifact_name, ext_path.display());
-    }
-    if install.copied_to_project > 0 {
-        eprintln!(
-            "  Copied {} instruction file(s) into the current directory",
-            install.copied_to_project
-        );
-    }
 }
 
 fn enforce_namespace_assertion(
@@ -943,7 +770,9 @@ fn enforce_signer_pinning(
 
     if let Some(existing) = existing {
         if let Some(provenance) = &existing.provenance {
-            if provenance.signer_identity != signer_identity {
+            if canonical_signer_identity(&provenance.signer_identity)
+                != canonical_signer_identity(signer_identity)
+            {
                 return Err(NonoError::PackageVerification {
                     package: provenance.repository.clone(),
                     reason: format!(
@@ -956,6 +785,16 @@ fn enforce_signer_pinning(
     }
 
     Ok(())
+}
+
+/// Strip the per-release `@<git_ref>` suffix from a keyless signer identity
+/// so version updates aren't misread as publisher changes. Pinning is meant
+/// to detect a change in repo or workflow file, not the tag/branch that
+/// triggered each release. Keyed identities (no `@`) pass through unchanged.
+fn canonical_signer_identity(uri: &str) -> &str {
+    uri.rsplit_once('@')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(uri)
 }
 fn signer_identity_uri(identity: &SignerIdentity) -> Result<String> {
     match identity {
@@ -976,9 +815,8 @@ fn infer_artifact_type(filename: &str) -> ArtifactType {
         "groups.json" => ArtifactType::Groups,
         "trust-policy.json" => ArtifactType::TrustPolicy,
         name if name.ends_with(".profile.json") => ArtifactType::Profile,
-        name if name.ends_with(".sh") => ArtifactType::Hook,
         name if name.ends_with(".md") => ArtifactType::Instruction,
-        _ => ArtifactType::Script,
+        _ => ArtifactType::Plugin,
     }
 }
 
@@ -1006,17 +844,6 @@ fn ensure_executable(path: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn expand_tilde(path: &str) -> Result<PathBuf> {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = xdg_home::home_dir().ok_or(NonoError::HomeNotFound)?;
-        Ok(home.join(rest))
-    } else if path == "~" {
-        xdg_home::home_dir().ok_or(NonoError::HomeNotFound)
-    } else {
-        Ok(PathBuf::from(path))
-    }
 }
 
 fn file_name(path: &str) -> Result<&str> {
@@ -1101,55 +928,6 @@ fn format_timestamp(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-
-    #[test]
-    fn remove_external_artifacts_preserves_shared_hook_scripts() {
-        let tempdir = TempDir::new().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
-        let hook_path = tempdir.path().join("nono-hook.sh");
-        fs::write(&hook_path, "#!/bin/sh\n").unwrap_or_else(|err| panic!("write failed: {err}"));
-
-        let mut artifacts = BTreeMap::new();
-        artifacts.insert(
-            "hooks/nono-hook.sh".to_string(),
-            LockedArtifact {
-                sha256: "abc123".to_string(),
-                artifact_type: ArtifactType::Hook,
-                installed_path: Some(hook_path.to_string_lossy().into_owned()),
-            },
-        );
-
-        remove_external_artifacts(&LockedPackage {
-            artifacts,
-            ..LockedPackage::default()
-        });
-
-        assert!(hook_path.exists(), "shared hook script should be retained");
-    }
-
-    #[test]
-    fn remove_external_artifacts_still_removes_non_hook_files() {
-        let tempdir = TempDir::new().unwrap_or_else(|err| panic!("tempdir failed: {err}"));
-        let script_path = tempdir.path().join("helper.sh");
-        fs::write(&script_path, "#!/bin/sh\n").unwrap_or_else(|err| panic!("write failed: {err}"));
-
-        let mut artifacts = BTreeMap::new();
-        artifacts.insert(
-            "scripts/helper.sh".to_string(),
-            LockedArtifact {
-                sha256: "abc123".to_string(),
-                artifact_type: ArtifactType::Script,
-                installed_path: Some(script_path.to_string_lossy().into_owned()),
-            },
-        );
-
-        remove_external_artifacts(&LockedPackage {
-            artifacts,
-            ..LockedPackage::default()
-        });
-
-        assert!(!script_path.exists(), "non-hook artifact should be removed");
-    }
 
     #[test]
     fn compare_versions_honors_prerelease_ordering() {

@@ -45,6 +45,13 @@ struct ShimRequest {
     env: HashMap<String, String>,
     /// PID of this shim process — used by the server as `command_pid` in audit logs.
     pid: u32,
+    /// Working directory of this shim process — the cwd the agent (or mediated
+    /// parent) was in when it invoked the command. The server uses this to set
+    /// the spawned binary's cwd, so commands like `git` resolve to the caller's
+    /// directory rather than the mediation server's launch cwd. `None` (or an
+    /// unreadable cwd) leaves the server's default behaviour in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -194,12 +201,22 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
 
     let env: HashMap<String, String> = std::env::vars().collect();
 
+    // Capture the shim's cwd. This is the agent's (or mediated parent's) cwd
+    // at the moment of invocation — propagated to the server so the spawned
+    // real binary runs in the caller's directory, not the server's launch cwd.
+    // Failure to read or stringify the cwd is non-fatal: send None and the
+    // server falls back to its default (its own cwd).
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.into_os_string().into_string().ok());
+
     let request = ShimRequest {
         command: command_name.to_string(),
         args: args.to_vec(),
         session_token,
         env,
         pid: std::process::id(),
+        cwd,
     };
 
     let request_bytes = match serde_json::to_vec(&request) {

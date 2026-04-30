@@ -43,6 +43,21 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) pre_session_name: Option<String>,
     /// Latch to fill in with the sandboxed process PID once forked; shared with the mediation server.
     pub(crate) mediation_sandboxed_pid_latch: Option<Arc<OnceLock<u32>>>,
+    /// Canonicalized real paths of mediated commands. Written into the
+    /// BPF-LSM deny map keyed by `(dev, ino)`. Empty when mediation is
+    /// inactive. Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) mediation_deny_set: Vec<std::path::PathBuf>,
+    /// Per-session shim directory. Used by the audit reader to
+    /// suppress BPF-emitted records for shim-routed execs (the shim
+    /// emits its own downstream record). `None` when mediation is
+    /// inactive. Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) mediation_shim_dir: Option<std::path::PathBuf>,
+    /// Directory where the audit reader appends `audit.jsonl`.
+    /// Linux only.
+    #[cfg(target_os = "linux")]
+    pub(crate) mediation_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -151,6 +166,12 @@ fn create_session_runtime_state(
 }
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
+    #[cfg(target_os = "linux")]
+    let mediation_deny_set = ctx.mediation_deny_set.clone();
+    #[cfg(target_os = "linux")]
+    let mediation_shim_dir = ctx.mediation_shim_dir.clone();
+    #[cfg(target_os = "linux")]
+    let mediation_audit_log_dir = ctx.mediation_audit_log_dir.clone();
     let SupervisedRuntimeContext {
         config,
         caps,
@@ -166,6 +187,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         pre_session_id,
         pre_session_name,
         mediation_sandboxed_pid_latch,
+        ..
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -243,6 +265,12 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
         },
+        #[cfg(target_os = "linux")]
+        mediation_deny_set,
+        #[cfg(target_os = "linux")]
+        mediation_shim_dir,
+        #[cfg(target_os = "linux")]
+        mediation_audit_log_dir,
     };
 
     if !session.detached_start {

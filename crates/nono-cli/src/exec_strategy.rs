@@ -267,6 +267,24 @@ pub struct SupervisorConfig<'a> {
     /// Bind ports allowed for seccomp proxy-only fallback.
     #[cfg(target_os = "linux")]
     pub proxy_bind_ports: Vec<u16>,
+    /// Canonicalized real paths of mediated commands. Populated from
+    /// `mediation.commands` at session start; written into the BPF deny
+    /// map keyed by `(dev, ino)`. Empty when mediation is inactive (no
+    /// BPF-LSM filter is installed in that case).
+    #[cfg(target_os = "linux")]
+    pub mediation_deny_set: Vec<std::path::PathBuf>,
+    /// Per-session shim directory (absolute). The userspace audit
+    /// reader suppresses BPF-emitted `allow_unmediated` records whose
+    /// resolved path lives under this directory — those execs are the
+    /// shim itself, which emits its own downstream audit record on
+    /// completion. `None` when mediation is inactive (no audit either).
+    #[cfg(target_os = "linux")]
+    pub mediation_shim_dir: Option<std::path::PathBuf>,
+    /// Directory where the audit reader appends `audit.jsonl`. Same
+    /// path the shim's own audit events land in. `None` when mediation
+    /// is inactive.
+    #[cfg(target_os = "linux")]
+    pub mediation_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -604,6 +622,120 @@ pub fn execute_supervised(
     // Clear any stale forwarding target before forking.
     clear_signal_forwarding_target();
 
+    // BPF-LSM mediation filter (Linux). Sole enforcement path for mediated
+    // commands. Installed PRE-fork so that:
+    //   - the BPF program is loaded and attached before the child has a
+    //     chance to `execve`, eliminating the install race.
+    //   - the per-session cgroup exists with a known id before fork; the
+    //     child writes its own pid to `cgroup.procs` as its first
+    //     post-fork action so every subsequent exec is scoped.
+    //
+    // Failure modes hard-fail the session — silent partial enforcement
+    // is worse than a loud failure. See docs/linux-bpf-lsm-mediation.md
+    // §"Required deployment invariants".
+    // Drop order matters: declaration order is what runs.
+    //   (audit_reader, filter, cgroup)
+    // → audit_reader stops polling first (the ringbuf map is still
+    //   alive in the filter at that point).
+    // → filter detaches the BPF programs and frees the ringbuf map.
+    // → cgroup migrates leftover tasks back to the parent and rmdirs.
+    #[cfg(target_os = "linux")]
+    let pre_fork_bpf_lsm: Option<(
+        Option<nono::sandbox::bpf_audit::AuditReader>,
+        nono::sandbox::bpf_lsm::MediationFilterHandle,
+        nono::sandbox::bpf_lsm::SessionCgroup,
+    )> = {
+        let deny_paths: Option<&[std::path::PathBuf]> = supervisor
+            .map(|s| s.mediation_deny_set.as_slice())
+            .filter(|s| !s.is_empty());
+        if let Some(paths) = deny_paths {
+            let cgroup = nono::sandbox::bpf_lsm::create_session_cgroup_empty().map_err(|e| {
+                nono::error::NonoError::SandboxInit(format!(
+                    "BPF-LSM mediation filter required for mediation but \
+                         per-session cgroup creation failed ({e}). The broker \
+                         needs CAP_SYS_ADMIN plus CAP_DAC_OVERRIDE — install with \
+                         `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+                         /usr/bin/nono` (CAP_SYS_ADMIN alone is not enough when \
+                         the cgroup parent is root-owned: cgroup v2 mkdir checks \
+                         DAC before the cgroup-namespace privilege check)."
+                ))
+            })?;
+            let cgroup_id = cgroup.cgroup_id();
+            let filter = nono::sandbox::bpf_lsm::install_mediation_filter(paths, cgroup_id)
+                .map_err(|e| {
+                    let detail = match e {
+                        nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
+                            "bpf is not in /sys/kernel/security/lsm. The host kernel \
+                             must boot with lsm=...,bpf in the cmdline (add it to the \
+                             grub cmdline or equivalent for your platform)."
+                                .to_string()
+                        }
+                        other => format!(
+                            "{other}. If you expected BPF-LSM to be active, verify \
+                             CAP_BPF is in the broker's effective capability set \
+                             (e.g. `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
+                             /usr/bin/nono`)."
+                        ),
+                    };
+                    nono::error::NonoError::SandboxInit(format!(
+                        "BPF-LSM mediation filter required for mediation but install \
+                         failed: {detail}"
+                    ))
+                })?;
+            info!(
+                "BPF-LSM mediation filter active: cgroup_id={} deny_entries={} \
+                 (sole enforcement path for mediated commands; child joins cgroup post-fork)",
+                cgroup_id,
+                paths.len()
+            );
+
+            // Spawn the audit reader if the broker provided a log
+            // directory. Records flow from the BPF ringbuf →
+            // userspace → audit.jsonl. Drop order is enforced by
+            // tuple field order at the binding site: audit_reader
+            // first → filter second → cgroup third.
+            let audit_reader = match supervisor.and_then(|s| s.mediation_audit_log_dir.clone()) {
+                Some(dir) => {
+                    let shim = supervisor.and_then(|s| s.mediation_shim_dir.clone());
+                    // Build the (dev, ino) → canonical path map so
+                    // the audit reader can resolve event paths.
+                    // Same canonicalize-and-stat logic the BPF
+                    // loader uses; entries that fail are skipped.
+                    use std::os::unix::fs::MetadataExt;
+                    let mut inode_to_path = std::collections::HashMap::new();
+                    for raw in paths {
+                        if let Ok(canonical) = std::fs::canonicalize(raw) {
+                            if let Ok(meta) = std::fs::metadata(&canonical) {
+                                inode_to_path.insert((meta.dev(), meta.ino()), canonical);
+                            }
+                        }
+                    }
+                    match nono::sandbox::bpf_audit::AuditReader::start(
+                        filter.audit_ringbuf_map(),
+                        dir,
+                        shim,
+                        inode_to_path,
+                    ) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            warn!(
+                                "BPF-LSM audit reader could not start ({e}); \
+                                 mediation enforcement is unaffected, but audit \
+                                 records will not be written to audit.jsonl."
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            Some((audit_reader, filter, cgroup))
+        } else {
+            None
+        }
+    };
+
     // SAFETY: fork() is safe here because we validated threading context.
     // Child will call Sandbox::apply() which allocates, but this is safe
     // because the child is single-threaded (validated above).
@@ -611,6 +743,39 @@ pub fn execute_supervised(
 
     match fork_result {
         Ok(ForkResult::Child) => {
+            // CHILD FIRST ACTION: join the per-session cgroup so every
+            // subsequent exec is scoped by the BPF-LSM filter installed
+            // pre-fork. Must happen BEFORE Sandbox::apply (Landlock
+            // would block writes to /sys/fs/cgroup) and before any
+            // execve (an unscoped exec slips past the BPF check).
+            //
+            // Fail closed: if we can't join the cgroup, the BPF-LSM
+            // filter is effectively bypassable for this child, so
+            // refuse to continue rather than run agent code with
+            // weaker enforcement than the session promised.
+            #[cfg(target_os = "linux")]
+            if let Some((_, _, ref cgroup)) = pre_fork_bpf_lsm {
+                if let Err(e) = cgroup.add_pid(std::process::id()) {
+                    let detail = format!(
+                        "nono: failed to join session cgroup at {}: {}\n",
+                        cgroup.path().display(),
+                        e
+                    );
+                    let msg = detail.as_bytes();
+                    // SAFETY: write/_exit are async-signal-safe and we're
+                    // in the post-fork child path where higher-level Rust
+                    // APIs are unsafe.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            msg.as_ptr().cast::<libc::c_void>(),
+                            msg.len(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+            }
+
             #[cfg(target_os = "linux")]
             let mut child_caps = config.caps.clone();
             #[cfg(target_os = "linux")]
@@ -1061,6 +1226,22 @@ pub fn execute_supervised(
                     })
                     .collect()
             };
+
+            // BPF-LSM was installed pre-fork; rebind here so its Drop
+            // fires at end-of-supervisor-scope (detach BPF + rmdir cgroup).
+            #[cfg(target_os = "linux")]
+            let _bpf_lsm_handle = pre_fork_bpf_lsm;
+
+            // Verify deployment invariants and emit a session-start log line.
+            // The infrastructure (BPF-LSM, PR_SET_NO_NEW_PRIVS, Landlock) has
+            // already enforced these by the time we get here; the explicit
+            // verify-and-log step turns implicit guarantees into auditable
+            // session-start records that operators can grep for. See
+            // docs/linux-bpf-lsm-mediation.md §"Required deployment invariants".
+            #[cfg(target_os = "linux")]
+            if _bpf_lsm_handle.is_some() {
+                verify_agent_invariants(child);
+            }
 
             let (status, denials) =
                 if let (Some(sup_cfg), Some(mut sup_sock)) = (supervisor, supervisor_sock) {
@@ -1757,6 +1938,69 @@ fn get_thread_count() -> Result<usize> {
             "Cannot determine thread count on this platform".to_string(),
         ))
     }
+}
+
+/// Read the agent's `/proc/<pid>/status` once it has executed its
+/// final image and emit a structured info-level log line confirming
+/// what's enforced. Turns implicit guarantees (Landlock, NoNewPrivs,
+/// BPF-LSM) into auditable session-start records operators can grep for.
+///
+/// Polls for up to ~2s waiting for `CapEff: 0`. The agent inherits
+/// the broker's file-capability set at fork, which is non-zero; only
+/// after execve into a non-setcap'd binary does `CapEff` drop to zero.
+/// Times out with a warn rather than aborting the session — a stuck
+/// CapEff most likely means the agent hasn't execve'd yet, and killing
+/// the session here would produce a worse failure mode.
+///
+/// BPF-LSM being in the active LSM list is verified earlier, at
+/// `install_mediation_filter` time, which hard-fails if it isn't
+/// present. Reaching this function implies that check already passed.
+#[cfg(target_os = "linux")]
+fn verify_agent_invariants(child: Pid) {
+    use std::time::{Duration, Instant};
+    let agent_pid = child.as_raw() as u32;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last_observed: Option<u64> = None;
+    while Instant::now() < deadline {
+        match read_proc_cap_eff(agent_pid) {
+            Some(0) => {
+                info!(
+                    "Session invariants enforced: A bpf in /sys/kernel/security/lsm; \
+                     C agent CapEff=0 (verified post-execve); D PR_SET_NO_NEW_PRIVS \
+                     (set by sandbox pre-exec)"
+                );
+                return;
+            }
+            Some(bits) => {
+                last_observed = Some(bits);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None => {
+                // Process gone or status unreadable; the supervisor will
+                // observe the exit through waitpid shortly.
+                return;
+            }
+        }
+    }
+    warn!(
+        "Session invariant C check timed out: agent CapEff did not drop to 0 within 2s \
+         (last observed: {:?}). The agent may be a setcap'd binary or may not yet \
+         have execve'd. Mediation enforcement (BPF-LSM) is unaffected.",
+        last_observed
+    );
+}
+
+/// Read `CapEff:` from `/proc/<pid>/status` as a hex bitmap.
+/// Returns `None` if the file is missing or the line can't be parsed.
+#[cfg(target_os = "linux")]
+fn read_proc_cap_eff(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("CapEff:\t") {
+            return u64::from_str_radix(rest.trim(), 16).ok();
+        }
+    }
+    None
 }
 
 /// Supervisor IPC event loop (non-Linux).
@@ -3481,6 +3725,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3580,6 +3827,9 @@ mod tests {
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3655,6 +3905,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3688,6 +3941,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3719,6 +3975,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3734,6 +3993,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -3770,6 +4032,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -3909,6 +4174,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         assert!(

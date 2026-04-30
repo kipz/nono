@@ -1,14 +1,13 @@
 # Linux command mediation via BPF-LSM
 
-> **Status note:** the original framing of this work was "Linux exec
-> filter" (replacing the seccomp-unotify exec filter from PR
-> [kipz/nono#20](https://github.com/kipz/nono/pull/20)). Phase 2
-> added a `file_open` LSM hook to close read-time bypasses, and the
-> implementation landed under the name "BPF-LSM mediation filter".
-> The "exec filter" framing in the historical phase-plan sections
-> below predates that rename; current code uses
-> `install_mediation_filter` / `MediationFilterHandle` /
-> `src/bpf/mediation.bpf.c`.
+> **Note on naming:** earlier drafts of this document used the term
+> "exec filter" (inherited from the seccomp-unotify approach this work
+> replaced). The current implementation mediates both exec
+> (`bprm_check_security`) and file reads (`file_open`) of mediated
+> binaries, so the code uses the broader term "mediation filter".
+> The "exec filter" framing in the implementation-plan sections below
+> predates that rename; current code uses `install_mediation_filter` /
+> `MediationFilterHandle` / `src/bpf/mediation.bpf.c`.
 
 ## Summary
 

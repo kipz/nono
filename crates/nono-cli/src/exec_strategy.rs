@@ -666,8 +666,8 @@ pub fn execute_supervised(
                     let detail = match e {
                         nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
                             "bpf is not in /sys/kernel/security/lsm. The host kernel \
-                             must boot with lsm=...,bpf in the cmdline. See \
-                             drewmchugh/nono#3."
+                             must boot with lsm=...,bpf in the cmdline (add it to the \
+                             grub cmdline or equivalent for your platform)."
                                 .to_string()
                         }
                         other => format!(
@@ -1232,13 +1232,12 @@ pub fn execute_supervised(
             #[cfg(target_os = "linux")]
             let _bpf_lsm_handle = pre_fork_bpf_lsm;
 
-            // Phase 4 invariant assertions. The infrastructure (BPF-LSM,
-            // PR_SET_NO_NEW_PRIVS, Landlock) has already enforced these by
-            // the time we get here; the explicit verify-and-log step turns
-            // implicit guarantees into auditable session-start records that
-            // operators can grep for. See
-            // docs/linux-bpf-lsm-mediation.md §"Required deployment
-            // invariants" (A–D).
+            // Verify deployment invariants and emit a session-start log line.
+            // The infrastructure (BPF-LSM, PR_SET_NO_NEW_PRIVS, Landlock) has
+            // already enforced these by the time we get here; the explicit
+            // verify-and-log step turns implicit guarantees into auditable
+            // session-start records that operators can grep for. See
+            // docs/linux-bpf-lsm-mediation.md §"Required deployment invariants".
             #[cfg(target_os = "linux")]
             if _bpf_lsm_handle.is_some() {
                 verify_agent_invariants(child);
@@ -1941,25 +1940,21 @@ fn get_thread_count() -> Result<usize> {
     }
 }
 
-/// Phase 4 invariant verification — read the agent's
-/// `/proc/<pid>/status` once it has settled into its final image
-/// and emit a structured info-level log line summarising what's
-/// enforced. The explicit log line is the value-add: it turns
-/// implicit guarantees (Landlock, NoNewPrivs, BPF-LSM) into
-/// auditable session-start records.
+/// Read the agent's `/proc/<pid>/status` once it has executed its
+/// final image and emit a structured info-level log line confirming
+/// what's enforced. Turns implicit guarantees (Landlock, NoNewPrivs,
+/// BPF-LSM) into auditable session-start records operators can grep for.
 ///
-/// Polls for up to ~2s waiting for `CapEff: 0` (which only holds
-/// post-execve into a non-setcap'd binary; pre-execve, the agent
-/// has the broker's inherited caps). If the wait times out we
-/// log a warn rather than killing the session — failing closed
-/// here would mask the actual problem (probably the agent
-/// hasn't started yet) and produce a worse failure mode than
-/// just continuing.
+/// Polls for up to ~2s waiting for `CapEff: 0`. The agent inherits
+/// the broker's file-capability set at fork, which is non-zero; only
+/// after execve into a non-setcap'd binary does `CapEff` drop to zero.
+/// Times out with a warn rather than aborting the session — a stuck
+/// CapEff most likely means the agent hasn't execve'd yet, and killing
+/// the session here would produce a worse failure mode.
 ///
-/// Invariant A (`bpf` in active LSM list) is enforced earlier
-/// at install time (Phase 1 hard-fail in `install_mediation_filter`);
-/// reaching this function with `_bpf_lsm_handle.is_some()`
-/// already implies A holds.
+/// BPF-LSM being in the active LSM list is verified earlier, at
+/// `install_mediation_filter` time, which hard-fails if it isn't
+/// present. Reaching this function implies that check already passed.
 #[cfg(target_os = "linux")]
 fn verify_agent_invariants(child: Pid) {
     use std::time::{Duration, Instant};

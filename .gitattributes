@@ -16,3 +16,12 @@
 # Keep Windows batch files as CRLF
 *.bat text eol=crlf
 *.cmd text eol=crlf
+
+# Vendored kernel BTF header for the BPF-LSM program. Generated from
+# `bpftool btf dump file /sys/kernel/btf/vmlinux format c`; ~150k lines
+# of every kernel struct definition, of which the BPF program references
+# a handful (linux_binprm, file, inode, super_block). Marking it
+# generated keeps it out of language stats and code-search results, and
+# collapses it in PR diffs. See crates/nono/src/bpf/README.md for the
+# regeneration command.
+crates/nono/src/bpf/vmlinux.h linguist-generated=true

@@ -206,13 +206,12 @@ fn install_with_real_binary_in_deny_set() {
         .expect("install with /bin/true in deny set should succeed");
 }
 
-/// Phase 2 — verify both LSM hooks attach. The handle holds two
-/// links (`bprm_check_security` + `file_open`); construction
-/// returning Ok proves the verifier accepted both programs and
-/// the kernel attached both. Without the `file_open` hook the
-/// agent could read mediated-binary bytes and re-exec a copy at
-/// a non-deny-set path; this test guards the attach step that
-/// closes that bypass class.
+/// Verify both LSM hooks attach. The handle holds two links
+/// (`bprm_check_security` + `file_open`); construction returning Ok
+/// proves the verifier accepted both programs and the kernel attached
+/// both. Without the `file_open` hook the agent could read
+/// mediated-binary bytes and re-exec a copy at a non-deny-set path;
+/// this test guards the attach step that closes that bypass class.
 #[test]
 fn install_attaches_both_exec_and_file_open_hooks() {
     if !have_cap_bpf() {

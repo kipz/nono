@@ -1,9 +1,8 @@
 //! BPF-LSM mediation filter — end-to-end integration tests.
 //!
 //! Each test spawns a real `nono run` session with a minimal mediation
-//! profile and exercises the kernel-side BPF-LSM enforcement
-//! end-to-end. The test groups mirror the design doc's three security
-//! claims:
+//! profile and exercises the kernel-side BPF-LSM enforcement end-to-end.
+//! Tests are organised into four groups covering the full threat model:
 //!
 //! - **Exec mediation** (`bprm_check_security` hook): the agent cannot
 //!   exec a mediated binary by direct path or via shebang chain.
@@ -16,18 +15,15 @@
 //!   openat seccomp filter; the agent cannot install a competing
 //!   seccomp filter that bypasses the broker.
 //!
-//! Self-skip behaviour
-//! -------------------
-//! The integration tests need `target/debug/nono` to have
+//! Running the tests
+//! -----------------
+//! These tests need the `nono` binary to have
 //! `cap_bpf,cap_sys_admin,cap_dac_override+ep` so the spawned broker
 //! can install the BPF-LSM filter and create the per-session cgroup.
-//! Plain `cargo test` re-links the binary and clears file caps every
-//! time, so each test starts with a runtime check: if the binary
-//! lacks the caps, the test prints a `skipping: ...` line pointing
-//! at `make test-integration` and returns. This keeps the tests in
-//! the `cargo test` set without requiring sudo for everyday runs;
-//! `make test-integration` does the build → setcap → cargo-test
-//! dance so the suite actually runs.
+//! Each test starts with a runtime capability check and prints a
+//! `skipping: ...` message if the caps are absent, rather than failing,
+//! so plain `cargo test` always passes. Run `make test-integration` to
+//! build, apply the required caps, and execute the full suite.
 
 #![cfg(target_os = "linux")]
 
@@ -522,7 +518,7 @@ fn nonexistent_path_exec_returns_enoent_not_eacces() {
 }
 
 // =========================================================================
-// Group 2: Read mediation (BPF-LSM file_open hook, Phase 2)
+// Group 2: Read mediation (BPF-LSM file_open hook)
 // =========================================================================
 
 /// `cat <mediated_bin>` must be denied: file_open fires when cat
@@ -636,7 +632,7 @@ fn cat_of_non_mediated_binary_succeeds() {
 }
 
 // =========================================================================
-// Group 3: Audit (BPF ringbuf reader, Phase 3)
+// Group 3: Audit (BPF ringbuf reader)
 // =========================================================================
 
 /// Running a non-mediated binary inside the agent's cgroup must

@@ -272,19 +272,19 @@ pub struct SupervisorConfig<'a> {
     /// map keyed by `(dev, ino)`. Empty when mediation is inactive (no
     /// BPF-LSM filter is installed in that case).
     #[cfg(target_os = "linux")]
-    pub exec_deny_set: Vec<std::path::PathBuf>,
+    pub mediation_deny_set: Vec<std::path::PathBuf>,
     /// Per-session shim directory (absolute). The userspace audit
     /// reader suppresses BPF-emitted `allow_unmediated` records whose
     /// resolved path lives under this directory — those execs are the
     /// shim itself, which emits its own downstream audit record on
     /// completion. `None` when mediation is inactive (no audit either).
     #[cfg(target_os = "linux")]
-    pub exec_shim_dir: Option<std::path::PathBuf>,
+    pub mediation_shim_dir: Option<std::path::PathBuf>,
     /// Directory where the audit reader appends `audit.jsonl`. Same
     /// path the shim's own audit events land in. `None` when mediation
     /// is inactive.
     #[cfg(target_os = "linux")]
-    pub exec_audit_log_dir: Option<std::path::PathBuf>,
+    pub mediation_audit_log_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(target_os = "macos")]
@@ -622,7 +622,7 @@ pub fn execute_supervised(
     // Clear any stale forwarding target before forking.
     clear_signal_forwarding_target();
 
-    // BPF-LSM exec filter (Linux). Sole enforcement path for mediated
+    // BPF-LSM mediation filter (Linux). Sole enforcement path for mediated
     // commands. Installed PRE-fork so that:
     //   - the BPF program is loaded and attached before the child has a
     //     chance to `execve`, eliminating the install race.
@@ -642,16 +642,16 @@ pub fn execute_supervised(
     #[cfg(target_os = "linux")]
     let pre_fork_bpf_lsm: Option<(
         Option<nono::sandbox::bpf_audit::AuditReader>,
-        nono::sandbox::bpf_lsm::ExecFilterHandle,
+        nono::sandbox::bpf_lsm::MediationFilterHandle,
         nono::sandbox::bpf_lsm::SessionCgroup,
     )> = {
         let deny_paths: Option<&[std::path::PathBuf]> = supervisor
-            .map(|s| s.exec_deny_set.as_slice())
+            .map(|s| s.mediation_deny_set.as_slice())
             .filter(|s| !s.is_empty());
         if let Some(paths) = deny_paths {
             let cgroup = nono::sandbox::bpf_lsm::create_session_cgroup_empty().map_err(|e| {
                 nono::error::NonoError::SandboxInit(format!(
-                    "BPF-LSM exec filter required for mediation but \
+                    "BPF-LSM mediation filter required for mediation but \
                          per-session cgroup creation failed ({e}). The broker \
                          needs CAP_SYS_ADMIN plus CAP_DAC_OVERRIDE — install with \
                          `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep \
@@ -661,8 +661,8 @@ pub fn execute_supervised(
                 ))
             })?;
             let cgroup_id = cgroup.cgroup_id();
-            let filter =
-                nono::sandbox::bpf_lsm::install_exec_filter(paths, cgroup_id).map_err(|e| {
+            let filter = nono::sandbox::bpf_lsm::install_mediation_filter(paths, cgroup_id)
+                .map_err(|e| {
                     let detail = match e {
                         nono::sandbox::bpf_lsm::BpfLsmError::NotInActiveLsm => {
                             "bpf is not in /sys/kernel/security/lsm. The host kernel \
@@ -678,12 +678,12 @@ pub fn execute_supervised(
                         ),
                     };
                     nono::error::NonoError::SandboxInit(format!(
-                        "BPF-LSM exec filter required for mediation but install \
+                        "BPF-LSM mediation filter required for mediation but install \
                          failed: {detail}"
                     ))
                 })?;
             info!(
-                "BPF-LSM exec filter active: cgroup_id={} deny_entries={} \
+                "BPF-LSM mediation filter active: cgroup_id={} deny_entries={} \
                  (sole enforcement path for mediated commands; child joins cgroup post-fork)",
                 cgroup_id,
                 paths.len()
@@ -694,9 +694,9 @@ pub fn execute_supervised(
             // userspace → audit.jsonl. Drop order is enforced by
             // tuple field order at the binding site: audit_reader
             // first → filter second → cgroup third.
-            let audit_reader = match supervisor.and_then(|s| s.exec_audit_log_dir.clone()) {
+            let audit_reader = match supervisor.and_then(|s| s.mediation_audit_log_dir.clone()) {
                 Some(dir) => {
-                    let shim = supervisor.and_then(|s| s.exec_shim_dir.clone());
+                    let shim = supervisor.and_then(|s| s.mediation_shim_dir.clone());
                     // Build the (dev, ino) → canonical path map so
                     // the audit reader can resolve event paths.
                     // Same canonicalize-and-stat logic the BPF
@@ -1957,7 +1957,7 @@ fn get_thread_count() -> Result<usize> {
 /// just continuing.
 ///
 /// Invariant A (`bpf` in active LSM list) is enforced earlier
-/// at install time (Phase 1 hard-fail in `install_exec_filter`);
+/// at install time (Phase 1 hard-fail in `install_mediation_filter`);
 /// reaching this function with `_bpf_lsm_handle.is_some()`
 /// already implies A holds.
 #[cfg(target_os = "linux")]
@@ -3730,9 +3730,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3832,9 +3832,9 @@ mod tests {
             proxy_port: 8080,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         match unsafe { fork() } {
@@ -3910,9 +3910,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Allowed origin: validation passes
@@ -3946,9 +3946,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -3980,9 +3980,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -3998,9 +3998,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         // Localhost denied when not allowed
@@ -4037,9 +4037,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -4179,9 +4179,9 @@ mod tests {
             proxy_port: 0,
             #[cfg(target_os = "linux")]
             proxy_bind_ports: Vec::new(),
-            exec_deny_set: Vec::new(),
-            exec_shim_dir: None,
-            exec_audit_log_dir: None,
+            mediation_deny_set: Vec::new(),
+            mediation_shim_dir: None,
+            mediation_audit_log_dir: None,
         };
 
         assert!(

@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * exec_filter.bpf.c - BPF-LSM exec + open filter for nono mediation.
+ * mediation.bpf.c - BPF-LSM exec + open mediation filter for nono.
  *
  * Two LSM hooks consult a single (dev, ino) deny map and a shared
  * cgroup-ancestor scope check:

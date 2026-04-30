@@ -15,24 +15,20 @@ use tracing::{error, info};
 
 const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build the exec-filter state for the supervisor from a mediation
-/// session handle.
-///
-/// Returns a canonicalized deny set (empty when mediation is inactive or
-/// a canonicalization fails — those entries are simply dropped), the
-/// shim directory, and the audit log directory (the per-user
-/// `~/.nono/sessions` returned by [`crate::session::sessions_dir`],
-/// matching where the shim's audit server writes), used by the
-/// supervisor's exec-filter handler to classify trapped `execve`
 /// Canonicalize the mediation deny set for the BPF-LSM filter and
-/// extract the per-session shim directory. The BPF program keys on
-/// (dev, ino), but the loader resolves the canonical path inside
-/// `install_exec_filter`. The shim directory is plumbed through to
-/// the audit reader for record suppression.
+/// extract the per-session shim and audit-log directories.
 ///
-/// Returns `(deny_set, shim_dir, audit_log_dir)`.
+/// The BPF loader keys on `(dev, ino)` and resolves canonical paths
+/// inside [`crate::sandbox::bpf_lsm::install_mediation_filter`]. The
+/// shim directory is plumbed through to the audit reader for shim-
+/// path record suppression. Audit log dir is `~/.nono/sessions`
+/// (matching the shim's own audit log destination so both event
+/// shapes interleave in one file).
+///
+/// Returns `(deny_set, shim_dir, audit_log_dir)`. All three are
+/// empty / `None` when mediation is inactive.
 #[cfg(target_os = "linux")]
-fn exec_filter_state_from_mediation(
+fn mediation_filter_state(
     handle: Option<&crate::mediation::session::SessionHandle>,
 ) -> (
     Vec<std::path::PathBuf>,
@@ -452,8 +448,8 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
         exec_strategy::ExecStrategy::Supervised => {
             #[cfg(target_os = "linux")]
-            let (exec_deny_set, exec_shim_dir, exec_audit_log_dir) =
-                exec_filter_state_from_mediation(mediation_handle.as_ref());
+            let (mediation_deny_set, mediation_shim_dir, mediation_audit_log_dir) =
+                mediation_filter_state(mediation_handle.as_ref());
 
             let exit_code = execute_supervised_runtime(SupervisedRuntimeContext {
                 config: &config,
@@ -473,11 +469,11 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                     .as_ref()
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
                 #[cfg(target_os = "linux")]
-                exec_deny_set,
+                mediation_deny_set,
                 #[cfg(target_os = "linux")]
-                exec_shim_dir,
+                mediation_shim_dir,
                 #[cfg(target_os = "linux")]
-                exec_audit_log_dir,
+                mediation_audit_log_dir,
             })?;
 
             cleanup_capability_state_file(&cap_file_path);

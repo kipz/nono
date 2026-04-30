@@ -985,9 +985,9 @@ mod tests {
                 allow_launch_services_active: false,
                 proxy_port,
                 proxy_bind_ports,
-                exec_deny_set: Vec::new(),
-                exec_shim_dir: None,
-                exec_audit_log_dir: None,
+                mediation_deny_set: Vec::new(),
+                mediation_shim_dir: None,
+                mediation_audit_log_dir: None,
             }
         }
 

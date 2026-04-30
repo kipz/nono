@@ -18,7 +18,7 @@
 //!   does not affect enforcement. We log at debug-level on errors.
 //!
 //! Schema (Rust mirror of `struct audit_record` in
-//! `src/bpf/exec_filter.bpf.c` — keep in sync):
+//! `src/bpf/mediation.bpf.c` — keep in sync):
 
 #![cfg(all(target_os = "linux", feature = "bpf-lsm"))]
 
@@ -46,13 +46,20 @@ const REASON_NONE: u8 = 0;
 const REASON_EXEC_DENY: u8 = 1;
 const REASON_OPEN_DENY: u8 = 2;
 
-/// On-disk JSONL audit event. Mirrors the shape of
-/// `crate::mediation::filter_audit::FilterAuditEvent` over in
-/// `nono-cli`, but lives in the library because the audit reader
-/// runs in the library's BPF code path. Serialised fields match
-/// the legacy seccomp-era schema (Phase 3 schema): `action_type`
-/// is one of `"allow_unmediated"` / `"deny"`; `reason` is
-/// `"exec_deny"` / `"open_deny"` (only on deny).
+/// On-disk JSONL audit event emitted by the BPF-LSM mediation
+/// reader. Lives in the library because the audit reader is part
+/// of the BPF code path. Serialised fields:
+/// - `action_type`: `"allow_unmediated"` / `"deny"`.
+/// - `reason` (only on deny): `"exec_deny"` / `"open_deny"`.
+/// - `exit_code`: `Some(126)` on deny; absent on allow.
+/// - `path`: canonical resolved path of the binary; populated for
+///   deny events (the inode is in the deny set so the broker has
+///   the path); absent on allow_unmediated (an arbitrary inode
+///   the broker has no entry for).
+///
+/// The shim's own `mediation::AuditEvent` shape (in `nono-cli`)
+/// also lands in the same JSONL file; consumers distinguish by
+/// the `action_type` value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilterAuditEvent {
     pub command: String,
@@ -102,7 +109,7 @@ pub struct AuditReader {
 
 impl AuditReader {
     /// Start a polling task on the ring buffer. The map must be
-    /// the `audit_rb` map from a loaded `ExecFilterSkel`; passing
+    /// the `audit_rb` map from a loaded `MediationSkel`; passing
     /// any other map type yields a [`libbpf_rs::Error`] from the
     /// builder.
     ///

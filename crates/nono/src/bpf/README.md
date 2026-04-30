@@ -1,14 +1,28 @@
 # BPF programs
 
-BPF C source for the kernel-side exec filter. Compiled to BPF
-bytecode at build time by `libbpf-cargo` (driven from `build.rs`)
-and embedded into the `nono` library.
+BPF C source for the kernel-side mediation filter. Compiled to
+BPF bytecode at build time by `libbpf-cargo` (driven from
+`build.rs`) and embedded into the `nono` library.
 
 ## Files
 
-- `exec_filter.bpf.c` — LSM program at `bprm_check_security`.
-  Denies exec when the binary's `(dev, ino)` is in the deny set.
-  Loaded by `crate::sandbox::bpf_lsm::install_exec_filter`.
+- `mediation.bpf.c` — two LSM programs that share a `(dev, ino)`
+  deny map and a cgroup-ancestor scope check, plus a ring buffer
+  for audit records.
+
+  - `lsm/bprm_check_security` — fires after the kernel has
+    resolved the binary the exec will load (`bprm->file`).
+    Returning `-EACCES` atomically aborts the syscall. Closes
+    direct-path execs of mediated binaries.
+  - `lsm/file_open` — fires inside `do_filp_open` for every
+    successful path resolution that yields an fd. Denying opens
+    of mediated inodes prevents the agent from reading the
+    binary's bytes at all (closes copy / cp / `ld-linux <bin>` /
+    tmpfs / shellcode bypasses in one step).
+
+  Loaded by `crate::sandbox::bpf_lsm::install_mediation_filter`.
+  Audit records flow through the `audit_rb` ring buffer, drained
+  by `crate::sandbox::bpf_audit::AuditReader`.
 
 - `vmlinux.h` — vendored kernel-type header from
   `bpftool btf dump file /sys/kernel/btf/vmlinux format c`. Frozen
@@ -30,7 +44,7 @@ and embedded into the `nono` library.
 ## Build requirements
 
 `libbpf-cargo` invokes `clang` with `-target bpf` and emits
-`exec_filter.bpf.o` plus a Rust skeleton (`exec_filter.skel.rs`)
+`mediation.bpf.o` plus a Rust skeleton (`mediation.skel.rs`)
 under `$OUT_DIR`. The skeleton embeds the bytecode via
 `include_bytes!` so the compiled `nono` binary carries the BPF
 program. No runtime dependency on libbpf-cargo.
@@ -46,4 +60,9 @@ The host needs:
 - `bpf` in `/sys/kernel/security/lsm` (set via `lsm=...,bpf` on
   the kernel cmdline). The workspaces AMI ships a grub.d
   drop-in for this; see dd-source `am/bpf-lsm-workspace-ami`.
-- `CAP_BPF` (or `CAP_SYS_ADMIN`) on the loader process.
+- `CAP_BPF` for the BPF program load, `CAP_SYS_ADMIN` for the
+  per-session cgroup, and `CAP_DAC_OVERRIDE` when the cgroup
+  parent is root-owned (cgroup v2 `mkdir` checks DAC before
+  the cgroup-namespace privilege check). Recommended deployment:
+  `setcap cap_bpf,cap_sys_admin,cap_dac_override+ep
+  /usr/bin/nono`.

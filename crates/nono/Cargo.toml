@@ -70,7 +70,7 @@ syn = "2"
 prettyplease = "0.2"
 
 [target.'cfg(target_os = "linux")'.build-dependencies]
-# Compiles src/bpf/exec_filter.bpf.c at build time and emits a Rust
+# Compiles src/bpf/mediation.bpf.c at build time and emits a Rust
 # skeleton module under $OUT_DIR. Only pulled in on Linux; the
 # `bpf-lsm` feature controls whether build.rs actually invokes it.
 libbpf-cargo = "0.26"

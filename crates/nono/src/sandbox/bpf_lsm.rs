@@ -1,20 +1,23 @@
-//! BPF-LSM exec filter loader.
+//! BPF-LSM mediation filter loader.
 //!
-//! Closes the seccomp-unotify TOCTOU bypass on the mediation shim
-//! by mediating exec inside the kernel via the
-//! `bprm_check_security` LSM hook. The hook runs after the kernel
-//! has resolved the binary (`bprm->file` is the file the kernel
-//! will actually load) and before exec is committed; returning
-//! `-EACCES` from the BPF program atomically aborts the syscall,
-//! with no race against any user-memory pointer the agent
-//! controlled.
+//! Loads two LSM hooks that gate access to the mediated binaries
+//! the broker lists in `mediation.commands`:
 //!
-//! The deny set is keyed by `(dev, ino)` rather than path. The
-//! supervisor populates it at session start by canonicalizing each
+//! - `bprm_check_security` — fires after the kernel has resolved
+//!   the binary the call will actually load (`bprm->file`); a
+//!   `-EACCES` return atomically aborts the exec.
+//! - `file_open` — fires inside `do_filp_open` for every successful
+//!   path resolution that yields a file descriptor; denying opens
+//!   of mediated inodes prevents the agent from reading the
+//!   binary's bytes at all (closes copy-the-binary, dynamic-linker
+//!   trick, unprivileged-tmpfs, and shellcode bypasses in one step).
+//!
+//! Both hooks consult the same `(dev, ino)` deny map. The supervisor
+//! populates it at session start by canonicalizing each
 //! `mediation.commands` real path, `stat`ing it, and inserting the
-//! resulting `(st_dev, st_ino)` pair into the BPF map. Inode
-//! identity also covers hardlinks the agent might create at
-//! non-deny-set paths to evade a path-based check.
+//! resulting `(st_dev, st_ino)` pair. Inode identity also covers
+//! hardlinks the agent might create at non-deny-set paths to evade
+//! a path-based check.
 //!
 //! Kernel requirements:
 //! - `CONFIG_BPF_LSM=y` (Ubuntu 22.04 HWE 6.8 has this; verifiable
@@ -42,7 +45,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
 
     // Skeleton generated at build time by `libbpf-cargo` from
-    // `src/bpf/exec_filter.bpf.c`. Lives under `OUT_DIR` rather
+    // `src/bpf/mediation.bpf.c`. Lives under `OUT_DIR` rather
     // than the source tree.
     //
     // libbpf-cargo's generator uses `unwrap()` and `expect()` in
@@ -55,7 +58,7 @@ mod imp {
     #[allow(clippy::unwrap_used)]
     #[allow(clippy::expect_used)]
     mod skel {
-        include!(concat!(env!("OUT_DIR"), "/exec_filter.skel.rs"));
+        include!(concat!(env!("OUT_DIR"), "/mediation.skel.rs"));
     }
     use skel::*;
 
@@ -65,7 +68,7 @@ mod imp {
     use libbpf_rs::{Link, MapCore, MapFlags, OpenObject};
 
     /// Mirror of the `struct deny_key` declared in
-    /// `src/bpf/exec_filter.bpf.c`. Layout must match exactly.
+    /// `src/bpf/mediation.bpf.c`. Layout must match exactly.
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct DenyKey {
@@ -73,7 +76,7 @@ mod imp {
         ino: u64,
     }
 
-    /// Errors specific to BPF-LSM exec filter installation.
+    /// Errors specific to BPF-LSM mediation filter installation.
     #[derive(Debug)]
     pub enum BpfLsmError {
         /// `/sys/kernel/security/lsm` does not include `bpf`. The
@@ -93,7 +96,7 @@ mod imp {
         /// the kernel verifier rejecting the program.
         LibBpf(libbpf_rs::Error),
         /// More deny entries than the BPF map can hold (compile-time
-        /// `MAX_DENY_ENTRIES` in `exec_filter.bpf.c`).
+        /// `MAX_DENY_ENTRIES` in `mediation.bpf.c`).
         TooManyDenyEntries { got: usize, max: usize },
     }
 
@@ -150,18 +153,18 @@ mod imp {
     /// Live BPF-LSM exec/open filter. Holds the loaded BPF object
     /// and the attached links; dropping the handle detaches the
     /// programs and frees the kernel-side resources.
-    pub struct ExecFilterHandle {
+    pub struct MediationFilterHandle {
         // The skeleton owns the BPF object; we hold both it and
         // the attach links so RAII tears them down in the right
         // order (links first, object second — libbpf-rs's Drop
         // handles ordering when these are stored as separate
         // fields).
-        _skel: ExecFilterSkel<'static>,
+        _skel: MediationSkel<'static>,
         _exec_link: Link,
         _open_link: Link,
     }
 
-    impl ExecFilterHandle {
+    impl MediationFilterHandle {
         /// Reference to the audit ring buffer map. The lifetime
         /// is tied to `&self`, so callers must keep this handle
         /// alive while they're using the returned ref (typically
@@ -184,19 +187,20 @@ mod imp {
         }
     }
 
-    impl std::fmt::Debug for ExecFilterHandle {
+    impl std::fmt::Debug for MediationFilterHandle {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("ExecFilterHandle").finish_non_exhaustive()
+            f.debug_struct("MediationFilterHandle")
+                .finish_non_exhaustive()
         }
     }
 
     /// Compile-time-known maximum number of entries in the
     /// `deny_set` BPF map. Mirrors `MAX_DENY_ENTRIES` in
-    /// `src/bpf/exec_filter.bpf.c`. Bumping this requires a
+    /// `src/bpf/mediation.bpf.c`. Bumping this requires a
     /// rebuild.
     pub const MAX_DENY_ENTRIES: usize = 256;
 
-    /// Install the BPF-LSM exec filter and populate its deny set
+    /// Install the BPF-LSM mediation filter and populate its deny set
     /// from `deny_paths`. Each path is canonicalized via
     /// `std::fs::canonicalize` and `stat`ed for `(st_dev, st_ino)`.
     /// Paths that don't exist are silently skipped (matching the
@@ -207,36 +211,36 @@ mod imp {
     /// The handle must be kept alive for the duration of the
     /// session; dropping it detaches the program and the deny stops
     /// being enforced.
-    pub fn install_exec_filter(
+    pub fn install_mediation_filter(
         deny_paths: &[std::path::PathBuf],
         agent_cgroup_id: u64,
-    ) -> Result<ExecFilterHandle, BpfLsmError> {
+    ) -> Result<MediationFilterHandle, BpfLsmError> {
         if !is_bpf_lsm_available() {
             return Err(BpfLsmError::NotInActiveLsm);
         }
-        install_exec_filter_inner(deny_paths, agent_cgroup_id)
+        install_mediation_filter_inner(deny_paths, agent_cgroup_id)
     }
 
     /// Install the filter without checking
     /// `/sys/kernel/security/lsm`. Exposed for the smoke test to
     /// validate the verifier+load+attach pipeline on hosts that
     /// haven't been rebooted with `lsm=...,bpf` yet. Production
-    /// code should always go through [`install_exec_filter`]
+    /// code should always go through [`install_mediation_filter`]
     /// because attaching on a host without `bpf` in the active
     /// LSM stack succeeds but produces no enforcement — the BPF
     /// hook is registered, never fires.
     #[doc(hidden)]
-    pub fn install_exec_filter_no_lsm_check(
+    pub fn install_mediation_filter_no_lsm_check(
         deny_paths: &[std::path::PathBuf],
         agent_cgroup_id: u64,
-    ) -> Result<ExecFilterHandle, BpfLsmError> {
-        install_exec_filter_inner(deny_paths, agent_cgroup_id)
+    ) -> Result<MediationFilterHandle, BpfLsmError> {
+        install_mediation_filter_inner(deny_paths, agent_cgroup_id)
     }
 
-    fn install_exec_filter_inner(
+    fn install_mediation_filter_inner(
         deny_paths: &[std::path::PathBuf],
         agent_cgroup_id: u64,
-    ) -> Result<ExecFilterHandle, BpfLsmError> {
+    ) -> Result<MediationFilterHandle, BpfLsmError> {
         // Canonicalize-and-stat the deny paths first so we surface
         // any I/O errors before touching the kernel. Map entries
         // that fail to canonicalize are dropped silently — they
@@ -276,9 +280,9 @@ mod imp {
         let storage: &'static mut MaybeUninit<OpenObject> =
             Box::leak(Box::new(MaybeUninit::uninit()));
 
-        let builder = ExecFilterSkelBuilder::default();
+        let builder = MediationSkelBuilder::default();
         let open = builder.open(storage)?;
-        // The skeleton's `open()` returns an `OpenExecFilterSkel`
+        // The skeleton's `open()` returns an `OpenMediationSkel`
         // — at this point the BPF object is in userspace memory
         // but not yet in the kernel. `load()` calls bpf() to
         // verify and install.
@@ -324,7 +328,7 @@ mod imp {
         let exec_link = skel.progs.check_exec.attach()?;
         let open_link = skel.progs.check_file_open.attach()?;
 
-        Ok(ExecFilterHandle {
+        Ok(MediationFilterHandle {
             _skel: skel,
             _exec_link: exec_link,
             _open_link: open_link,
@@ -617,7 +621,7 @@ mod imp {
             let _ = is_bpf_lsm_available();
         }
 
-        // The actual install_exec_filter() test lives under
+        // The actual install_mediation_filter() test lives under
         // tests/bpf_lsm_smoke.rs; it requires `bpf` in the active
         // LSM stack and is gated behind an `NONO_BPF_LSM_TEST=1`
         // env var so it doesn't run on hosts that haven't picked
@@ -652,22 +656,22 @@ mod imp {
 
     /// Placeholder handle for the off-Linux build.
     #[derive(Debug)]
-    pub struct ExecFilterHandle;
+    pub struct MediationFilterHandle;
 
     pub const MAX_DENY_ENTRIES: usize = 0;
 
-    pub fn install_exec_filter(
+    pub fn install_mediation_filter(
         _deny_paths: &[std::path::PathBuf],
         _agent_cgroup_id: u64,
-    ) -> Result<ExecFilterHandle, BpfLsmError> {
+    ) -> Result<MediationFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }
 
     #[doc(hidden)]
-    pub fn install_exec_filter_no_lsm_check(
+    pub fn install_mediation_filter_no_lsm_check(
         _deny_paths: &[std::path::PathBuf],
         _agent_cgroup_id: u64,
-    ) -> Result<ExecFilterHandle, BpfLsmError> {
+    ) -> Result<MediationFilterHandle, BpfLsmError> {
         Err(BpfLsmError::Unsupported)
     }
 

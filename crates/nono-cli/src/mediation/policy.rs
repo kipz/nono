@@ -43,6 +43,14 @@ pub struct ShimRequest {
     /// Used to populate `command_pid` in the audit log.
     #[serde(default)]
     pub pid: u32,
+    /// Working directory of the shim at invocation time — the caller's cwd.
+    /// Used to set the spawned real binary's cwd via `Command::current_dir`.
+    /// Without this, the spawned binary inherits the mediation server's cwd
+    /// (the nono launch cwd), which silently breaks tools that resolve config
+    /// from cwd — git in a worktree being the canonical case. `None` (older
+    /// shim, or unreadable cwd) preserves the legacy behaviour.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 /// Response the mediation server sends back to the shim binary.
@@ -201,6 +209,7 @@ pub async fn apply(
                             ctx,
                             commands,
                             Some((stdin_fd, stdout_fd, stderr_fd)),
+                            request.cwd.as_deref(),
                         )
                         .await;
                         return (result, "passthrough");
@@ -280,6 +289,7 @@ pub async fn apply(
                                 ctx,
                                 commands,
                                 None,
+                                request.cwd.as_deref(),
                             )
                             .await
                         }
@@ -318,6 +328,7 @@ pub async fn apply(
                                 ctx,
                                 commands,
                                 None,
+                                request.cwd.as_deref(),
                             )
                             .await
                         }
@@ -344,6 +355,7 @@ pub async fn apply(
         ctx,
         commands,
         Some((stdin_fd, stdout_fd, stderr_fd)),
+        request.cwd.as_deref(),
     )
     .await;
     (resp, "passthrough")
@@ -383,6 +395,21 @@ pub async fn admin_passthrough(
     let env: HashMap<String, String> = std::env::vars().collect();
     let args = request.args.clone();
     let real_path = cmd.real_path.clone();
+    let cmd_name = cmd.name.clone();
+    // Resolve caller cwd off the blocking thread so the warning is emitted on
+    // the tokio runtime thread.
+    let spawn_cwd: Option<std::path::PathBuf> = request.cwd.as_deref().and_then(|cwd| {
+        let path = std::path::Path::new(cwd);
+        if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            warn!(
+                "admin passthrough: caller cwd '{}' is not a directory, spawning '{}' with server cwd",
+                cwd, cmd_name
+            );
+            None
+        }
+    });
 
     let result = tokio::task::spawn_blocking(move || -> nono::Result<ShimResponse> {
         use std::process::{Command, Stdio};
@@ -395,6 +422,9 @@ pub async fn admin_passthrough(
             .stdin(Stdio::from(stdin_fd))
             .stdout(Stdio::from(stdout_fd))
             .stderr(Stdio::from(stderr_fd));
+        if let Some(ref cwd) = spawn_cwd {
+            cmd_builder.current_dir(cwd);
+        }
 
         let mut child = cmd_builder
             .spawn()
@@ -531,6 +561,7 @@ async fn exec_passthrough(
     ctx: &SessionCtx<'_>,
     all_commands: &[ResolvedCommand],
     stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
+    request_cwd: Option<&str>,
 ) -> ShimResponse {
     let mut env = build_exec_env(sandbox_env, broker);
 
@@ -698,12 +729,33 @@ async fn exec_passthrough(
 
     let streaming = stdio_fds.is_some();
 
+    // Resolve the spawn cwd once, off the spawn_blocking thread, so we can log
+    // a warning if the caller's cwd is unusable. We only honour it when it
+    // points at an existing directory; otherwise the spawned binary inherits
+    // the server's cwd (legacy behaviour). `None` (older shim or unreadable
+    // cwd) also falls back to legacy behaviour.
+    let spawn_cwd: Option<std::path::PathBuf> = request_cwd.and_then(|cwd| {
+        let path = std::path::Path::new(cwd);
+        if path.is_dir() {
+            Some(path.to_path_buf())
+        } else {
+            warn!(
+                "mediation: caller cwd '{}' is not a directory, spawning '{}' with server cwd",
+                cwd, cmd_name
+            );
+            None
+        }
+    });
+
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
         use std::os::unix::process::CommandExt;
         use std::process::{Command, Stdio};
 
         let mut cmd_builder = Command::new(&real_path);
         cmd_builder.args(&args).env_clear().envs(&env);
+        if let Some(ref cwd) = spawn_cwd {
+            cmd_builder.current_dir(cwd);
+        }
 
         // Streaming: child inherits the shim's stdio fds directly so binary
         // data (ssh/git) flows through unmodified. Buffered: capture stdout
@@ -1325,6 +1377,7 @@ mod tests {
             session_token: String::new(),
             env,
             pid: 0,
+            cwd: None,
         };
         let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "respond", "stderr: {}", resp.stderr);
@@ -1353,6 +1406,7 @@ mod tests {
             session_token: String::new(),
             env,
             pid: 0,
+            cwd: None,
         };
         let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "denied");
@@ -1386,6 +1440,7 @@ mod tests {
             session_token: String::new(),
             env,
             pid: 0,
+            cwd: None,
         };
         let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "denied");
@@ -1418,6 +1473,7 @@ mod tests {
             session_token: String::new(),
             env,
             pid: 0,
+            cwd: None,
         };
         let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "respond");
@@ -2230,6 +2286,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
+            cwd: None,
         };
 
         let broker = make_broker();
@@ -2292,6 +2349,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
+            cwd: None,
         };
 
         let broker = make_broker();
@@ -2350,6 +2408,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
+            cwd: None,
         };
 
         let broker = make_broker();
@@ -2409,6 +2468,7 @@ mod tests {
             session_token: String::new(),
             env: HashMap::new(),
             pid: 0,
+            cwd: None,
         };
 
         let broker = make_broker();
@@ -2570,6 +2630,77 @@ mod tests {
             buf.is_empty(),
             "Respond path should not write anything to passed stdout fd, got {:?}",
             buf
+        );
+    }
+
+    /// Passthrough spawns the real binary with the caller's cwd from
+    /// `ShimRequest.cwd`, not the mediation server's own cwd. Regression test
+    /// for the worktree bug where `git` from a Claude worktree silently
+    /// resolved to the main repo because the spawn inherited the server's
+    /// launch cwd.
+    #[tokio::test]
+    async fn test_passthrough_uses_request_cwd() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        // Use /bin/pwd because it prints its cwd and exits — independent of
+        // any external binary on PATH.
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/bin/pwd"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        // Use a tempdir as the caller cwd so it differs from whatever cwd the
+        // test runner has. Canonicalise because /bin/pwd resolves symlinks
+        // (e.g. /tmp -> /private/tmp on macOS).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let caller_cwd = std::fs::canonicalize(temp.path())
+            .expect("canonicalize tempdir")
+            .to_string_lossy()
+            .into_owned();
+
+        let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
+        let (child_out, mut test_out) = UnixStream::pair().expect("pair stdout");
+        let (child_err, _test_err) = UnixStream::pair().expect("pair stderr");
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            cwd: Some(caller_cwd.clone()),
+            ..Default::default()
+        };
+
+        let (resp, action_type) = apply(
+            req,
+            &[cmd],
+            make_broker(),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+            OwnedFd::from(child_in),
+            OwnedFd::from(child_out),
+            OwnedFd::from(child_err),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+
+        let mut buf = Vec::new();
+        let _ = test_out.read_to_end(&mut buf);
+        let pwd_output = String::from_utf8(buf).expect("utf8 pwd output");
+        assert_eq!(
+            pwd_output.trim_end(),
+            caller_cwd,
+            "pwd should print the caller's cwd from ShimRequest.cwd"
         );
     }
 }

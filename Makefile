@@ -65,6 +65,33 @@ test-ffi:
 test-doc:
 	cargo test --doc
 
+# Integration tests for the BPF-LSM mediation filter. These spawn a
+# real `nono run` session, which requires the test binary to have
+# cap_bpf,cap_sys_admin,cap_dac_override+ep so the broker can install
+# the BPF program and create the per-session cgroup.
+#
+# Cargo re-links `target/debug/nono` and clears file caps on every
+# `cargo test`, so this target builds the binaries first, setcaps the
+# `nono` binary, and only then runs the integration suite. Without
+# the setcap step the tests self-skip with an informative message.
+#
+# Requires sudo for the setcap call. CI runs this; everyday `make
+# ci` does not (it sticks to the no-sudo `cargo test` which leaves
+# these tests in their self-skip mode).
+test-integration:
+	# Build everything the test profile needs (nono + nono-shim) but
+	# don't run yet — we need a stable nono binary so setcap doesn't
+	# get clobbered before the actual test invocation.
+	cargo test --no-run -p nono-cli --test bpf_lsm_integration
+	# `nono-shim` is built lazily by the test harness's first call,
+	# but doing it here too ensures it lives next to nono before we
+	# setcap (avoids any first-run interference).
+	cargo build -p nono-shim --bin nono-shim
+	# Apply file caps so the spawned broker can install BPF-LSM.
+	# Subsequent `cargo test` is a no-op rebuild and preserves caps.
+	sudo setcap cap_bpf,cap_sys_admin,cap_dac_override+ep target/debug/nono
+	cargo test -p nono-cli --test bpf_lsm_integration -- --nocapture
+
 # Check targets (lint + format)
 check: clippy fmt-check
 

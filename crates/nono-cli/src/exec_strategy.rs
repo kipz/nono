@@ -631,7 +631,7 @@ pub fn execute_supervised(
     //     post-fork action so every subsequent exec is scoped.
     //
     // Failure modes hard-fail the session — silent partial enforcement
-    // is worse than a loud failure. See docs/linux-exec-filter-plan.md
+    // is worse than a loud failure. See docs/linux-bpf-lsm-mediation.md
     // §"Required deployment invariants".
     // Drop order matters: declaration order is what runs.
     //   (audit_reader, filter, cgroup)
@@ -1237,7 +1237,7 @@ pub fn execute_supervised(
             // the time we get here; the explicit verify-and-log step turns
             // implicit guarantees into auditable session-start records that
             // operators can grep for. See
-            // docs/linux-exec-filter-plan.md §"Required deployment
+            // docs/linux-bpf-lsm-mediation.md §"Required deployment
             // invariants" (A–D).
             #[cfg(target_os = "linux")]
             if _bpf_lsm_handle.is_some() {

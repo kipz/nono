@@ -645,7 +645,7 @@ test above confirms the kernel side of that.
 ### 2026-04-29 — BPF-LSM landing summary
 
 The 5-phase BPF-LSM implementation plan in
-`docs/linux-exec-filter-plan.md` (this file's neighbour, formerly
+`docs/linux-bpf-lsm-mediation.md` (this file's neighbour, formerly
 `linux-exec-filter-bpf-lsm.md`) has landed:
 
 - **Phase 1** (commit `ab34ebb`): seccomp-unotify exec filter

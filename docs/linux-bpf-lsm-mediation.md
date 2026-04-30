@@ -1252,7 +1252,7 @@ In `crates/nono-cli/tests/invariants.rs` (new):
 
 ### Phase 5 — doc reorg (done)
 
-This file *is* the new `docs/linux-exec-filter-plan.md`. The
+This file *is* the new `docs/linux-bpf-lsm-mediation.md`. The
 old seccomp-era plan lives at
 `docs/archive/linux-exec-filter-plan-seccomp-era.md`.
 

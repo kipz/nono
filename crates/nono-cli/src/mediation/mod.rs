@@ -274,6 +274,7 @@ pub struct EnvPolicy {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -401,18 +402,17 @@ mod tests {
     #[test]
     fn test_caller_policy_distinguishes_null_vs_empty_allowed_parents() {
         // Field absent: any parent allowed.
-        let p1: CallerPolicy =
-            serde_json::from_str(r#"{ "agent_allowed": true }"#).expect("parse p1");
+        let p1: CallerPolicy = serde_json::from_str(r#"{ "agent_allowed": true }"#).unwrap();
         assert!(p1.allowed_parents.is_none());
 
         // Empty array: no mediated parent allowed.
         let p2: CallerPolicy =
-            serde_json::from_str(r#"{ "allowed_parents": [] }"#).expect("parse p2");
+            serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
         assert_eq!(p2.allowed_parents.as_deref(), Some(&[][..]));
 
         // Listed: only the named parents allowed.
         let p3: CallerPolicy =
-            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).expect("parse p3");
+            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
         assert_eq!(
             p3.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])

@@ -66,6 +66,10 @@ pub struct ShimResponse {
 /// Bundles the per-session paths and token needed by `apply` and `exec_passthrough`.
 pub struct SessionCtx<'a> {
     pub shim_dir: &'a std::path::Path,
+    /// Directory of source-path sidecar files. Forwarded to the mediated
+    /// subprocess as `NONO_SHIM_SOURCES_DIR` so nono-shim can resolve real
+    /// binaries reliably without re-walking PATH at exec time.
+    pub shim_sources_dir: &'a std::path::Path,
     pub socket_path: &'a std::path::Path,
     pub session_token: &'a str,
     /// Working directory of the nono session (the parent launch cwd or
@@ -630,6 +634,14 @@ async fn exec_passthrough(
     // this, shims in the filtered dir would skip the wrong directory and find
     // themselves again, causing infinite exec recursion (EAGAIN).
     env.insert("NONO_SHIM_DIR".to_string(), shim_dir_str.clone());
+
+    // Forward NONO_SHIM_SOURCES_DIR — points to the session-level sidecar dir
+    // (not filtered per-command), so nono-shim can resolve real binaries by
+    // looking up the recorded source path before falling back to PATH.
+    env.insert(
+        "NONO_SHIM_SOURCES_DIR".to_string(),
+        ctx.shim_sources_dir.to_string_lossy().to_string(),
+    );
 
     // Inject mediation socket path and session token so the shim binaries
     // invoked by the exec'd command can authenticate to the mediation server.
@@ -1271,6 +1283,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1286,6 +1299,7 @@ mod tests {
     fn ctx() -> SessionCtx<'static> {
         SessionCtx {
             shim_dir: std::path::Path::new("/tmp"),
+            shim_sources_dir: std::path::Path::new("/tmp"),
             socket_path: std::path::Path::new("/tmp/test.sock"),
             session_token: "test_token",
             workdir: std::path::Path::new("/tmp"),
@@ -1514,6 +1528,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1548,6 +1563,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1583,6 +1599,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1616,6 +1633,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1650,6 +1668,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1685,6 +1704,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1803,6 +1823,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1846,6 +1867,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2032,7 +2054,9 @@ mod tests {
 
         let session_dir = tempfile::tempdir().expect("create temp dir");
         let shim_dir = session_dir.path().join("shims");
+        let shim_sources_dir = session_dir.path().join("shim-sources");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::create_dir_all(&shim_sources_dir).expect("create shim sources dir");
 
         // Create fake shim files (need to exist for build_filtered_shim_dir)
         for name in &["gh", "ddtool"] {
@@ -2082,6 +2106,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: &shim_dir,
+                shim_sources_dir: &shim_sources_dir,
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2121,6 +2146,21 @@ mod tests {
             "PATH should start with NONO_SHIM_DIR ({}), got: {}",
             child_shim_dir,
             child_path
+        );
+
+        // NONO_SHIM_SOURCES_DIR is propagated unchanged from the SessionCtx —
+        // it must not be filtered per-command, since the sidecar files only
+        // exist at the session level.
+        let sources_line = resp
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("NONO_SHIM_SOURCES_DIR="))
+            .expect("NONO_SHIM_SOURCES_DIR not found in env output");
+        let child_sources_dir = sources_line.trim_start_matches("NONO_SHIM_SOURCES_DIR=");
+        assert_eq!(
+            child_sources_dir,
+            shim_sources_dir.to_string_lossy(),
+            "NONO_SHIM_SOURCES_DIR must point to the session-level sources dir"
         );
     }
 
@@ -2167,6 +2207,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2230,6 +2271,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2298,6 +2340,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2361,6 +2404,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2420,6 +2464,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2480,6 +2525,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2548,6 +2594,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2617,6 +2664,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2690,6 +2738,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),

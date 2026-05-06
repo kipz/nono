@@ -1015,13 +1015,8 @@ mod tests {
         let policy = load_network_policy(json).expect("policy should load");
 
         let custom = HashMap::new();
-        let routes = resolve_credentials(
-            &policy,
-            &["gitlab".to_string()],
-            &custom,
-            test_workdir(),
-        )
-        .expect("should resolve");
+        let routes = resolve_credentials(&policy, &["gitlab".to_string()], &custom, test_workdir())
+            .expect("should resolve");
         assert_eq!(routes.len(), 1);
 
         let gitlab = &routes[0];

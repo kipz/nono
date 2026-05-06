@@ -39,6 +39,7 @@ pub async fn run(
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
     shim_dir: PathBuf,
+    shim_sources_dir: PathBuf,
     admin_state: super::admin::AdminState,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_socket_path: PathBuf,
@@ -79,6 +80,7 @@ pub async fn run(
 
     let commands = Arc::new(commands);
     let shim_dir = Arc::new(shim_dir);
+    let shim_sources_dir = Arc::new(shim_sources_dir);
     let socket_path = Arc::new(socket_path);
     let workdir = Arc::new(workdir);
 
@@ -89,6 +91,7 @@ pub async fn run(
                 let broker = Arc::clone(&broker);
                 let token = Arc::clone(&session_token);
                 let sd = Arc::clone(&shim_dir);
+                let ssd = Arc::clone(&shim_sources_dir);
                 let sp = Arc::clone(&socket_path);
                 let wd = Arc::clone(&workdir);
                 let sess_dir = Arc::clone(&audit_log_dir);
@@ -102,6 +105,7 @@ pub async fn run(
                         broker,
                         token.clone(),
                         &sd,
+                        &ssd,
                         &sp,
                         admin_rx,
                         gate,
@@ -131,6 +135,7 @@ async fn handle_connection(
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
     shim_dir: &std::path::Path,
+    shim_sources_dir: &std::path::Path,
     socket_path: &std::path::Path,
     admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
@@ -223,6 +228,7 @@ async fn handle_connection(
     let command_pid = request.pid;
     let ctx = super::policy::SessionCtx {
         shim_dir,
+        shim_sources_dir,
         socket_path,
         session_token: &session_token,
         workdir,

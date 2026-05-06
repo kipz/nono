@@ -357,29 +357,199 @@ fn send_audit_event(command_name: &str, args: &[String], exit_code: i32) {
     }
 }
 
-/// Resolve the real binary by searching PATH, skipping the shim directory.
-fn resolve_real_binary(command_name: &str) -> Option<std::path::PathBuf> {
-    let shim_dir = std::env::var("NONO_SHIM_DIR").ok();
-    let path_var = std::env::var("PATH").ok()?;
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if !path.is_file() {
+        return false;
+    }
+    match path.metadata() {
+        Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
 
+/// Resolve via the source sidecar written at session start. The session dir
+/// holds `<NONO_SHIM_SOURCES_DIR>/<name>` containing the absolute path of the
+/// real binary `name` resolved to when the shim was created. Reading this
+/// avoids re-walking PATH at exec time, which can race with PATH manipulation
+/// in nested shells (e.g. husky hooks) and miss user toolchain dirs that were
+/// present at session start but stripped from the inner PATH.
+fn resolve_from_sources_sidecar_at(
+    sources_dir: Option<&str>,
+    command_name: &str,
+) -> Option<std::path::PathBuf> {
+    let sources_dir = sources_dir?;
+    let sidecar = Path::new(sources_dir).join(command_name);
+    let recorded = std::fs::read_to_string(&sidecar).ok()?;
+    let candidate = std::path::PathBuf::from(recorded.trim());
+    if is_executable_file(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+/// Walk PATH searching for `command_name`, skipping `shim_dir` to avoid
+/// re-entering the shim. Used as a fallback when the sources sidecar is
+/// missing or stale.
+fn resolve_from_path_at(
+    path_var: &str,
+    shim_dir: Option<&str>,
+    command_name: &str,
+) -> Option<std::path::PathBuf> {
     for dir in path_var.split(':') {
-        // Skip the shim directory to avoid infinite recursion
-        if let Some(ref sd) = shim_dir {
-            if dir == sd.as_str() {
+        if let Some(sd) = shim_dir {
+            if dir == sd {
                 continue;
             }
         }
-
         let candidate = Path::new(dir).join(command_name);
-        if candidate.is_file() {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = candidate.metadata() {
-                if meta.permissions().mode() & 0o111 != 0 {
-                    return Some(candidate);
-                }
-            }
+        if is_executable_file(&candidate) {
+            return Some(candidate);
         }
     }
-
     None
+}
+
+/// Resolve the real binary for `command_name`. Prefers the source sidecar
+/// recorded at session start; falls back to a PATH walk that skips the shim
+/// directory.
+fn resolve_real_binary(command_name: &str) -> Option<std::path::PathBuf> {
+    let sources_dir = std::env::var("NONO_SHIM_SOURCES_DIR").ok();
+    if let Some(p) = resolve_from_sources_sidecar_at(sources_dir.as_deref(), command_name) {
+        return Some(p);
+    }
+    let shim_dir = std::env::var("NONO_SHIM_DIR").ok();
+    let path_var = std::env::var("PATH").ok()?;
+    resolve_from_path_at(&path_var, shim_dir.as_deref(), command_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_executable(path: &Path, content: &[u8]) {
+        std::fs::write(path, content).expect("write executable");
+        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms).expect("set perms");
+    }
+
+    #[test]
+    fn sources_sidecar_returns_recorded_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        let sources_dir = tmp.path().join("sources");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(&sources_dir).expect("sources dir");
+
+        let real = bin_dir.join("yarn");
+        write_executable(&real, b"#!/bin/sh\necho real\n");
+        std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
+
+        let resolved =
+            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        assert_eq!(resolved.as_deref(), Some(real.as_path()));
+    }
+
+    #[test]
+    fn sources_sidecar_trims_trailing_newline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        let sources_dir = tmp.path().join("sources");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(&sources_dir).expect("sources dir");
+
+        let real = bin_dir.join("yarn");
+        write_executable(&real, b"#!/bin/sh\n");
+        std::fs::write(
+            sources_dir.join("yarn"),
+            format!("{}\n", real.display()),
+        )
+        .expect("sidecar");
+
+        let resolved =
+            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        assert_eq!(resolved.as_deref(), Some(real.as_path()));
+    }
+
+    #[test]
+    fn sources_sidecar_returns_none_when_recorded_path_is_gone() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sources_dir = tmp.path().join("sources");
+        std::fs::create_dir_all(&sources_dir).expect("sources dir");
+        std::fs::write(sources_dir.join("yarn"), "/nonexistent/yarn").expect("sidecar");
+
+        let resolved =
+            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn sources_sidecar_returns_none_when_recorded_path_is_not_executable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        let sources_dir = tmp.path().join("sources");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        std::fs::create_dir_all(&sources_dir).expect("sources dir");
+
+        let real = bin_dir.join("yarn");
+        std::fs::write(&real, b"data").expect("write file");
+        let mut perms = std::fs::metadata(&real).expect("metadata").permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&real, perms).expect("set perms");
+
+        std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
+
+        let resolved =
+            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn sources_sidecar_returns_none_when_dir_unset() {
+        let resolved = resolve_from_sources_sidecar_at(None, "yarn");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn sources_sidecar_returns_none_when_sidecar_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resolved =
+            resolve_from_sources_sidecar_at(Some(tmp.path().to_str().expect("path is utf-8")), "yarn");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn path_walk_skips_shim_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim_dir = tmp.path().join("shims");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        std::fs::create_dir_all(&real_dir).expect("real dir");
+
+        write_executable(&shim_dir.join("yarn"), b"#!/bin/sh\necho shim\n");
+        write_executable(&real_dir.join("yarn"), b"#!/bin/sh\necho real\n");
+
+        let path_var = format!(
+            "{}:{}",
+            shim_dir.to_string_lossy(),
+            real_dir.to_string_lossy()
+        );
+        let resolved =
+            resolve_from_path_at(&path_var, Some(shim_dir.to_str().expect("path is utf-8")), "yarn");
+        assert_eq!(resolved.as_deref(), Some(real_dir.join("yarn").as_path()));
+    }
+
+    #[test]
+    fn path_walk_returns_none_when_no_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let resolved = resolve_from_path_at(
+            tmp.path().to_str().expect("path is utf-8"),
+            None,
+            "definitely-not-a-real-command",
+        );
+        assert!(resolved.is_none());
+    }
 }

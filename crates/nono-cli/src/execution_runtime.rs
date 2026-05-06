@@ -552,10 +552,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let mediation_path_value;
     let mediation_commands_str;
     let mediation_audit_socket_str;
+    let mediation_sources_dir_str;
     if let Some(ref handle) = mediation_handle {
         env_vars.push(("NONO_SESSION_TOKEN", &mediation_token_str));
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_str));
         env_vars.push(("NONO_SHIM_DIR", &mediation_path_str));
+        // Source-path sidecars: nono-shim consults <NONO_SHIM_SOURCES_DIR>/<name>
+        // before falling back to a PATH walk, so resolution is stable across
+        // intermediate shells that munge PATH (e.g. husky pre-commit hooks).
+        mediation_sources_dir_str = handle.shim_sources_dir.display().to_string();
+        env_vars.push(("NONO_SHIM_SOURCES_DIR", &mediation_sources_dir_str));
         // Tell shims which commands use full mediation vs audit-only passthrough.
         mediation_commands_str = handle.mediated_commands.join(",");
         env_vars.push(("NONO_MEDIATED_COMMANDS", &mediation_commands_str));

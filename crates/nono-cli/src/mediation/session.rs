@@ -56,6 +56,11 @@ pub struct ResolvedCommand {
 pub struct SessionHandle {
     /// Directory containing shim symlinks (must be prepended to child PATH).
     pub shim_dir: PathBuf,
+    /// Directory of source-path sidecar files written at session start. Each
+    /// entry `<name>` contains the absolute path of the real binary `name`
+    /// resolved to. nono-shim reads these to find real binaries reliably even
+    /// when PATH has been munged in nested shells.
+    pub shim_sources_dir: PathBuf,
     /// Real path of the nono-shim binary (needed for sandbox file-read allow rules).
     pub shim_binary: PathBuf,
     /// Path of the Unix socket the mediation server listens on.
@@ -129,6 +134,7 @@ pub fn setup(
 
     let session_dir = session_dir_path();
     let shim_dir = session_dir.join("shims");
+    let shim_sources_dir = session_dir.join("shim-sources");
     let socket_path = session_dir.join("mediation.sock");
     let control_socket_path = session_dir.join("control.sock");
     let audit_socket_path = session_dir.join("audit.sock");
@@ -137,6 +143,18 @@ pub fn setup(
         NonoError::SandboxInit(format!(
             "mediation: failed to create shim dir {}: {}",
             shim_dir.display(),
+            e
+        ))
+    })?;
+
+    // Sidecar dir holding `shim-sources/<name>` files. Each file records the
+    // absolute path of the real binary that `<name>` resolved to at session
+    // start, so nono-shim can find it again at exec time without re-walking
+    // PATH (which can be munged by intermediate shells like husky hooks).
+    std::fs::create_dir_all(&shim_sources_dir).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to create shim sources dir {}: {}",
+            shim_sources_dir.display(),
             e
         ))
     })?;
@@ -182,6 +200,7 @@ pub fn setup(
         let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary, &workdir)? else {
             continue;
         };
+        write_shim_source(&shim_sources_dir, &resolved.name, &resolved.real_path);
         blocked_binaries.push(resolved.real_path.clone());
         resolved_commands.push(resolved);
     }
@@ -205,18 +224,24 @@ pub fn setup(
                     if shim_path.exists() || shim_path.symlink_metadata().is_ok() {
                         continue;
                     }
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
-                            let _ = std::os::unix::fs::symlink(&shim_binary, &shim_path);
-                        }
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                    if std::os::unix::fs::symlink(&shim_binary, &shim_path).is_err() {
+                        continue;
+                    }
+                    if let Some(name_str) = name.to_str() {
+                        write_shim_source(&shim_sources_dir, name_str, &entry.path());
                     }
                 }
             }
         }
     }
     debug!(
-        "Mediation: created universal audit shims in {}",
-        shim_dir.display()
+        "Mediation: created universal audit shims in {} (source paths in {})",
+        shim_dir.display(),
+        shim_sources_dir.display()
     );
 
     // -------------------------------------------------------------------------
@@ -311,6 +336,7 @@ pub fn setup(
     let broker_clone = Arc::clone(&broker);
     let token_arc: Arc<str> = Arc::from(session_token.as_str());
     let shim_dir_clone = shim_dir.clone();
+    let shim_sources_dir_clone = shim_sources_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
     let audit_sock = audit_socket_path.clone();
@@ -323,6 +349,7 @@ pub fn setup(
             broker_clone,
             token_arc,
             shim_dir_clone,
+            shim_sources_dir_clone,
             admin_clone,
             gate_clone,
             audit_sock,
@@ -359,6 +386,7 @@ pub fn setup(
 
     Ok(Some(SessionHandle {
         shim_dir,
+        shim_sources_dir,
         shim_binary,
         socket_path,
         session_dir,
@@ -372,6 +400,21 @@ pub fn setup(
         sandboxed_pid_latch,
         _runtime: runtime,
     }))
+}
+
+/// Write the source sidecar `<sources_dir>/<name>` containing the absolute
+/// real binary path. Best-effort: a write failure is logged but does not
+/// abort session setup, since nono-shim falls back to a PATH walk if the
+/// sidecar is missing.
+fn write_shim_source(sources_dir: &Path, name: &str, real_path: &Path) {
+    let sidecar = sources_dir.join(name);
+    if let Err(e) = std::fs::write(&sidecar, real_path.display().to_string()) {
+        tracing::warn!(
+            "mediation: failed to write shim source sidecar {}: {}",
+            sidecar.display(),
+            e
+        );
+    }
 }
 
 /// Resolve a command entry: find the real binary, create the shim symlink.
@@ -743,5 +786,27 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    #[test]
+    fn test_write_shim_source_creates_sidecar_with_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_path = PathBuf::from("/opt/homebrew/bin/yarn");
+        write_shim_source(tmp.path(), "yarn", &real_path);
+
+        let sidecar = tmp.path().join("yarn");
+        assert!(sidecar.is_file(), "sidecar file should exist");
+        let content = std::fs::read_to_string(&sidecar).expect("read sidecar");
+        assert_eq!(content, real_path.display().to_string());
+    }
+
+    #[test]
+    fn test_write_shim_source_overwrites_existing_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_shim_source(tmp.path(), "yarn", &PathBuf::from("/old/yarn"));
+        write_shim_source(tmp.path(), "yarn", &PathBuf::from("/new/yarn"));
+
+        let content = std::fs::read_to_string(tmp.path().join("yarn")).expect("read sidecar");
+        assert_eq!(content, "/new/yarn");
     }
 }

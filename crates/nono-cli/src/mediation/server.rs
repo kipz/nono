@@ -266,89 +266,94 @@ async fn recv_three_fds(
     }
     let was_nonblock = (original_flags & libc::O_NONBLOCK) != 0;
     if was_nonblock {
-        let r =
-            unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags & !libc::O_NONBLOCK) };
+        let r = unsafe { libc::fcntl(raw_fd, libc::F_SETFL, original_flags & !libc::O_NONBLOCK) };
         if r < 0 {
             return Err(std::io::Error::last_os_error());
         }
     }
 
-    let recv_result = tokio::task::spawn_blocking(move || -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
-        let fd_size = std::mem::size_of::<RawFd>();
-        let n: usize = 3;
-        let payload_len = n * fd_size;
+    let recv_result =
+        tokio::task::spawn_blocking(move || -> std::io::Result<(OwnedFd, OwnedFd, OwnedFd)> {
+            let fd_size = std::mem::size_of::<RawFd>();
+            let n: usize = 3;
+            let payload_len = n * fd_size;
 
-        let mut data = [0u8; 1];
-        let mut iov = libc::iovec {
-            iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
-            iov_len: data.len(),
-        };
-        // SAFETY: pure size calculations.
-        let cmsg_space = unsafe { libc::CMSG_SPACE(payload_len as u32) } as usize;
-        let cmsg_len = unsafe { libc::CMSG_LEN(payload_len as u32) } as usize;
+            let mut data = [0u8; 1];
+            let mut iov = libc::iovec {
+                iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
+                iov_len: data.len(),
+            };
+            // SAFETY: pure size calculations.
+            let cmsg_space = unsafe { libc::CMSG_SPACE(payload_len as u32) } as usize;
+            let cmsg_len = unsafe { libc::CMSG_LEN(payload_len as u32) } as usize;
 
-        let mut cmsg_buf = vec![0u8; cmsg_space];
-        // SAFETY: msghdr is plain old data and will be fully initialized below.
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov as *mut libc::iovec;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
-        msg.msg_controllen = cmsg_space as _;
+            let mut cmsg_buf = vec![0u8; cmsg_space];
+            // SAFETY: msghdr is plain old data and will be fully initialized below.
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov as *mut libc::iovec;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+            msg.msg_controllen = cmsg_space as _;
 
-        // SAFETY: raw_fd is a valid blocking socket; msg references live buffers.
-        let received = unsafe { libc::recvmsg(raw_fd, &mut msg, 0) };
-        if received < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if received == 0 {
-            return Err(std::io::Error::other(
-                "socket closed while waiting for stdio fds",
-            ));
-        }
-        if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-            return Err(std::io::Error::other(
-                "ancillary data truncated receiving stdio fds",
-            ));
-        }
-
-        // SAFETY: msg references cmsg_buf which is still live here.
-        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
-        if cmsg.is_null() {
-            return Err(std::io::Error::other("no control message for stdio fds"));
-        }
-        // SAFETY: cmsg was returned by libc and points into cmsg_buf.
-        let header = unsafe { &*cmsg };
-        if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
-            return Err(std::io::Error::other("unexpected control message type for stdio fds"));
-        }
-        if (header.cmsg_len as usize) < cmsg_len {
-            return Err(std::io::Error::other("SCM_RIGHTS message too small for 3 fds"));
-        }
-
-        let mut fds = [-1i32; 3];
-        // SAFETY: CMSG_DATA points at the fd payload for this header.
-        unsafe {
-            for i in 0..n {
-                std::ptr::copy_nonoverlapping(
-                    libc::CMSG_DATA(cmsg).add(i * fd_size),
-                    (&mut fds[i] as *mut RawFd).cast::<u8>(),
-                    fd_size,
-                );
+            // SAFETY: raw_fd is a valid blocking socket; msg references live buffers.
+            let received = unsafe { libc::recvmsg(raw_fd, &mut msg, 0) };
+            if received < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-        }
-        if fds.iter().any(|&fd| fd < 0) {
-            return Err(std::io::Error::other("received invalid fd in stdio fds"));
-        }
-        // SAFETY: fds were just received via SCM_RIGHTS and validated above.
-        Ok(unsafe {
-            (
-                OwnedFd::from_raw_fd(fds[0]),
-                OwnedFd::from_raw_fd(fds[1]),
-                OwnedFd::from_raw_fd(fds[2]),
-            )
+            if received == 0 {
+                return Err(std::io::Error::other(
+                    "socket closed while waiting for stdio fds",
+                ));
+            }
+            if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
+                return Err(std::io::Error::other(
+                    "ancillary data truncated receiving stdio fds",
+                ));
+            }
+
+            // SAFETY: msg references cmsg_buf which is still live here.
+            let cmsg =
+                unsafe { libc::CMSG_FIRSTHDR(&msg as *const libc::msghdr as *mut libc::msghdr) };
+            if cmsg.is_null() {
+                return Err(std::io::Error::other("no control message for stdio fds"));
+            }
+            // SAFETY: cmsg was returned by libc and points into cmsg_buf.
+            let header = unsafe { &*cmsg };
+            if header.cmsg_level != libc::SOL_SOCKET || header.cmsg_type != libc::SCM_RIGHTS {
+                return Err(std::io::Error::other(
+                    "unexpected control message type for stdio fds",
+                ));
+            }
+            if (header.cmsg_len as usize) < cmsg_len {
+                return Err(std::io::Error::other(
+                    "SCM_RIGHTS message too small for 3 fds",
+                ));
+            }
+
+            let mut fds = [-1i32; 3];
+            // SAFETY: CMSG_DATA points at the fd payload for this header.
+            unsafe {
+                for i in 0..n {
+                    std::ptr::copy_nonoverlapping(
+                        libc::CMSG_DATA(cmsg).add(i * fd_size),
+                        (&mut fds[i] as *mut RawFd).cast::<u8>(),
+                        fd_size,
+                    );
+                }
+            }
+            if fds.iter().any(|&fd| fd < 0) {
+                return Err(std::io::Error::other("received invalid fd in stdio fds"));
+            }
+            // SAFETY: fds were just received via SCM_RIGHTS and validated above.
+            Ok(unsafe {
+                (
+                    OwnedFd::from_raw_fd(fds[0]),
+                    OwnedFd::from_raw_fd(fds[1]),
+                    OwnedFd::from_raw_fd(fds[2]),
+                )
+            })
         })
-    })
-    .await;
+        .await;
 
     if was_nonblock {
         // Restore non-blocking mode for tokio.

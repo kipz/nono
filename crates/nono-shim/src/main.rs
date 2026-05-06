@@ -82,7 +82,12 @@ struct AuditEvent {
 /// (as happens when `git` is invoked from within `gh`'s execution sandbox).
 ///
 /// Inlined from the nono crate so the shim's dependency footprint stays minimal.
-fn send_stdio_fds(sock_fd: RawFd, stdin: RawFd, stdout: RawFd, stderr: RawFd) -> std::io::Result<()> {
+fn send_stdio_fds(
+    sock_fd: RawFd,
+    stdin: RawFd,
+    stdout: RawFd,
+    stderr: RawFd,
+) -> std::io::Result<()> {
     let fds = [stdin, stdout, stderr];
     let fd_size = std::mem::size_of::<RawFd>();
     let payload_len = fds.len() * fd_size;
@@ -245,7 +250,12 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     // Pass stdin/stdout/stderr as a single SCM_RIGHTS message so the server
     // can wire them directly to the real binary in passthrough cases.
     let sock_fd = stream.as_raw_fd();
-    if let Err(e) = send_stdio_fds(sock_fd, libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO) {
+    if let Err(e) = send_stdio_fds(
+        sock_fd,
+        libc::STDIN_FILENO,
+        libc::STDOUT_FILENO,
+        libc::STDERR_FILENO,
+    ) {
         eprintln!("nono-shim: failed to send stdio fds: {}", e);
         return 127;
     }

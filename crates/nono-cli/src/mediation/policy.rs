@@ -1240,8 +1240,10 @@ mod tests {
             buf
         });
 
-        let (mut resp, action) =
-            apply(req, cmds, broker, ctx, approval, stdin_fd, stdout_fd, stderr_fd).await;
+        let (mut resp, action) = apply(
+            req, cmds, broker, ctx, approval, stdin_fd, stdout_fd, stderr_fd,
+        )
+        .await;
 
         let stdout_streamed = stdout_handle.join().unwrap_or_default();
         let stderr_streamed = stderr_handle.join().unwrap_or_default();
@@ -2560,8 +2562,16 @@ mod tests {
         assert_eq!(action_type, "passthrough");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
         // Streaming path: the response carries no buffered output.
-        assert!(resp.stdout.is_empty(), "expected empty resp.stdout in streaming mode, got {} bytes", resp.stdout.len());
-        assert!(resp.stderr.is_empty(), "expected empty resp.stderr in streaming mode, got {} bytes", resp.stderr.len());
+        assert!(
+            resp.stdout.is_empty(),
+            "expected empty resp.stdout in streaming mode, got {} bytes",
+            resp.stdout.len()
+        );
+        assert!(
+            resp.stderr.is_empty(),
+            "expected empty resp.stderr in streaming mode, got {} bytes",
+            resp.stderr.len()
+        );
 
         let received = drain.join().expect("drain thread");
         assert_eq!(

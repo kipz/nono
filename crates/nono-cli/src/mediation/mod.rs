@@ -405,13 +405,11 @@ mod tests {
         assert!(p1.allowed_parents.is_none());
 
         // Empty array: no mediated parent allowed.
-        let p2: CallerPolicy =
-            serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
+        let p2: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
         assert_eq!(p2.allowed_parents.as_deref(), Some(&[][..]));
 
         // Listed: only the named parents allowed.
-        let p3: CallerPolicy =
-            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
+        let p3: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
         assert_eq!(
             p3.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])

@@ -3424,13 +3424,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
-        // Child's mediation config takes precedence; base is ignored.
-        // (Merging two mediation configs would be complex and is not needed.)
-        mediation: if child.mediation.is_active() {
-            child.mediation
-        } else {
-            base.mediation
-        },
+        mediation: crate::mediation::merge::merge_mediation(base.mediation, child.mediation),
     }
 }
 

@@ -322,6 +322,7 @@ GHSA-27vp-2mmc-vmh3
 ### Bug Fixes
 
 - *(pty)* Forward bare ESC immediately instead of buffering for CSI-u detach match, fixing ESC key in TUI apps inside tmux with `extended-keys-format csi-u` (#941)
+- *(sandbox/macos)* Mediation sockets now reachable when `network.allow_domain` is set. Seatbelt classifies AF_UNIX `connect(2)` as `network-outbound`; under `NetworkMode::ProxyOnly` the base `(deny network*)` blocked the audit/mediation shim's connect to `<session_dir>/{mediation,control,audit}.sock`. Adds a directory-scoped `UnixSocketCapability` for the session dir alongside the existing `FsCapability`. Fixes #33.
 
 ### Notes
 

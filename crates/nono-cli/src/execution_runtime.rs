@@ -349,6 +349,25 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             nono::FsCapability::new_dir(&handle.session_dir, nono::AccessMode::ReadWrite)
                 .map_err(|e| nono::NonoError::SandboxInit(format!("mediation session dir: {e}")))?,
         );
+        // Grant connect(2) for the per-session AF_UNIX sockets (mediation.sock,
+        // control.sock, audit.sock — all direct children of session_dir). The
+        // FsCapability above covers open/read/write but Seatbelt classifies
+        // connect(2) on Unix sockets as `network-outbound`, so under
+        // `NetworkMode::ProxyOnly` (e.g. when the resolved profile sets
+        // `network.allow_domain`) the base `(deny network*)` clause blocks the
+        // shim's connect to mediation.sock. A directory-scoped UnixSocket grant
+        // (Connect mode, non-recursive) emits the regex carve-out that covers
+        // every direct child socket without leaking access to anything else
+        // under the session dir.
+        caps.add_unix_socket(
+            nono::UnixSocketCapability::new_dir(
+                &handle.session_dir,
+                nono::UnixSocketMode::Connect,
+            )
+            .map_err(|e| {
+                nono::NonoError::SandboxInit(format!("mediation session sockets: {e}"))
+            })?,
+        );
 
         info!(
             "Mediation session active: {} commands mediated, shim_dir={}",

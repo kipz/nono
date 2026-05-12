@@ -6,8 +6,8 @@
 //! 3. If matched with `Respond`: returns the configured `ShimResponse` without calling the binary.
 //! 4. If matched with `Capture`: runs the real binary (or a script), stores output in the broker,
 //!    returns a `nono_<hex>` nonce to the sandbox.
-//! 5. If not matched: execs the real binary. Nonce-bearing env vars from the sandbox are promoted
-//!    (replaced with real values); all other sandbox env vars are discarded.
+//! 5. If not matched: execs the real binary. `nono_<64-hex>` substrings inside both argv and
+//!    env-var values are replaced with the broker's real value before exec.
 
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
@@ -537,10 +537,12 @@ static FILTERED_SHIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// - Prepends `shim_dir` to PATH so subprocess invocations of mediated commands
 ///   route through the mediation server instead of running directly inside the
 ///   per-command sandbox (where network is restricted).
-/// - From the sandbox env, promotes only nonce-bearing vars (`nono_` prefix).
-///   All other sandbox env vars are discarded to prevent sandbox injection.
+/// - From the sandbox env, every `nono_<64-hex>` substring inside a value is
+///   promoted to the broker's stored real value. Non-nonce text passes through.
 /// - Dangerous var names (PATH, LD_PRELOAD, etc.) are blocked even with valid nonces.
-/// - Arg nonces: any arg starting with `nono_` is replaced with the real value.
+/// - Arg nonces: any `nono_<64-hex>` substring inside an arg is replaced with
+///   the real value, so embedded uses like `-H "Authorization: Bearer nono_..."`
+///   work without the caller having to put the nonce at the start of the arg.
 ///
 /// When `allow_commands` is non-empty on the sandbox, a filtered shim directory is
 /// created containing symlinks only for commands NOT in the allow list. Allowed
@@ -664,20 +666,11 @@ async fn exec_passthrough(
     let sandbox_context_nonce = broker.issue(Zeroizing::new(cmd.name.clone()));
     env.insert("NONO_SANDBOX_CONTEXT".to_string(), sandbox_context_nonce);
 
-    // Promote nonce values in args
-    let args: Vec<String> = args
-        .iter()
-        .map(|a| {
-            if a.starts_with("nono_") {
-                broker
-                    .resolve(a)
-                    .map(|r| r.as_str().to_string())
-                    .unwrap_or_else(|| a.clone())
-            } else {
-                a.clone()
-            }
-        })
-        .collect();
+    // Promote nonce values in args. Any `nono_<64-hex>` substring is replaced
+    // with the broker's resolved value, so headers like
+    // `Authorization: Bearer nono_...` expand to the real token before the
+    // exec'd command sees them.
+    let args: Vec<String> = args.iter().map(|a| promote_nonces_in_str(a, broker)).collect();
 
     let real_path = cmd.real_path.clone();
     let cmd_name = cmd.name.clone();
@@ -1132,22 +1125,60 @@ fn build_exec_env(
     // vars. If a var was not blocked by the profile's `env.block` list it is permitted
     // to flow through to mediated commands. System execution vars (PATH, LD_PRELOAD,
     // etc.) are always blocked as defense-in-depth regardless of profile configuration.
+    //
+    // Substring promotion: any `nono_<64-hex>` substring in a value is replaced with
+    // the broker's resolved value, so capture rules that emit shaped values like
+    // `Authorization: Bearer <jwt>` expand correctly when consumed via the env.
     for (key, value) in sandbox_env {
         if DANGEROUS_ENV_VAR_NAMES.contains(&key.as_str()) {
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
-        if value.starts_with("nono_") {
-            if let Some(real) = broker.resolve(value) {
-                env.insert(key.clone(), real.as_str().to_string());
-            }
-            // Unknown nonce: silently discard — don't let sandbox probe broker contents.
-        } else {
-            env.insert(key.clone(), value.clone());
-        }
+        env.insert(key.clone(), promote_nonces_in_str(value, broker));
     }
 
     env
+}
+
+/// Replace every `nono_<64-hex>` substring in `s` with the broker's resolved
+/// value. Substrings that look like nonces but were never issued are left in
+/// place verbatim, matching the existing argv behaviour and avoiding a probe
+/// oracle that would only return shape information the caller already has.
+fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
+    const PREFIX: &[u8] = b"nono_";
+    const HEX_LEN: usize = 64;
+    const NONCE_LEN: usize = PREFIX.len() + HEX_LEN;
+
+    let bytes = s.as_bytes();
+    if bytes.len() < NONCE_LEN {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut last_end = 0usize;
+    let mut i = 0usize;
+    while i + NONCE_LEN <= bytes.len() {
+        if &bytes[i..i + PREFIX.len()] == PREFIX
+            && bytes[i + PREFIX.len()..i + NONCE_LEN]
+                .iter()
+                .all(|b| b.is_ascii_digit() || (*b >= b'a' && *b <= b'f'))
+        {
+            // bytes[i] == b'n' is ASCII, so i is on a UTF-8 char boundary and
+            // s[last_end..i] / s[i..i+NONCE_LEN] are valid str slices.
+            out.push_str(&s[last_end..i]);
+            let nonce = &s[i..i + NONCE_LEN];
+            match broker.resolve(nonce) {
+                Some(real) => out.push_str(real.as_str()),
+                None => out.push_str(nonce),
+            }
+            i += NONCE_LEN;
+            last_end = i;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&s[last_end..]);
+    out
 }
 
 #[cfg(test)]
@@ -1945,21 +1976,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_exec_env_discards_unknown_nonce() {
+    fn test_build_exec_env_leaves_unknown_nonce_in_place() {
         let broker = make_broker();
         let mut sandbox_env = HashMap::new();
-        // A nonce-like value that was never issued
-        sandbox_env.insert(
-            "MY_TOKEN".to_string(),
-            "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        );
+        // A nonce-shaped value that was never issued by this broker.
+        let unknown =
+            "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string();
+        sandbox_env.insert("MY_TOKEN".to_string(), unknown.clone());
 
         let env = build_exec_env(&sandbox_env, &broker);
-        // Unknown nonce: var should not be set to any nonce value
-        assert_ne!(
-            env.get("MY_TOKEN").map(|s| s.as_str()),
-            Some("nono_0000000000000000000000000000000000000000000000000000000000000000")
-        );
+        // Substring promotion: unknown nonces are passed through verbatim
+        // rather than discarded. The sandbox can probe shape but cannot recover
+        // any issued nonce this way.
+        assert_eq!(env.get("MY_TOKEN").map(|s| s.as_str()), Some(unknown.as_str()));
     }
 
     // --- Filtered shim dir tests ---
@@ -2761,5 +2790,105 @@ mod tests {
             caller_cwd,
             "pwd should print the caller's cwd from ShimRequest.cwd"
         );
+    }
+
+    // --- promote_nonces_in_str ---
+
+    #[test]
+    fn promote_nonces_substitutes_pure_nonce_arg() {
+        let broker = TokenBroker::new();
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
+        assert_eq!(promote_nonces_in_str(&nonce, &broker), "real-token");
+    }
+
+    #[test]
+    fn promote_nonces_substitutes_embedded_nonce() {
+        let broker = TokenBroker::new();
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
+        let arg = format!("X-Token: {}", nonce);
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker),
+            "X-Token: real-token"
+        );
+    }
+
+    #[test]
+    fn promote_nonces_substitutes_multiple_nonces_in_one_arg() {
+        let broker = TokenBroker::new();
+        let a = broker.issue(Zeroizing::new("AAA".to_string()));
+        let b = broker.issue(Zeroizing::new("BBB".to_string()));
+        let arg = format!("first={} second={}", a, b);
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker),
+            "first=AAA second=BBB"
+        );
+    }
+
+    #[test]
+    fn promote_nonces_leaves_malformed_prefix_alone() {
+        let broker = TokenBroker::new();
+        // Too few hex chars after the prefix — not a valid nonce shape.
+        let arg = "nono_abc123";
+        assert_eq!(promote_nonces_in_str(arg, &broker), arg);
+        // Prefix followed by non-hex characters in the 64-char window.
+        let arg2 = format!("nono_{}", "z".repeat(64));
+        assert_eq!(promote_nonces_in_str(&arg2, &broker), arg2);
+        // Uppercase hex must not match — broker only emits lowercase.
+        let arg3 = format!("nono_{}", "A".repeat(64));
+        assert_eq!(promote_nonces_in_str(&arg3, &broker), arg3);
+    }
+
+    #[test]
+    fn promote_nonces_leaves_unknown_nonce_alone() {
+        let broker = TokenBroker::new();
+        // Shape is valid but the nonce was never issued.
+        let arg = format!("nono_{}", "a".repeat(64));
+        assert_eq!(promote_nonces_in_str(&arg, &broker), arg);
+    }
+
+    #[test]
+    fn promote_nonces_preserves_surrounding_text() {
+        let broker = TokenBroker::new();
+        let nonce = broker.issue(Zeroizing::new("XYZ".to_string()));
+        let arg = format!("prefix-{}-suffix", nonce);
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker),
+            "prefix-XYZ-suffix"
+        );
+    }
+
+    #[test]
+    fn promote_nonces_no_match_returns_original() {
+        let broker = TokenBroker::new();
+        assert_eq!(promote_nonces_in_str("plain string", &broker), "plain string");
+        assert_eq!(promote_nonces_in_str("", &broker), "");
+    }
+
+    #[test]
+    fn build_exec_env_promotes_substring_in_value() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("jwt-body".to_string()));
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Authorization: Bearer {}", nonce),
+        );
+        let env = build_exec_env(&sandbox_env, &broker);
+        assert_eq!(
+            env.get("AUTH_HEADER").map(String::as_str),
+            Some("Authorization: Bearer jwt-body"),
+        );
+    }
+
+    #[test]
+    fn build_exec_env_still_blocks_dangerous_names() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("evil".to_string()));
+        let mut sandbox_env = HashMap::new();
+        sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
+        sandbox_env.insert("SAFE".to_string(), nonce);
+        let env = build_exec_env(&sandbox_env, &broker);
+        assert!(!env.contains_key("LD_PRELOAD"));
+        assert_eq!(env.get("SAFE").map(String::as_str), Some("evil"));
     }
 }

@@ -4806,11 +4806,12 @@ mod tests {
             .expect("temp dir path is valid UTF-8")
             .to_string();
 
-        let mut env_c: Vec<CString> =
-            vec![
-                CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim))
-                    .expect("valid CString"),
-            ];
+        // Simulate env_c after env_vars have been applied — session shim dir is
+        // already prepended to PATH (as main.rs does via mediation_path_str).
+        let mut env_c: Vec<CString> = vec![
+            CString::new(format!("PATH={}:/usr/bin:/bin", fake_session_shim))
+                .expect("valid CString"),
+        ];
 
         apply_open_shim_path(&mut env_c, open_shim_dir.path());
 

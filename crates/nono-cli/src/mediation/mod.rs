@@ -402,15 +402,18 @@ mod tests {
     #[test]
     fn test_caller_policy_distinguishes_null_vs_empty_allowed_parents() {
         // Field absent: any parent allowed.
-        let p1: CallerPolicy = serde_json::from_str(r#"{ "agent_allowed": true }"#).unwrap();
+        let p1: CallerPolicy =
+            serde_json::from_str(r#"{ "agent_allowed": true }"#).expect("deserialize p1");
         assert!(p1.allowed_parents.is_none());
 
         // Empty array: no mediated parent allowed.
-        let p2: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
+        let p2: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": [] }"#).expect("deserialize p2");
         assert_eq!(p2.allowed_parents.as_deref(), Some(&[][..]));
 
         // Listed: only the named parents allowed.
-        let p3: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
+        let p3: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).expect("deserialize p3");
         assert_eq!(
             p3.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])

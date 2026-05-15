@@ -13,7 +13,7 @@
 //!   Request:  u32 big-endian length || JSON payload
 //!   Response: u32 big-endian length || JSON payload
 
-use super::admin::{write_admin_audit, AdminModeStatus, AdminState};
+use super::admin::{AdminModeStatus, AdminState, write_admin_audit};
 use nix::libc;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -322,9 +322,8 @@ fn bind_socket_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixListen
     })?;
 
     let old_umask = unsafe { libc::umask(0o077) };
-    let std_listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
+    let std_listener = std::os::unix::net::UnixListener::bind(path).inspect_err(|_e| {
         unsafe { libc::umask(old_umask) };
-        e
     });
     unsafe { libc::umask(old_umask) };
 

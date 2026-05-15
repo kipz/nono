@@ -6,6 +6,7 @@
 
 pub(crate) mod builtin;
 mod credential_provider;
+pub(crate) mod dynamic_providers;
 
 pub use credential_provider::{
     CredentialProviderDef, CredentialProviderRequestBodyFormat,
@@ -2853,6 +2854,7 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 #[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
+    dynamic_providers::expand_profile_tokens(&mut profile)?;
     validate_credential_capture_resolved(&profile)?;
     validate_credential_provider_resolved(&profile)?;
     validate_profile_tls_intercept(&profile)?;
@@ -4947,6 +4949,24 @@ mod tests {
             unique.len(),
             profile.groups.include.len(),
             "Groups should have no duplicates"
+        );
+    }
+
+    #[test]
+    fn finalize_profile_errors_on_unknown_dynamic_provider_token() {
+        // An `@<provider>:<query>` token with an unrecognised provider
+        // should surface as a profile-load error rather than silently
+        // leaving the literal token in the path list (where it would
+        // later fail capability construction with a much less clear
+        // message about a missing file named `@foo:bar`).
+        let mut profile = Profile::default();
+        profile.filesystem.read_file = vec!["@unknown:foo".to_string()];
+
+        let err = finalize_profile(profile).expect_err("expected unknown-provider error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown"),
+            "error should name the unknown provider, got: {msg}"
         );
     }
 

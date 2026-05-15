@@ -16,8 +16,8 @@ use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -66,10 +66,6 @@ pub struct ShimResponse {
 /// Bundles the per-session paths and token needed by `apply` and `exec_passthrough`.
 pub struct SessionCtx<'a> {
     pub shim_dir: &'a std::path::Path,
-    /// Directory of source-path sidecar files. Forwarded to the mediated
-    /// subprocess as `NONO_SHIM_SOURCES_DIR` so nono-shim can resolve real
-    /// binaries reliably without re-walking PATH at exec time.
-    pub shim_sources_dir: &'a std::path::Path,
     pub socket_path: &'a std::path::Path,
     pub session_token: &'a str,
     /// Working directory of the nono session (the parent launch cwd or
@@ -190,37 +186,34 @@ pub async fn apply(
     // If the request comes from within a per-command sandbox (via allow_commands),
     // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
     // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
-    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT") {
-        if let Some(parent_name) = broker.resolve(ctx_nonce) {
-            if let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name) {
-                if let Some(ref sb) = parent_cmd.sandbox {
-                    if sb.allow_commands.contains(&request.command) {
-                        debug!(
-                            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
-                            request.command, &**parent_name
-                        );
-                        // No per-command sandbox — same as the capture path.
-                        // The real binary needs full access to system resources
-                        // (e.g. Keychain, vault) to fetch credentials. Security
-                        // comes from the parent's sandbox, not the child's.
-                        // Stream stdio directly through the shim's fds.
-                        let result = exec_passthrough(
-                            cmd,
-                            &request.args,
-                            &request.env,
-                            &broker,
-                            None,
-                            ctx,
-                            commands,
-                            Some((stdin_fd, stdout_fd, stderr_fd)),
-                            request.cwd.as_deref(),
-                        )
-                        .await;
-                        return (result, "passthrough");
-                    }
-                }
-            }
-        }
+    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
+        && let Some(parent_name) = broker.resolve(ctx_nonce)
+        && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
+        && let Some(ref sb) = parent_cmd.sandbox
+        && sb.allow_commands.contains(&request.command)
+    {
+        debug!(
+            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
+            request.command, &**parent_name
+        );
+        // No per-command sandbox — same as the capture path.
+        // The real binary needs full access to system resources
+        // (e.g. Keychain, vault) to fetch credentials. Security
+        // comes from the parent's sandbox, not the child's.
+        // Stream stdio directly through the shim's fds.
+        let result = exec_passthrough(
+            cmd,
+            &request.args,
+            &request.env,
+            &broker,
+            None,
+            ctx,
+            commands,
+            Some((stdin_fd, stdout_fd, stderr_fd)),
+            request.cwd.as_deref(),
+        )
+        .await;
+        return (result, "passthrough");
     }
 
     // Check intercept rules in order
@@ -637,14 +630,6 @@ async fn exec_passthrough(
     // themselves again, causing infinite exec recursion (EAGAIN).
     env.insert("NONO_SHIM_DIR".to_string(), shim_dir_str.clone());
 
-    // Forward NONO_SHIM_SOURCES_DIR — points to the session-level sidecar dir
-    // (not filtered per-command), so nono-shim can resolve real binaries by
-    // looking up the recorded source path before falling back to PATH.
-    env.insert(
-        "NONO_SHIM_SOURCES_DIR".to_string(),
-        ctx.shim_sources_dir.to_string_lossy().to_string(),
-    );
-
     // Inject mediation socket path and session token so the shim binaries
     // invoked by the exec'd command can authenticate to the mediation server.
     // This allows exec plugins (e.g. kubectl's credential plugin) to route
@@ -670,7 +655,10 @@ async fn exec_passthrough(
     // with the broker's resolved value, so headers like
     // `Authorization: Bearer nono_...` expand to the real token before the
     // exec'd command sees them.
-    let args: Vec<String> = args.iter().map(|a| promote_nonces_in_str(a, broker)).collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| promote_nonces_in_str(a, broker))
+        .collect();
 
     let real_path = cmd.real_path.clone();
     let cmd_name = cmd.name.clone();
@@ -705,27 +693,28 @@ async fn exec_passthrough(
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
     let mut proxy_port: Option<u16> = None;
 
-    if let Some(ref sb) = sandbox {
-        if !sb.network.allowed_hosts.is_empty() && !sb.network.block {
-            let proxy_config = nono_proxy::ProxyConfig {
-                allowed_hosts: sb.network.allowed_hosts.clone(),
-                ..Default::default()
-            };
-            match nono_proxy::start(proxy_config).await {
-                Ok(handle) => {
-                    for (k, v) in handle.env_vars() {
-                        env.insert(k, v);
-                    }
-                    proxy_port = Some(handle.port);
-                    proxy_handle = Some(handle);
+    if let Some(ref sb) = sandbox
+        && !sb.network.allowed_hosts.is_empty()
+        && !sb.network.block
+    {
+        let proxy_config = nono_proxy::ProxyConfig {
+            allowed_hosts: sb.network.allowed_hosts.clone(),
+            ..Default::default()
+        };
+        match nono_proxy::start(proxy_config).await {
+            Ok(handle) => {
+                for (k, v) in handle.env_vars() {
+                    env.insert(k, v);
                 }
-                Err(e) => {
-                    return ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!("nono-mediation: failed to start network proxy: {}\n", e),
-                        exit_code: 1,
-                    };
-                }
+                proxy_port = Some(handle.port);
+                proxy_handle = Some(handle);
+            }
+            Err(e) => {
+                return ShimResponse {
+                    stdout: String::new(),
+                    stderr: format!("nono-mediation: failed to start network proxy: {}\n", e),
+                    exit_code: 1,
+                };
             }
         }
     }
@@ -803,10 +792,10 @@ async fn exec_passthrough(
             // system paths (e.g. ~/dd/devtools/bin/gh). Use the ORIGINAL (pre-canonicalize)
             // parent so FsCapability emits Seatbelt rules for both the symlink path and the
             // resolved canonical path — Seatbelt checks paths as-accessed (pre-resolution).
-            if let Some(parent) = real_path.parent() {
-                if parent.exists() {
-                    caps = caps.allow_path(parent, nono::AccessMode::Read)?;
-                }
+            if let Some(parent) = real_path.parent()
+                && parent.exists()
+            {
+                caps = caps.allow_path(parent, nono::AccessMode::Read)?;
             }
 
             // Allow the shim directory and the nono-shim binary so that subprocesses
@@ -849,13 +838,13 @@ async fn exec_passthrough(
             // keychain without exposing them to the agent (the token flows through
             // the command's internal auth, not stdout).
             #[cfg(target_os = "macos")]
-            if sb.keychain_access {
-                if let Ok(home) = std::env::var("HOME") {
-                    let login = format!("{}/Library/Keychains/login.keychain-db", home);
-                    let metadata = format!("{}/Library/Keychains/metadata.keychain-db", home);
-                    caps = add_sandbox_file(caps, &login, nono::AccessMode::Read, &cmd_name)?;
-                    caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
-                }
+            if sb.keychain_access
+                && let Ok(home) = std::env::var("HOME")
+            {
+                let login = format!("{}/Library/Keychains/login.keychain-db", home);
+                let metadata = format!("{}/Library/Keychains/metadata.keychain-db", home);
+                caps = add_sandbox_file(caps, &login, nono::AccessMode::Read, &cmd_name)?;
+                caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
             }
 
             if sb.network.block {
@@ -1184,9 +1173,9 @@ fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediation::CallerPolicy;
     use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
     use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
-    use crate::mediation::CallerPolicy;
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
@@ -1314,7 +1303,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1330,7 +1318,6 @@ mod tests {
     fn ctx() -> SessionCtx<'static> {
         SessionCtx {
             shim_dir: std::path::Path::new("/tmp"),
-            shim_sources_dir: std::path::Path::new("/tmp"),
             socket_path: std::path::Path::new("/tmp/test.sock"),
             session_token: "test_token",
             workdir: std::path::Path::new("/tmp"),
@@ -1559,7 +1546,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1594,7 +1580,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1630,7 +1615,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1664,7 +1648,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1699,7 +1682,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1735,7 +1717,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1854,7 +1835,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1898,7 +1878,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1988,7 +1967,10 @@ mod tests {
         // Substring promotion: unknown nonces are passed through verbatim
         // rather than discarded. The sandbox can probe shape but cannot recover
         // any issued nonce this way.
-        assert_eq!(env.get("MY_TOKEN").map(|s| s.as_str()), Some(unknown.as_str()));
+        assert_eq!(
+            env.get("MY_TOKEN").map(|s| s.as_str()),
+            Some(unknown.as_str())
+        );
     }
 
     // --- Filtered shim dir tests ---
@@ -2083,9 +2065,7 @@ mod tests {
 
         let session_dir = tempfile::tempdir().expect("create temp dir");
         let shim_dir = session_dir.path().join("shims");
-        let shim_sources_dir = session_dir.path().join("shim-sources");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-        std::fs::create_dir_all(&shim_sources_dir).expect("create shim sources dir");
 
         // Create fake shim files (need to exist for build_filtered_shim_dir)
         for name in &["gh", "ddtool"] {
@@ -2135,7 +2115,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: &shim_dir,
-                shim_sources_dir: &shim_sources_dir,
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2175,21 +2154,6 @@ mod tests {
             "PATH should start with NONO_SHIM_DIR ({}), got: {}",
             child_shim_dir,
             child_path
-        );
-
-        // NONO_SHIM_SOURCES_DIR is propagated unchanged from the SessionCtx —
-        // it must not be filtered per-command, since the sidecar files only
-        // exist at the session level.
-        let sources_line = resp
-            .stdout
-            .lines()
-            .find(|l| l.starts_with("NONO_SHIM_SOURCES_DIR="))
-            .expect("NONO_SHIM_SOURCES_DIR not found in env output");
-        let child_sources_dir = sources_line.trim_start_matches("NONO_SHIM_SOURCES_DIR=");
-        assert_eq!(
-            child_sources_dir,
-            shim_sources_dir.to_string_lossy(),
-            "NONO_SHIM_SOURCES_DIR must point to the session-level sources dir"
         );
     }
 
@@ -2236,7 +2200,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2300,7 +2263,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2369,7 +2331,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2433,7 +2394,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2493,7 +2453,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2554,7 +2513,6 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2623,7 +2581,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2693,7 +2650,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2767,7 +2723,6 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
-                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2806,10 +2761,7 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
         let arg = format!("X-Token: {}", nonce);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "X-Token: real-token"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "X-Token: real-token");
     }
 
     #[test]
@@ -2818,10 +2770,7 @@ mod tests {
         let a = broker.issue(Zeroizing::new("AAA".to_string()));
         let b = broker.issue(Zeroizing::new("BBB".to_string()));
         let arg = format!("first={} second={}", a, b);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "first=AAA second=BBB"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "first=AAA second=BBB");
     }
 
     #[test]
@@ -2851,16 +2800,16 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("XYZ".to_string()));
         let arg = format!("prefix-{}-suffix", nonce);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "prefix-XYZ-suffix"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "prefix-XYZ-suffix");
     }
 
     #[test]
     fn promote_nonces_no_match_returns_original() {
         let broker = TokenBroker::new();
-        assert_eq!(promote_nonces_in_str("plain string", &broker), "plain string");
+        assert_eq!(
+            promote_nonces_in_str("plain string", &broker),
+            "plain string"
+        );
         assert_eq!(promote_nonces_in_str("", &broker), "");
     }
 

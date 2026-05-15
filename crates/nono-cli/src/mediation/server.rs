@@ -12,7 +12,7 @@
 use super::admin::AdminModeStatus;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
-use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
+use super::policy::{ShimRequest, ShimResponse, admin_passthrough, apply};
 use super::session::ResolvedCommand;
 use super::{AuditEvent, SessionAuditInfo};
 use nix::libc;
@@ -39,10 +39,8 @@ pub async fn run(
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
     shim_dir: PathBuf,
-    shim_sources_dir: PathBuf,
     admin_state: super::admin::AdminState,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
-    audit_socket_path: PathBuf,
     audit_log_dir: PathBuf,
     workdir: PathBuf,
     audit_info: Arc<SessionAuditInfo>,
@@ -53,34 +51,9 @@ pub async fn run(
     let listener = bind_socket_owner_only(&socket_path)?;
     debug!("Mediation server listening on {}", socket_path.display());
 
-    // Wrap audit_log_dir so both the audit receiver and connection handler can share it.
     let audit_log_dir = Arc::new(audit_log_dir);
-
-    // Bind audit datagram socket for fire-and-forget command logging
-    let _ = std::fs::remove_file(&audit_socket_path);
-    match bind_dgram_owner_only(&audit_socket_path) {
-        Ok(audit_socket) => {
-            let audit_log_dir_arc = Arc::clone(&audit_log_dir);
-            let audit_info_arc = Arc::clone(&audit_info);
-            tokio::spawn(async move {
-                run_audit_receiver(audit_socket, audit_log_dir_arc, audit_info_arc).await;
-            });
-            debug!(
-                "Audit datagram socket listening on {}",
-                audit_socket_path.display()
-            );
-        }
-        Err(e) => {
-            warn!(
-                "Failed to bind audit socket: {} — audit logging disabled",
-                e
-            );
-        }
-    }
-
     let commands = Arc::new(commands);
     let shim_dir = Arc::new(shim_dir);
-    let shim_sources_dir = Arc::new(shim_sources_dir);
     let socket_path = Arc::new(socket_path);
     let workdir = Arc::new(workdir);
 
@@ -91,7 +64,6 @@ pub async fn run(
                 let broker = Arc::clone(&broker);
                 let token = Arc::clone(&session_token);
                 let sd = Arc::clone(&shim_dir);
-                let ssd = Arc::clone(&shim_sources_dir);
                 let sp = Arc::clone(&socket_path);
                 let wd = Arc::clone(&workdir);
                 let sess_dir = Arc::clone(&audit_log_dir);
@@ -105,7 +77,6 @@ pub async fn run(
                         broker,
                         token.clone(),
                         &sd,
-                        &ssd,
                         &sp,
                         admin_rx,
                         gate,
@@ -135,7 +106,6 @@ async fn handle_connection(
     broker: Arc<TokenBroker>,
     session_token: Arc<str>,
     shim_dir: &std::path::Path,
-    shim_sources_dir: &std::path::Path,
     socket_path: &std::path::Path,
     admin_receiver: tokio::sync::watch::Receiver<AdminModeStatus>,
     approval: Arc<dyn ApprovalGate + Send + Sync>,
@@ -228,7 +198,6 @@ async fn handle_connection(
     let command_pid = request.pid;
     let ctx = super::policy::SessionCtx {
         shim_dir,
-        shim_sources_dir,
         socket_path,
         session_token: &session_token,
         workdir,
@@ -339,10 +308,10 @@ async fn recv_three_fds(
             let mut fds = [-1i32; 3];
             // SAFETY: CMSG_DATA points at the fd payload for this header.
             unsafe {
-                for i in 0..n {
+                for (i, fd) in fds.iter_mut().enumerate().take(n) {
                     std::ptr::copy_nonoverlapping(
                         libc::CMSG_DATA(cmsg).add(i * fd_size),
-                        (&mut fds[i] as *mut RawFd).cast::<u8>(),
+                        (fd as *mut RawFd).cast::<u8>(),
                         fd_size,
                     );
                 }
@@ -432,9 +401,8 @@ fn bind_socket_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixListen
     })?;
 
     let old_umask = unsafe { libc::umask(0o077) };
-    let std_listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
+    let std_listener = std::os::unix::net::UnixListener::bind(path).inspect_err(|_e| {
         unsafe { libc::umask(old_umask) };
-        e
     });
     unsafe { libc::umask(old_umask) };
 
@@ -448,58 +416,6 @@ fn umask_guard() -> &'static Mutex<()> {
     UMASK_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Bind a Unix datagram socket with restrictive permissions (0o600).
-fn bind_dgram_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixDatagram> {
-    let lock = umask_guard();
-    let _guard = lock.lock().map_err(|_| {
-        std::io::Error::other("mediation: failed to acquire umask synchronization lock")
-    })?;
-
-    let old_umask = unsafe { libc::umask(0o077) };
-    let std_sock = std::os::unix::net::UnixDatagram::bind(path).map_err(|e| {
-        unsafe { libc::umask(old_umask) };
-        e
-    });
-    unsafe { libc::umask(old_umask) };
-
-    let std_sock = std_sock?;
-    std_sock.set_nonblocking(true)?;
-    tokio::net::UnixDatagram::from_std(std_sock)
-}
-
-/// Receive audit events from shims and append them to `audit.jsonl`.
-///
-/// Shim-originated events do not carry session context (the shim has no
-/// access to it). The server stamps each received event with the session
-/// fields before writing to disk.
-async fn run_audit_receiver(
-    socket: tokio::net::UnixDatagram,
-    audit_log_dir: Arc<PathBuf>,
-    audit_info: Arc<SessionAuditInfo>,
-) {
-    let mut buf = vec![0u8; 8192];
-    loop {
-        match socket.recv(&mut buf).await {
-            Ok(n) => {
-                if let Ok(mut event) = serde_json::from_slice::<AuditEvent>(&buf[..n]) {
-                    event.args = scrub_args(&event.args);
-                    event.session_id = audit_info.session_id.clone();
-                    event.session_name = audit_info.session_name.clone();
-                    event.nono_pid = audit_info.nono_pid;
-                    event.sandboxed_pid = audit_info.sandboxed_pid.get().copied();
-                    append_audit_log(&audit_log_dir, &event);
-                } else {
-                    warn!("audit socket: failed to parse event");
-                }
-            }
-            Err(e) => {
-                warn!("audit socket recv error: {}", e);
-                break;
-            }
-        }
-    }
-}
-
 /// Append a single audit event as a JSON line to `audit.jsonl`.
 fn append_audit_log(audit_log_dir: &Path, event: &AuditEvent) {
     use std::io::Write;
@@ -510,10 +426,9 @@ fn append_audit_log(audit_log_dir: &Path, event: &AuditEvent) {
         .append(true)
         .mode(0o600)
         .open(&log_path)
+        && let Ok(line) = serde_json::to_string(event)
     {
-        if let Ok(line) = serde_json::to_string(event) {
-            let _ = writeln!(f, "{}", line);
-        }
+        let _ = writeln!(f, "{}", line);
     }
 }
 
@@ -607,11 +522,11 @@ fn scrub_nono_tokens(s: &str) -> String {
 }
 
 fn scrub_url_credentials(value: &str) -> String {
-    if let Ok(mut u) = url::Url::parse(value) {
-        if u.password().is_some() {
-            let _ = u.set_password(Some("[redacted]"));
-            return u.to_string();
-        }
+    if let Ok(mut u) = url::Url::parse(value)
+        && u.password().is_some()
+    {
+        let _ = u.set_password(Some("[redacted]"));
+        return u.to_string();
     }
     value.to_string()
 }

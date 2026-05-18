@@ -35,39 +35,64 @@ pub(crate) mod git {
 
     use nono::{NonoError, Result};
 
-    /// Invoke `git config --list --show-origin --show-scope` and parse
-    /// the result via [`read_paths_from_stdout`], which keeps only the
-    /// lines tagged with the `global` or `system` scope.
+    /// Paths extracted from `git config --list --show-origin --show-scope`,
+    /// split by filesystem type so the consumer (a profile) can route each
+    /// kind to the right capability list — `files` into `fs_read_file`
+    /// and `dirs` into `fs_read`.
+    ///
+    /// `core.hooksPath` is the only directory-typed expansion today;
+    /// every other path-valued knob points at a single file.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct GitConfigPaths {
+        pub files: Vec<String>,
+        pub dirs: Vec<String>,
+    }
+
+    /// Invoke `git config --list --show-origin --show-scope` and return
+    /// the file-typed paths the git binary needs to read at startup —
+    /// every config file in the effective chain (with `include.path` /
+    /// `includeIf` traversal) plus the values of path-valued keys that
+    /// reference single files (`core.attributesFile`, `core.excludesFile`,
+    /// `commit.template`).
+    ///
+    /// `core.hooksPath` (a directory) is NOT returned here; see
+    /// [`read_hooks_path`].
     ///
     /// The scope filter happens in the parser (not via git's
     /// `--global`/`--system` CLI flags) because the CLI flags disable
     /// `include.path` traversal under that scope — and `include.path`
-    /// is the main reason this provider exists (covering the common
-    /// `~/.gitconfig` → `~/.gitconfig-work` pattern without enumerating
-    /// every per-user dotfile in the shipped profile).
+    /// is the main reason this provider exists.
     ///
-    /// `local` and `worktree` scopes are dropped: they come from
-    /// per-repo `.git/config`, which is attacker-controlled in the
-    /// clone-and-run threat model. A malicious clone that sets
-    /// `core.attributesFile=/etc/passwd` in its local config would
-    /// otherwise widen the sandbox at session start.
+    /// `local` and `worktree` scopes are dropped: they come from per-repo
+    /// `.git/config`, which is attacker-controlled in the clone-and-run
+    /// threat model.
     ///
-    /// Returns an empty list if `git` is absent or exits non-zero —
-    /// both are treated as "no expansion possible" rather than
-    /// profile-load failures, since the provider's job is to add
-    /// helpful read access on top of whatever the profile already
-    /// grants.
-    pub(crate) fn read_paths() -> Result<Vec<String>> {
-        run(None, None)
+    /// Returns an empty list if `git` is absent or exits non-zero — both
+    /// are treated as "no expansion possible" rather than profile-load
+    /// failures, since the provider's job is to add helpful read access
+    /// on top of whatever the profile already grants.
+    pub(crate) fn read_files() -> Result<Vec<String>> {
+        Ok(run(None, None)?.files)
     }
 
-    /// Test seam: run the provider against a fixed global config path.
-    /// Sets `GIT_CONFIG_GLOBAL` (overrides `~/.gitconfig`) and
-    /// `GIT_CONFIG_SYSTEM=/dev/null` (suppresses /etc/gitconfig noise
-    /// that varies per host) so tests can pin the output to a known
-    /// fixture.
+    /// Invoke `git config --list --show-origin --show-scope` and return
+    /// the directory-typed paths the git binary needs to read (today: just
+    /// `core.hooksPath` if set in the `global` or `system` scope).
+    ///
+    /// Returned paths are intended for `fs_read` lists; using
+    /// [`read_files`] for the same value would fail capability
+    /// construction because `fs_read_file` rejects directories.
+    pub(crate) fn read_hooks_path() -> Result<Vec<String>> {
+        Ok(run(None, None)?.dirs)
+    }
+
+    /// Test seam: parse a known-fixture global config and return the
+    /// files+dirs split. Sets `GIT_CONFIG_GLOBAL` (overrides
+    /// `~/.gitconfig`) and `GIT_CONFIG_SYSTEM=/dev/null` (suppresses
+    /// `/etc/gitconfig` noise that varies per host) so tests can pin
+    /// the output.
     #[cfg(test)]
-    pub(super) fn read_paths_with_global(global_config: &Path) -> Result<Vec<String>> {
+    pub(super) fn read_paths_with_global(global_config: &Path) -> Result<GitConfigPaths> {
         run(None, Some(global_config))
     }
 
@@ -75,11 +100,14 @@ pub(crate) mod git {
     /// global config path. Used to verify per-repo `.git/config` cannot
     /// influence the expansion.
     #[cfg(test)]
-    pub(super) fn read_paths_in(cwd: &Path, global_config: Option<&Path>) -> Result<Vec<String>> {
+    pub(super) fn read_paths_in(
+        cwd: &Path,
+        global_config: Option<&Path>,
+    ) -> Result<GitConfigPaths> {
         run(Some(cwd), global_config)
     }
 
-    fn run(cwd: Option<&Path>, global_config_override: Option<&Path>) -> Result<Vec<String>> {
+    fn run(cwd: Option<&Path>, global_config_override: Option<&Path>) -> Result<GitConfigPaths> {
         let mut cmd = Command::new("git");
         // `--show-scope` tags every line with the scope it came from
         // (`system` / `global` / `local` / `worktree` / `command`). The
@@ -102,56 +130,50 @@ pub(crate) mod git {
             Ok(o) => o,
             // git missing or otherwise unspawnable: silently return empty.
             // The sandbox keeps whatever static paths the profile declares.
-            Err(_) => return Ok(Vec::new()),
+            Err(_) => return Ok(GitConfigPaths::default()),
         };
         if !output.status.success() {
-            return Ok(Vec::new());
+            return Ok(GitConfigPaths::default());
         }
         let stdout = String::from_utf8(output.stdout)
             .map_err(|e| NonoError::ProfileParse(format!("git config produced non-UTF-8: {e}")))?;
-        Ok(read_paths_from_stdout(&stdout))
+        Ok(parse_paths_from_stdout(&stdout))
     }
 
     /// Parse the stdout of `git config --list --show-origin --show-scope`
-    /// into the set of paths whose contents the git binary needs to read.
+    /// into a [`GitConfigPaths`] split by capability type.
     ///
-    /// Returns deduplicated absolute paths drawn from two sources:
+    /// `files` collects:
     /// 1. `file:<path>` origins — every config file that contributed to
     ///    the effective config (including transitively-included files).
-    /// 2. Values of well-known path-valued config keys (`core.attributesFile`,
-    ///    `core.excludesFile`, `core.hooksPath`, `commit.template`) — these
-    ///    point at files git itself opens at startup but which live outside
-    ///    the config-file chain.
+    /// 2. Values of file-typed path keys (`core.attributesFile`,
+    ///    `core.excludesFile`, `commit.template`).
     ///
-    /// Only lines tagged with the `global` or `system` scope are considered.
+    /// `dirs` collects values of `core.hooksPath` — the only well-known
+    /// directory-typed config knob this provider exposes.
+    ///
+    /// Only lines tagged with the `global` or `system` scope are kept;
     /// `local` and `worktree` scopes are dropped because they come from
     /// per-repo `.git/config`, which is attacker-controlled in the
-    /// clone-and-run threat model — a malicious clone could otherwise
-    /// inject paths (`core.attributesFile=/etc/passwd`) and widen the
-    /// sandbox.
-    ///
-    /// Non-`file:` origins (`cmdline:`, `blob:HEAD:…`, `standard input:`)
-    /// are skipped — there is no filesystem path to grant. Path values
-    /// are passed through verbatim so callers can resolve `~`/`$VAR` later
-    /// via the usual profile expansion pipeline.
-    pub(super) fn read_paths_from_stdout(stdout: &str) -> Vec<String> {
+    /// clone-and-run threat model. Non-`file:` origins (`cmdline:`,
+    /// `blob:HEAD:…`, `standard input:`) reference no filesystem path
+    /// to grant and are skipped. Values are passed through verbatim so
+    /// callers can resolve `~`/`$VAR` later via the usual profile
+    /// expansion pipeline.
+    pub(super) fn parse_paths_from_stdout(stdout: &str) -> GitConfigPaths {
         use std::collections::BTreeSet;
 
-        const PATH_VALUED_KEYS: &[&str] = &[
+        const FILE_PATH_KEYS: &[&str] = &[
             "core.attributesfile",
             "core.excludesfile",
-            "core.hookspath",
             "commit.template",
         ];
+        const DIR_PATH_KEYS: &[&str] = &["core.hookspath"];
         const TRUSTED_SCOPES: &[&str] = &["global", "system"];
 
-        let mut seen = BTreeSet::new();
-        let mut out = Vec::new();
-        let mut push = |path: String| {
-            if !path.is_empty() && seen.insert(path.clone()) {
-                out.push(path);
-            }
-        };
+        let mut files_seen = BTreeSet::new();
+        let mut dirs_seen = BTreeSet::new();
+        let mut out = GitConfigPaths::default();
 
         for line in stdout.lines() {
             // Line shape: `<scope>\t<origin>\t<key>=<value>` (from
@@ -170,8 +192,11 @@ pub(crate) mod git {
             // Origin is one of `file:<path>`, `cmdline:`, `blob:<rev>:<path>`,
             // or `standard input:`. Only `file:` origins reference a path
             // we can grant read access to.
-            if let Some(path) = origin.strip_prefix("file:") {
-                push(path.to_string());
+            if let Some(path) = origin.strip_prefix("file:")
+                && !path.is_empty()
+                && files_seen.insert(path.to_string())
+            {
+                out.files.push(path.to_string());
             }
 
             let Some((key, value)) = rest.split_once('=') else {
@@ -181,8 +206,17 @@ pub(crate) mod git {
             // portion. Normalize to lowercase for the comparison so user
             // configs that write `core.attributesFile` mixed-case still
             // match.
-            if PATH_VALUED_KEYS.contains(&key.to_lowercase().as_str()) {
-                push(value.to_string());
+            let key_lower = key.to_lowercase();
+            if value.is_empty() {
+                continue;
+            }
+            if FILE_PATH_KEYS.contains(&key_lower.as_str()) && files_seen.insert(value.to_string())
+            {
+                out.files.push(value.to_string());
+            } else if DIR_PATH_KEYS.contains(&key_lower.as_str())
+                && dirs_seen.insert(value.to_string())
+            {
+                out.dirs.push(value.to_string());
             }
         }
         out
@@ -196,7 +230,8 @@ pub(crate) mod git {
 fn dispatch_token(provider: &str, query: &str) -> Result<Vec<String>> {
     match provider {
         "git" => match query {
-            "config-paths" => git::read_paths(),
+            "config-files" => git::read_files(),
+            "hooks-path" => git::read_hooks_path(),
             other => Err(NonoError::ProfileParse(format!(
                 "unknown git provider query '{other}'"
             ))),
@@ -276,9 +311,10 @@ mod tests {
     #[test]
     fn parse_token_recognises_at_provider_colon_query() {
         assert_eq!(
-            parse_token("@git:config-paths"),
-            Some(("git", "config-paths"))
+            parse_token("@git:config-files"),
+            Some(("git", "config-files"))
         );
+        assert_eq!(parse_token("@git:hooks-path"), Some(("git", "hooks-path")));
     }
 
     #[test]
@@ -313,12 +349,12 @@ mod tests {
     fn expand_path_list_splices_provider_output_in_place() {
         let input = vec![
             "~/.gitconfig".to_string(),
-            "@git:config-paths".to_string(),
+            "@git:config-files".to_string(),
             "/etc/static".to_string(),
         ];
         let out = expand_path_list_with(&input, |provider, query| {
             assert_eq!(provider, "git");
-            assert_eq!(query, "config-paths");
+            assert_eq!(query, "config-files");
             Ok(vec!["/a".to_string(), "/b".to_string()])
         })
         .expect("expansion");
@@ -326,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn git_read_paths_from_stdout_extracts_config_file_paths() {
+    fn parse_paths_from_stdout_extracts_config_file_paths_into_files() {
         let stdout = "\
 global\tfile:/home/u/.gitconfig\tuser.name=Alice
 global\tfile:/home/u/.gitconfig\tuser.email=alice@example.com
@@ -334,25 +370,30 @@ global\tfile:/home/u/.gitconfig-work\tcommit.template=/tmp/template
 command\tcmdline:\tcore.editor=vim
 global\tfile:/home/u/.gitconfig\tinclude.path=~/.gitconfig-work
 ";
-        let out = git::read_paths_from_stdout(stdout);
-        assert!(out.contains(&"/home/u/.gitconfig".to_string()));
-        assert!(out.contains(&"/home/u/.gitconfig-work".to_string()));
+        let out = git::parse_paths_from_stdout(stdout);
+        assert!(out.files.contains(&"/home/u/.gitconfig".to_string()));
+        assert!(out.files.contains(&"/home/u/.gitconfig-work".to_string()));
+        assert!(out.dirs.is_empty(), "dirs should be empty: {:?}", out.dirs);
     }
 
     #[test]
-    fn git_read_paths_from_stdout_dedupes_repeated_file_origins() {
+    fn parse_paths_from_stdout_dedupes_repeated_file_origins() {
         let stdout = "\
 global\tfile:/home/u/.gitconfig\tuser.name=Alice
 global\tfile:/home/u/.gitconfig\tuser.email=alice@example.com
 global\tfile:/home/u/.gitconfig\tcore.editor=vim
 ";
-        let out = git::read_paths_from_stdout(stdout);
-        let count = out.iter().filter(|p| *p == "/home/u/.gitconfig").count();
-        assert_eq!(count, 1, "got {:?}", out);
+        let out = git::parse_paths_from_stdout(stdout);
+        let count = out
+            .files
+            .iter()
+            .filter(|p| *p == "/home/u/.gitconfig")
+            .count();
+        assert_eq!(count, 1, "got {:?}", out.files);
     }
 
     #[test]
-    fn git_read_paths_from_stdout_ignores_non_file_origins() {
+    fn parse_paths_from_stdout_ignores_non_file_origins() {
         // cmdline:, blob:, standard input — none of these are filesystem
         // paths we can grant read access to.
         let stdout = "\
@@ -360,12 +401,13 @@ command\tcmdline:\tcore.editor=vim
 local\tblob:HEAD:.gitmodules\tsubmodule.foo.url=x
 global\tstandard input:\tuser.name=Alice
 ";
-        let out = git::read_paths_from_stdout(stdout);
-        assert!(out.is_empty(), "got {:?}", out);
+        let out = git::parse_paths_from_stdout(stdout);
+        assert!(out.files.is_empty(), "got files {:?}", out.files);
+        assert!(out.dirs.is_empty(), "got dirs {:?}", out.dirs);
     }
 
     #[test]
-    fn git_read_paths_from_stdout_drops_local_and_worktree_scopes() {
+    fn parse_paths_from_stdout_drops_local_and_worktree_scopes() {
         // Threat model: attacker-controlled per-repo .git/config (scope
         // `local`) or per-worktree config (scope `worktree`) should
         // never widen the sandbox. Only `global` and `system` scopes
@@ -376,22 +418,36 @@ local\tfile:/repo/.git/config\tcore.attributesFile=/etc/passwd
 worktree\tfile:/repo/.git/config.worktree\tcore.hooksPath=/etc/sudoers.d
 system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
 ";
-        let out = git::read_paths_from_stdout(stdout);
-        assert!(out.contains(&"/home/u/.gitattributes".to_string()));
-        assert!(out.contains(&"/etc/git-template".to_string()));
-        assert!(out.contains(&"/home/u/.gitconfig".to_string()));
-        assert!(out.contains(&"/etc/gitconfig".to_string()));
+        let out = git::parse_paths_from_stdout(stdout);
+        assert!(out.files.contains(&"/home/u/.gitattributes".to_string()));
+        assert!(out.files.contains(&"/etc/git-template".to_string()));
+        assert!(out.files.contains(&"/home/u/.gitconfig".to_string()));
+        assert!(out.files.contains(&"/etc/gitconfig".to_string()));
+        for leaked in ["/etc/passwd", "/etc/sudoers.d", "/repo/.git/config"] {
+            assert!(
+                !out.files.iter().any(|p| p == leaked) && !out.dirs.iter().any(|p| p == leaked),
+                "untrusted-scope path leaked: {leaked} in {out:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_paths_from_stdout_routes_hooks_path_to_dirs() {
+        // core.hooksPath is a directory; consumers will want to slot it
+        // into `fs_read` rather than `fs_read_file` so the hook scripts
+        // underneath it are reachable. Keep it out of `files` so the
+        // file-typed capability path in nono doesn't reject it.
+        let stdout = "\
+global\tfile:/home/u/.gitconfig\tcore.hooksPath=/home/u/.githooks
+global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
+";
+        let out = git::parse_paths_from_stdout(stdout);
+        assert_eq!(out.dirs, vec!["/home/u/.githooks".to_string()]);
+        assert!(out.files.contains(&"/home/u/.gitattributes".to_string()));
         assert!(
-            !out.iter().any(|p| p == "/etc/passwd"),
-            "local-scope path leaked: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|p| p == "/etc/sudoers.d"),
-            "worktree-scope path leaked: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|p| p == "/repo/.git/config"),
-            "local-scope origin leaked: {out:?}"
+            !out.files.iter().any(|p| p == "/home/u/.githooks"),
+            "hooksPath leaked into files: {:?}",
+            out.files
         );
     }
 
@@ -411,12 +467,14 @@ system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
 
         let cfg_str = cfg.to_str().expect("utf8 tempdir");
         assert!(
-            paths.iter().any(|p| p == cfg_str),
-            "expected gitconfig path {cfg_str} in output, got {paths:?}"
+            paths.files.iter().any(|p| p == cfg_str),
+            "expected gitconfig path {cfg_str} in files, got {:?}",
+            paths.files
         );
         assert!(
-            paths.iter().any(|p| p == "~/.gitattributes-test"),
-            "expected attributesFile value in output, got {paths:?}"
+            paths.files.iter().any(|p| p == "~/.gitattributes-test"),
+            "expected attributesFile value in files, got {:?}",
+            paths.files
         );
     }
 
@@ -467,11 +525,13 @@ system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
         let paths = git::read_paths_in(&repo, Some(&global_cfg)).expect("git config provider");
 
         assert!(
-            paths.iter().any(|p| p == global_attrs),
-            "global attributesFile missing, got {paths:?}"
+            paths.files.iter().any(|p| p == global_attrs),
+            "global attributesFile missing, got {:?}",
+            paths.files
         );
         assert!(
-            !paths.iter().any(|p| p == evil_attrs),
+            !paths.files.iter().any(|p| p == evil_attrs)
+                && !paths.dirs.iter().any(|p| p == evil_attrs),
             "per-repo attributesFile leaked into provider output (sandbox bypass), got {paths:?}"
         );
     }
@@ -497,21 +557,23 @@ system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
         let cfg_str = cfg.to_str().expect("utf8");
         let work_str = work.to_str().expect("utf8");
         assert!(
-            paths.iter().any(|p| p == cfg_str),
-            "main gitconfig missing, got {paths:?}"
+            paths.files.iter().any(|p| p == cfg_str),
+            "main gitconfig missing, got {:?}",
+            paths.files
         );
         assert!(
-            paths.iter().any(|p| p == work_str),
-            "included gitconfig-work missing, got {paths:?}"
+            paths.files.iter().any(|p| p == work_str),
+            "included gitconfig-work missing, got {:?}",
+            paths.files
         );
     }
 
     #[test]
-    fn git_read_paths_from_stdout_extracts_path_valued_keys() {
-        // core.attributesFile and friends point at files git itself wants
-        // to read at startup. They live wherever the user puts them, and
-        // missing entries from the sandbox cause "Operation not permitted"
-        // warnings.
+    fn parse_paths_from_stdout_extracts_path_valued_keys() {
+        // core.attributesFile, core.excludesFile, commit.template point at
+        // single files; core.hooksPath points at a directory. Each kind
+        // must land in the matching bucket so consumers route into the
+        // right capability list.
         let stdout = "\
 global\tfile:/home/u/.gitconfig\tcore.attributesFile=~/.gitattributes
 global\tfile:/home/u/.gitconfig\tcore.excludesFile=~/.gitexcludes
@@ -519,11 +581,11 @@ global\tfile:/home/u/.gitconfig\tcore.hooksPath=~/.githooks
 global\tfile:/home/u/.gitconfig\tcommit.template=~/.gitmessage
 global\tfile:/home/u/.gitconfig\tuser.name=Alice
 ";
-        let out = git::read_paths_from_stdout(stdout);
-        assert!(out.contains(&"~/.gitattributes".to_string()));
-        assert!(out.contains(&"~/.gitexcludes".to_string()));
-        assert!(out.contains(&"~/.githooks".to_string()));
-        assert!(out.contains(&"~/.gitmessage".to_string()));
+        let out = git::parse_paths_from_stdout(stdout);
+        assert!(out.files.contains(&"~/.gitattributes".to_string()));
+        assert!(out.files.contains(&"~/.gitexcludes".to_string()));
+        assert!(out.files.contains(&"~/.gitmessage".to_string()));
+        assert_eq!(out.dirs, vec!["~/.githooks".to_string()]);
     }
 
     #[test]

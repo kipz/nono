@@ -35,15 +35,30 @@ pub(crate) mod git {
 
     use nono::{NonoError, Result};
 
-    /// Invoke `git config --list --show-origin` against the user's
-    /// effective config and parse the result via
-    /// [`read_paths_from_stdout`]. Returns an empty list if `git` is
-    /// absent or exits non-zero — both are treated as "no expansion
-    /// possible" rather than profile-load failures, since the provider's
-    /// job is to add helpful read access on top of whatever the profile
-    /// already grants.
+    /// Invoke `git config --list --show-origin --show-scope` and parse
+    /// the result via [`read_paths_from_stdout`], which keeps only the
+    /// lines tagged with the `global` or `system` scope.
+    ///
+    /// The scope filter happens in the parser (not via git's
+    /// `--global`/`--system` CLI flags) because the CLI flags disable
+    /// `include.path` traversal under that scope — and `include.path`
+    /// is the main reason this provider exists (covering the common
+    /// `~/.gitconfig` → `~/.gitconfig-work` pattern without enumerating
+    /// every per-user dotfile in the shipped profile).
+    ///
+    /// `local` and `worktree` scopes are dropped: they come from
+    /// per-repo `.git/config`, which is attacker-controlled in the
+    /// clone-and-run threat model. A malicious clone that sets
+    /// `core.attributesFile=/etc/passwd` in its local config would
+    /// otherwise widen the sandbox at session start.
+    ///
+    /// Returns an empty list if `git` is absent or exits non-zero —
+    /// both are treated as "no expansion possible" rather than
+    /// profile-load failures, since the provider's job is to add
+    /// helpful read access on top of whatever the profile already
+    /// grants.
     pub(crate) fn read_paths() -> Result<Vec<String>> {
-        run(None)
+        run(None, None)
     }
 
     /// Test seam: run the provider against a fixed global config path.
@@ -53,12 +68,32 @@ pub(crate) mod git {
     /// fixture.
     #[cfg(test)]
     pub(super) fn read_paths_with_global(global_config: &Path) -> Result<Vec<String>> {
-        run(Some(global_config))
+        run(None, Some(global_config))
     }
 
-    fn run(global_config_override: Option<&Path>) -> Result<Vec<String>> {
+    /// Test seam: run the provider with both a specific cwd and a fixed
+    /// global config path. Used to verify per-repo `.git/config` cannot
+    /// influence the expansion.
+    #[cfg(test)]
+    pub(super) fn read_paths_in(cwd: &Path, global_config: Option<&Path>) -> Result<Vec<String>> {
+        run(Some(cwd), global_config)
+    }
+
+    fn run(cwd: Option<&Path>, global_config_override: Option<&Path>) -> Result<Vec<String>> {
         let mut cmd = Command::new("git");
-        cmd.args(["config", "--list", "--show-origin"]);
+        // `--show-scope` tags every line with the scope it came from
+        // (`system` / `global` / `local` / `worktree` / `command`). The
+        // parser keeps `global` and `system` lines and drops `local` /
+        // `worktree` so an attacker-controlled per-repo .git/config
+        // cannot widen the sandbox via the provider. `--global` as a
+        // CLI scope filter would do the same job at the input boundary
+        // but it disables include.path traversal under that scope (see
+        // the regression test), losing the main reason this provider
+        // exists.
+        cmd.args(["config", "--list", "--show-origin", "--show-scope"]);
+        if let Some(d) = cwd {
+            cmd.current_dir(d);
+        }
         if let Some(path) = global_config_override {
             cmd.env("GIT_CONFIG_GLOBAL", path);
             cmd.env("GIT_CONFIG_SYSTEM", "/dev/null");
@@ -88,6 +123,13 @@ pub(crate) mod git {
     ///    point at files git itself opens at startup but which live outside
     ///    the config-file chain.
     ///
+    /// Only lines tagged with the `global` or `system` scope are considered.
+    /// `local` and `worktree` scopes are dropped because they come from
+    /// per-repo `.git/config`, which is attacker-controlled in the
+    /// clone-and-run threat model — a malicious clone could otherwise
+    /// inject paths (`core.attributesFile=/etc/passwd`) and widen the
+    /// sandbox.
+    ///
     /// Non-`file:` origins (`cmdline:`, `blob:HEAD:…`, `standard input:`)
     /// are skipped — there is no filesystem path to grant. Path values
     /// are passed through verbatim so callers can resolve `~`/`$VAR` later
@@ -101,6 +143,7 @@ pub(crate) mod git {
             "core.hookspath",
             "commit.template",
         ];
+        const TRUSTED_SCOPES: &[&str] = &["global", "system"];
 
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
@@ -111,13 +154,22 @@ pub(crate) mod git {
         };
 
         for line in stdout.lines() {
-            // Line shape: `<origin>\t<key>=<value>`. The origin is one of
-            // `file:<path>`, `cmdline:`, `blob:<rev>:<path>`, or
-            // `standard input:`. Only `file:` origins reference a path
-            // we can grant read access to.
-            let Some((origin, rest)) = line.split_once('\t') else {
+            // Line shape: `<scope>\t<origin>\t<key>=<value>` (from
+            // `--show-scope --show-origin`). Drop lines from untrusted
+            // scopes (`local`, `worktree`, `command`) before doing
+            // anything else.
+            let Some((scope, after_scope)) = line.split_once('\t') else {
                 continue;
             };
+            if !TRUSTED_SCOPES.contains(&scope) {
+                continue;
+            }
+            let Some((origin, rest)) = after_scope.split_once('\t') else {
+                continue;
+            };
+            // Origin is one of `file:<path>`, `cmdline:`, `blob:<rev>:<path>`,
+            // or `standard input:`. Only `file:` origins reference a path
+            // we can grant read access to.
             if let Some(path) = origin.strip_prefix("file:") {
                 push(path.to_string());
             }
@@ -276,11 +328,11 @@ mod tests {
     #[test]
     fn git_read_paths_from_stdout_extracts_config_file_paths() {
         let stdout = "\
-file:/home/u/.gitconfig\tuser.name=Alice
-file:/home/u/.gitconfig\tuser.email=alice@example.com
-file:/home/u/.gitconfig-work\tcommit.template=/tmp/template
-cmdline:\tcore.editor=vim
-file:/home/u/.gitconfig\tinclude.path=~/.gitconfig-work
+global\tfile:/home/u/.gitconfig\tuser.name=Alice
+global\tfile:/home/u/.gitconfig\tuser.email=alice@example.com
+global\tfile:/home/u/.gitconfig-work\tcommit.template=/tmp/template
+command\tcmdline:\tcore.editor=vim
+global\tfile:/home/u/.gitconfig\tinclude.path=~/.gitconfig-work
 ";
         let out = git::read_paths_from_stdout(stdout);
         assert!(out.contains(&"/home/u/.gitconfig".to_string()));
@@ -290,9 +342,9 @@ file:/home/u/.gitconfig\tinclude.path=~/.gitconfig-work
     #[test]
     fn git_read_paths_from_stdout_dedupes_repeated_file_origins() {
         let stdout = "\
-file:/home/u/.gitconfig\tuser.name=Alice
-file:/home/u/.gitconfig\tuser.email=alice@example.com
-file:/home/u/.gitconfig\tcore.editor=vim
+global\tfile:/home/u/.gitconfig\tuser.name=Alice
+global\tfile:/home/u/.gitconfig\tuser.email=alice@example.com
+global\tfile:/home/u/.gitconfig\tcore.editor=vim
 ";
         let out = git::read_paths_from_stdout(stdout);
         let count = out.iter().filter(|p| *p == "/home/u/.gitconfig").count();
@@ -304,12 +356,43 @@ file:/home/u/.gitconfig\tcore.editor=vim
         // cmdline:, blob:, standard input — none of these are filesystem
         // paths we can grant read access to.
         let stdout = "\
-cmdline:\tcore.editor=vim
-blob:HEAD:.gitmodules\tsubmodule.foo.url=x
-standard input:\tuser.name=Alice
+command\tcmdline:\tcore.editor=vim
+local\tblob:HEAD:.gitmodules\tsubmodule.foo.url=x
+global\tstandard input:\tuser.name=Alice
 ";
         let out = git::read_paths_from_stdout(stdout);
         assert!(out.is_empty(), "got {:?}", out);
+    }
+
+    #[test]
+    fn git_read_paths_from_stdout_drops_local_and_worktree_scopes() {
+        // Threat model: attacker-controlled per-repo .git/config (scope
+        // `local`) or per-worktree config (scope `worktree`) should
+        // never widen the sandbox. Only `global` and `system` scopes
+        // contribute paths.
+        let stdout = "\
+global\tfile:/home/u/.gitconfig\tcore.attributesFile=/home/u/.gitattributes
+local\tfile:/repo/.git/config\tcore.attributesFile=/etc/passwd
+worktree\tfile:/repo/.git/config.worktree\tcore.hooksPath=/etc/sudoers.d
+system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
+";
+        let out = git::read_paths_from_stdout(stdout);
+        assert!(out.contains(&"/home/u/.gitattributes".to_string()));
+        assert!(out.contains(&"/etc/git-template".to_string()));
+        assert!(out.contains(&"/home/u/.gitconfig".to_string()));
+        assert!(out.contains(&"/etc/gitconfig".to_string()));
+        assert!(
+            !out.iter().any(|p| p == "/etc/passwd"),
+            "local-scope path leaked: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p == "/etc/sudoers.d"),
+            "worktree-scope path leaked: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p == "/repo/.git/config"),
+            "local-scope origin leaked: {out:?}"
+        );
     }
 
     #[test]
@@ -334,6 +417,62 @@ standard input:\tuser.name=Alice
         assert!(
             paths.iter().any(|p| p == "~/.gitattributes-test"),
             "expected attributesFile value in output, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn git_read_paths_excludes_per_repo_local_config_overrides() {
+        // Threat model: a malicious repo's .git/config could set
+        // core.attributesFile=/etc/passwd (or include.path=/etc/shadow)
+        // to widen the sandbox on a victim who runs the agent inside the
+        // repo. The provider must restrict itself to global+system scope
+        // so per-repo state cannot influence the expansion.
+        use std::io::Write;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let global_cfg = tmp.path().join("global-gitconfig");
+        let global_attrs = "/tmp/global-attributes-trusted";
+        let evil_attrs = "/etc/passwd";
+
+        {
+            let mut f = std::fs::File::create(&global_cfg).expect("create global");
+            writeln!(f, "[user]\n\tname = Test").expect("write user");
+            writeln!(f, "[core]\n\tattributesFile = {global_attrs}").expect("write attrs");
+        }
+
+        // Hostile repo with a .git/config that tries to inject a path
+        // outside the user's home directory. cwd here would be the
+        // attacker-controlled clone.
+        let repo = tmp.path().join("hostile-repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+        let status = Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&repo)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init failed");
+        let status = Command::new("git")
+            .args(["config", "core.attributesFile", evil_attrs])
+            .current_dir(&repo)
+            .status()
+            .expect("git config local");
+        assert!(status.success(), "git config local failed");
+
+        // Run the provider from inside the hostile repo with the trusted
+        // global config in scope. Switching cwd directly is racy in tests,
+        // so we use a thin shell-out helper that takes a cwd and uses the
+        // same env-var test seam.
+        let paths = git::read_paths_in(&repo, Some(&global_cfg)).expect("git config provider");
+
+        assert!(
+            paths.iter().any(|p| p == global_attrs),
+            "global attributesFile missing, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p == evil_attrs),
+            "per-repo attributesFile leaked into provider output (sandbox bypass), got {paths:?}"
         );
     }
 
@@ -374,11 +513,11 @@ standard input:\tuser.name=Alice
         // missing entries from the sandbox cause "Operation not permitted"
         // warnings.
         let stdout = "\
-file:/home/u/.gitconfig\tcore.attributesFile=~/.gitattributes
-file:/home/u/.gitconfig\tcore.excludesFile=~/.gitexcludes
-file:/home/u/.gitconfig\tcore.hooksPath=~/.githooks
-file:/home/u/.gitconfig\tcommit.template=~/.gitmessage
-file:/home/u/.gitconfig\tuser.name=Alice
+global\tfile:/home/u/.gitconfig\tcore.attributesFile=~/.gitattributes
+global\tfile:/home/u/.gitconfig\tcore.excludesFile=~/.gitexcludes
+global\tfile:/home/u/.gitconfig\tcore.hooksPath=~/.githooks
+global\tfile:/home/u/.gitconfig\tcommit.template=~/.gitmessage
+global\tfile:/home/u/.gitconfig\tuser.name=Alice
 ";
         let out = git::read_paths_from_stdout(stdout);
         assert!(out.contains(&"~/.gitattributes".to_string()));

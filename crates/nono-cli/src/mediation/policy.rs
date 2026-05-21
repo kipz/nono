@@ -689,6 +689,26 @@ async fn exec_passthrough(
         })
         .unwrap_or_default();
 
+    // Collect full real binary paths for allow_commands targets so they can be
+    // exec'd directly (bypassing the shim) inside this command's sandbox when
+    // process-exec is restricted by default.
+    let allowed_binary_real_paths: Vec<std::path::PathBuf> = sandbox
+        .as_ref()
+        .map(|sb| &sb.allow_commands)
+        .filter(|ac| !ac.is_empty())
+        .map(|allow_cmds| {
+            allow_cmds
+                .iter()
+                .filter_map(|name| {
+                    all_commands
+                        .iter()
+                        .find(|c| c.name == *name)
+                        .map(|c| c.real_path.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Start a per-command proxy if allowed_hosts is configured (and block is not set).
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
     let mut proxy_port: Option<u16> = None;
@@ -810,6 +830,29 @@ async fn exec_passthrough(
             // their real binaries directly (bypassing the shim).
             for dir in &allowed_binary_dirs {
                 caps = caps.allow_path(dir, nono::AccessMode::Read)?;
+            }
+
+            // Process-spawn gating.
+            //
+            // By default a per-command sandbox cannot spawn child processes via
+            // process-exec. This closes the ssh ProxyCommand exfil class where a
+            // Seatbelt child inherits ssh's fs_read access to ~/.ssh and uses
+            // /bin/sh -c to smuggle private keys out via the network. Commands
+            // that legitimately shell out to helpers (git, gh, aws, kubectl, etc.)
+            // must opt in with `allow_process_exec: true` in their CommandSandbox.
+            //
+            // Even when restricted, the command must be able to launch itself and
+            // any binaries it declares via `allow_commands` — those run directly
+            // inside this command's sandbox, bypassing the shim.
+            if !sb.allow_process_exec {
+                caps = caps.restrict_process_exec();
+                caps = caps.allow_exec_path(&real_path);
+                if let Some(ref real_shim) = real_shim_binary {
+                    caps = caps.allow_exec_path(real_shim);
+                }
+                for bin in &allowed_binary_real_paths {
+                    caps = caps.allow_exec_path(bin);
+                }
             }
 
             // Add command-specific configured paths. `~` and `$VAR` tokens
@@ -2088,6 +2131,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec!["ddtool".to_string()],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2181,6 +2225,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2245,6 +2290,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2311,6 +2357,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2374,6 +2421,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2433,6 +2481,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2493,6 +2542,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2525,6 +2575,215 @@ mod tests {
             !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
             "keychain_access should not override network block, but HTTPS_PROXY found: {}",
             resp.stdout
+        );
+    }
+
+    // --- allow_process_exec tests ---
+
+    /// Default per-command sandbox (allow_process_exec: false) blocks subprocess
+    /// spawning at the Seatbelt layer. This closes the ssh ProxyCommand exfil
+    /// class — a sandbox that grants ~/.ssh fs_read cannot launch /bin/sh to
+    /// smuggle key material out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_per_command_sandbox_denies_subprocess_by_default() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: false,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        // /bin/sh runs (its path is allowed via real_path) but cannot launch
+        // /usr/bin/true; sh reports non-zero exit.
+        assert_ne!(
+            resp.exit_code, 0,
+            "expected sh to fail launching /usr/bin/true under deny-by-default; stdout={} stderr={}",
+            resp.stdout, resp.stderr
+        );
+    }
+
+    /// `allow_process_exec: true` lifts the deny so a command can shell out to
+    /// helpers freely. Used by trusted commands with helper sprawl (git, gh, aws,
+    /// kubectl, etc.) where enumerating every helper is impractical.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_per_command_sandbox_allows_subprocess_when_opted_in() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: true,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(
+            resp.exit_code, 0,
+            "expected sh -c /usr/bin/true to succeed with allow_process_exec=true; stderr={}",
+            resp.stderr
+        );
+    }
+
+    /// `allow_commands` targets are exec-allowed inside the caller's sandbox
+    /// even when `allow_process_exec: false`. Verifies the bypass-the-shim
+    /// design: the listed binary is run directly with no re-mediation.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_allow_commands_binary_is_exec_allowed_when_restricted() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        // build_filtered_shim_dir requires fake shim files in shim_dir, and
+        // creates the filtered dir as a sibling — so shim_dir's parent must
+        // be writable. Use a tempdir.
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        for name in &["testcmd", "myhelper"] {
+            let p = shim_dir.join(name);
+            std::fs::write(&p, "fake-shim").expect("write shim");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let other = ResolvedCommand {
+            name: "myhelper".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec!["myhelper".to_string()],
+                keychain_access: false,
+                allow_process_exec: false,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd, other],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: &shim_dir,
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(
+            resp.exit_code, 0,
+            "expected allow_commands target to be exec-allowed even under restrict; stderr={}",
+            resp.stderr
         );
     }
 

@@ -1624,7 +1624,7 @@ fn wait_for_child_with_pty(
         let in_band_detach_requested = pty.take_detach_request();
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
 
-        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
                     && Instant::now() >= deadline
@@ -1640,6 +1640,13 @@ fn wait_for_child_with_pty(
                     let status = wait_for_child(child)?;
                     return Ok(status);
                 }
+                continue;
+            }
+            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
+                pty.pause_terminal_for_prompt();
+                unsafe { libc::raise(libc::SIGTSTP) };
+                pty.resume_terminal_after_prompt();
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {
@@ -2124,7 +2131,7 @@ fn run_supervisor_loop(
             in_band_detach_requested,
         );
 
-        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
                     && Instant::now() >= deadline
@@ -2139,6 +2146,17 @@ fn run_supervisor_loop(
                     let _ = signal::kill(child, Signal::SIGKILL);
                     return Ok((wait_for_child(child)?, denials));
                 }
+                continue;
+            }
+            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
+                if let Some(ref mut p) = pty {
+                    p.pause_terminal_for_prompt();
+                }
+                unsafe { libc::raise(libc::SIGTSTP) };
+                if let Some(ref mut p) = pty {
+                    p.resume_terminal_after_prompt();
+                }
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {
@@ -2395,7 +2413,7 @@ fn run_supervisor_loop(
             in_band_detach_requested,
         );
 
-        match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
+        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED)) {
             Ok(WaitStatus::StillAlive) => {
                 if let Some((deadline, timeout_cfg)) = startup_deadline
                     && Instant::now() >= deadline
@@ -2410,6 +2428,17 @@ fn run_supervisor_loop(
                     let _ = signal::kill(child, Signal::SIGKILL);
                     return Ok((wait_for_child(child)?, denials, ipc_denials));
                 }
+                continue;
+            }
+            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
+                if let Some(ref mut p) = pty {
+                    p.pause_terminal_for_prompt();
+                }
+                unsafe { libc::raise(libc::SIGTSTP) };
+                if let Some(ref mut p) = pty {
+                    p.resume_terminal_after_prompt();
+                }
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {

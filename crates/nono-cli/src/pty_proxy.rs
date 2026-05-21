@@ -236,6 +236,9 @@ pub struct PtyProxy {
     pending_detach_escape: Vec<u8>,
     /// In-band detach requested from the attached client.
     detach_requested: bool,
+    /// Ctrl-Z (0x1a) intercepted from the attached client; signals the
+    /// supervisor to pause the child and suspend itself via SIGTSTP.
+    job_control_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -363,6 +366,7 @@ impl PtyProxy {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            job_control_requested: false,
         })
     }
 
@@ -783,6 +787,13 @@ impl PtyProxy {
         std::mem::take(&mut self.detach_requested)
     }
 
+    /// Returns true once for each Ctrl-Z job-control request intercepted from
+    /// the attached client.  The caller is responsible for stopping the child
+    /// and suspending itself via SIGTSTP.
+    pub fn take_job_control_request(&mut self) -> bool {
+        std::mem::take(&mut self.job_control_requested)
+    }
+
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
     /// Returns true when a terminal-backed client was paused and must later
@@ -1064,6 +1075,19 @@ impl PtyProxy {
                     self.pending_detach_match_len = 1;
                     continue;
                 }
+            }
+
+            // Intercept Ctrl-Z (0x1a) for PTY-level job control.  The outer
+            // terminal is in raw mode (ISIG cleared), so \x1a is a plain byte
+            // rather than a kernel-generated SIGTSTP.  We consume it here and
+            // signal the supervisor loop to stop the child and suspend itself.
+            if byte == 0x1a {
+                debug!(
+                    "PTY proxy: intercepted Ctrl-Z, setting job_control_requested for session {}",
+                    self.session_id
+                );
+                self.job_control_requested = true;
+                continue;
             }
 
             forwarded.push(byte);
@@ -2423,6 +2447,7 @@ mod tests {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            job_control_requested: false,
         }
     }
 
@@ -2917,5 +2942,40 @@ mod tests {
 
         assert!(proxy.proxy_master_to_client());
         assert!(proxy.client.is_none());
+    }
+
+    #[test]
+    fn filter_client_input_intercepts_ctrl_z_standalone() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        assert!(forwarded.is_empty(), "ctrl-z should not be forwarded");
+        assert!(proxy.take_job_control_request());
+    }
+
+    #[test]
+    fn filter_client_input_intercepts_ctrl_z_embedded() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"ab\x1acd");
+        assert_eq!(forwarded, b"abcd", "only ctrl-z should be consumed");
+        assert!(proxy.take_job_control_request());
+    }
+
+    #[test]
+    fn filter_client_input_take_job_control_resets() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.filter_client_input(b"\x1a");
+        assert!(proxy.take_job_control_request());
+        assert!(!proxy.take_job_control_request(), "flag should be cleared after take");
+    }
+
+    #[test]
+    fn filter_client_input_ctrl_z_does_not_interfere_with_detach_sequence() {
+        // If \x1a is the detach-sequence prefix, the detach state machine consumes it.
+        let mut proxy = build_test_proxy(&[0x1a, b'd']);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        // Partially matched detach — not forwarded, but also not a job-control request
+        assert!(forwarded.is_empty());
+        assert!(!proxy.take_job_control_request(), "partial detach match should not set job_control");
+        assert!(!proxy.take_detach_request());
     }
 }

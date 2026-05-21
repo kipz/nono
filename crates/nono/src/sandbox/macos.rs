@@ -495,9 +495,28 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
-    profile.push_str("(allow process-fork)\n");
+    // Process operations: by default permit all exec and fork. When the
+    // capability set restricts process-exec, deny exec by default and emit
+    // explicit allow rules only for the paths in `allowed_exec_paths`.
+    // `process-fork` remains allowed so threading and fork-without-exec
+    // continue to work; the kernel's deny on exec is what closes the
+    // child-process exfiltration escape.
+    if caps.process_exec_restricted() {
+        profile.push_str("(allow process-fork)\n");
+        for (path, is_subpath) in caps.allowed_exec_paths() {
+            let path_str = path.to_string_lossy();
+            // Escape backslashes and double quotes for the Seatbelt string literal.
+            let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+            let filter = if *is_subpath { "subpath" } else { "literal" };
+            profile.push_str(&format!(
+                "(allow process-exec ({} \"{}\"))\n",
+                filter, escaped
+            ));
+        }
+    } else {
+        profile.push_str("(allow process-exec*)\n");
+        profile.push_str("(allow process-fork)\n");
+    }
 
     // Process info: allow self-inspection and same-sandbox inspection for both
     // Isolated and AllowSameSandbox, matching Linux behaviour where Landlock
@@ -843,8 +862,72 @@ mod tests {
 
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
+        // Default process spawn is unrestricted.
+        assert!(profile.contains("(allow process-exec*)"));
         // Network is allowed by default
         assert!(profile.contains("(allow network-outbound)"));
+    }
+
+    #[test]
+    fn test_restricted_spawn_denies_default() {
+        let caps = CapabilitySet::new().restrict_process_exec();
+        let profile = generate_profile(&caps).unwrap();
+
+        // Blanket allow must not be present.
+        assert!(
+            !profile.contains("(allow process-exec*)"),
+            "blanket allow leaked into restricted profile:\n{}",
+            profile
+        );
+        // Fork remains allowed for threading.
+        assert!(profile.contains("(allow process-fork)"));
+        // Implicit deny by default.
+        assert!(profile.contains("(deny default)"));
+    }
+
+    #[test]
+    fn test_restricted_spawn_literal_paths() {
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_path("/usr/local/bin/git")
+            .allow_exec_path("/opt/homebrew/bin/ssh");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(allow process-exec*)"));
+        assert!(
+            profile.contains("(allow process-exec (literal \"/usr/local/bin/git\"))"),
+            "missing git literal allow:\n{}",
+            profile
+        );
+        assert!(
+            profile.contains("(allow process-exec (literal \"/opt/homebrew/bin/ssh\"))"),
+            "missing ssh literal allow:\n{}",
+            profile
+        );
+    }
+
+    #[test]
+    fn test_restricted_spawn_subpath() {
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_subpath("/opt/homebrew/bin");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow process-exec (subpath \"/opt/homebrew/bin\"))"),
+            "missing subpath allow:\n{}",
+            profile
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_inert_without_restriction() {
+        // Adding paths without enabling restriction is a no-op: blanket allow wins.
+        let caps = CapabilitySet::new().allow_exec_path("/usr/local/bin/git");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec*)"));
+        assert!(!profile.contains("(allow process-exec (literal"));
     }
 
     /// Repro for tls-intercept-qa T2 failure: `head <SSL_CERT_FILE>` returned

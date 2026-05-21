@@ -119,7 +119,12 @@ fn merge_intercept_rules(
 }
 
 /// Recursive merge of a [`CommandSandbox`]. Restrictive-wins on security gates
-/// (`network.block`, `keychain_access`); list fields union.
+/// (`network.block`, `keychain_access`, `allow_process_exec`); list fields union.
+///
+/// `allow_process_exec` merges with AND: granting broad spawn is a permission,
+/// so an extending profile that opts in cannot un-deny what the base denies.
+/// A base that already grants `allow_process_exec: true` can be tightened by
+/// the extending profile setting it back to `false`.
 fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> CommandSandbox {
     CommandSandbox {
         network: NetworkConfig {
@@ -132,6 +137,7 @@ fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> Command
         fs_write_file: dedup_append(&base.fs_write_file, &child.fs_write_file),
         allow_commands: dedup_append(&base.allow_commands, &child.allow_commands),
         keychain_access: base.keychain_access || child.keychain_access,
+        allow_process_exec: base.allow_process_exec && child.allow_process_exec,
     }
 }
 

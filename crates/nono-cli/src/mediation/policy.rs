@@ -184,8 +184,16 @@ pub async fn apply(
     }
 
     // If the request comes from within a per-command sandbox (via allow_commands),
-    // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
-    // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
+    // skip intercepts — credentials flow between trusted sub-processes, not to the
+    // agent. The sandbox context nonce is unforgeable (only the server can issue
+    // valid nonces).
+    //
+    // The child's own per-command sandbox is still applied. Skipping it here would
+    // let a parent with `allow_commands: ["ssh"]` invoke ssh entirely unsandboxed,
+    // re-opening the ProxyCommand exfil class that the process-exec default-deny
+    // is designed to close (issue #249). The child's sandbox already grants the
+    // filesystem access the child needs (~/.ssh for ssh, ~/.vault-token for
+    // ddtool, etc.), so applying it here doesn't break the credential flow.
     if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
         && let Some(parent_name) = broker.resolve(ctx_nonce)
         && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
@@ -196,17 +204,12 @@ pub async fn apply(
             "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
             request.command, &**parent_name
         );
-        // No per-command sandbox — same as the capture path.
-        // The real binary needs full access to system resources
-        // (e.g. Keychain, vault) to fetch credentials. Security
-        // comes from the parent's sandbox, not the child's.
-        // Stream stdio directly through the shim's fds.
         let result = exec_passthrough(
             cmd,
             &request.args,
             &request.env,
             &broker,
-            None,
+            cmd.sandbox.clone(),
             ctx,
             commands,
             Some((stdin_fd, stdout_fd, stderr_fd)),

@@ -2137,7 +2137,7 @@ mod tests {
         // be the filtered shim dir created by exec_passthrough.
         assert_ne!(
             child_shim_dir,
-            shim_dir.to_string_lossy().as_ref(),
+            shim_dir.to_string_lossy().as_ref() as &str,
             "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
         );
 

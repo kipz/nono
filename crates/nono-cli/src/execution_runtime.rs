@@ -311,9 +311,18 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 })?,
         );
 
+        // Deny the real binary paths of all mediated commands so the agent cannot
+        // bypass mediation by invoking them via absolute path. The PATH shims
+        // handle by-name invocations; the seatbelt deny rules close the absolute-
+        // path escape. See `blocked_binaries` in `mediation::session::SessionHandle`.
+        for binary_path in &handle.blocked_binaries {
+            caps = caps.deny_exec_path(binary_path);
+        }
+
         info!(
-            "Mediation session active: shim_dir={}",
-            handle.shim_dir.display()
+            "Mediation session active: shim_dir={}, denied_exec_paths={}",
+            handle.shim_dir.display(),
+            handle.blocked_binaries.len()
         );
     } else {
         mediation_path_str = String::new();

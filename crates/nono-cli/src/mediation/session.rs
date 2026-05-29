@@ -179,7 +179,15 @@ pub fn setup(
         let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary, &workdir)? else {
             continue;
         };
+        // Push the as-found path (which::which may return a symlink).
+        // Also push the canonicalized target so that exec via the real binary
+        // path is blocked even when the agent bypasses the symlink.
         blocked_binaries.push(resolved.real_path.clone());
+        if let Ok(canonical) = resolved.real_path.canonicalize() {
+            if canonical != resolved.real_path {
+                blocked_binaries.push(canonical);
+            }
+        }
         resolved_commands.push(resolved);
     }
 

@@ -2791,6 +2791,111 @@ mod tests {
         );
     }
 
+    /// Regression: `allow_process_exec: true` does not bypass the filesystem sandbox.
+    ///
+    /// git (and similar commands) carry `allow_process_exec: true` so they can run
+    /// hooks and credential helpers. The risk is that a subprocess spawned by git
+    /// (e.g. ssh via a ProxyCommand) could read sensitive files such as `~/.ssh`
+    /// private keys. This test verifies that even with `allow_process_exec: true`,
+    /// the per-command filesystem grants still bound what subprocesses can read.
+    ///
+    /// We write a sentinel file to `$HOME` (outside system_read_macos paths like
+    /// /tmp and /var) and verify a subprocess spawned inside a sandbox that does not
+    /// grant `$HOME` read access cannot exfiltrate it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_allow_process_exec_does_not_bypass_fs_sandbox() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let sentinel_value = "NONO_FS_SENTINEL_12345";
+
+        // Hold ENV_LOCK while reading HOME: other tests (rollback_runtime,
+        // exec_strategy) temporarily set HOME to a /tmp path while holding
+        // this lock. If we read HOME concurrently without the lock we may get
+        // a temp path that is inside system_read_macos (/tmp, /var) and the
+        // sentinel would be readable, causing a false failure.
+        let sentinel_path: String = {
+            let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+            let home = std::env::var("HOME").expect("HOME must be set");
+            // If HOME is a temp dir (set by a parallel test) the sentinel
+            // would land in a system-readable location — skip the test.
+            if home.starts_with("/tmp")
+                || home.starts_with("/private/tmp")
+                || home.starts_with("/var")
+            {
+                return;
+            }
+            let dir = format!("{}/.nono-test-regression-{}", home, std::process::id());
+            std::fs::create_dir_all(&dir).expect("create sentinel dir");
+            let path = format!("{}/secret", dir);
+            std::fs::write(&path, sentinel_value).expect("write sentinel");
+            path
+            // lock drops here
+        };
+        let sentinel_dir = std::path::Path::new(&sentinel_path)
+            .parent()
+            .expect("sentinel has parent")
+            .to_path_buf();
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: true,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("cat '{}' 2>/dev/null; echo done", sentinel_path),
+            ],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, _action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&sentinel_dir);
+
+        assert!(
+            !resp.stdout.contains(sentinel_value),
+            "subprocess with allow_process_exec: true read a file outside fs_read grants \
+             (git ProxyCommand bypass); stdout={}",
+            resp.stdout
+        );
+    }
+
     // --- Streaming passthrough fd-protocol tests ---
 
     /// Pipe binary data (every byte 0x00..=0xFF, including 0xFF) through the

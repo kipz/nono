@@ -516,6 +516,16 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     } else {
         profile.push_str("(allow process-exec*)\n");
         profile.push_str("(allow process-fork)\n");
+        // Close the absolute-path bypass for mediated commands. The agent's PATH
+        // shims intercept by-name invocations; these deny rules block the real
+        // binary when called by absolute path. Seatbelt is last-rule-wins for
+        // same-operation filtered rules, so these denies after the broad allow
+        // take precedence.
+        for path in caps.denied_exec_paths() {
+            let path_str = path.to_string_lossy();
+            let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+            profile.push_str(&format!("(deny process-exec (literal \"{escaped}\"))\n"));
+        }
     }
 
     // Process info: allow self-inspection and same-sandbox inspection for both
@@ -2005,5 +2015,64 @@ mod tests {
 
         assert!(!profile.contains("(deny network*)"));
         assert!(!profile.contains("mDNSResponder"));
+    }
+
+    // --- mediated-binary exec bypass tests ---
+
+    #[test]
+    fn test_deny_exec_path_emitted_after_allow_all() {
+        // deny rules must appear AFTER (allow process-exec*) so that Seatbelt's
+        // last-rule-wins semantics give the deny precedence.
+        let caps = CapabilitySet::new()
+            .deny_exec_path("/opt/homebrew/bin/gh")
+            .deny_exec_path("/usr/bin/security");
+        let profile = generate_profile(&caps).unwrap();
+
+        let allow_pos = profile
+            .find("(allow process-exec*)")
+            .expect("blanket allow must be present");
+        let deny_gh = "(deny process-exec (literal \"/opt/homebrew/bin/gh\"))";
+        let deny_sec = "(deny process-exec (literal \"/usr/bin/security\"))";
+        let deny_gh_pos = profile.find(deny_gh).expect("deny for gh must be present");
+        let deny_sec_pos = profile.find(deny_sec).expect("deny for security must be present");
+        assert!(deny_gh_pos > allow_pos, "gh deny must come after allow-all");
+        assert!(deny_sec_pos > allow_pos, "security deny must come after allow-all");
+    }
+
+    #[test]
+    fn test_deny_exec_path_escapes_special_chars() {
+        let caps = CapabilitySet::new().deny_exec_path("/path/with\"quote/bin");
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            profile.contains("(deny process-exec (literal \"/path/with\\\"quote/bin\"))"),
+            "double-quote in path must be escaped:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn test_deny_exec_path_noop_in_restricted_mode() {
+        // In restricted mode the allowlist already excludes unlisted paths via
+        // the implicit (deny default). Adding a deny_exec_path is redundant and
+        // must not emit an extra deny rule.
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_path("/usr/bin/bash")
+            .deny_exec_path("/opt/homebrew/bin/gh");
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            !profile.contains("(deny process-exec (literal \"/opt/homebrew/bin/gh\"))"),
+            "deny rule must not appear in restricted mode:\n{profile}"
+        );
+        assert!(!profile.contains("(allow process-exec*)"));
+    }
+
+    #[test]
+    fn test_no_deny_exec_rules_by_default() {
+        let caps = CapabilitySet::new();
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            !profile.contains("(deny process-exec (literal"),
+            "no deny-exec rules expected in default caps:\n{profile}"
+        );
     }
 }

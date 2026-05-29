@@ -970,7 +970,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,

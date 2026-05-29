@@ -964,7 +964,7 @@ fn build_filtered_shim_dir(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if allow_set.contains(name_str.as_ref()) {
+        if allow_set.contains(name_str.as_ref() as &str) {
             // If the allowed command has its own mediation rules (intercepts or sandbox),
             // keep the shim so it routes through the mediation server. Only exclude
             // commands that have no mediation and should resolve to real binaries directly.
@@ -2137,7 +2137,7 @@ mod tests {
         // be the filtered shim dir created by exec_passthrough.
         assert_ne!(
             child_shim_dir,
-            shim_dir.to_string_lossy().as_ref(),
+            shim_dir.to_string_lossy().as_ref() as &str,
             "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
         );
 

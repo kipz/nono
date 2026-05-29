@@ -843,6 +843,7 @@ async fn exec_passthrough(
             // /bin/sh -c to smuggle private keys out via the network. Commands
             // that legitimately shell out to helpers (git, gh, aws, kubectl, etc.)
             // must opt in with `allow_process_exec: true` in their CommandSandbox.
+            // See docs/cli/features/profile-authoring.mdx § "Per-command Sandboxes".
             //
             // Even when restricted, the command must be able to launch itself and
             // any binaries it declares via `allow_commands` — those run directly

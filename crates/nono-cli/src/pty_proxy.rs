@@ -812,6 +812,25 @@ impl PtyProxy {
         }
     }
 
+    /// Re-enter raw mode and replay the screen after a job-control suspension.
+    ///
+    /// Call this after the supervisor returns from `raise(SIGTSTP)` to undo
+    /// what [`Self::pause_terminal_for_prompt`] did.
+    pub fn resume_terminal_after_prompt(&mut self) {
+        if !self
+            .client
+            .as_ref()
+            .is_some_and(AttachedClient::is_terminal)
+        {
+            return;
+        }
+        self.saved_termios = set_terminal_raw();
+        let replay = self.attach_replay_bytes();
+        if !replay.is_empty() {
+            let _ = write_all_fd(libc::STDOUT_FILENO, &replay);
+        }
+    }
+
     /// Restore terminal settings.
     fn restore_terminal(&mut self) {
         if let Some(ref termios) = self.saved_termios {
@@ -2965,7 +2984,10 @@ mod tests {
         let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
         proxy.filter_client_input(b"\x1a");
         assert!(proxy.take_job_control_request());
-        assert!(!proxy.take_job_control_request(), "flag should be cleared after take");
+        assert!(
+            !proxy.take_job_control_request(),
+            "flag should be cleared after take"
+        );
     }
 
     #[test]
@@ -2975,7 +2997,10 @@ mod tests {
         let forwarded = proxy.filter_client_input(b"\x1a");
         // Partially matched detach — not forwarded, but also not a job-control request
         assert!(forwarded.is_empty());
-        assert!(!proxy.take_job_control_request(), "partial detach match should not set job_control");
+        assert!(
+            !proxy.take_job_control_request(),
+            "partial detach match should not set job_control"
+        );
         assert!(!proxy.take_detach_request());
     }
 }

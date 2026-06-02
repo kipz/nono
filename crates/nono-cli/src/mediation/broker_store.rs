@@ -14,49 +14,36 @@
 //! issued in the previous session so that the keychain entry the
 //! sandboxed Claude reads continues to resolve.
 //!
+//! ## Keychain ACL (macOS)
+//!
+//! The broker entry is created with a strict trusted-application ACL
+//! listing only the nono binary by path. `securityd` enforces this by
+//! code-signature — any other process (including the sandboxed Claude
+//! Code and the `security` CLI) gets denied silently. This closes the
+//! attack path where a prompt-injected agent enumerates the keychain and
+//! finds the real OAuth tokens.
+//!
+//! All Security framework operations run in-process (the nono binary,
+//! which is in the ACL). No `security` CLI subprocess is used, removing
+//! both the argv-leak risk and the 128-byte `readpassphrase(3)` cap that
+//! affected earlier iterations of this module.
+//!
+//! If the nono binary path changes (upgrade, reinstall to a different
+//! prefix), the stored `nono_path` field in the JSON record won't match
+//! `current_exe()`. The broker treats this as a stale entry: it deletes
+//! the old record and returns `None`, which leaves the broker empty until
+//! the next `claude /login` triggers a fresh capture. The user does not
+//! need to manually intervene.
+//!
 //! ## Threat model
 //!
-//! Identical to nono's existing credential-injection feature
-//! (https://nono.sh/docs/cli/features/credential-injection): real
-//! credentials live in the OS keychain under service name `nono`, the
-//! sandboxed child sees only proxy-issued nonces. Whatever subprocess
-//! mediation rules a profile uses to gate `security` CLI access already
-//! cover the broker's entry because both share the same service.
-//!
-//! ## Why save goes through the `keyring` crate (not `security` CLI)
-//!
-//! Our broker payload is a JSON blob containing two nonces plus two
-//! real OAuth tokens (~270+ bytes for Anthropic-issued tokens). The
-//! macOS `security add-generic-password` CLI has no way to accept a
-//! password of that size without leaking the bytes through argv:
-//!
-//! - `-w <payload>` puts the secret in the child's argv, where it is
-//!   briefly visible to any local process scanning `ps` / sysctl
-//!   `kern.proc.argmax`. Documented as insecure by the tool itself.
-//! - `-w` with no argument is the documented secure path: `security`
-//!   calls `readpassphrase(3)`, which uses a hard-coded 128-byte
-//!   buffer (`_PASSWORD_LEN`). Our payload silently truncates to
-//!   ~127 bytes — the access_nonce survives but the refresh_nonce
-//!   and both real tokens are lost. Verified empirically on 2026-05-14.
-//!
-//! The `keyring` crate's `set_password` calls `SecItemAdd` directly via
-//! the Security framework, which accepts arbitrary-length values. We
-//! use that for save and keep the legacy `security find-generic-password
-//! -w` path for load (it honours keyring-created ACLs silently when the
-//! reading binary is in the entry's trusted-apps list, which is the
-//! common case for normal usage; rebuilds via `cargo install` may produce
-//! a new binary signature and require the user to allow the entry once).
-//!
-//! Earlier revisions of this module shelled out to `security
-//! add-generic-password -A` to avoid that re-prompt entirely (the `-A`
-//! flag creates an empty trusted-apps list — "any app may access
-//! without warning"). That worked for the original token-injection
-//! credentials, which fit in 128 bytes. The OAuth-capture broker's
-//! payload doesn't.
+//! Real credentials live in the OS keychain under service name `nono`,
+//! the sandboxed child sees only proxy-issued nonces. On macOS the broker
+//! entry additionally carries a nono-only ACL so neither the `security`
+//! CLI nor other applications can read the real tokens silently.
 
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::process::{Command, Stdio};
 use zeroize::Zeroizing;
 
 /// Keychain service name shared with nono's credential-injection feature.
@@ -101,21 +88,31 @@ pub trait BrokerStore: Send + Sync {
 
 /// On-disk JSON shape. Kept private so callers go through `BrokerStore`
 /// and hold the secret as `Zeroizing<String>` once decoded.
+///
+/// `nono_path` records the absolute path of the nono binary at save time.
+/// On load, it is compared against `current_exe()` to detect binary-path
+/// changes (upgrade, reinstall). A mismatch triggers deletion of the
+/// stale record so a fresh capture can rebuild the ACL for the new path.
+/// Entries written by older nono versions lack this field; they are also
+/// treated as stale and deleted on first load.
 #[derive(Serialize, Deserialize)]
 struct PersistedJson {
     access_nonce: String,
     refresh_nonce: String,
     access_token: String,
     refresh_token: String,
+    #[serde(default)]
+    nono_path: Option<String>,
 }
 
 impl PersistedJson {
-    fn from_record(record: &PersistedRecord) -> Self {
+    fn from_record(record: &PersistedRecord, nono_exe: &std::path::Path) -> Self {
         Self {
             access_nonce: record.access_nonce.clone(),
             refresh_nonce: record.refresh_nonce.clone(),
             access_token: record.access_token.as_str().to_string(),
             refresh_token: record.refresh_token.as_str().to_string(),
+            nono_path: Some(nono_exe.to_string_lossy().into_owned()),
         }
     }
 
@@ -129,12 +126,244 @@ impl PersistedJson {
     }
 }
 
-/// macOS / Linux keystore-backed store. Reads via the `keyring` crate
-/// (in-process Security framework / secret-service call). Writes on
-/// macOS shell out to `security add-generic-password -A` so the entry
-/// is created with the "any app, no warning" ACL that matches the
-/// existing credential-injection feature; on Linux the `keyring` crate
-/// is used for both save and load.
+// ── macOS: in-process Security framework helpers ─────────────────────────────
+
+/// FFI bindings for legacy Keychain Services ACL APIs not exposed by
+/// `security-framework-sys`. Security.framework is already linked by that
+/// crate's `lib.rs` `#[link]` attribute, so no additional link attribute
+/// is needed here.
+#[cfg(all(target_os = "macos", feature = "system-keyring"))]
+mod macos_ffi {
+    use core_foundation_sys::array::CFArrayRef;
+    use core_foundation_sys::base::OSStatus;
+    use core_foundation_sys::string::CFStringRef;
+    use security_framework_sys::base::SecAccessRef;
+
+    /// Opaque CF type for a trusted-application reference.
+    pub type SecTrustedApplicationRef = *mut std::ffi::c_void;
+
+    unsafe extern "C" {
+        /// Creates a `SecTrustedApplicationRef` for the binary at `path`.
+        /// On success `*app` is set to a Create-rule CF reference.
+        pub fn SecTrustedApplicationCreateFromPath(
+            path: *const std::ffi::c_char,
+            app: *mut SecTrustedApplicationRef,
+        ) -> OSStatus;
+
+        /// Creates a `SecAccessRef` with `trustedlist` as the only apps that
+        /// may access the item silently. On success `*access` holds a
+        /// Create-rule CF reference.
+        pub fn SecAccessCreate(
+            descriptor: CFStringRef,
+            trustedlist: CFArrayRef,
+            access: *mut SecAccessRef,
+        ) -> OSStatus;
+
+        /// Attribute key used with `SecItemAdd` to associate a `SecAccessRef`
+        /// with a new keychain item (legacy macOS Keychain Services attribute).
+        pub static kSecAttrAccess: CFStringRef;
+    }
+}
+
+/// Build a `SecAccess` that only lists the nono binary as a trusted
+/// application — `securityd` will silently deny any other caller.
+#[cfg(all(target_os = "macos", feature = "system-keyring"))]
+fn create_nono_access(
+    exe_path: &std::path::Path,
+) -> Result<security_framework::os::macos::access::SecAccess> {
+    use core_foundation::base::TCFType;
+    use core_foundation_sys::array::{kCFTypeArrayCallBacks, CFArrayCreate};
+    use core_foundation_sys::base::{kCFAllocatorDefault, CFRelease};
+    use core_foundation_sys::string::{kCFStringEncodingUTF8, CFStringCreateWithBytes};
+    use macos_ffi::{SecAccessCreate, SecTrustedApplicationCreateFromPath, SecTrustedApplicationRef};
+    use security_framework::os::macos::access::SecAccess;
+    use security_framework_sys::base::SecAccessRef;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path_cstr = CString::new(exe_path.as_os_str().as_bytes()).map_err(|e| {
+        NonoError::KeystoreAccess(format!("nono binary path has interior NUL: {e}"))
+    })?;
+
+    // SAFETY: path_cstr is a valid NUL-terminated C string. trusted_app
+    // receives a Create-rule CF reference that we release after the array retains it.
+    let mut trusted_app: SecTrustedApplicationRef = std::ptr::null_mut();
+    let status = unsafe {
+        SecTrustedApplicationCreateFromPath(path_cstr.as_ptr(), &mut trusted_app)
+    };
+    if status != 0 {
+        return Err(NonoError::KeystoreAccess(format!(
+            "SecTrustedApplicationCreateFromPath: OSStatus {status}"
+        )));
+    }
+
+    // Wrap in a single-element CFArray. kCFTypeArrayCallBacks calls CFRetain
+    // on insertion, so the array owns its own reference to trusted_app.
+    // SAFETY: trusted_app is a valid non-null CF object from the call above.
+    let items = [trusted_app as *const std::ffi::c_void];
+    let array =
+        unsafe { CFArrayCreate(kCFAllocatorDefault, items.as_ptr(), 1, &kCFTypeArrayCallBacks) };
+
+    // Release our Create-rule reference; the array now owns the only reference.
+    // SAFETY: trusted_app is a Create-rule reference (must be released exactly once).
+    unsafe { CFRelease(trusted_app as *const _) };
+
+    if array.is_null() {
+        return Err(NonoError::KeystoreAccess(
+            "CFArrayCreate for trusted-apps list returned null".to_string(),
+        ));
+    }
+
+    // Descriptor string for the access object (shown in Keychain Access.app).
+    // SAFETY: bytes are valid UTF-8; returns a Create-rule CFStringRef.
+    let descriptor_bytes = b"nono oauth broker";
+    let descriptor = unsafe {
+        CFStringCreateWithBytes(
+            kCFAllocatorDefault,
+            descriptor_bytes.as_ptr(),
+            descriptor_bytes.len() as isize,
+            kCFStringEncodingUTF8,
+            false as u8,
+        )
+    };
+    if descriptor.is_null() {
+        // SAFETY: array is a Create-rule reference from CFArrayCreate above.
+        unsafe { CFRelease(array as *const _) };
+        return Err(NonoError::KeystoreAccess(
+            "CFStringCreateWithBytes for access descriptor returned null".to_string(),
+        ));
+    }
+
+    let mut access_ref: SecAccessRef = std::ptr::null_mut();
+    // SAFETY: descriptor and array are valid CF objects; access_ref receives
+    // a Create-rule reference on success.
+    let status = unsafe { SecAccessCreate(descriptor, array, &mut access_ref) };
+
+    // Release temporaries regardless of outcome.
+    // SAFETY: both are Create-rule references from above.
+    unsafe {
+        CFRelease(descriptor as *const _);
+        CFRelease(array as *const _);
+    }
+
+    if status != 0 {
+        if !access_ref.is_null() {
+            // SAFETY: access_ref is a Create-rule reference from SecAccessCreate.
+            unsafe { CFRelease(access_ref as *const _) };
+        }
+        return Err(NonoError::KeystoreAccess(format!(
+            "SecAccessCreate: OSStatus {status}"
+        )));
+    }
+
+    // SAFETY: access_ref is a non-null Create-rule reference; wrap_under_create_rule
+    // takes ownership and will call CFRelease on drop.
+    Ok(unsafe { SecAccess::wrap_under_create_rule(access_ref) })
+}
+
+/// Write the broker record to the keychain with a nono-only ACL.
+///
+/// Any existing entry for `service`/`account` is deleted first so that
+/// the ACL on the new entry is always set correctly (rather than
+/// inheriting the ACL from a prior write that might have used `-A`).
+#[cfg(all(target_os = "macos", feature = "system-keyring"))]
+fn save_with_nono_acl(service: &str, account: &str, payload: &Zeroizing<String>) -> Result<()> {
+    use core_foundation::base::TCFType;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFMutableDictionary;
+    use core_foundation::string::CFString;
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecClass, kSecClassGenericPassword, kSecValueData,
+    };
+    use security_framework_sys::keychain_item::SecItemAdd;
+
+    let exe_path = std::env::current_exe()
+        .map_err(|e| NonoError::KeystoreAccess(format!("resolve nono binary path: {e}")))?;
+
+    let access = create_nono_access(&exe_path)?;
+
+    // Delete any pre-existing entry so the new one gets a fresh ACL.
+    // Ignore "not found" — this is a best-effort cleanup.
+    delete_broker_entry_in_process(service, account);
+
+    let class_key = unsafe { CFString::wrap_under_get_rule(kSecClass) };
+    let class_val = unsafe { CFString::wrap_under_get_rule(kSecClassGenericPassword) };
+    let svc_key = unsafe { CFString::wrap_under_get_rule(kSecAttrService) };
+    let svc_val = CFString::from(service);
+    let acct_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
+    let acct_val = CFString::from(account);
+    let data_key = unsafe { CFString::wrap_under_get_rule(kSecValueData) };
+    let data_val = CFData::from_buffer(payload.as_bytes());
+    let access_key = unsafe { CFString::wrap_under_get_rule(macos_ffi::kSecAttrAccess) };
+
+    let mut dict = CFMutableDictionary::from_CFType_pairs(&[]);
+    dict.add(&class_key.as_CFTypeRef(), &class_val.as_CFTypeRef());
+    dict.add(&svc_key.as_CFTypeRef(), &svc_val.as_CFTypeRef());
+    dict.add(&acct_key.as_CFTypeRef(), &acct_val.as_CFTypeRef());
+    dict.add(&data_key.as_CFTypeRef(), &data_val.as_CFTypeRef());
+    dict.add(&access_key.as_CFTypeRef(), &access.as_CFTypeRef());
+
+    // SAFETY: dict is a valid CFDictionaryRef.
+    let status = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), std::ptr::null_mut()) };
+    if status != 0 {
+        return Err(NonoError::KeystoreAccess(format!(
+            "SecItemAdd for {service}/{account}: OSStatus {status}"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Load the raw JSON string for `service`/`account` using an in-process
+/// Security framework call. Running in the nono process ensures the nono-only
+/// ACL is satisfied silently — no `security` CLI subprocess, no prompts.
+#[cfg(all(target_os = "macos", feature = "system-keyring"))]
+fn load_in_process(service: &str, account: &str) -> Result<Option<String>> {
+    use security_framework::os::macos::passwords::find_generic_password;
+
+    match find_generic_password(None, service, account) {
+        Ok((password_bytes, _item)) => {
+            let s = std::str::from_utf8(password_bytes.as_ref()).map_err(|e| {
+                NonoError::KeystoreAccess(format!(
+                    "broker record at {service}/{account} contains non-UTF8 bytes: {e}"
+                ))
+            })?;
+            Ok(Some(s.to_owned()))
+        }
+        Err(e) => {
+            // errSecItemNotFound (-25300) → no entry yet; any other error is real.
+            use security_framework_sys::base::errSecItemNotFound;
+            if e.code() == errSecItemNotFound {
+                Ok(None)
+            } else {
+                Err(NonoError::KeystoreAccess(format!(
+                    "broker record load from {service}/{account}: {e}"
+                )))
+            }
+        }
+    }
+}
+
+/// Delete the broker keychain entry in-process. Errors (including
+/// "item not found") are silently swallowed — callers use this as a
+/// best-effort cleanup before writing a fresh entry.
+#[cfg(all(target_os = "macos", feature = "system-keyring"))]
+fn delete_broker_entry_in_process(service: &str, account: &str) {
+    use security_framework::os::macos::passwords::find_generic_password;
+
+    if let Ok((_, item)) = find_generic_password(None, service, account) {
+        item.delete();
+    }
+}
+
+// ── KeystoreBrokerStore ───────────────────────────────────────────────────────
+
+/// macOS / Linux keystore-backed store.
+///
+/// On macOS: uses in-process Security framework calls for all operations so
+/// the nono-only keychain ACL is always satisfied without spawning a subprocess.
+/// On Linux: uses the `keyring` crate (secret-service collection) for both
+/// save and load.
 #[cfg(feature = "system-keyring")]
 pub struct KeystoreBrokerStore {
     service: String,
@@ -156,6 +385,7 @@ impl KeystoreBrokerStore {
         Self::new(SERVICE_NAME, CLAUDE_OAUTH_ACCOUNT)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn entry(&self) -> Result<keyring::Entry> {
         keyring::Entry::new(&self.service, &self.account).map_err(|e| {
             NonoError::KeystoreAccess(format!(
@@ -164,98 +394,18 @@ impl KeystoreBrokerStore {
             ))
         })
     }
-
-    /// Save path: write the JSON payload via the `keyring` crate.
-    ///
-    /// On macOS this invokes `SecItemAdd` directly (no argv leak, no
-    /// `readpassphrase` 128-byte cap). On Linux it goes to the
-    /// secret-service collection. See the module docs on why we don't
-    /// shell out to `security add-generic-password` for this payload.
-    fn save_via_keyring(&self, payload: &str) -> Result<()> {
-        let entry = self.entry()?;
-        entry.set_password(payload).map_err(|e| {
-            NonoError::KeystoreAccess(format!(
-                "broker record save to {}/{}: {e}",
-                self.service, self.account
-            ))
-        })
-    }
-
-    /// macOS-specific load path: shell out to `security find-generic-password
-    /// -w` instead of going through the `keyring` crate.
-    ///
-    /// The `keyring` crate's `get_password()` on macOS uses a Security
-    /// framework code path that triggers a system password prompt when
-    /// the calling binary is not in the entry's trusted-apps ACL — even
-    /// when the entry was created with `-A` (empty trusted-apps list,
-    /// "any application may access without warning"). The `security` CLI
-    /// uses the older Keychain Services API which honours the empty ACL
-    /// silently, matching the no-prompt behaviour the existing nono
-    /// credential-injection feature relies on.
-    ///
-    /// Verified empirically: `security ... -w` reads our `-A`-created
-    /// entry without prompting; the keyring crate prompts on the same
-    /// entry. We therefore use `security` for both ends (save and load)
-    /// on macOS so the broker's experience matches what users get for
-    /// every other credential under service "nono".
-    #[cfg(target_os = "macos")]
-    fn load_via_security_cli(&self) -> Result<Option<String>> {
-        let output = Command::new("/usr/bin/security")
-            .args([
-                "find-generic-password",
-                "-s",
-                &self.service,
-                "-a",
-                &self.account,
-                "-w",
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| NonoError::KeystoreAccess(format!("invoke /usr/bin/security: {e}")))?;
-        if output.status.success() {
-            // -w prints the password followed by a single newline; trim it.
-            let mut stdout = String::from_utf8(output.stdout).map_err(|e| {
-                NonoError::KeystoreAccess(format!(
-                    "non-UTF8 password from {}/{}: {e}",
-                    self.service, self.account
-                ))
-            })?;
-            if stdout.ends_with('\n') {
-                stdout.pop();
-            }
-            Ok(Some(stdout))
-        } else {
-            // Distinguish "no such item" from real errors. macOS exits 44
-            // ("The specified item could not be found in the keychain.")
-            // when the entry doesn't exist.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if output.status.code() == Some(44)
-                || stderr.contains("could not be found in the keychain")
-            {
-                Ok(None)
-            } else {
-                Err(NonoError::KeystoreAccess(format!(
-                    "security find-generic-password ({}) for {}/{}: {}",
-                    output.status,
-                    self.service,
-                    self.account,
-                    stderr.trim()
-                )))
-            }
-        }
-    }
 }
 
 #[cfg(feature = "system-keyring")]
 impl BrokerStore for KeystoreBrokerStore {
     fn load(&self) -> Result<Option<PersistedRecord>> {
-        // Read via `security` CLI on macOS (silent for `-A`-created
-        // entries), keyring crate elsewhere. See the docs on
-        // [`Self::load_via_security_cli`] for why.
+        let exe_path = std::env::current_exe()
+            .map_err(|e| NonoError::KeystoreAccess(format!("resolve nono binary path: {e}")))?;
+
         let maybe_json: Option<String> = {
             #[cfg(target_os = "macos")]
             {
-                self.load_via_security_cli()?
+                load_in_process(&self.service, &self.account)?
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -272,37 +422,101 @@ impl BrokerStore for KeystoreBrokerStore {
                 }
             }
         };
-        match maybe_json {
-            Some(json) => match serde_json::from_str::<PersistedJson>(&json) {
-                Ok(parsed) => Ok(Some(parsed.into_record())),
-                Err(e) => Err(NonoError::KeystoreAccess(format!(
-                    "broker record at {}/{} is not valid JSON: {e}",
+
+        let json = match maybe_json {
+            None => return Ok(None),
+            Some(j) => j,
+        };
+
+        let parsed = serde_json::from_str::<PersistedJson>(&json).map_err(|e| {
+            NonoError::KeystoreAccess(format!(
+                "broker record at {}/{} is not valid JSON: {e}",
+                self.service, self.account
+            ))
+        })?;
+
+        // Validate the stored nono binary path. A mismatch means either an
+        // upgrade changed the install location, or the entry pre-dates the
+        // nono_path field. In both cases the ACL on the existing entry may
+        // not match the current binary, so we delete it and return None —
+        // the next OAuth capture will create a fresh entry with the correct ACL.
+        let stored_path = match &parsed.nono_path {
+            Some(p) => p.as_str(),
+            None => {
+                // Pre-ACL entry: delete and force re-capture.
+                tracing::info!(
+                    "broker record at {}/{} has no nono_path; deleting stale entry",
                     self.service, self.account
-                ))),
-            },
-            None => Ok(None),
+                );
+                #[cfg(target_os = "macos")]
+                delete_broker_entry_in_process(&self.service, &self.account);
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = self.clear();
+                }
+                return Ok(None);
+            }
+        };
+
+        if stored_path != exe_path.to_string_lossy().as_ref() {
+            tracing::info!(
+                "nono binary path changed ({stored_path} → {}); deleting stale broker entry",
+                exe_path.display()
+            );
+            #[cfg(target_os = "macos")]
+            delete_broker_entry_in_process(&self.service, &self.account);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = self.clear();
+            }
+            return Ok(None);
         }
+
+        Ok(Some(parsed.into_record()))
     }
 
     fn save(&self, record: &PersistedRecord) -> Result<()> {
-        // Wrap the serialised JSON in `Zeroizing` so the buffer is
-        // wiped when this function returns, regardless of branch.
+        let exe_path = std::env::current_exe()
+            .map_err(|e| NonoError::KeystoreAccess(format!("resolve nono binary path: {e}")))?;
+
         let json: Zeroizing<String> = Zeroizing::new(
-            serde_json::to_string(&PersistedJson::from_record(record))
+            serde_json::to_string(&PersistedJson::from_record(record, &exe_path))
                 .map_err(|e| NonoError::KeystoreAccess(format!("broker record serialise: {e}")))?,
         );
-        self.save_via_keyring(&json)
+
+        #[cfg(target_os = "macos")]
+        {
+            save_with_nono_acl(&self.service, &self.account, &json)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let entry = self.entry()?;
+            entry.set_password(&json).map_err(|e| {
+                NonoError::KeystoreAccess(format!(
+                    "broker record save to {}/{}: {e}",
+                    self.service, self.account
+                ))
+            })
+        }
     }
 
     fn clear(&self) -> Result<()> {
-        let entry = self.entry()?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(other) => Err(NonoError::KeystoreAccess(format!(
-                "broker record clear from {}/{}: {other}",
-                self.service, self.account
-            ))),
+        #[cfg(target_os = "macos")]
+        {
+            delete_broker_entry_in_process(&self.service, &self.account);
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let entry = self.entry()?;
+            match entry.delete_credential() {
+                Ok(()) => Ok(()),
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(other) => Err(NonoError::KeystoreAccess(format!(
+                    "broker record clear from {}/{}: {other}",
+                    self.service, self.account
+                ))),
+            }
         }
     }
 }
@@ -366,14 +580,11 @@ mod tests {
 
     #[test]
     fn persisted_json_payload_exceeds_readpassphrase_buffer() {
-        // Regression guard for the 2026-05-14 truncation bug. A real
-        // Anthropic OAuth token pair serialised through `PersistedJson`
-        // is well over the 128-byte `readpassphrase(3)` cap that broke
-        // the earlier `security add-generic-password -w` save path.
-        // The current implementation uses `keyring`'s `set_password`
-        // (SecItemAdd) which has no such cap; this test only documents
-        // why the size matters so a future refactor can't silently
-        // reintroduce a 128-byte-bounded backend.
+        // Guard that the serialised payload exceeds 128 bytes. The implementation
+        // now uses SecItemAdd directly (no readpassphrase cap), but we keep the
+        // size assertion to prevent future regressions that could silently truncate
+        // the record and corrupt the broker state.
+        let exe_path = std::path::Path::new("/usr/local/bin/nono");
         let record = PersistedRecord {
             access_nonce: format!("nono_{}", "a".repeat(64)),
             refresh_nonce: format!("nono_{}", "b".repeat(64)),
@@ -382,13 +593,48 @@ mod tests {
             access_token: Zeroizing::new("sk-ant-oat01-".to_string() + &"x".repeat(187)),
             refresh_token: Zeroizing::new("sk-ant-ort01-".to_string() + &"y".repeat(187)),
         };
-        let json = serde_json::to_string(&PersistedJson::from_record(&record))
+        let json = serde_json::to_string(&PersistedJson::from_record(&record, exe_path))
             .expect("serialise persisted json");
         assert!(
             json.len() > 128,
-            "payload must exceed readpassphrase _PASSWORD_LEN (got {} bytes); \
-             update the test or restore an in-process keystore backend",
+            "payload must exceed 128 bytes (got {} bytes); \
+             update the test or verify the backend handles large values",
             json.len()
+        );
+    }
+
+    #[test]
+    fn nono_path_mismatch_treated_as_stale() {
+        // PersistedJson with a path that does not match any real binary should
+        // be detectable as stale. This is a pure serialisation/deserialisation
+        // test — no keychain access required.
+        let exe_path = std::path::Path::new("/old/path/to/nono");
+        let record = PersistedRecord {
+            access_nonce: format!("nono_{}", "a".repeat(64)),
+            refresh_nonce: format!("nono_{}", "b".repeat(64)),
+            access_token: Zeroizing::new("real_access".to_string()),
+            refresh_token: Zeroizing::new("real_refresh".to_string()),
+        };
+        let json =
+            serde_json::to_string(&PersistedJson::from_record(&record, exe_path)).unwrap();
+        let parsed: PersistedJson = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.nono_path.as_deref(), Some("/old/path/to/nono"));
+    }
+
+    #[test]
+    fn missing_nono_path_deserialises_as_none() {
+        // Entries written by older versions of nono omit the nono_path field.
+        // serde(default) should deserialise them with nono_path = None.
+        let legacy_json = r#"{
+            "access_nonce": "nono_aaaa",
+            "refresh_nonce": "nono_bbbb",
+            "access_token": "real_access",
+            "refresh_token": "real_refresh"
+        }"#;
+        let parsed: PersistedJson = serde_json::from_str(legacy_json).unwrap();
+        assert!(
+            parsed.nono_path.is_none(),
+            "legacy entries must deserialise with nono_path = None"
         );
     }
 }

@@ -975,7 +975,7 @@ fn build_filtered_shim_dir(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
-        if allow_set.contains(name_str.as_ref()) {
+        if allow_set.contains(name_str.as_ref() as &str) {
             // If the allowed command has its own mediation rules (intercepts or sandbox),
             // keep the shim so it routes through the mediation server. Only exclude
             // commands that have no mediation and should resolve to real binaries directly.
@@ -2108,6 +2108,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec!["ddtool".to_string()],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2217,6 +2218,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2282,6 +2284,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2349,6 +2352,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2413,6 +2417,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2473,6 +2478,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: false,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2534,6 +2540,7 @@ mod tests {
                 fs_write_file: vec![],
                 allow_commands: vec![],
                 keychain_access: true,
+                allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };

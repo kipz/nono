@@ -905,6 +905,43 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
+    /// Restrict process-exec to a specific allowlist of paths.
+    ///
+    /// When `false` (default), the generated profile permits `process-exec*`
+    /// — preserving the historical behaviour of allowing the sandboxed
+    /// process to fork-exec arbitrary binaries.
+    ///
+    /// When `true`, the generated profile denies `process-exec*` by default
+    /// (via the implicit `(deny default)`) and emits explicit allow rules
+    /// only for the paths in [`Self::allowed_exec_paths`]. `process-fork`
+    /// remains allowed so threading and `fork()`-without-exec keep working.
+    ///
+    /// This is the gate used to close child-process exec escapes such as
+    /// the ssh `ProxyCommand` exfiltration class: a per-command sandbox
+    /// that grants `~/.ssh` read access but denies process-exec cannot
+    /// spawn an arbitrary shell that would inherit the same grants.
+    restricted_exec: bool,
+    /// Paths that may be exec'd when [`Self::restricted_exec`] is `true`.
+    ///
+    /// Each entry is `(path, is_subpath)`: `is_subpath = true` emits a
+    /// Seatbelt `(subpath ...)` rule (recursive match on the directory),
+    /// `is_subpath = false` emits a `(literal ...)` rule (exact file).
+    ///
+    /// Has no effect when `restricted_exec` is `false`.
+    allowed_exec_paths: Vec<(PathBuf, bool)>,
+    /// Paths that must not be exec'd when process-exec is unrestricted.
+    ///
+    /// When `restricted_exec` is `false` (the default), the generated Seatbelt
+    /// profile emits `(allow process-exec*)` followed by
+    /// `(deny process-exec (literal "<path>"))` for each entry. This closes the
+    /// absolute-path bypass for mediated commands: the agent's PATH shims
+    /// intercept by-name invocations, and these deny rules block the real-binary
+    /// absolute path. Seatbelt is last-rule-wins for same-operation filtered
+    /// rules, so the deny placed after the broad allow takes precedence.
+    ///
+    /// Has no effect when `restricted_exec` is `true`; in that mode the
+    /// allowlist already excludes unlisted paths via the implicit deny default.
+    denied_exec_paths: Vec<PathBuf>,
 }
 
 impl CapabilitySet {
@@ -1137,6 +1174,62 @@ impl CapabilitySet {
         self
     }
 
+    /// Restrict process-exec to an explicit allowlist of paths (builder pattern)
+    ///
+    /// When set, the generated Seatbelt profile denies `process-exec*` by
+    /// default; only paths added via [`Self::allow_exec_path`] or
+    /// [`Self::allow_exec_subpath`] may be exec'd. `process-fork` remains
+    /// allowed.
+    ///
+    /// Mediation uses this on per-command sandboxes to close child-process
+    /// exec escapes such as ssh's `ProxyCommand` exfiltration.
+    #[must_use]
+    pub fn restrict_process_exec(mut self) -> Self {
+        self.restricted_exec = true;
+        self
+    }
+
+    /// Allow exec of a specific binary path when process-exec is restricted.
+    ///
+    /// Emits `(allow process-exec (literal "<path>"))`. No effect unless
+    /// [`Self::restrict_process_exec`] has also been set.
+    ///
+    /// The path is not canonicalized — callers pass the path they want the
+    /// rule to match (Seatbelt evaluates paths as-accessed).
+    #[must_use]
+    pub fn allow_exec_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.allowed_exec_paths.push((path.into(), false));
+        self
+    }
+
+    /// Allow exec of any binary under a directory when process-exec is restricted.
+    ///
+    /// Emits `(allow process-exec (subpath "<path>"))`. No effect unless
+    /// [`Self::restrict_process_exec`] has also been set.
+    #[must_use]
+    pub fn allow_exec_subpath(mut self, path: impl Into<PathBuf>) -> Self {
+        self.allowed_exec_paths.push((path.into(), true));
+        self
+    }
+
+    /// Deny exec of a specific binary path even when process-exec is unrestricted.
+    ///
+    /// Emits `(deny process-exec (literal "<path>"))` after the global allow in
+    /// the Seatbelt profile, exploiting Seatbelt's last-rule-wins semantics so
+    /// the deny takes precedence. Use this to close the absolute-path bypass for
+    /// mediated commands whose PATH shim only intercepts by-name invocations.
+    ///
+    /// Has no effect when `restrict_process_exec` is active (the allowlist model
+    /// already excludes the path via the implicit deny default).
+    ///
+    /// The path is not canonicalized — callers pass the path they want the rule
+    /// to match (Seatbelt evaluates paths as-accessed).
+    #[must_use]
+    pub fn deny_exec_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.denied_exec_paths.push(path.into());
+        self
+    }
+
     /// Add a command to the allow list (builder pattern)
     ///
     /// Allowed commands override any blocklist. This is primarily for CLI use.
@@ -1226,7 +1319,7 @@ impl CapabilitySet {
         self.tcp_bind_ports.push(port);
     }
 
-    /// Add a localhost IPC port (mutable)
+    /// Localhost IPC port; `0` is macOS-only (`localhost:*` TCP outbound).
     pub fn add_localhost_port(&mut self, port: u16) {
         self.localhost_ports.push(port);
     }
@@ -1416,6 +1509,29 @@ impl CapabilitySet {
     #[must_use]
     pub fn seatbelt_debug_deny(&self) -> bool {
         self.seatbelt_debug_deny
+    }
+
+    /// Check whether process-exec is restricted to a path allowlist.
+    #[must_use]
+    pub fn process_exec_restricted(&self) -> bool {
+        self.restricted_exec
+    }
+
+    /// Get the list of paths permitted to be exec'd under restriction.
+    ///
+    /// Each entry is `(path, is_subpath)`. Empty unless
+    /// [`Self::restrict_process_exec`] has been set.
+    #[must_use]
+    pub fn allowed_exec_paths(&self) -> &[(PathBuf, bool)] {
+        &self.allowed_exec_paths
+    }
+
+    /// Get paths denied from exec when process-exec is unrestricted.
+    ///
+    /// Empty when `restrict_process_exec` is active (no effect in that mode).
+    #[must_use]
+    pub fn denied_exec_paths(&self) -> &[PathBuf] {
+        &self.denied_exec_paths
     }
 
     /// Get allowed commands

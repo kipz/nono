@@ -1,8 +1,6 @@
 use crate::exec_strategy::StartupTimeoutConfig;
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
+use crate::output::format_startup_blocked;
 use std::io::{self, IsTerminal, Write};
-use std::time::Duration;
 
 pub(crate) fn print_terminal_safe_stderr(message: &str) {
     let mut stderr = io::stderr();
@@ -14,141 +12,42 @@ pub(crate) fn print_terminal_safe_stderr(message: &str) {
     }
 }
 
-fn prompt_startup_termination(timeout_cfg: StartupTimeoutConfig<'_>, has_output: bool) -> bool {
-    let description = if has_output {
-        format!(
-            "[nono] Startup appears blocked: `{}` has not become interactive after {} seconds.",
-            timeout_cfg.program,
-            timeout_cfg.timeout.as_secs()
-        )
-    } else {
-        format!(
-            "[nono] Startup appears blocked: `{}` produced no terminal output after {} seconds.",
-            timeout_cfg.program,
-            timeout_cfg.timeout.as_secs()
-        )
-    };
+fn notify_startup_termination(timeout_cfg: StartupTimeoutConfig<'_>, has_output: bool) {
+    let lines = format_startup_blocked(
+        timeout_cfg.program,
+        timeout_cfg.timeout.as_secs(),
+        has_output,
+        timeout_cfg.recommended_profile,
+    );
 
     let mut tty_out = match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
         Ok(file) => file,
         Err(_) => {
-            print_terminal_safe_stderr(&format!(
-                "{}\n[nono] `{}` usually needs the built-in `{}` profile.\n[nono] Try: nono run --profile {} -- {}\n[nono] Terminating startup-blocked process so diagnostics can show denied paths.",
-                description,
-                timeout_cfg.program,
-                timeout_cfg.profile,
-                timeout_cfg.profile,
-                timeout_cfg.program,
-            ));
-            return true;
+            for line in &lines {
+                print_terminal_safe_stderr(line);
+            }
+            return;
         }
     };
 
     let _ = writeln!(tty_out);
-    let _ = writeln!(tty_out, "{}", description);
-    let _ = writeln!(
-        tty_out,
-        "[nono] `{}` usually needs the built-in `{}` profile.",
-        timeout_cfg.program, timeout_cfg.profile
-    );
-    let _ = writeln!(
-        tty_out,
-        "[nono] Try: nono run --profile {} -- {}",
-        timeout_cfg.profile, timeout_cfg.program
-    );
-    let _ = writeln!(
-        tty_out,
-        "[nono] Terminating startup-blocked process so diagnostics can show denied paths."
-    );
+    for line in &lines {
+        let _ = writeln!(tty_out, "{}", line);
+    }
     let _ = tty_out.flush();
-    true
 }
 
-struct StartupPromptTerminalGuard {
-    tty: Option<std::fs::File>,
-    saved_termios: Option<nix::sys::termios::Termios>,
-    child: Pid,
-    child_stopped: bool,
-}
-
-impl StartupPromptTerminalGuard {
-    fn pause_without_pty(child: Pid) -> Self {
-        // SIGSTOP freezes the direct child so its output doesn't interleave with
-        // the prompt. Descendants keep running, and the child's network peers
-        // may time out if the prompt is answered "no". Acceptable tradeoff:
-        // the prompt only fires after the startup timeout already elapsed.
-        let child_stopped = signal::kill(child, Signal::SIGSTOP).is_ok();
-        if child_stopped {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let mut guard = Self {
-            tty: None,
-            saved_termios: None,
-            child,
-            child_stopped,
-        };
-
-        let tty = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")
-        {
-            Ok(tty) => tty,
-            Err(_) => return guard,
-        };
-
-        let original = match nix::sys::termios::tcgetattr(&tty) {
-            Ok(termios) => termios,
-            Err(_) => return guard,
-        };
-
-        let mut prompt_termios = original.clone();
-        crate::profile_save_runtime::configure_prompt_termios(&mut prompt_termios);
-        if nix::sys::termios::tcsetattr(&tty, nix::sys::termios::SetArg::TCSANOW, &prompt_termios)
-            .is_err()
-        {
-            return guard;
-        }
-
-        let _ = nix::sys::termios::tcflush(&tty, nix::sys::termios::FlushArg::TCIFLUSH);
-        guard.saved_termios = Some(original);
-        guard.tty = Some(tty);
-        guard
-    }
-
-    fn finish(self, resume_child: bool) {
-        if let (Some(tty), Some(saved_termios)) = (self.tty.as_ref(), self.saved_termios.as_ref()) {
-            let _ = nix::sys::termios::tcsetattr(
-                tty,
-                nix::sys::termios::SetArg::TCSANOW,
-                saved_termios,
-            );
-        }
-
-        if self.child_stopped && resume_child {
-            let _ = signal::kill(self.child, Signal::SIGCONT);
-        }
-    }
-}
-
-pub(crate) fn prompt_startup_termination_for_child(
-    child: Pid,
+pub(crate) fn notify_startup_termination_for_child(
     timeout_cfg: StartupTimeoutConfig<'_>,
     has_output: bool,
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
-) -> bool {
+) {
     if let Some(proxy) = pty {
-        let paused_terminal = proxy.pause_terminal_for_prompt();
-        let terminate = prompt_startup_termination(timeout_cfg, has_output);
-        if paused_terminal && !terminate {
-            proxy.resume_terminal_after_prompt();
-        }
-        return terminate;
+        // Restore the terminal from raw mode so the message renders cleanly.
+        proxy.pause_terminal_for_prompt();
+        notify_startup_termination(timeout_cfg, has_output);
+        return;
     }
 
-    let guard = StartupPromptTerminalGuard::pause_without_pty(child);
-    let terminate = prompt_startup_termination(timeout_cfg, has_output);
-    guard.finish(!terminate);
-    terminate
+    notify_startup_termination(timeout_cfg, has_output);
 }

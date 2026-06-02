@@ -36,6 +36,8 @@ pub(crate) struct RollbackExitContext<'a> {
     pub(crate) audit_snapshot_state: Option<AuditSnapshotState>,
     pub(crate) audit_tracked_paths: Vec<PathBuf>,
     pub(crate) audit_recorder: Option<&'a Mutex<AuditRecorder>>,
+    pub(crate) supervisor_network_audit_events:
+        Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
     pub(crate) audit_integrity_enabled: bool,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) executable_identity: Option<&'a ExecutableIdentity>,
@@ -460,6 +462,7 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder,
+        supervisor_network_audit_events,
         audit_integrity_enabled,
         proxy_handle,
         executable_identity,
@@ -477,6 +480,12 @@ pub(crate) fn finalize_supervised_exit(ctx: RollbackExitContext<'_>) -> Result<(
         Vec::new,
         nono_proxy::server::ProxyHandle::drain_audit_events,
     );
+    if let Some(events_mutex) = supervisor_network_audit_events {
+        let mut supervisor_events = events_mutex.lock().map_err(|_| {
+            nono::NonoError::Snapshot("Network audit event lock poisoned".to_string())
+        })?;
+        network_events.extend(supervisor_events.drain(..));
+    }
     let (audit_event_count, audit_integrity) = if let Some(recorder_mutex) = audit_recorder {
         let mut recorder = recorder_mutex
             .lock()

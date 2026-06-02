@@ -416,6 +416,44 @@ On macOS, Seatbelt provides the kernel enforcement layer via `sandbox_init()`. T
 
 Supervised mode on macOS provides rollback snapshots (content-addressable filesystem snapshots for restoring pre-session state) and the diagnostic footer, but does not provide capability expansion. The Seatbelt sandbox is the single enforcement layer.
 
+## Isolation Scope and Deployment Model
+
+nono provides fine-grained, kernel-enforced capability control, but it is not a monolithic isolation stack. Understanding this distinction matters when deciding how to set policy and deploy nono.
+
+### What nono is
+
+nono is a capability-based sandbox that provides fine-grained isolation controls and operates at the OS syscall level. It uses Landlock on Linux and Seatbelt on macOS. It gives precise, per-path, per-domain, per-socket, per-env-var, per-operation control over what a process can touch and see. It's designed for the nuances of an agent acting within its operating context—something not practical or even possible with a microVM or container.
+
+### What nono is not
+
+nono is not Firecracker, not a hypervisor, and not a container runtime. It does not provide a separate kernel boundary, hardware-level memory isolation, or full filesystem namespace separation. The sandboxed process shares the host kernel with everything else running on the machine.
+
+This has a direct practical implication: **nono's effectiveness is proportional to the accuracy of the policy applied to the environment it runs in.** Operating systems and Linux distributions vary significantly in their default filesystem layouts. Package managers, init systems, and service daemons leave files in locations that differ between distributions, and `/run` is a clear example, where contents and structure can vary widely. nono ships with sensible defaults for common layouts, but no default set can anticipate every variation, and an incorrectly scoped policy can leave gaps.
+
+This is not a weakness unique to nono. SELinux, AppArmor, and seccomp profiles all require tuning to the environment and face the same problem. The difference is that nono makes policy explicit and declarative.
+
+<Callout type="info">
+  nono can act as a complete isolation layer when its policy is correctly tuned to the environment it runs in. It is not a turnkey solution that works identically out of the box across every distribution and service configuration, it is a primitive that rewards correct configuration.
+</Callout>
+
+### Combining nono with hardware isolation
+
+For deployments that require the strongest possible guarantees, nono composes cleanly with existing isolation layers. Running nono inside a container or microVM gives you both layers simultaneously:
+
+- The hardware-level boundary, kernel isolation, and namespace separation of the container or VM
+- The fine-grained per-path, per-operation capability control of nono inside that boundary
+
+Neither layer replaces the other. A microVM or container without nono cannot restrict an agent to specific files within a mounted directory, short of managing potentially hundreds of volume mounts, an approach that becomes operationally unworkable at any real scale. nono without a microVM trusts the host kernel and the host filesystem layout is aligned with the policy.
+
+| Deployment | Perimeter | Granularity |
+|------------|-----------|-------------|
+| nono alone | Host kernel (Landlock / Seatbelt) | Per-path, per-operation |
+| Container alone | Namespace + cgroup boundary | Coarse (mount, network namespace) |
+| microVM alone | Hardware VMM boundary | Coarse (virtual device, network) |
+| nono inside container or microVM | Hardware VMM + kernel enforcement | Per-path, per-operation within the VM boundary |
+
+The recommended posture for the highest-assurance deployments is: use a lightweight VM (Firecracker, etc) or hardened container runtimes (Edera, Kata) for the outer perimeter, and nono inside for fine-grained capability control. For most development, CI, and local agent use cases, nono alone, correctly configured for the host environment, provides meaningful, kernel-enforced isolation without the operational overhead of a VM.
+
 ## Summary
 
 The architecture optimizes for three properties simultaneously:

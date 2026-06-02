@@ -1,8 +1,13 @@
 use crate::audit_attestation::prepare_audit_signer;
+#[cfg(unix)]
+use crate::hook_runtime;
 use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
-use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state, session};
+use crate::{
+    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, output,
+    sandbox_state, session,
+};
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
 use sha2::{Digest, Sha256};
@@ -11,9 +16,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tracing::{error, info};
-
-const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+use tracing::{error, info, warn};
 
 fn apply_pre_fork_sandbox(
     strategy: exec_strategy::ExecStrategy,
@@ -130,26 +133,6 @@ fn recommended_builtin_profile(program: &Path) -> Option<&'static str> {
     }
 }
 
-fn should_apply_startup_timeout(
-    recommended_profile: Option<&str>,
-    cmd_args: &[impl AsRef<std::ffi::OsStr>],
-) -> bool {
-    recommended_profile.is_some() && cmd_args.is_empty()
-}
-
-fn startup_timeout_profile<'a>(
-    recommended_profile: Option<&'a str>,
-    explicit_profile: Option<&str>,
-) -> Option<&'a str> {
-    let recommended = recommended_profile?;
-    if let Some(explicit) = explicit_profile
-        && (explicit == recommended || explicit == format!("{recommended}-local"))
-    {
-        return None;
-    }
-    Some(recommended)
-}
-
 pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let LaunchPlan {
         program,
@@ -191,8 +174,6 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     } else {
         None
     };
-    let startup_timeout_profile =
-        startup_timeout_profile(known_builtin_profile, flags.session.profile_name.as_deref());
 
     let recommended_program_name = resolved_program
         .file_name()
@@ -202,10 +183,39 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     if let Some(profile) = recommended_profile {
         output::print_profile_hint(recommended_program_name, profile, flags.silent);
     }
+    let allowed_domain_strs: Vec<String> = flags
+        .proxy
+        .allow_domain
+        .iter()
+        .map(|e| e.domain().to_string())
+        .collect();
+    let domain_endpoints: Vec<sandbox_state::DomainEndpointState> = flags
+        .proxy
+        .allow_domain
+        .iter()
+        .filter_map(|e| match e {
+            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
+                if !endpoints.is_empty() =>
+            {
+                Some(sandbox_state::DomainEndpointState {
+                    domain: domain.clone(),
+                    endpoints: endpoints
+                        .iter()
+                        .map(|r| sandbox_state::EndpointRuleState {
+                            method: r.method.clone(),
+                            path: r.path.clone(),
+                        })
+                        .collect(),
+                })
+            }
+            _ => None,
+        })
+        .collect();
     let cap_file = write_capability_state_file(
         &caps,
         &flags.bypass_protection_paths,
-        &flags.proxy.allow_domain,
+        &allowed_domain_strs,
+        &domain_endpoints,
         flags.silent,
     );
     let cap_file_path = cap_file.unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
@@ -301,19 +311,24 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         // every direct child socket without leaking access to anything else
         // under the session dir.
         caps.add_unix_socket(
-            nono::UnixSocketCapability::new_dir(
-                &handle.session_dir,
-                nono::UnixSocketMode::Connect,
-            )
-            .map_err(|e| {
-                nono::NonoError::SandboxInit(format!("mediation session sockets: {e}"))
-            })?,
+            nono::UnixSocketCapability::new_dir(&handle.session_dir, nono::UnixSocketMode::Connect)
+                .map_err(|e| {
+                    nono::NonoError::SandboxInit(format!("mediation session sockets: {e}"))
+                })?,
         );
 
+        // Deny the real binary paths of all mediated commands so the agent cannot
+        // bypass mediation by invoking them via absolute path. The PATH shims
+        // handle by-name invocations; the seatbelt deny rules close the absolute-
+        // path escape. See `blocked_binaries` in `mediation::session::SessionHandle`.
+        for binary_path in &handle.blocked_binaries {
+            caps = caps.deny_exec_path(binary_path);
+        }
+
         info!(
-            "Mediation session active: {} commands mediated, shim_dir={}",
-            handle.mediated_commands.len(),
-            handle.shim_dir.display()
+            "Mediation session active: shim_dir={}, denied_exec_paths={}",
+            handle.shim_dir.display(),
+            handle.blocked_binaries.len()
         );
     } else {
         mediation_path_str = String::new();
@@ -334,6 +349,46 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         ));
     }
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
+
+    // Session id shared across before- and after-hook so paired setup/teardown
+    // scripts see the same NONO_SESSION_ID. Only allocated when at least one
+    // hook is configured.
+    let hook_session_id: Option<String> =
+        (flags.session_hooks.before.is_some() || flags.session_hooks.after.is_some()).then(|| {
+            std::env::var(DETACHED_SESSION_ID_ENV)
+                .ok()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(session::generate_session_id)
+        });
+
+    // ---- Before-hook execution (Unix-only) ----
+    #[cfg(unix)]
+    let hook_env_vars_owned: Vec<(String, String)> = flags
+        .session_hooks
+        .before
+        .as_ref()
+        .zip(hook_session_id.as_deref())
+        .map(|(before, session_id)| {
+            match hook_runtime::execute_before_hook(before, session_id, &current_dir) {
+                Ok(env) => {
+                    if !env.is_empty() {
+                        info!(
+                            "Before-hook exported {} env vars (script: {})",
+                            env.len(),
+                            before.script.display()
+                        );
+                    }
+                    env
+                }
+                Err(e) => {
+                    warn!("Before-hook failed (continuing): {e}");
+                    Vec::new()
+                }
+            }
+        })
+        .unwrap_or_default();
+    #[cfg(not(unix))]
+    let hook_env_vars_owned: Vec<(String, String)> = Vec::new();
 
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
         .iter()
@@ -369,6 +424,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         mediation_path_value = format!("{}:{current_path}", mediation_path_str);
         env_vars.push(("PATH", &mediation_path_value));
     }
+
+    // Hook env vars have lowest priority: prepend so secrets and proxy override.
+    for (key, value) in hook_env_vars_owned.iter().rev() {
+        env_vars.insert(0, (key.as_str(), value.as_str()));
+    }
+
 
     let threading = select_threading_context(
         !loaded_secrets.is_empty(),
@@ -423,6 +484,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         }
     };
 
+    #[cfg(target_os = "linux")]
+    if flags.af_unix_mediation.is_pathname() && nono::sandbox::is_wsl2() {
+        return Err(NonoError::SandboxInit(
+            "WSL2: linux.af_unix_mediation = \"pathname\" requires seccomp user notification, \
+             but WSL2 reports EBUSY for seccomp notify listeners. Disable AF_UNIX mediation or \
+             run on native Linux."
+                .to_string(),
+        ));
+    }
+
     let config = exec_strategy::ExecConfig {
         command: &command,
         resolved_program: &resolved_program,
@@ -439,18 +510,19 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             .as_deref()
             .or(recommended_profile),
         ignored_denial_paths: &flags.ignored_denial_paths,
-        startup_timeout: if should_apply_startup_timeout(startup_timeout_profile, &cmd_args) {
-            startup_timeout_profile.map(|profile| exec_strategy::StartupTimeoutConfig {
-                timeout: PROFILE_HINT_STARTUP_TIMEOUT,
+        startup_timeout: flags
+            .startup_timeout_secs
+            .filter(|&secs| secs > 0)
+            .map(|secs| exec_strategy::StartupTimeoutConfig {
+                timeout: Duration::from_secs(secs),
                 program: recommended_program_name,
-                profile,
-            })
-        } else {
-            None
-        },
+                recommended_profile: known_builtin_profile,
+            }),
         capability_elevation: flags.capability_elevation,
         #[cfg(target_os = "linux")]
         seccomp_proxy_fallback,
+        #[cfg(target_os = "linux")]
+        af_unix_mediation: flags.af_unix_mediation,
         allowed_env_vars: flags.allowed_env_vars,
         denied_env_vars: flags.denied_env_vars,
         extra_blocked_env: &mediation_env_block,
@@ -482,6 +554,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                     .map(|_| Arc::clone(&sandboxed_pid_latch)),
             })?;
 
+            // ---- After-hook execution (Unix-only) ----
+            #[cfg(unix)]
+            if let (Some(after), Some(session_id)) = (
+                flags.session_hooks.after.as_ref(),
+                hook_session_id.as_deref(),
+            ) && let Err(e) =
+                hook_runtime::execute_after_hook(after, session_id, &current_dir, exit_code)
+            {
+                warn!("After-hook failed: {e}");
+            }
+
             cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
@@ -500,10 +583,15 @@ fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
+    domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let state =
-        sandbox_state::SandboxState::from_caps(caps, bypass_protection_paths, allowed_domains);
+    let state = sandbox_state::SandboxState::from_caps(
+        caps,
+        bypass_protection_paths,
+        allowed_domains,
+        domain_endpoints,
+    );
 
     for _ in 0..8 {
         let cap_file = next_capability_state_file_path();
@@ -546,10 +634,7 @@ fn write_capability_state_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
-        startup_timeout_profile,
-    };
+    use super::{compute_executable_identity, recommended_builtin_profile};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::path::Path;
@@ -569,38 +654,6 @@ mod tests {
     #[test]
     fn recommended_builtin_profile_ignores_unknown_commands() {
         assert_eq!(recommended_builtin_profile(Path::new("/usr/bin/env")), None);
-    }
-
-    #[test]
-    fn startup_timeout_applies_only_to_bare_interactive_profiled_tools() {
-        let no_args: [&str; 0] = [];
-        assert!(should_apply_startup_timeout(Some("claude-code"), &no_args));
-        assert!(!should_apply_startup_timeout(
-            Some("claude-code"),
-            &["--version"]
-        ));
-        assert!(!should_apply_startup_timeout(None, &no_args));
-    }
-
-    #[test]
-    fn startup_timeout_profile_ignores_matching_explicit_profile_only() {
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), None),
-            Some("claude-code")
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("default")),
-            Some("claude-code")
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("claude-code")),
-            None
-        );
-        assert_eq!(
-            startup_timeout_profile(Some("claude-code"), Some("claude-code-local")),
-            None
-        );
-        assert_eq!(startup_timeout_profile(None, Some("default")), None);
     }
 
     #[test]

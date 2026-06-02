@@ -458,6 +458,24 @@ fn emit_unix_socket_rules(profile: &mut String, caps: &CapabilitySet) -> Result<
     Ok(())
 }
 
+/// Seatbelt rules: one `(remote tcp "localhost:N")` per non-zero port; `0` adds
+/// a single `localhost:*` outbound rule (`localhost:0` is invalid in Seatbelt).
+fn push_localhost_tcp_outbound_seatbelt_rules(profile: &mut String, localhost_ports: &[u16]) {
+    let wildcard = localhost_ports.contains(&0);
+    for &lp in localhost_ports {
+        if lp == 0 {
+            continue;
+        }
+        profile.push_str(&format!(
+            "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
+            lp
+        ));
+    }
+    if wildcard {
+        profile.push_str("(allow network-outbound (remote tcp \"localhost:*\"))\n");
+    }
+}
+
 /// Generate a Seatbelt profile from capabilities
 ///
 /// This is a pure primitive - it generates rules ONLY for paths in the CapabilitySet.
@@ -477,9 +495,38 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Allow specific process operations needed for execution
-    profile.push_str("(allow process-exec*)\n");
-    profile.push_str("(allow process-fork)\n");
+    // Process operations: by default permit all exec and fork. When the
+    // capability set restricts process-exec, deny exec by default and emit
+    // explicit allow rules only for the paths in `allowed_exec_paths`.
+    // `process-fork` remains allowed so threading and fork-without-exec
+    // continue to work; the kernel's deny on exec is what closes the
+    // child-process exfiltration escape.
+    if caps.process_exec_restricted() {
+        profile.push_str("(allow process-fork)\n");
+        for (path, is_subpath) in caps.allowed_exec_paths() {
+            let path_str = path.to_string_lossy();
+            // Escape backslashes and double quotes for the Seatbelt string literal.
+            let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+            let filter = if *is_subpath { "subpath" } else { "literal" };
+            profile.push_str(&format!(
+                "(allow process-exec ({} \"{}\"))\n",
+                filter, escaped
+            ));
+        }
+    } else {
+        profile.push_str("(allow process-exec*)\n");
+        profile.push_str("(allow process-fork)\n");
+        // Close the absolute-path bypass for mediated commands. The agent's PATH
+        // shims intercept by-name invocations; these deny rules block the real
+        // binary when called by absolute path. Seatbelt is last-rule-wins for
+        // same-operation filtered rules, so these denies after the broad allow
+        // take precedence.
+        for path in caps.denied_exec_paths() {
+            let path_str = path.to_string_lossy();
+            let escaped = path_str.replace('\\', "\\\\").replace('"', "\\\"");
+            profile.push_str(&format!("(deny process-exec (literal \"{escaped}\"))\n"));
+        }
+    }
 
     // Process info: allow self-inspection and same-sandbox inspection for both
     // Isolated and AllowSameSandbox, matching Linux behaviour where Landlock
@@ -645,20 +692,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(allow file-write* (extension \"com.apple.app-sandbox.read-write\"))\n");
     }
 
-    // SECURITY: Platform deny rules are placed BETWEEN read and write rules.
-    // This matches the research CLI pattern where sensitive path denials come
-    // after read allows but before write allows. In Seatbelt, more specific rules
-    // always win regardless of order; for equal specificity, last-match wins.
-    // Placing deny rules here ensures they override read allows when equally specific,
-    // while write allows below can still override deny-unlink for user-granted paths.
-    for rule in caps.platform_rules() {
-        profile.push_str(rule);
-        profile.push('\n');
-    }
-
     // Add write rules for all capabilities with Write or ReadWrite access.
-    // These come AFTER platform deny rules so user-granted write paths can
-    // override global denials like (deny file-write-unlink).
     // Emits rules for both original and resolved paths when they differ.
     for cap in caps.fs_capabilities() {
         match cap.access {
@@ -671,6 +705,18 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 // Read-only doesn't need write access
             }
         }
+    }
+
+    // SECURITY: Platform-supplied rules (from groups, add_deny_access, and
+    // unsafe_macos_seatbelt_rules) are emitted AFTER user write allows so
+    // targeted denies actually win. Seatbelt is last-rule-wins for filtered
+    // rules of the same operation, so a deny placed before a broad allow such
+    // as `(allow file-write* (subpath "/"))` is silently overridden.
+    // Unselectored denies like `(deny file-write-unlink)` block regardless of
+    // order, so unlink semantics are preserved.
+    for rule in caps.platform_rules() {
+        profile.push_str(rule);
+        profile.push('\n');
     }
 
     // Network rules
@@ -705,12 +751,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 profile.push_str(
                     "(allow system-socket (socket-domain AF_INET6) (socket-type SOCK_STREAM))\n",
                 );
-                for lp in localhost_ports {
-                    profile.push_str(&format!(
-                        "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
-                        lp
-                    ));
-                }
+                push_localhost_tcp_outbound_seatbelt_rules(&mut profile, localhost_ports);
                 // Seatbelt cannot filter bind/inbound by port
                 profile.push_str("(allow network-bind)\n");
                 profile.push_str("(allow network-inbound)\n");
@@ -726,12 +767,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
                 port
             ));
-            for lp in localhost_ports {
-                profile.push_str(&format!(
-                    "(allow network-outbound (remote tcp \"localhost:{}\"))\n",
-                    lp
-                ));
-            }
+            push_localhost_tcp_outbound_seatbelt_rules(&mut profile, localhost_ports);
             // Scope system-socket for TCP (required for connect/bind to proxy).
             profile.push_str(
                 "(allow system-socket (socket-domain AF_INET) (socket-type SOCK_STREAM))\n",
@@ -836,8 +872,72 @@ mod tests {
 
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
+        // Default process spawn is unrestricted.
+        assert!(profile.contains("(allow process-exec*)"));
         // Network is allowed by default
         assert!(profile.contains("(allow network-outbound)"));
+    }
+
+    #[test]
+    fn test_restricted_spawn_denies_default() {
+        let caps = CapabilitySet::new().restrict_process_exec();
+        let profile = generate_profile(&caps).unwrap();
+
+        // Blanket allow must not be present.
+        assert!(
+            !profile.contains("(allow process-exec*)"),
+            "blanket allow leaked into restricted profile:\n{}",
+            profile
+        );
+        // Fork remains allowed for threading.
+        assert!(profile.contains("(allow process-fork)"));
+        // Implicit deny by default.
+        assert!(profile.contains("(deny default)"));
+    }
+
+    #[test]
+    fn test_restricted_spawn_literal_paths() {
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_path("/usr/local/bin/git")
+            .allow_exec_path("/opt/homebrew/bin/ssh");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(!profile.contains("(allow process-exec*)"));
+        assert!(
+            profile.contains("(allow process-exec (literal \"/usr/local/bin/git\"))"),
+            "missing git literal allow:\n{}",
+            profile
+        );
+        assert!(
+            profile.contains("(allow process-exec (literal \"/opt/homebrew/bin/ssh\"))"),
+            "missing ssh literal allow:\n{}",
+            profile
+        );
+    }
+
+    #[test]
+    fn test_restricted_spawn_subpath() {
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_subpath("/opt/homebrew/bin");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(
+            profile.contains("(allow process-exec (subpath \"/opt/homebrew/bin\"))"),
+            "missing subpath allow:\n{}",
+            profile
+        );
+    }
+
+    #[test]
+    fn test_allowed_paths_inert_without_restriction() {
+        // Adding paths without enabling restriction is a no-op: blanket allow wins.
+        let caps = CapabilitySet::new().allow_exec_path("/usr/local/bin/git");
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow process-exec*)"));
+        assert!(!profile.contains("(allow process-exec (literal"));
     }
 
     /// Repro for tls-intercept-qa T2 failure: `head <SSL_CERT_FILE>` returned
@@ -1058,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_platform_rules_between_reads_and_writes() {
+    fn test_generate_profile_platform_rules_after_writes() {
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability {
             original: PathBuf::from("/test"),
@@ -1067,28 +1167,31 @@ mod tests {
             is_file: false,
             source: CapabilitySource::User,
         });
-        caps.add_platform_rule("(deny file-write-unlink)").unwrap();
+        caps.add_platform_rule("(deny file-write* (subpath \"/test/protected\"))")
+            .unwrap();
 
         let profile = generate_profile(&caps).unwrap();
 
         let read_pos = profile
             .find("(allow file-read* (subpath \"/test\"))")
             .expect("read rule not found");
-        let deny_pos = profile
-            .find("(deny file-write-unlink)")
-            .expect("deny rule not found");
         let write_pos = profile
             .find("(allow file-write* (subpath \"/test\"))")
             .expect("write rule not found");
+        let deny_pos = profile
+            .find("(deny file-write* (subpath \"/test/protected\"))")
+            .expect("deny rule not found");
 
-        // Order: read rules -> platform deny rules -> write rules
+        // Order: read rules -> write rules -> platform rules
+        // Targeted denies must come after broad write allows so they win under
+        // Seatbelt's last-rule-wins semantics for filtered rules.
         assert!(
-            read_pos < deny_pos,
-            "read rules must come before platform deny rules"
+            read_pos < write_pos,
+            "read rules must come before write rules"
         );
         assert!(
-            deny_pos < write_pos,
-            "platform deny rules must come before write rules"
+            write_pos < deny_pos,
+            "platform rules must come after write rules so targeted denies override broad allows"
         );
     }
 
@@ -1129,7 +1232,10 @@ mod tests {
 
     #[test]
     fn test_generate_profile_gpu_rules_ordering() {
-        // GPU rules (as platform rules) should appear between read and write rules
+        // GPU/IOKit rules carried via platform_rules target a different
+        // operation (iokit-get-properties), so they don't interact with file
+        // read/write ordering. They follow the platform_rules emission point
+        // (after write allows) and must still appear in the generated profile.
         let mut caps = CapabilitySet::new();
         caps.add_fs(FsCapability {
             original: PathBuf::from("/test"),
@@ -1146,20 +1252,20 @@ mod tests {
         let read_pos = profile
             .find("(allow file-read* (subpath \"/test\"))")
             .expect("read rule not found");
-        let iokit_pos = profile
-            .find("(allow iokit-get-properties)")
-            .expect("iokit rule not found");
         let write_pos = profile
             .find("(allow file-write* (subpath \"/test\"))")
             .expect("write rule not found");
+        let iokit_pos = profile
+            .find("(allow iokit-get-properties)")
+            .expect("iokit rule not found");
 
         assert!(
-            read_pos < iokit_pos,
-            "read rules must come before GPU/IOKit platform rules"
+            read_pos < write_pos,
+            "read rules must come before write rules"
         );
         assert!(
-            iokit_pos < write_pos,
-            "GPU/IOKit platform rules must come before write rules"
+            write_pos < iokit_pos,
+            "platform rules emit after write rules"
         );
     }
 
@@ -1785,6 +1891,31 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_profile_blocked_with_localhost_port_zero_wildcard() {
+        let caps = CapabilitySet::new().block_network().allow_localhost_port(0);
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(deny network*)"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
+        assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:0\"))"));
+        assert!(profile.contains("(allow network-bind)"));
+        assert!(profile.contains("(allow network-inbound)"));
+    }
+
+    #[test]
+    fn test_generate_profile_blocked_mixed_localhost_zero_and_fixed_port() {
+        let caps = CapabilitySet::new()
+            .block_network()
+            .allow_localhost_port(0)
+            .allow_localhost_port(7654);
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:7654\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
+        assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:0\"))"));
+    }
+
+    #[test]
     fn test_generate_profile_proxy_with_localhost_ports() {
         let caps = CapabilitySet::new()
             .proxy_only(54321)
@@ -1799,6 +1930,18 @@ mod tests {
         // Bind/inbound enabled because localhost_ports is non-empty
         assert!(profile.contains("(allow network-bind)"));
         assert!(profile.contains("(allow network-inbound)"));
+    }
+
+    #[test]
+    fn test_generate_profile_proxy_with_localhost_port_zero_wildcard() {
+        let caps = CapabilitySet::new()
+            .proxy_only(54321)
+            .allow_localhost_port(0);
+        let profile = generate_profile(&caps).unwrap();
+
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"));
+        assert!(profile.contains("(allow network-outbound (remote tcp \"localhost:*\"))"));
+        assert!(!profile.contains("(allow network-outbound (remote tcp \"localhost:0\"))"));
     }
 
     #[test]
@@ -1872,5 +2015,64 @@ mod tests {
 
         assert!(!profile.contains("(deny network*)"));
         assert!(!profile.contains("mDNSResponder"));
+    }
+
+    // --- mediated-binary exec bypass tests ---
+
+    #[test]
+    fn test_deny_exec_path_emitted_after_allow_all() {
+        // deny rules must appear AFTER (allow process-exec*) so that Seatbelt's
+        // last-rule-wins semantics give the deny precedence.
+        let caps = CapabilitySet::new()
+            .deny_exec_path("/opt/homebrew/bin/gh")
+            .deny_exec_path("/usr/bin/security");
+        let profile = generate_profile(&caps).unwrap();
+
+        let allow_pos = profile
+            .find("(allow process-exec*)")
+            .expect("blanket allow must be present");
+        let deny_gh = "(deny process-exec (literal \"/opt/homebrew/bin/gh\"))";
+        let deny_sec = "(deny process-exec (literal \"/usr/bin/security\"))";
+        let deny_gh_pos = profile.find(deny_gh).expect("deny for gh must be present");
+        let deny_sec_pos = profile.find(deny_sec).expect("deny for security must be present");
+        assert!(deny_gh_pos > allow_pos, "gh deny must come after allow-all");
+        assert!(deny_sec_pos > allow_pos, "security deny must come after allow-all");
+    }
+
+    #[test]
+    fn test_deny_exec_path_escapes_special_chars() {
+        let caps = CapabilitySet::new().deny_exec_path("/path/with\"quote/bin");
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            profile.contains("(deny process-exec (literal \"/path/with\\\"quote/bin\"))"),
+            "double-quote in path must be escaped:\n{profile}"
+        );
+    }
+
+    #[test]
+    fn test_deny_exec_path_noop_in_restricted_mode() {
+        // In restricted mode the allowlist already excludes unlisted paths via
+        // the implicit (deny default). Adding a deny_exec_path is redundant and
+        // must not emit an extra deny rule.
+        let caps = CapabilitySet::new()
+            .restrict_process_exec()
+            .allow_exec_path("/usr/bin/bash")
+            .deny_exec_path("/opt/homebrew/bin/gh");
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            !profile.contains("(deny process-exec (literal \"/opt/homebrew/bin/gh\"))"),
+            "deny rule must not appear in restricted mode:\n{profile}"
+        );
+        assert!(!profile.contains("(allow process-exec*)"));
+    }
+
+    #[test]
+    fn test_no_deny_exec_rules_by_default() {
+        let caps = CapabilitySet::new();
+        let profile = generate_profile(&caps).unwrap();
+        assert!(
+            !profile.contains("(deny process-exec (literal"),
+            "no deny-exec rules expected in default caps:\n{profile}"
+        );
     }
 }

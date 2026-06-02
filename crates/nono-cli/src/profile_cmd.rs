@@ -55,6 +55,31 @@ pub fn run_profile(args: ProfileCmdArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_init(args: ProfileInitArgs) -> Result<()> {
+    // If the name looks like an org/pack reference, check whether it matches
+    // an installed pack before falling through to the generic name-validation
+    // error — this gives the user actionable guidance.
+    if profile::is_registry_ref(&args.name) {
+        let short_name = args
+            .name
+            .split_once('/')
+            .map_or(args.name.as_str(), |(_, n)| n);
+        let suggested = format!("{}-local", short_name);
+        let extends_target = args.extends.as_deref().unwrap_or(args.name.as_str());
+        crate::output::print_warning(&format!(
+            "'{}' is a pack reference, not a profile name. \
+             Choose a plain name for your profile.",
+            args.name
+        ));
+        let t = theme::current();
+        eprintln!(
+            "  {} nono profile init {} --extends {}",
+            theme::fg("Try:", t.green).bold(),
+            suggested,
+            extends_target
+        );
+        return Err(NonoError::Cancelled(String::new()));
+    }
+
     // Validate profile name
     if !profile::is_valid_profile_name(&args.name) {
         return Err(NonoError::ProfileParse(format!(
@@ -75,6 +100,27 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
             "Profile file already exists: {}\nUse --force to overwrite",
             output_path.display()
         )));
+    }
+
+    // Block names that match an embedded built-in profile. Pack profiles use
+    // `org/name` keys (e.g. `always-further/hermes`), which are invalid as
+    // profile names, so a short name like `hermes` cannot shadow a pack.
+    {
+        let pol = policy::load_embedded_policy()?;
+        if pol.profiles.contains_key(args.name.as_str()) {
+            crate::output::print_warning(&format!(
+                "Cannot create profile '{}': it conflicts with the built-in '{}' profile.",
+                args.name, args.name
+            ));
+            let t = theme::current();
+            eprintln!(
+                "  {} nono profile init {}-local --extends {}",
+                theme::fg("Try:", t.green).bold(),
+                args.name,
+                args.name
+            );
+            return Err(NonoError::Cancelled(String::new()));
+        }
     }
 
     // Validate --extends target exists in any of the three sources the
@@ -295,7 +341,7 @@ fn profile_exists(name: &str) -> bool {
     if profile::builtin::get_builtin(name).is_some() {
         return true;
     }
-    if let Ok(path) = profile::get_user_profile_path(name)
+    if let Ok(path) = profile::resolve_user_profile_path(name)
         && path.exists()
     {
         return true;
@@ -923,6 +969,13 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             theme::fg(&format!("{policy:?}"), t.text)
         );
     }
+    if let Some(mode) = profile.linux.af_unix_mediation {
+        println!(
+            "  {} {}",
+            theme::fg("Linux AF_UNIX mediation:", t.subtext),
+            theme::fg(&format!("{mode:?}"), t.text)
+        );
+    }
 
     // Filesystem
     let fs = &profile.filesystem;
@@ -986,10 +1039,20 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             );
         }
         if !net.allow_domain.is_empty() {
+            let display: Vec<String> = net
+                .allow_domain
+                .iter()
+                .map(|e| match e {
+                    profile::AllowDomainEntry::Plain(s) => s.clone(),
+                    profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                        format!("{} ({} endpoint rules)", domain, endpoints.len())
+                    }
+                })
+                .collect();
             println!(
                 "    {}: {}",
                 theme::fg("allow_domain", t.subtext),
-                net.allow_domain.join(", ")
+                display.join(", ")
             );
         }
         if !net.resolved_credentials().is_empty() {
@@ -1168,6 +1231,9 @@ fn profile_to_json(
         security.insert("wsl2_proxy_policy".into(), serde_json::json!(v));
     }
     val["security"] = serde_json::Value::Object(security);
+    if let Some(v) = profile.linux.af_unix_mediation {
+        val["linux"] = serde_json::json!({ "af_unix_mediation": v });
+    }
 
     // Filesystem (canonical schema — `allow`/`read`/`write`/`*_file`/`deny`/
     // `bypass_protection`). Legacy keys deserialize into these fields via
@@ -1403,6 +1469,12 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         t,
     );
     any_diff |= diff_scalar_option(
+        "linux.af_unix_mediation",
+        &p1.linux.af_unix_mediation.map(|v| format!("{v:?}")),
+        &p2.linux.af_unix_mediation.map(|v| format!("{v:?}")),
+        t,
+    );
+    any_diff |= diff_scalar_option(
         "signal_mode",
         &p1.security.signal_mode.map(|v| format!("{v:?}")),
         &p2.security.signal_mode.map(|v| format!("{v:?}")),
@@ -1440,12 +1512,20 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
         }
     }
 
+    let p1_allow_domain_strs: Vec<String> = p1
+        .network
+        .allow_domain
+        .iter()
+        .map(|e| e.domain().to_string())
+        .collect();
+    let p2_allow_domain_strs: Vec<String> = p2
+        .network
+        .allow_domain
+        .iter()
+        .map(|e| e.domain().to_string())
+        .collect();
     let net_vec_diffs = diff_string_vecs(&[
-        (
-            "allow_domain",
-            &p1.network.allow_domain,
-            &p2.network.allow_domain,
-        ),
+        ("allow_domain", &p1_allow_domain_strs, &p2_allow_domain_strs),
         (
             "credentials",
             p1.network.resolved_credentials(),
@@ -1772,12 +1852,15 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
                 println!(
                     "      {} credential_format: {}",
                     theme::fg("-", t.red),
-                    theme::fg(&old.credential_format, t.red)
+                    theme::fg(&credential_format_diff_label(&old.credential_format), t.red)
                 );
                 println!(
                     "      {} credential_format: {}",
                     theme::fg("+", t.green),
-                    theme::fg(&new.credential_format, t.green)
+                    theme::fg(
+                        &credential_format_diff_label(&new.credential_format),
+                        t.green
+                    )
                 );
             }
             if old.path_pattern != new.path_pattern {
@@ -1835,6 +1918,14 @@ pub(crate) fn cmd_diff(args: ProfileDiffArgs) -> Result<()> {
     Ok(())
 }
 
+/// Human-readable label for optional credential_format in profile diffs.
+fn credential_format_diff_label(f: &Option<String>) -> String {
+    match f {
+        None => "(default)".to_string(),
+        Some(s) => s.clone(),
+    }
+}
+
 /// Print a diff for an optional scalar field. Returns true if there was a difference.
 fn diff_scalar_option(
     label: &str,
@@ -1889,6 +1980,19 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
         serde_json::json!({ "added": added, "removed": removed })
     };
 
+    let p1_allow_domain_strs: Vec<String> = p1
+        .network
+        .allow_domain
+        .iter()
+        .map(|e| e.domain().to_string())
+        .collect();
+    let p2_allow_domain_strs: Vec<String> = p2
+        .network
+        .allow_domain
+        .iter()
+        .map(|e| e.domain().to_string())
+        .collect();
+
     let ou1 = p1.open_urls.as_ref();
     let ou2 = p2.open_urls.as_ref();
 
@@ -1913,6 +2017,13 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
             "profile2": p2.security.wsl2_proxy_policy,
             "changed": p1.security.wsl2_proxy_policy != p2.security.wsl2_proxy_policy,
         },
+        "linux": {
+            "af_unix_mediation": {
+                "profile1": p1.linux.af_unix_mediation,
+                "profile2": p2.linux.af_unix_mediation,
+                "changed": p1.linux.af_unix_mediation != p2.linux.af_unix_mediation,
+            }
+        },
         "filesystem": diff_fs_json(&p1.filesystem, &p2.filesystem),
         "workdir": {
             "profile1": p1.workdir.access,
@@ -1930,7 +2041,7 @@ fn diff_to_json(name1: &str, name2: &str, p1: &Profile, p2: &Profile) -> serde_j
                 "profile2": p2.network.resolved_network_profile(),
                 "changed": p1.network.resolved_network_profile() != p2.network.resolved_network_profile(),
             },
-            "allow_domain": diff_vec(&p1.network.allow_domain, &p2.network.allow_domain),
+            "allow_domain": diff_vec(&p1_allow_domain_strs, &p2_allow_domain_strs),
             "credentials": diff_vec(p1.network.resolved_credentials(), p2.network.resolved_credentials()),
             "open_port": {
                 "profile1": p1.network.open_port,
@@ -2183,15 +2294,15 @@ fn resolve_validate_target(input: &std::path::Path) -> std::path::PathBuf {
     let Some(name) = input.to_str() else {
         return input.to_path_buf();
     };
-    if name.contains('/') || name.ends_with(".json") {
+    if profile::is_file_path_ref(name) {
         return input.to_path_buf();
     }
-    if let Ok(p) = profile::get_user_profile_path(name)
+    if let Ok(p) = profile::resolve_user_profile_path(name)
         && p.exists()
     {
         return p;
     }
-    if let Some(p) = profile::find_pack_store_profile(name) {
+    if let Some((p, _)) = profile::find_pack_store_profile(name) {
         return p;
     }
     input.to_path_buf()
@@ -2872,10 +2983,39 @@ fn resolve_to_manifest(
         manifest::NetworkMode::Unrestricted
     };
 
+    let manifest_endpoints: Vec<manifest::NetworkEndpoint> = prof
+        .network
+        .allow_domain
+        .iter()
+        .filter_map(|e| match e {
+            profile::AllowDomainEntry::WithEndpoints { domain, endpoints }
+                if !endpoints.is_empty() =>
+            {
+                let host: manifest::NetworkEndpointHost = domain.as_str().try_into().ok()?;
+                let rules = endpoints
+                    .iter()
+                    .filter_map(|r| {
+                        let method: manifest::EndpointRuleMethod =
+                            r.method.as_str().try_into().ok()?;
+                        let path: manifest::EndpointRulePath = r.path.as_str().try_into().ok()?;
+                        Some(manifest::EndpointRule { method, path })
+                    })
+                    .collect();
+                Some(manifest::NetworkEndpoint { host, rules })
+            }
+            _ => None,
+        })
+        .collect();
+
     let network = Some(manifest::Network {
         mode: network_mode,
-        allow_domains: prof.network.allow_domain.clone(),
-        endpoints: Vec::new(),
+        allow_domains: prof
+            .network
+            .allow_domain
+            .iter()
+            .map(|e| e.domain().to_string())
+            .collect(),
+        endpoints: manifest_endpoints,
         dns: true,
         ports: if prof.network.listen_port.is_empty() && prof.network.open_port.is_empty() {
             None
@@ -3005,7 +3145,10 @@ fn resolve_to_manifest(
             inject: Some(manifest::CredentialInject {
                 mode: inject_mode,
                 header: cred.inject_header.clone(),
-                format: cred.credential_format.clone(),
+                format: nono_proxy::config::resolved_credential_format(
+                    &cred.inject_header,
+                    cred.credential_format.as_deref(),
+                ),
                 path_pattern: cred.path_pattern.clone(),
                 path_replacement: cred.path_replacement.clone(),
                 query_param_name: cred.query_param_name.clone(),
@@ -3211,6 +3354,117 @@ mod tests {
         assert!(result.is_err());
         let err = result.expect_err("error");
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_init_blocked_when_shadowing_builtin() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        // `openclaw` is a known built-in profile; init to the default path must be blocked.
+        let result = cmd_init(ProfileInitArgs {
+            name: "openclaw".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(
+            matches!(err, nono::NonoError::Cancelled(_)),
+            "expected Cancelled (shadow block), got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_init_blocked_with_custom_output_when_shadowing_builtin() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let out = dir.path().join("openclaw-draft.json");
+        // Shadow check applies even when --output points to a custom path.
+        let result = cmd_init(ProfileInitArgs {
+            name: "openclaw".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: Some(out.clone()),
+            force: false,
+        });
+        assert!(result.is_err());
+        let err = result.expect_err("error");
+        assert!(
+            matches!(err, nono::NonoError::Cancelled(_)),
+            "expected Cancelled (shadow block), got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_init_allowed_when_pack_has_same_short_name() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        // Set up a fake pack that provides a profile with install_as "my-agent".
+        // Creating a user profile named "my-agent" must be allowed — packs are
+        // referenced by their full `org/name` key, not by `install_as`.
+        let pack_dir = xdg
+            .join("nono")
+            .join("packages")
+            .join("test-ns")
+            .join("test-pack");
+        std::fs::create_dir_all(pack_dir.join("profiles")).expect("mkdir pack");
+        let manifest = r#"{
+            "schema_version": 1,
+            "name": "test-pack",
+            "artifacts": [
+                {"type": "profile", "path": "profiles/my-agent.json", "install_as": "my-agent"}
+            ]
+        }"#;
+        std::fs::write(pack_dir.join("package.json"), manifest).expect("write manifest");
+        std::fs::write(
+            pack_dir.join("profiles").join("my-agent.json"),
+            "{\"meta\":{\"name\":\"my-agent\",\"version\":\"1.0.0\"}}\n",
+        )
+        .expect("write pack profile");
+
+        let profiles_dir = xdg.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("mkdir profiles");
+
+        let result = cmd_init(ProfileInitArgs {
+            name: "my-agent".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        });
+        assert!(result.is_ok(), "expected ok, got: {:?}", result.err());
     }
 
     #[test]
@@ -3506,27 +3760,27 @@ mod tests {
             "expected 'default' in profiles"
         );
         assert!(
-            profiles.contains(&"opencode".to_string()),
-            "expected 'codex' in profiles"
+            profiles.contains(&"openclaw".to_string()),
+            "expected 'openclaw' in profiles"
         );
     }
 
     #[test]
     fn test_show_resolves_inheritance() {
-        let profile = profile::load_profile("opencode").expect("opencode profile should load");
+        let profile = profile::load_profile("openclaw").expect("openclaw profile should load");
         assert!(
             !profile.groups.include.is_empty(),
-            "opencode should have groups"
+            "openclaw should have groups"
         );
-        // opencode extends default, so it should have default's base groups
+        // openclaw extends default, so it should have default's base groups
         let has_deny = profile.groups.include.iter().any(|g| g.contains("deny"));
-        assert!(has_deny, "opencode should inherit deny groups");
+        assert!(has_deny, "openclaw should inherit deny groups");
     }
 
     #[test]
     fn test_diff_shows_differences() {
         let p1 = profile::load_profile("default").expect("default should load");
-        let p2 = profile::load_profile("opencode").expect("opencode should load");
+        let p2 = profile::load_profile("openclaw").expect("openclaw should load");
 
         let g1: BTreeSet<&str> = p1.groups.include.iter().map(|s| s.as_str()).collect();
         let g2: BTreeSet<&str> = p2.groups.include.iter().map(|s| s.as_str()).collect();
@@ -3534,7 +3788,7 @@ mod tests {
         let added: BTreeSet<&&str> = g2.difference(&g1).collect();
         assert!(
             !added.is_empty(),
-            "codex should have additional groups over default"
+            "openclaw should have additional groups over default"
         );
     }
 

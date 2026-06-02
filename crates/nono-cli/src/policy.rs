@@ -167,10 +167,12 @@ impl ProfileDef {
             commands: self.commands.clone(),
             filesystem: self.filesystem.clone(),
             network: self.network.clone(),
+            linux: profile::LinuxConfig::default(),
             env_credentials: self.env_credentials.clone(),
             environment: None,
             workdir: self.workdir.clone(),
             hooks: self.hooks.clone(),
+            session_hooks: profile::SessionHooks::default(),
             rollback: self.rollback.clone(),
             open_urls: self.open_urls.clone(),
             allow_launch_services: self.allow_launch_services,
@@ -179,6 +181,7 @@ impl ProfileDef {
             interactive: self.interactive,
             skipdirs: Vec::new(),
             packs: self.packs.clone(),
+            binary: None,
             command_args: self.command_args.clone(),
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
             mediation: self.mediation.clone(),
@@ -1116,17 +1119,12 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
             }
             // Check if deny path is a child of an allowed directory
             if deny_path.starts_with(&cap.resolved) && *deny_path != cap.resolved {
-                let conflict = format!(
+                fatal_conflicts.push(format!(
                     "deny '{}' overlaps allowed parent '{}' (source: {})",
                     deny_path.display(),
                     cap.resolved.display(),
                     cap.source,
-                );
-                warn!(
-                    "Landlock cannot enforce {}. This deny has no effect on Linux.",
-                    conflict
-                );
-                fatal_conflicts.push(conflict);
+                ));
             }
         }
     }
@@ -1138,25 +1136,27 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> R
     fatal_conflicts.sort();
     fatal_conflicts.dedup();
 
+    let count = fatal_conflicts.len();
+    const PREVIEW_LIMIT: usize = 5;
     let preview = fatal_conflicts
         .iter()
-        .take(5)
-        .map(|c| format!("- {}", c))
+        .take(PREVIEW_LIMIT)
+        .map(|conflict| format!("- {conflict}"))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let remainder = fatal_conflicts.len().saturating_sub(5);
+    let remainder = count.saturating_sub(PREVIEW_LIMIT);
     let more = if remainder > 0 {
-        format!("\n- ... and {} more conflict(s)", remainder)
+        format!("\n- ... and {remainder} more conflict(s)")
     } else {
         String::new()
     };
 
     Err(NonoError::SandboxInit(format!(
         "Landlock deny-overlap is not enforceable on Linux. Refusing to start with conflicting policy.\n\
-         Remove the broad allow path, remove the deny path, or restructure permissions.\n\
-         Conflicts:\n{}{}",
-        preview, more
+         {count} deny rule(s) cannot apply under an allowed parent directory.\n\
+         Conflicts:\n{preview}{more}\n\
+         Remove the broad allow path, remove the deny path, or restructure permissions.",
     )))
 }
 
@@ -2349,6 +2349,13 @@ mod tests {
         // We filter to Linux-applicable groups (platform: None or "linux")
         // and check directly from parsed policy so this catches regressions
         // on all CI platforms (including macOS).
+        //
+        // We hold ENV_LOCK because expand_path() reads HOME/TMPDIR from the
+        // process env, and other tests in the suite mutate those vars.
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let policy = load_embedded_policy().expect("embedded policy must load");
 
         let is_linux_applicable =

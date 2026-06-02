@@ -74,7 +74,7 @@ pub(crate) struct TrustLaunchOptions {
 pub(crate) struct ProxyLaunchOptions {
     pub(crate) active: bool,
     pub(crate) network_profile: Option<String>,
-    pub(crate) allow_domain: Vec<String>,
+    pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
     pub(crate) upstream_proxy: Option<String>,
@@ -100,6 +100,8 @@ pub(crate) struct ExecutionFlags {
     pub(crate) capability_elevation: bool,
     #[cfg(target_os = "linux")]
     pub(crate) wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy,
+    #[cfg(target_os = "linux")]
+    pub(crate) af_unix_mediation: crate::profile::LinuxAfUnixMediation,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
     pub(crate) session: SessionLaunchOptions,
@@ -107,8 +109,10 @@ pub(crate) struct ExecutionFlags {
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
     pub(crate) redaction_policy: nono::ScrubPolicy,
+    pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
+    pub(crate) startup_timeout_secs: Option<u64>,
     pub(crate) mediation: crate::mediation::MediationConfig,
 }
 
@@ -123,6 +127,8 @@ impl ExecutionFlags {
             capability_elevation: false,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: crate::profile::Wsl2ProxyPolicy::Error,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: crate::profile::LinuxAfUnixMediation::Off,
             bypass_protection_paths: Vec::new(),
             ignored_denial_paths: Vec::new(),
             session: SessionLaunchOptions::default(),
@@ -134,8 +140,10 @@ impl ExecutionFlags {
             },
             proxy: ProxyLaunchOptions::default(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
+            session_hooks: profile::SessionHooks::default(),
             allowed_env_vars: None,
             denied_env_vars: None,
+            startup_timeout_secs: None,
             mediation: crate::mediation::MediationConfig::default(),
         })
     }
@@ -157,6 +165,7 @@ pub(crate) fn prepare_run_launch_plan(
     let no_audit_integrity = run_args.no_audit_integrity;
     let audit_sign_key = run_args.audit_sign_key.clone();
     let trust_override = run_args.trust_override;
+    let startup_timeout_secs = run_args.startup_timeout_secs;
 
     if audit_sign_key
         .as_deref()
@@ -244,6 +253,8 @@ pub(crate) fn prepare_run_launch_plan(
             capability_elevation: prepared.capability_elevation,
             #[cfg(target_os = "linux")]
             wsl2_proxy_policy: prepared.wsl2_proxy_policy,
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: prepared.af_unix_mediation,
             bypass_protection_paths: prepared.bypass_protection_paths,
             ignored_denial_paths: prepared.ignored_denial_paths,
             session: SessionLaunchOptions {
@@ -266,8 +277,10 @@ pub(crate) fn prepare_run_launch_plan(
             trust,
             proxy,
             redaction_policy,
+            session_hooks: prepared.session_hooks,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
+            startup_timeout_secs,
             mediation: prepared.mediation,
         },
     })

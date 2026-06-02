@@ -45,9 +45,13 @@
       "$ref": "#/$defs/NetworkConfig",
       "description": "Network access configuration including proxy settings, credential injection, and port allowlists."
     },
+    "linux": {
+      "$ref": "#/$defs/LinuxConfig",
+      "description": "Linux-specific hardening controls."
+    },
     "env_credentials": {
       "$ref": "#/$defs/SecretsConfig",
-      "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
+      "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore at startup."
     },
     "secrets": {
       "$ref": "#/$defs/SecretsConfig",
@@ -67,6 +71,10 @@
     "hooks": {
       "$ref": "#/$defs/HooksConfig",
       "description": "Hook configurations for target applications. Maps application names to their hook definitions."
+    },
+    "session_hooks": {
+      "$ref": "#/$defs/SessionHooks",
+      "description": "Session lifecycle hooks. Scripts run outside the sandbox with host privileges before and after the sandboxed process."
     },
     "rollback": {
       "$ref": "#/$defs/RollbackConfig",
@@ -222,6 +230,25 @@
       "type": "string",
       "enum": ["error", "insecure_proxy"],
       "description": "WSL2 proxy fallback policy. 'error' (default) refuses to run if proxy-only mode cannot be kernel-enforced. 'insecure_proxy' allows degraded execution where the credential proxy injects credentials but the sandboxed process is not prevented from bypassing the proxy."
+    },
+    "LinuxConfig": {
+      "type": "object",
+      "description": "Linux-specific hardening controls.",
+      "additionalProperties": false,
+      "properties": {
+        "af_unix_mediation": {
+          "oneOf": [
+            { "$ref": "#/$defs/LinuxAfUnixMediation" },
+            { "type": "null" }
+          ],
+          "description": "Opt-in pathname AF_UNIX mediation. 'off' preserves compatibility. 'pathname' requires explicit filesystem.unix_socket* grants for pathname Unix socket connect/bind."
+        }
+      }
+    },
+    "LinuxAfUnixMediation": {
+      "type": "string",
+      "enum": ["off", "pathname"],
+      "description": "Linux pathname AF_UNIX mediation mode."
     },
     "ProfileSignalMode": {
       "type": "string",
@@ -402,8 +429,13 @@
         },
         "allow_domain": {
           "type": "array",
-          "items": { "type": "string" },
-          "description": "Additional domains to allow through the proxy on top of the network profile hosts."
+          "items": {
+            "oneOf": [
+              { "type": "string" },
+              { "$ref": "#/$defs/AllowDomainWithEndpoints" }
+            ]
+          },
+          "description": "Additional domains to allow through the proxy. Entries can be plain hostname strings (CONNECT tunnel, no L7 filtering) or objects with endpoint rules (TLS-intercepted method+path filtering). When endpoints are present, only matching requests are allowed (default-deny)."
         },
         "proxy_allow": {
           "type": "array",
@@ -428,7 +460,7 @@
         "open_port": {
           "type": "array",
           "items": { "type": "integer" },
-          "description": "Localhost TCP ports to allow bidirectional IPC (connect + bind)."
+          "description": "Localhost TCP IPC (connect+bind). Port 0: macOS only (localhost:* outbound); Linux needs explicit ports."
         },
         "port_allow": {
           "type": "array",
@@ -490,7 +522,7 @@
         },
         "credential_key": {
           "type": "string",
-          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
+          "description": "Keystore account name for the credential (e.g., \"telegram_bot_token\"), or a 1Password op:// URI, Bitwarden bw:// URI, apple-password:// URI, file:// URI, or env:// URI (e.g., \"env://MY_TOKEN\"). Mutually exclusive with auth."
         },
         "auth": {
           "$ref": "#/$defs/OAuth2Config",
@@ -507,9 +539,11 @@
           "default": "Authorization"
         },
         "credential_format": {
-          "type": "string",
-          "description": "Format string for the credential value, using {} as placeholder. Only used when inject_mode is \"header\".",
-          "default": "Bearer {}"
+          "oneOf": [
+            { "type": "string" },
+            { "type": "null" }
+          ],
+          "description": "Template with {} for the secret (header inject mode). If set, used as-is. If omitted: Authorization header (case-insensitive) defaults to Bearer {}; other headers default to {} (secret only)."
         },
         "path_pattern": {
           "oneOf": [
@@ -544,7 +578,7 @@
             { "type": "string" },
             { "type": "null" }
           ],
-          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, apple-password://, or file://). Optional for env:// (derived from the URI)."
+          "description": "Explicit environment variable name for the phantom token (e.g., \"OPENAI_API_KEY\"). Required when credential_key is a URI manager reference (op://, bw://, apple-password://, or file://). Optional for env:// (derived from the URI)."
         },
         "endpoint_rules": {
           "type": "array",
@@ -590,6 +624,23 @@
         "path": {
           "type": "string",
           "description": "URL path glob pattern. Uses standard glob syntax: \"*\" matches one path segment, \"**\" matches zero or more segments."
+        }
+      }
+    },
+    "AllowDomainWithEndpoints": {
+      "type": "object",
+      "description": "Domain with fine-grained method+path endpoint restrictions. Requires TLS interception for L7 filtering. When endpoints is non-empty, only matching method+path combinations are allowed (default-deny).",
+      "additionalProperties": false,
+      "required": ["domain", "endpoints"],
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "Domain hostname to allow (e.g., \"api.github.com\")."
+        },
+        "endpoints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/EndpointRule" },
+          "description": "L7 method+path rules. Only requests matching at least one rule are allowed."
         }
       }
     },
@@ -675,7 +726,7 @@
     },
     "SecretsConfig": {
       "type": "object",
-      "description": "Maps keystore account names (or op://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",
+      "description": "Maps keystore account names (or op://, bw://, apple-password://, env:// URIs) to environment variable names. Secrets are loaded from the system keystore under the service name \"nono\".",
       "additionalProperties": {
         "oneOf": [
           {
@@ -755,6 +806,38 @@
         "script": {
           "type": "string",
           "description": "Script filename from data/hooks/ to install."
+        }
+      }
+    },
+    "SessionHooks": {
+      "type": "object",
+      "description": "Session lifecycle hooks. before runs before the sandboxed child is forked; after runs after it exits. Both run outside the sandbox with host privileges.",
+      "additionalProperties": false,
+      "properties": {
+        "before": {
+          "$ref": "#/$defs/SessionHook",
+          "description": "Hook executed before the sandboxed process starts. May export environment variables to the sandboxed child via NONO_ENV_FILE."
+        },
+        "after": {
+          "$ref": "#/$defs/SessionHook",
+          "description": "Hook executed after the sandboxed process exits. Receives the child exit code via NONO_EXIT_CODE."
+        }
+      }
+    },
+    "SessionHook": {
+      "type": "object",
+      "description": "A single session lifecycle hook configuration.",
+      "additionalProperties": false,
+      "required": ["script"],
+      "properties": {
+        "script": {
+          "type": "string",
+          "description": "Absolute path to the hook script. Must be an executable regular file owned by the current user or root, not located in a world-writable directory. Validated at execution time."
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional timeout in seconds. If set, the hook is killed (SIGTERM then SIGKILL) after this duration. If absent, no timeout is enforced."
         }
       }
     },

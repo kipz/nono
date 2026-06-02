@@ -5,6 +5,7 @@
 //! into the binary) or user-defined (in ~/.config/nono/profiles/).
 
 pub(crate) mod builtin;
+pub(crate) mod dynamic_providers;
 
 use nono::{NonoError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -263,11 +264,13 @@ pub struct CustomCredentialDef {
     /// Only used when inject_mode is "header".
     #[serde(default = "default_inject_header")]
     pub inject_header: String,
-    /// Format string for the credential value (default: "Bearer {}")
-    /// Use {} as placeholder for the credential value.
-    /// Only used when inject_mode is "header".
-    #[serde(default = "default_credential_format")]
-    pub credential_format: String,
+    /// How the injected header value is built (`{}` is replaced by the secret). Only when `inject_mode` is header.
+    ///
+    /// If you set this field, that whole string is used as-is — `Authorization` or any other header.
+    ///
+    /// If you omit it: an `Authorization` header (any capitalization) defaults to `Bearer {}`; any other header defaults to `{}` (secret only, no prefix).
+    #[serde(default)]
+    pub credential_format: Option<String>,
 
     // --- URL path mode fields ---
     /// Pattern to match in incoming URL path. Use {} as placeholder for phantom token.
@@ -299,7 +302,7 @@ pub struct CustomCredentialDef {
     ///
     /// When set, the proxy uses this as the SDK API key env var instead of
     /// deriving it from `credential_key.to_uppercase()`. Required when
-    /// `credential_key` is a URI manager reference (`op://`,
+    /// `credential_key` is a URI manager reference (`op://`, `bw://`,
     /// `apple-password://`, or `file://`).
     #[serde(default)]
     pub env_var: Option<String>,
@@ -342,10 +345,6 @@ fn default_inject_header() -> String {
     "Authorization".to_string()
 }
 
-fn default_credential_format() -> String {
-    "Bearer {}".to_string()
-}
-
 /// Check if a character is a valid HTTP token character per RFC 7230.
 fn is_http_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric()
@@ -373,6 +372,7 @@ fn is_http_token_char(c: char) -> bool {
 /// Accepts either:
 /// - A bare keyring account name (alphanumeric + underscores only)
 /// - A 1Password `op://` URI (validated by `nono::keystore::validate_op_uri`)
+/// - A Bitwarden `bw://` URI (validated by `nono::keystore::validate_bw_uri`)
 /// - An Apple Passwords `apple-password://` URI
 /// - A `file://` URI pointing to an absolute path (validated by `nono::keystore::validate_file_uri`)
 /// - An `env://` URI referencing a host environment variable (validated by `nono::keystore::validate_env_uri`)
@@ -389,6 +389,13 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         nono::keystore::validate_op_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
                 "invalid 1Password URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
+    } else if nono::keystore::is_bw_uri(key) {
+        nono::keystore::validate_bw_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid Bitwarden URI for custom credential '{}': {}",
                 context_name, e
             ))
         })
@@ -418,7 +425,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / apple-password:// / file:// / env:// URI)",
+                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// URI)",
                 key, context_name
             )));
         }
@@ -430,10 +437,10 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `apple-password://` / `file://` / `env://` URI
+///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
-///   - `header`: inject_header must be valid HTTP token, credential_format no CRLF
+///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
 ///   - `url_path`: path_pattern required, no CRLF in patterns
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
@@ -481,13 +488,14 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         // uppercased into an env var name, so env_var is required for them.
         // env:// is exempt: the var name is derived from the URI itself.
         if (nono::keystore::is_op_uri(key)
+            || nono::keystore::is_bw_uri(key)
             || nono::keystore::is_apple_password_uri(key)
             || nono::keystore::is_file_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op://, apple-password://, or file://); \
+                 manager reference (op://, bw://, apple-password://, or file://); \
                  set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
@@ -582,10 +590,14 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
             }
 
             if *mode == InjectMode::Header {
+                let parent_resolved = nono_proxy::config::resolved_credential_format(
+                    cred.inject_header.as_str(),
+                    cred.credential_format.as_deref(),
+                );
                 let format = proxy
                     .credential_format
                     .as_deref()
-                    .unwrap_or(cred.credential_format.as_str());
+                    .unwrap_or(parent_resolved.as_str());
                 if format.contains('\r') || format.contains('\n') {
                     return Err(NonoError::ProfileParse(format!(
                         "proxy.credential_format for custom credential '{}' contains invalid CRLF characters; \
@@ -688,7 +700,7 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
 /// - `token_url` must be HTTPS (or HTTP for loopback addresses)
 /// - `client_id` must not be empty
 /// - `client_secret` must not be empty and must be a credential reference
-///   (env://, file://, op://, apple-password://) or plain value
+///   (env://, file://, op://, bw://, apple-password://) or plain value
 fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     // Validate token_url — same rules as upstream URL (HTTPS or loopback HTTP)
     validate_upstream_url(&auth.token_url, &format!("{}/auth.token_url", name))?;
@@ -729,8 +741,12 @@ fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
         )));
     }
 
-    // Validate credential_format (no CRLF injection)
-    if cred.credential_format.contains('\r') || cred.credential_format.contains('\n') {
+    // Validate effective credential_format (no CRLF injection)
+    let effective_format = nono_proxy::config::resolved_credential_format(
+        cred.inject_header.as_str(),
+        cred.credential_format.as_deref(),
+    );
+    if effective_format.contains('\r') || effective_format.contains('\n') {
         return Err(NonoError::ProfileParse(format!(
             "credential_format for custom credential '{}' contains invalid CRLF characters; \
              this could enable header injection attacks",
@@ -872,8 +888,8 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
 
 /// Validate env_credentials keys in a profile.
 ///
-/// Keys can be keyring account names, `op://` URIs, `apple-password://` URIs,
-/// `keyring://` URIs, `env://` URIs, or `file://` URIs.
+/// Keys can be keyring account names, `op://` URIs, `bw://` URIs,
+/// `apple-password://` URIs, `keyring://` URIs, `env://` URIs, or `file://` URIs.
 /// Keyring account names are validated at load time by the keyring crate itself,
 /// but URI entries need structural validation upfront.
 fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
@@ -881,6 +897,10 @@ fn validate_env_credential_keys(profile: &Profile) -> Result<()> {
         if nono::keystore::is_op_uri(key) {
             nono::keystore::validate_op_uri(key).map_err(|e| {
                 NonoError::ProfileParse(format!("invalid 1Password URI in env_credentials: {}", e))
+            })?;
+        } else if nono::keystore::is_bw_uri(key) {
+            nono::keystore::validate_bw_uri(key).map_err(|e| {
+                NonoError::ProfileParse(format!("invalid Bitwarden URI in env_credentials: {}", e))
             })?;
         } else if nono::keystore::is_apple_password_uri(key) {
             nono::keystore::validate_apple_password_uri(key).map_err(|e| {
@@ -985,6 +1005,36 @@ where
     }
 }
 
+/// An entry in the `allow_domain` array.
+///
+/// Can be either a plain hostname string (backward compatible, CONNECT tunnel)
+/// or an object with a domain and endpoint rules (requires TLS interception
+/// for L7 method+path filtering).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowDomainEntry {
+    /// Plain hostname — allowed via CONNECT tunnel without L7 inspection.
+    Plain(String),
+    /// Domain with endpoint restrictions — requires TLS interception.
+    /// When `endpoints` is non-empty, only matching method+path combinations
+    /// are allowed (default-deny).
+    WithEndpoints {
+        domain: String,
+        #[serde(default)]
+        endpoints: Vec<nono_proxy::config::EndpointRule>,
+    },
+}
+
+impl AllowDomainEntry {
+    /// Extract the domain/hostname regardless of variant.
+    pub fn domain(&self) -> &str {
+        match self {
+            Self::Plain(s) => s,
+            Self::WithEndpoints { domain, .. } => domain,
+        }
+    }
+}
+
 /// Network configuration in a profile
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1001,6 +1051,7 @@ pub struct NetworkConfig {
     #[serde(default, skip_serializing_if = "InheritableValue::is_inherit")]
     pub network_profile: InheritableValue<String>,
     /// Additional domains to allow through the proxy (on top of profile hosts).
+    /// Entries can be plain hostname strings or objects with endpoint rules.
     /// Canonical profile key: `allow_domain` (legacy `proxy_allow` and
     /// `allow_proxy` are also accepted).
     /// ALIAS(canonical="allow_domain", introduced="v0.0.0", remove_by="indefinite", issue="#415")
@@ -1010,7 +1061,7 @@ pub struct NetworkConfig {
         alias = "proxy_allow",
         alias = "allow_proxy"
     )]
-    pub allow_domain: Vec<String>,
+    pub allow_domain: Vec<AllowDomainEntry>,
     /// Credential services to enable via reverse proxy.
     /// Canonical profile key: `credentials` (legacy `proxy_credentials` accepted).
     ///
@@ -1025,10 +1076,7 @@ pub struct NetworkConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub credentials: Option<Vec<String>>,
-    /// Localhost TCP ports to allow bidirectional IPC (connect + bind).
-    /// Equivalent to `--open-port` CLI flag.
-    /// Canonical profile key: `open_port` (legacy `port_allow` and `allow_port`
-    /// are also accepted).
+    /// Localhost TCP IPC (`--open-port`). **`0`**: macOS only, means `localhost:*` outbound.
     /// ALIAS(canonical="open_port", introduced="v0.0.0", remove_by="indefinite", issue="#415")
     #[serde(
         default,
@@ -1173,6 +1221,41 @@ pub struct HooksConfig {
     pub hooks: HashMap<String, HookConfig>,
 }
 
+/// A single session lifecycle hook configuration.
+///
+/// Defines a script to execute before or after the sandboxed session.
+/// Scripts run with the user's full host privileges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHook {
+    /// Absolute path to the hook script.
+    /// Must be an executable regular file. Validated at execution time.
+    pub script: PathBuf,
+
+    /// Optional timeout in seconds.
+    /// If set, the hook is killed after this duration.
+    /// If absent, no timeout is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Session lifecycle hooks for a profile.
+///
+/// `before`: executed in the parent process before the sandboxed child is forked.
+///           Has host privileges. Can export env vars via NONO_ENV_FILE.
+///
+/// `after`: executed in the parent process after the sandboxed child exits.
+///          Has host privileges. Cleanup only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionHooks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<SessionHook>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<SessionHook>,
+}
+
 /// Working directory access level for profiles
 ///
 /// Controls whether and how the current working directory is automatically
@@ -1268,6 +1351,40 @@ pub enum Wsl2ProxyPolicy {
     /// Use only when credential injection is more important than network
     /// lockdown (e.g., development workflows where the agent is trusted).
     InsecureProxy,
+}
+
+/// Linux pathname AF_UNIX seccomp mediation mode.
+///
+/// When set to `pathname`, pathname Unix socket `connect(2)` and `bind(2)`
+/// calls are mediated by the supervisor and must match explicit
+/// `filesystem.unix_socket*` grants. The default `off` mode preserves
+/// compatibility: filesystem grants may still make pathname sockets reachable
+/// on Landlock V4+.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinuxAfUnixMediation {
+    /// Do not install the V4+ AF_UNIX-only seccomp mediation filter.
+    #[default]
+    Off,
+    /// Mediate pathname AF_UNIX sockets through explicit socket grants.
+    Pathname,
+}
+
+impl LinuxAfUnixMediation {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[must_use]
+    pub fn is_pathname(self) -> bool {
+        matches!(self, LinuxAfUnixMediation::Pathname)
+    }
+}
+
+/// Linux-specific profile controls.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxConfig {
+    /// Opt-in pathname AF_UNIX mediation mode.
+    #[serde(default)]
+    pub af_unix_mediation: Option<LinuxAfUnixMediation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1457,6 +1574,8 @@ pub struct Profile {
     pub filesystem: FilesystemConfig,
     #[serde(default)]
     pub network: NetworkConfig,
+    #[serde(default)]
+    pub linux: LinuxConfig,
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     pub env_credentials: SecretsConfig,
@@ -1466,6 +1585,11 @@ pub struct Profile {
     pub workdir: WorkdirConfig,
     #[serde(default)]
     pub hooks: HooksConfig,
+    /// Session lifecycle hooks (before/after sandbox).
+    /// Runs outside the sandbox with host privileges.
+    /// `before` can export env vars via NONO_ENV_FILE.
+    #[serde(default)]
+    pub session_hooks: SessionHooks,
     /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     pub rollback: RollbackConfig,
@@ -1502,6 +1626,11 @@ pub struct Profile {
     /// Each entry is a `<namespace>/<name>` reference to an installed pack.
     #[serde(default)]
     pub packs: Vec<String>,
+    /// Binary path or command name to run when no trailing `-- <command>` is given.
+    /// Resolved via `PATH` lookup or canonicalized if absolute. Only honoured
+    /// for user-authored profiles (ignored for pack and built-in profiles).
+    #[serde(default)]
+    pub binary: Option<String>,
     /// Extra arguments appended to the child command at launch.
     /// Supports variable expansion (e.g. `$NONO_PACKAGES`).
     #[serde(default)]
@@ -1561,6 +1690,8 @@ struct ProfileDeserialize {
     policy: crate::deprecated_schema::LegacyPolicyPatch,
     #[serde(default)]
     network: NetworkConfig,
+    #[serde(default)]
+    linux: LinuxConfig,
     /// ALIAS(canonical="env_credentials", introduced="v0.0.0", remove_by="indefinite", issue="#143")
     #[serde(default, alias = "secrets")]
     env_credentials: SecretsConfig,
@@ -1570,6 +1701,8 @@ struct ProfileDeserialize {
     workdir: WorkdirConfig,
     #[serde(default)]
     hooks: HooksConfig,
+    #[serde(default)]
+    session_hooks: SessionHooks,
     /// ALIAS(canonical="rollback", introduced="v0.0.0", remove_by="indefinite", issue="#124")
     #[serde(default, alias = "undo")]
     rollback: RollbackConfig,
@@ -1586,6 +1719,8 @@ struct ProfileDeserialize {
     skipdirs: Vec<String>,
     #[serde(default)]
     packs: Vec<String>,
+    #[serde(default)]
+    binary: Option<String>,
     /// ALIAS(canonical="command_args", introduced="v0.0.0", remove_by="indefinite", issue="N/A")
     #[serde(default)]
     #[serde(alias = "brokered_commands")]
@@ -1613,10 +1748,12 @@ impl From<ProfileDeserialize> for Profile {
             commands: raw.commands,
             filesystem: raw.filesystem,
             network: raw.network,
+            linux: raw.linux,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
             workdir: raw.workdir,
             hooks: raw.hooks,
+            session_hooks: raw.session_hooks,
             rollback: raw.rollback,
             open_urls: raw.open_urls,
             allow_launch_services: raw.allow_launch_services,
@@ -1625,6 +1762,7 @@ impl From<ProfileDeserialize> for Profile {
             interactive: raw.interactive,
             skipdirs: raw.skipdirs,
             packs: raw.packs,
+            binary: raw.binary,
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             mediation: raw.mediation,
@@ -1660,7 +1798,7 @@ pub fn is_user_override(name: &str) -> bool {
     if !is_valid_profile_name(name) {
         return false;
     }
-    get_user_profile_path(name)
+    resolve_user_profile_path(name)
         .map(|p| p.exists())
         .unwrap_or(false)
 }
@@ -1681,7 +1819,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
 
     // Direct file path
-    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+    if is_file_path_ref(name_or_path) {
         return parse_profile_file(Path::new(name_or_path))
             .ok()
             .and_then(|p| p.extends);
@@ -1692,7 +1830,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
     }
 
     // User profile
-    if let Ok(profile_path) = get_user_profile_path(name_or_path)
+    if let Ok(profile_path) = resolve_user_profile_path(name_or_path)
         && profile_path.exists()
     {
         return parse_profile_file(&profile_path)
@@ -1702,7 +1840,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 
     // Pack-store: any installed pack that declares a profile artifact with
     // matching `install_as`.
-    if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+    if let Some((profile_path, _)) = find_pack_store_profile(name_or_path) {
         return parse_profile_file(&profile_path)
             .ok()
             .and_then(|p| p.extends);
@@ -1752,12 +1890,16 @@ pub fn load_profile(name_or_path: &str) -> Result<Profile> {
                 // Pull completed AND the wiring interpreter ran during
                 // install — no extra "wire" pass needed here. Just
                 // re-resolve through the pack-store branch and load.
-                if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+                if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
                     tracing::info!(
                         "Loading pack-store profile from: {}",
                         profile_path.display()
                     );
-                    return finalize_profile(load_from_file(&profile_path)?);
+                    let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+                    if !profile.packs.contains(&pack_key) {
+                        profile.packs.push(pack_key);
+                    }
+                    return Ok(profile);
                 }
                 Err(NonoError::ProfileNotFound(format!(
                     "{name_or_path}\n  the registry pack pulled but did not install \
@@ -1826,7 +1968,7 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
     if is_registry_ref(name_or_path) {
         return load_registry_profile(name_or_path).map(Some);
     }
-    if name_or_path.contains('/') || name_or_path.ends_with(".json") {
+    if is_file_path_ref(name_or_path) {
         return load_profile_from_path(Path::new(name_or_path)).map(Some);
     }
     if !is_valid_profile_name(name_or_path) {
@@ -1835,17 +1977,22 @@ fn load_profile_inner(name_or_path: &str) -> Result<Option<Profile>> {
             name_or_path
         )));
     }
-    let profile_path = get_user_profile_path(name_or_path)?;
+    let profile_path = resolve_user_profile_path(name_or_path)?;
     if profile_path.exists() {
         tracing::info!("Loading user profile from: {}", profile_path.display());
         return finalize_profile(load_from_file(&profile_path)?).map(Some);
     }
-    if let Some(profile_path) = find_pack_store_profile(name_or_path) {
+    if let Some((profile_path, pack_key)) = find_pack_store_profile(name_or_path) {
         tracing::info!(
             "Loading pack-store profile from: {}",
             profile_path.display()
         );
-        let profile = finalize_profile(load_from_file(&profile_path)?)?;
+        let mut profile = finalize_profile(load_from_file(&profile_path)?)?;
+        // Inject the source pack ref so it's always present in the
+        // verification list, even if the profile JSON doesn't declare it.
+        if !profile.packs.contains(&pack_key) {
+            profile.packs.push(pack_key);
+        }
         // If we just resolved through `always-further/claude`, also offer
         // to strip pre-0.43 inbuilt-hook leftovers. Catches the path
         // where users `nono pull always-further/claude` directly,
@@ -1898,11 +2045,43 @@ fn profile_path_is_in_pack(profile_path: &Path, store: &Path, ns: &str, name: &s
 /// resolved by returning the first (alphabetical by `<namespace>/<name>`)
 /// — collisions are rare and the resolver is best-effort; the operator
 /// can pin via the user profile dir if needed.
-pub(crate) fn find_pack_store_profile(name: &str) -> Option<PathBuf> {
+/// Returns `(profile_path, pack_key)` for the first installed pack that
+/// provides a profile artifact matching `name` (by `install_as` or alias).
+/// Returns `None` if no pack provides a matching profile.
+pub(crate) fn find_pack_store_profile(name: &str) -> Option<(PathBuf, String)> {
     let store = crate::package::package_store_dir().ok()?;
     if !store.exists() {
         return None;
     }
+
+    // Fast path: if name is in `org/pack-name[@version]` format, look up the
+    // pack directly rather than scanning every pack's install_as values.
+    // parse_package_ref strips the optional @version so we always look under
+    // the installed `packages/org/pack` directory, not `packages/org/pack@ver`.
+    if is_registry_ref(name) {
+        return (|| {
+            let pkg = crate::package::parse_package_ref(name).ok()?;
+            let pack_path = store.join(&pkg.namespace).join(&pkg.name);
+            if !pack_path.is_dir() {
+                return None;
+            }
+            let manifest_str = std::fs::read_to_string(pack_path.join("package.json")).ok()?;
+            let manifest: crate::package::PackageManifest =
+                serde_json::from_str(&manifest_str).ok()?;
+            manifest
+                .artifacts
+                .iter()
+                .filter(|a| a.artifact_type == crate::package::ArtifactType::Profile)
+                .find_map(|a| {
+                    let install_as = a.install_as.as_deref()?;
+                    let profile_file = pack_path
+                        .join("profiles")
+                        .join(format!("{install_as}.json"));
+                    profile_file.exists().then(|| (profile_file, pkg.key()))
+                })
+        })();
+    }
+
     let mut matches: Vec<(String, PathBuf)> = Vec::new();
     let ns_entries = std::fs::read_dir(&store).ok()?;
     for ns_entry in ns_entries.flatten() {
@@ -1960,12 +2139,12 @@ pub(crate) fn find_pack_store_profile(name: &str) -> Option<PathBuf> {
         }
     }
     matches.sort_by(|a, b| a.0.cmp(&b.0));
-    matches.into_iter().next().map(|(_, p)| p)
+    matches.into_iter().next().map(|(key, path)| (path, key))
 }
 
 /// Returns true if the string looks like a registry package reference
 /// (`namespace/name` or `namespace/name@version`) rather than a filesystem path.
-fn is_registry_ref(s: &str) -> bool {
+pub(crate) fn is_registry_ref(s: &str) -> bool {
     // Strip optional @version suffix for the path check
     let path_part = s.split_once('@').map_or(s, |(p, _)| p);
     let parts: Vec<&str> = path_part.split('/').collect();
@@ -1975,6 +2154,13 @@ fn is_registry_ref(s: &str) -> bool {
         && !s.starts_with('/')
         && !s.ends_with(".json")
         && parts.iter().all(|p| !p.is_empty())
+}
+
+/// Returns true if the profile name looks like a direct filesystem path
+/// (contains path separators or has a recognized profile file extension)
+/// rather than a simple profile name or registry reference.
+pub(crate) fn is_file_path_ref(s: &str) -> bool {
+    !is_registry_ref(s) && (s.contains('/') || s.ends_with(".json") || s.ends_with(".jsonc"))
 }
 
 /// Load a profile from a registry pack. If the pack isn't installed locally,
@@ -2077,6 +2263,7 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
+    dynamic_providers::expand_profile_tokens(&mut profile)?;
     Ok(profile)
 }
 
@@ -2144,8 +2331,10 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
 }
 
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
-    let profile: Profile =
-        serde_json::from_slice(content).map_err(|e| NonoError::ProfileParse(e.to_string()))?;
+    let text = std::str::from_utf8(content)
+        .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
+
+    let profile: Profile = crate::jsonc::parse(text).map_err(NonoError::ProfileParse)?;
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
@@ -2283,7 +2472,7 @@ fn load_base_profile_raw(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
-    if !is_valid_profile_name(name) {
+    if !is_valid_profile_name(name) && !is_registry_ref(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
             name
@@ -2310,14 +2499,21 @@ fn load_base_profile_raw(
     }
 
     // 1. User profiles take precedence.
-    let profile_path = get_user_profile_path(name)?;
+    let profile_path = resolve_user_profile_path(name)?;
     if profile_path.exists() {
         return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
     }
 
     // 2. Pack-store: any installed pack with a matching `install_as`.
-    if let Some(profile_path) = find_pack_store_profile(name) {
-        return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+    // Inject the source pack key into `packs` so it propagates through
+    // the merge chain and reaches verification even if the profile JSON
+    // doesn't declare its own pack.
+    if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
+        let mut base = parse_profile_file(&profile_path)?;
+        if !base.packs.contains(&pack_key) {
+            base.packs.push(pack_key);
+        }
+        return Ok(ResolvedBase::Global(base));
     }
 
     // 3. Built-in profile from embedded policy.
@@ -2340,8 +2536,12 @@ fn load_base_profile_raw(
         let outcome = crate::migration::check_and_run(name)?;
         match outcome {
             crate::migration::MigrationOutcome::Migrated => {
-                if let Some(profile_path) = find_pack_store_profile(name) {
-                    return Ok(ResolvedBase::Global(parse_profile_file(&profile_path)?));
+                if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
+                    let mut base = parse_profile_file(&profile_path)?;
+                    if !base.packs.contains(&pack_key) {
+                        base.packs.push(pack_key);
+                    }
+                    return Ok(ResolvedBase::Global(base));
                 }
             }
             crate::migration::MigrationOutcome::Skipped => {
@@ -2439,7 +2639,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 .network
                 .network_profile
                 .merge(base.network.network_profile),
-            allow_domain: dedup_append(&base.network.allow_domain, &child.network.allow_domain),
+            allow_domain: merge_allow_domain(
+                &base.network.allow_domain,
+                &child.network.allow_domain,
+            ),
             open_port: dedup_append(&base.network.open_port, &child.network.open_port),
             listen_port: dedup_append(&base.network.listen_port, &child.network.listen_port),
             connect_port: dedup_append(&base.network.connect_port, &child.network.connect_port),
@@ -2472,6 +2675,12 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 &child.network.upstream_bypass,
             ),
         },
+        linux: LinuxConfig {
+            af_unix_mediation: child
+                .linux
+                .af_unix_mediation
+                .or(base.linux.af_unix_mediation),
+        },
         env_credentials: SecretsConfig {
             mappings: {
                 let mut merged = base.env_credentials.mappings;
@@ -2503,6 +2712,10 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged
             },
         },
+        session_hooks: SessionHooks {
+            before: child.session_hooks.before.or(base.session_hooks.before),
+            after: child.session_hooks.after.or(base.session_hooks.after),
+        },
         rollback: RollbackConfig {
             exclude_patterns: dedup_append(
                 &base.rollback.exclude_patterns,
@@ -2525,6 +2738,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         interactive: base.interactive || child.interactive,
         skipdirs: dedup_append(&base.skipdirs, &child.skipdirs),
         packs: dedup_append(&base.packs, &child.packs),
+        binary: child.binary.or(base.binary),
         command_args: dedup_append(&base.command_args, &child.command_args),
         unsafe_macos_seatbelt_rules: dedup_append(
             &base.unsafe_macos_seatbelt_rules,
@@ -2551,9 +2765,64 @@ pub(crate) fn dedup_append<T: Eq + std::hash::Hash + Clone>(base: &[T], child: &
     result
 }
 
-/// Get the path to a user profile
+/// Merge `allow_domain` entries from base and child profiles.
+///
+/// For the same domain, endpoint rules are **appended** (child rules added to base).
+/// A plain entry upgraded with endpoints from the other side becomes `WithEndpoints`.
+/// Order: base domains first, then child-only domains.
+pub(crate) fn merge_allow_domain(
+    base: &[AllowDomainEntry],
+    child: &[AllowDomainEntry],
+) -> Vec<AllowDomainEntry> {
+    let mut domains: Vec<String> = Vec::new();
+    let mut rules: HashMap<String, Vec<nono_proxy::config::EndpointRule>> = HashMap::new();
+
+    for entry in base.iter().chain(child.iter()) {
+        let (domain, endpoints) = match entry {
+            AllowDomainEntry::Plain(d) => (d.clone(), &[][..]),
+            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                (domain.clone(), endpoints.as_slice())
+            }
+        };
+        if !domains.contains(&domain) {
+            domains.push(domain.clone());
+        }
+        rules
+            .entry(domain)
+            .or_default()
+            .extend_from_slice(endpoints);
+    }
+
+    domains
+        .into_iter()
+        .map(|domain| {
+            let endpoints = rules.remove(&domain).unwrap_or_default();
+            if endpoints.is_empty() {
+                AllowDomainEntry::Plain(domain)
+            } else {
+                AllowDomainEntry::WithEndpoints { domain, endpoints }
+            }
+        })
+        .collect()
+}
+
+/// Get the path to a user profile (default `.json` extension, used for writes).
 pub(crate) fn get_user_profile_path(name: &str) -> Result<PathBuf> {
     Ok(user_profile_dir()?.join(format!("{}.json", name)))
+}
+
+/// Resolve an existing user profile, preferring `.jsonc` over `.json`.
+///
+/// Returns the path to the first file that exists, checking `.jsonc` first.
+/// Falls back to the default `.json` path if neither exists (for callers
+/// that check `.exists()` themselves).
+pub(crate) fn resolve_user_profile_path(name: &str) -> Result<PathBuf> {
+    let dir = user_profile_dir()?;
+    let jsonc_path = dir.join(format!("{name}.jsonc"));
+    if jsonc_path.exists() {
+        return Ok(jsonc_path);
+    }
+    Ok(dir.join(format!("{name}.json")))
 }
 
 pub(crate) fn user_profile_dir() -> Result<PathBuf> {
@@ -2831,13 +3100,17 @@ pub fn list_profiles() -> Vec<String> {
     let mut profiles = builtin::list_builtin();
 
     // Add user profiles (if home directory is available)
-    if let Ok(profile_path) = get_user_profile_path("")
-        && let Some(dir) = profile_path.parent()
+    if let Ok(dir) = user_profile_dir()
         && dir.exists()
         && let Ok(entries) = fs::read_dir(dir)
     {
         for entry in entries.flatten() {
-            if let Some(name) = entry.path().file_stem() {
+            let path = entry.path();
+            let is_profile_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| ext == "json" || ext == "jsonc");
+            if is_profile_ext && let Some(name) = path.file_stem() {
                 let name_str = name.to_string_lossy().to_string();
                 if !profiles.contains(&name_str) {
                     profiles.push(name_str);
@@ -3281,8 +3554,8 @@ mod tests {
 
     #[test]
     fn test_load_builtin_profile() {
-        let profile = load_profile("opencode").expect("Failed to load profile");
-        assert_eq!(profile.meta.name, "opencode");
+        let profile = load_profile("openclaw").expect("Failed to load profile");
+        assert_eq!(profile.meta.name, "openclaw");
         assert!(!profile.network.block); // network allowed by default
     }
 
@@ -3328,13 +3601,25 @@ mod tests {
 
     #[test]
     fn test_list_profiles() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempdir().expect("tmpdir");
+        let canonical = dir.path().canonicalize().expect("canonicalize tmpdir");
+        let canonical_str = canonical.to_str().expect("tmpdir is valid UTF-8");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", canonical_str)]);
+
         let profiles = list_profiles();
         assert!(profiles.contains(&"openclaw".to_string()));
-        assert!(profiles.contains(&"opencode".to_string()));
-        // claude-code and codex were removed from the inbuilt profiles in
-        // v0.43.0; they ship via registry packs.
+        assert!(profiles.contains(&"swival".to_string()));
+        // These profiles were removed from built-ins; they ship via registry packs:
+        //   claude-code / claude → always-further/claude   (removed v0.43.0)
+        //   codex               → always-further/codex    (removed v0.43.0)
+        //   opencode            → always-further/opencode (removed)
         assert!(!profiles.contains(&"claude-code".to_string()));
         assert!(!profiles.contains(&"codex".to_string()));
+        assert!(!profiles.contains(&"opencode".to_string()));
     }
 
     #[test]
@@ -3535,6 +3820,34 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_env_credentials_accepts_bw_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "bw://my-api-key": "MY_SECRET",
+                "bw://my-item/password": "MY_PASS"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        assert!(validate_env_credential_keys(&profile).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_credentials_rejects_invalid_bw_uri() {
+        let json_str = r#"{
+            "meta": { "name": "test-profile" },
+            "env_credentials": {
+                "bw://": "MY_SECRET"
+            }
+        }"#;
+
+        let profile: Profile = serde_json::from_str(json_str).expect("Failed to parse profile");
+        let err = validate_env_credential_keys(&profile).expect_err("should reject");
+        assert!(err.to_string().contains("Bitwarden URI"));
+    }
+
+    #[test]
     fn test_validate_env_credentials_accepts_keyring_uri() {
         let json_str = r#"{
             "meta": { "name": "test-profile" },
@@ -3644,6 +3957,24 @@ mod tests {
             unique.len(),
             profile.groups.include.len(),
             "Groups should have no duplicates"
+        );
+    }
+
+    #[test]
+    fn finalize_profile_errors_on_unknown_dynamic_provider_token() {
+        // An `@<provider>:<query>` token with an unrecognised provider
+        // should surface as a profile-load error rather than silently
+        // leaving the literal token in the path list (where it would
+        // later fail capability construction with a much less clear
+        // message about a missing file named `@foo:bar`).
+        let mut profile = Profile::default();
+        profile.filesystem.read_file = vec!["@unknown:foo".to_string()];
+
+        let err = finalize_profile(profile).expect_err("expected unknown-provider error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown"),
+            "error should name the unknown provider, got: {msg}"
         );
     }
 
@@ -3796,7 +4127,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -3872,7 +4203,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_invalid_format_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\r\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\r\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CRLF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3924,7 +4255,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_cr_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\rEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\rEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("CR in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3933,7 +4264,7 @@ mod tests {
     #[test]
     fn test_validate_custom_credential_format_with_lf_rejected() {
         let mut cred = header_cred_builder();
-        cred.credential_format = "Bearer {}\nEvil: header".to_string();
+        cred.credential_format = Some("Bearer {}\nEvil: header".to_string());
         let result = validate_custom_credential("test", &cred);
         let err = result.expect_err("LF in format should be rejected");
         assert!(err.to_string().contains("CRLF"));
@@ -3943,7 +4274,7 @@ mod tests {
     fn test_validate_custom_credential_various_valid_formats() {
         for format in ["Bearer {}", "Token {}", "{}", "Basic {}", "ApiKey={}"] {
             let mut cred = header_cred_builder();
-            cred.credential_format = format.to_string();
+            cred.credential_format = Some(format.to_string());
             assert!(
                 validate_custom_credential("test", &cred).is_ok(),
                 "Expected format '{}' to be valid",
@@ -3988,7 +4319,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: None,
             query_param_name: None,
@@ -4010,7 +4341,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None, // Missing required field
             path_replacement: None,
             query_param_name: None,
@@ -4034,7 +4365,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot/token/".to_string()), // No {} placeholder
             path_replacement: None,
             query_param_name: None,
@@ -4058,7 +4389,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot{}/".to_string()),
             query_param_name: None,
@@ -4080,7 +4411,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::UrlPath,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: Some("/bot{}/".to_string()),
             path_replacement: Some("/v2/bot/fixed/".to_string()), // No {} placeholder
             query_param_name: None,
@@ -4104,7 +4435,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("key".to_string()),
@@ -4126,7 +4457,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None, // Missing required field
@@ -4150,7 +4481,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::QueryParam,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: Some("".to_string()), // Empty
@@ -4174,7 +4505,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::BasicAuth,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4267,6 +4598,46 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_env_var_with_bw_uri_requires_env_var() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-api-key".to_string());
+        cred.env_var = None;
+        let result = validate_custom_credential("openai", &cred);
+        let err = result.expect_err("bw:// URI without env_var should be rejected");
+        assert!(err.to_string().contains("env_var is required"));
+    }
+
+    #[test]
+    fn test_validate_env_var_with_bw_uri_and_env_var_ok() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-api-key".to_string());
+        cred.env_var = Some("OPENAI_API_KEY".to_string());
+        assert!(validate_custom_credential("openai", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_env_var_with_bw_uri_field_and_env_var_ok() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://my-item/password".to_string());
+        cred.env_var = Some("OPENAI_API_KEY".to_string());
+        assert!(validate_custom_credential("openai", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_validate_credential_key_rejects_invalid_bw_uri() {
+        let mut cred = header_cred_builder();
+        cred.credential_key = Some("bw://".to_string());
+        cred.env_var = Some("MY_VAR".to_string());
+        let err = validate_custom_credential("openai", &cred)
+            .expect_err("empty bw:// item ID should be rejected");
+        assert!(
+            err.to_string().contains("Bitwarden URI"),
+            "expected Bitwarden-specific error, got: {}",
+            err
+        );
+    }
+
+    #[test]
     fn test_validate_env_var_with_apple_password_uri_requires_env_var() {
         let mut cred = header_cred_builder();
         cred.credential_key = Some("apple-password://github.com/alice@example.com".to_string());
@@ -4335,7 +4706,7 @@ mod tests {
             }),
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -4557,7 +4928,7 @@ mod tests {
             network: NetworkConfig {
                 block: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
-                allow_domain: vec!["base.example.com".to_string()],
+                allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 open_port: vec![3000],
                 listen_port: vec![4000],
                 connect_port: vec![],
@@ -4566,6 +4937,7 @@ mod tests {
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
+            linux: LinuxConfig::default(),
             env_credentials: SecretsConfig {
                 mappings: {
                     let mut m = HashMap::new();
@@ -4580,6 +4952,7 @@ mod tests {
             hooks: HooksConfig {
                 hooks: HashMap::new(),
             },
+            session_hooks: SessionHooks::default(),
             rollback: RollbackConfig {
                 exclude_patterns: vec!["node_modules".to_string()],
                 exclude_globs: vec!["*.pyc".to_string()],
@@ -4594,6 +4967,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["vendor".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
@@ -4636,7 +5010,7 @@ mod tests {
             network: NetworkConfig {
                 block: false,
                 network_profile: InheritableValue::Inherit,
-                allow_domain: vec!["child.example.com".to_string()],
+                allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 open_port: vec![3000, 5000],
                 listen_port: vec![4000, 6000],
                 connect_port: vec![],
@@ -4645,6 +5019,7 @@ mod tests {
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
+            linux: LinuxConfig::default(),
             env_credentials: SecretsConfig {
                 mappings: {
                     let mut m = HashMap::new();
@@ -4659,6 +5034,7 @@ mod tests {
             hooks: HooksConfig {
                 hooks: HashMap::new(),
             },
+            session_hooks: SessionHooks::default(),
             rollback: RollbackConfig {
                 exclude_patterns: vec![],
                 exclude_globs: vec![],
@@ -4673,6 +5049,7 @@ mod tests {
             interactive: false,
             skipdirs: vec!["dist".to_string()],
             packs: vec![],
+            binary: None,
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
@@ -4701,6 +5078,30 @@ mod tests {
         let merged = merge_profiles(base_profile(), child_profile());
         // base has [3000], child has [3000, 5000] — merged should dedup to [3000, 5000]
         assert_eq!(merged.network.open_port, vec![3000, 5000]);
+    }
+
+    #[test]
+    fn test_profile_parses_linux_af_unix_mediation() {
+        let json = r#"{
+            "meta": {"name": "linux-ipc", "version": "1.0"},
+            "linux": {"af_unix_mediation": "pathname"}
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse profile");
+        assert_eq!(
+            profile.linux.af_unix_mediation,
+            Some(LinuxAfUnixMediation::Pathname)
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_inherits_linux_af_unix_mediation() {
+        let mut base = base_profile();
+        base.linux.af_unix_mediation = Some(LinuxAfUnixMediation::Pathname);
+        let merged = merge_profiles(base, child_profile());
+        assert_eq!(
+            merged.linux.af_unix_mediation,
+            Some(LinuxAfUnixMediation::Pathname)
+        );
     }
 
     #[test]
@@ -4736,6 +5137,126 @@ mod tests {
         assert_eq!(merged.meta.version, "2.0");
     }
 
+    // ============================================================================
+    // session_hooks: type-level + merge semantics
+    // ============================================================================
+
+    #[test]
+    fn test_session_hook_deserializes() {
+        let json = r#"{
+            "meta": { "name": "p" },
+            "session_hooks": {
+                "before": { "script": "/usr/local/bin/setup.sh", "timeout_secs": 10 },
+                "after":  { "script": "/usr/local/bin/cleanup.sh" }
+            }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse session_hooks profile");
+        let before = profile
+            .session_hooks
+            .before
+            .as_ref()
+            .expect("before is set");
+        assert_eq!(before.script, PathBuf::from("/usr/local/bin/setup.sh"));
+        assert_eq!(before.timeout_secs, Some(10));
+        let after = profile.session_hooks.after.as_ref().expect("after is set");
+        assert_eq!(after.script, PathBuf::from("/usr/local/bin/cleanup.sh"));
+        assert_eq!(after.timeout_secs, None);
+    }
+
+    #[test]
+    fn test_session_hook_optional_timeout_omitted() {
+        let json = r#"{
+            "meta": { "name": "p" },
+            "session_hooks": { "before": { "script": "/x/y.sh" } }
+        }"#;
+        let profile: Profile = serde_json::from_str(json).expect("parse profile");
+        assert_eq!(profile.session_hooks.before.unwrap().timeout_secs, None);
+    }
+
+    #[test]
+    fn test_session_hook_rejects_unknown_field() {
+        let json = r#"{
+            "meta": { "name": "p" },
+            "session_hooks": {
+                "before": {
+                    "script": "/x/y.sh",
+                    "args": ["--foo"]
+                }
+            }
+        }"#;
+        let result = serde_json::from_str::<Profile>(json);
+        assert!(
+            result.is_err(),
+            "SessionHook should reject unknown fields, got: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_session_hooks_rejects_unknown_field() {
+        // Catches typos like "befor" or "after_run".
+        let json = r#"{
+            "meta": { "name": "p" },
+            "session_hooks": { "befor": { "script": "/x/y.sh" } }
+        }"#;
+        let result = serde_json::from_str::<Profile>(json);
+        assert!(
+            result.is_err(),
+            "SessionHooks must reject unknown fields, got: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_merge_profiles_session_hooks_child_overrides_per_field() {
+        let mut base = base_profile();
+        base.session_hooks = SessionHooks {
+            before: Some(SessionHook {
+                script: PathBuf::from("/base/before.sh"),
+                timeout_secs: Some(5),
+            }),
+            after: Some(SessionHook {
+                script: PathBuf::from("/base/after.sh"),
+                timeout_secs: None,
+            }),
+        };
+        let mut child = child_profile();
+        child.session_hooks = SessionHooks {
+            before: Some(SessionHook {
+                script: PathBuf::from("/child/before.sh"),
+                timeout_secs: None,
+            }),
+            after: None,
+        };
+
+        let merged = merge_profiles(base, child);
+        let merged_before = merged.session_hooks.before.expect("before present");
+        assert_eq!(merged_before.script, PathBuf::from("/child/before.sh"));
+        assert_eq!(merged_before.timeout_secs, None);
+        let merged_after = merged
+            .session_hooks
+            .after
+            .expect("after preserved from base");
+        assert_eq!(merged_after.script, PathBuf::from("/base/after.sh"));
+    }
+
+    #[test]
+    fn test_merge_profiles_session_hooks_child_inherits_when_absent() {
+        let mut base = base_profile();
+        base.session_hooks = SessionHooks {
+            before: Some(SessionHook {
+                script: PathBuf::from("/base/before.sh"),
+                timeout_secs: Some(7),
+            }),
+            after: None,
+        };
+        let merged = merge_profiles(base, child_profile());
+        let before = merged.session_hooks.before.expect("inherited from base");
+        assert_eq!(before.script, PathBuf::from("/base/before.sh"));
+        assert_eq!(before.timeout_secs, Some(7));
+        assert!(merged.session_hooks.after.is_none());
+    }
+
     #[test]
     fn test_merge_profiles_merges_custom_credentials() {
         let mut base = base_profile();
@@ -4747,7 +5268,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4769,7 +5290,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4909,7 +5430,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Bearer {}".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4931,7 +5452,7 @@ mod tests {
                 auth: None,
                 inject_mode: InjectMode::Header,
                 inject_header: "Authorization".to_string(),
-                credential_format: "Token {}".to_string(),
+                credential_format: Some("Token {}".to_string()),
                 path_pattern: None,
                 path_replacement: None,
                 query_param_name: None,
@@ -4962,7 +5483,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": "opencode",
+                "extends": "openclaw",
                 "meta": { "name": "ext-test" },
                 "filesystem": { "allow": ["/tmp/ext-test"] }
             }"#,
@@ -4971,10 +5492,10 @@ mod tests {
 
         let profile = load_from_file(&profile_path).expect("load extended profile");
         assert_eq!(profile.meta.name, "ext-test");
-        // Should inherit codex's filesystem paths
+        // Should inherit openclaw's filesystem paths
         assert!(
             profile.filesystem.allow.len() > 1,
-            "Expected inherited paths from codex, got: {:?}",
+            "Expected inherited paths from openclaw, got: {:?}",
             profile.filesystem.allow
         );
         assert!(
@@ -5033,15 +5554,15 @@ mod tests {
 
     #[test]
     fn test_extends_chain_three_levels() {
-        // Test A -> B -> codex (built-in)
+        // Test A -> B -> openclaw (built-in)
         let dir = tempdir().expect("tmpdir");
 
-        // B extends codex
+        // B extends openclaw
         let b_path = dir.path().join("b.json");
         std::fs::write(
             &b_path,
             r#"{
-                "extends": "opencode",
+                "extends": "openclaw",
                 "meta": { "name": "b-profile" },
                 "filesystem": { "allow": ["/b/path"] }
             }"#,
@@ -5656,9 +6177,9 @@ mod tests {
 
     #[test]
     fn test_extends_duplicate_base_deduplicates() {
-        // extends: ["opencode", "opencode"] — duplicate is silently skipped
+        // extends: ["openclaw", "openclaw"] — duplicate is silently skipped
         let profile = Profile {
-            extends: Some(vec!["opencode".to_string(), "opencode".to_string()]),
+            extends: Some(vec!["openclaw".to_string(), "openclaw".to_string()]),
             ..Default::default()
         };
 
@@ -5704,7 +6225,7 @@ mod tests {
         std::fs::write(
             &profile_path,
             r#"{
-                "extends": ["opencode", "opencode"],
+                "extends": ["openclaw", "openclaw"],
                 "meta": { "name": "shared-base-test" }
             }"#,
         )
@@ -5890,7 +6411,10 @@ mod tests {
         .expect("parse profile with supported aliases");
 
         assert!(profile.network.block);
-        assert_eq!(profile.network.allow_domain, vec!["api.openai.com"]);
+        assert_eq!(
+            profile.network.allow_domain,
+            vec![AllowDomainEntry::Plain("api.openai.com".to_string())]
+        );
         assert_eq!(profile.network.open_port, vec![3000]);
         assert_eq!(
             profile.network.upstream_proxy.as_deref(),
@@ -5927,14 +6451,151 @@ mod tests {
     }
 
     #[test]
+    fn test_allow_domain_deserializes_plain_string() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "test" },
+                "network": {
+                    "allow_domain": ["api.openai.com", "*.googleapis.com"]
+                }
+            }"#,
+        )
+        .expect("parse profile with plain allow_domain");
+
+        assert_eq!(
+            profile.network.allow_domain,
+            vec![
+                AllowDomainEntry::Plain("api.openai.com".to_string()),
+                AllowDomainEntry::Plain("*.googleapis.com".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_allow_domain_deserializes_with_endpoints() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+                "meta": { "name": "test" },
+                "network": {
+                    "allow_domain": [
+                        "api.openai.com",
+                        {
+                            "domain": "api.github.com",
+                            "endpoints": [
+                                { "method": "GET", "path": "/repos/my-org/**" },
+                                { "method": "POST", "path": "/repos/my-org/*/issues" }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("parse profile with endpoint-restricted domain");
+
+        assert_eq!(profile.network.allow_domain.len(), 2);
+        assert_eq!(
+            profile.network.allow_domain[0],
+            AllowDomainEntry::Plain("api.openai.com".to_string())
+        );
+        match &profile.network.allow_domain[1] {
+            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                assert_eq!(domain, "api.github.com");
+                assert_eq!(endpoints.len(), 2);
+                assert_eq!(endpoints[0].method, "GET");
+                assert_eq!(endpoints[0].path, "/repos/my-org/**");
+                assert_eq!(endpoints[1].method, "POST");
+                assert_eq!(endpoints[1].path, "/repos/my-org/*/issues");
+            }
+            other => panic!("expected WithEndpoints, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge_allow_domain_appends_endpoints_for_same_domain() {
+        let base = vec![AllowDomainEntry::WithEndpoints {
+            domain: "api.github.com".to_string(),
+            endpoints: vec![nono_proxy::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/repos/my-org/**".to_string(),
+            }],
+        }];
+        let child = vec![AllowDomainEntry::WithEndpoints {
+            domain: "api.github.com".to_string(),
+            endpoints: vec![nono_proxy::config::EndpointRule {
+                method: "POST".to_string(),
+                path: "/repos/my-org/*/issues".to_string(),
+            }],
+        }];
+
+        let merged = merge_allow_domain(&base, &child);
+
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                assert_eq!(domain, "api.github.com");
+                assert_eq!(endpoints.len(), 2);
+                assert_eq!(endpoints[0].method, "GET");
+                assert_eq!(endpoints[1].method, "POST");
+            }
+            other => panic!("expected WithEndpoints, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge_allow_domain_plain_plus_endpoints_becomes_with_endpoints() {
+        let base = vec![AllowDomainEntry::Plain("api.github.com".to_string())];
+        let child = vec![AllowDomainEntry::WithEndpoints {
+            domain: "api.github.com".to_string(),
+            endpoints: vec![nono_proxy::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/repos/**".to_string(),
+            }],
+        }];
+
+        let merged = merge_allow_domain(&base, &child);
+
+        assert_eq!(merged.len(), 1);
+        match &merged[0] {
+            AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                assert_eq!(domain, "api.github.com");
+                assert_eq!(endpoints.len(), 1);
+            }
+            other => panic!("expected WithEndpoints, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_merge_allow_domain_preserves_distinct_domains() {
+        let base = vec![AllowDomainEntry::Plain("api.openai.com".to_string())];
+        let child = vec![AllowDomainEntry::WithEndpoints {
+            domain: "api.github.com".to_string(),
+            endpoints: vec![nono_proxy::config::EndpointRule {
+                method: "GET".to_string(),
+                path: "/repos/**".to_string(),
+            }],
+        }];
+
+        let merged = merge_allow_domain(&base, &child);
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0],
+            AllowDomainEntry::Plain("api.openai.com".to_string())
+        );
+        assert!(
+            matches!(&merged[1], AllowDomainEntry::WithEndpoints { domain, .. } if domain == "api.github.com")
+        );
+    }
+
+    #[test]
     fn test_extends_can_clear_inherited_network_profile_with_null() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let profile_path = dir.path().join("codex-netopen.json");
+        let profile_path = dir.path().join("openclaw-netopen.json");
         std::fs::write(
             &profile_path,
             r#"{
-                "meta": { "name": "codex-netopen" },
-                "extends": "opencode",
+                "meta": { "name": "openclaw-netopen" },
+                "extends": "openclaw",
                 "network": { "network_profile": null }
             }"#,
         )
@@ -5948,8 +6609,8 @@ mod tests {
                 .filesystem
                 .allow
                 .iter()
-                .any(|path| path == "$HOME/.opencode"),
-            "expected filesystem grants from opencode to still be inherited",
+                .any(|path| path == "$HOME/.openclaw"),
+            "expected filesystem grants from openclaw to still be inherited",
         );
     }
 
@@ -6233,7 +6894,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6258,7 +6919,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6286,7 +6947,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6314,7 +6975,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6374,7 +7035,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6396,7 +7057,7 @@ mod tests {
             auth: None,
             inject_mode: InjectMode::Header,
             inject_header: "Authorization".to_string(),
-            credential_format: "Bearer {}".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
             path_pattern: None,
             path_replacement: None,
             query_param_name: None,
@@ -6530,6 +7191,102 @@ mod tests {
         assert!(
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn jsonc_comments_and_trailing_commas() {
+        let jsonc = br#"{
+            // Profile for my agent
+            "meta": {
+                "name": "jsonc-test",
+                "description": "Testing JSONC features", // inline comment
+            },
+            "filesystem": {
+                /* Grant read to source,
+                   write to output */
+                "read": ["/src"],
+                "write": ["/output"],
+            },
+            "network": {
+                "block": true, // no network access
+            },
+        }"#;
+
+        let profile = parse_profile_bytes(jsonc).expect("JSONC with comments and trailing commas");
+        assert_eq!(profile.meta.name, "jsonc-test");
+        assert_eq!(profile.filesystem.read, vec!["/src"]);
+        assert_eq!(profile.filesystem.write, vec!["/output"]);
+        assert!(profile.network.block);
+    }
+
+    #[test]
+    fn jsonc_resolve_prefers_jsonc_extension() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let canonical = dir.path().canonicalize().expect("canonicalize tempdir");
+        let canonical_str = canonical.to_str().expect("tempdir is valid UTF-8");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", canonical_str)]);
+
+        let profiles_dir = canonical.join("nono").join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+
+        std::fs::write(
+            profiles_dir.join("myprofile.jsonc"),
+            b"{ \"meta\": { \"name\": \"from-jsonc\" } }",
+        )
+        .expect("write jsonc");
+        std::fs::write(
+            profiles_dir.join("myprofile.json"),
+            b"{ \"meta\": { \"name\": \"from-json\" } }",
+        )
+        .expect("write json");
+
+        let resolved = resolve_user_profile_path("myprofile").expect("resolve");
+        assert!(
+            resolved.extension().and_then(|e| e.to_str()) == Some("jsonc"),
+            "should prefer .jsonc: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn profile_binary_field_parses_and_inherits() {
+        let base = br#"{
+            "meta": { "name": "base" },
+            "binary": "/usr/bin/base-agent"
+        }"#;
+        let base_profile = parse_profile_bytes(base).expect("parse base");
+        assert_eq!(base_profile.binary.as_deref(), Some("/usr/bin/base-agent"));
+
+        let child = br#"{
+            "meta": { "name": "child" },
+            "binary": "/opt/child-agent"
+        }"#;
+        let child_profile = parse_profile_bytes(child).expect("parse child");
+        assert_eq!(child_profile.binary.as_deref(), Some("/opt/child-agent"));
+
+        let merged = merge_profiles(base_profile, child_profile);
+        assert_eq!(
+            merged.binary.as_deref(),
+            Some("/opt/child-agent"),
+            "child binary should override base"
+        );
+
+        let no_binary = br#"{ "meta": { "name": "no-bin" } }"#;
+        let no_bin_profile = parse_profile_bytes(no_binary).expect("parse no-binary");
+        assert!(no_bin_profile.binary.is_none());
+
+        let base2 =
+            parse_profile_bytes(br#"{ "meta": { "name": "b2" }, "binary": "/usr/bin/inherited" }"#)
+                .expect("parse");
+        let merged2 = merge_profiles(base2, no_bin_profile);
+        assert_eq!(
+            merged2.binary.as_deref(),
+            Some("/usr/bin/inherited"),
+            "child without binary should inherit from base"
         );
     }
 }

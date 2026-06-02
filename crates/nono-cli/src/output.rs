@@ -447,6 +447,48 @@ pub fn print_warning(message: &str) {
     eprintln!("  {} {}", fg("warning:", t.red).bold(), fg(message, t.text),);
 }
 
+/// Format startup-blocked lines for writing to /dev/tty or stderr.
+/// Returns a Vec of lines ready to write (without trailing newline).
+pub fn format_startup_blocked(
+    program: &str,
+    timeout_secs: u64,
+    has_output: bool,
+    recommended_profile: Option<&str>,
+) -> Vec<String> {
+    let t = theme::current();
+    let label = fg("blocked:", t.yellow).bold().to_string();
+    let reason = if has_output {
+        format!(
+            "`{}` has not become interactive after {} seconds.",
+            program, timeout_secs
+        )
+    } else {
+        format!(
+            "`{}` produced no terminal output after {} seconds.",
+            program, timeout_secs
+        )
+    };
+    let mut lines = vec![
+        format!("  {} {}", label, fg(&reason, t.text)),
+        format!(
+            "  {}",
+            fg(
+                "Terminating process — re-run with -v to inspect denied paths.",
+                t.subtext
+            )
+        ),
+    ];
+    if let Some(profile) = recommended_profile {
+        lines.push(format!(
+            "  {} nono run --profile {} -- {}",
+            fg("Try:", t.green).bold(),
+            profile,
+            program,
+        ));
+    }
+    lines
+}
+
 /// Print a styled diagnostic footer emitted by the core diagnostic formatter.
 pub fn print_diagnostic_footer(footer: &str) {
     let rendered = render_diagnostic_footer(footer);
@@ -577,7 +619,16 @@ fn render_diagnostic_line(idx: usize, line: &str, t: &theme::Theme) -> String {
     }
 
     if line.starts_with("  /") || line.starts_with("  ~/") {
-        return format!("  {}", fg(line.trim_start(), t.text).bold());
+        let content = line.trim_start();
+        return if let Some(idx) = content.rfind(" (") {
+            format!(
+                "  {} {}",
+                fg(&content[..idx], t.text).bold(),
+                &content[idx + 1..],
+            )
+        } else {
+            format!("  {}", fg(content, t.text).bold())
+        };
     }
 
     if line.starts_with("    + ") {
@@ -875,6 +926,23 @@ mod tests {
         let footer = "nono diagnostic\n────────\nThe command failed.\n  Learn: nono learn";
         let rendered = render_diagnostic_footer(footer);
         assert_eq!(rendered.lines().count(), 4);
+    }
+
+    #[test]
+    fn render_diagnostic_footer_splits_path_on_last_paren_group() {
+        // Path contains " (" in the directory name — rfind ensures we split on
+        // the *last* parenthesised group (the access type), not the one
+        // embedded in the path.
+        let footer = "  /home/user/my (project)/file (read)";
+        let rendered = render_diagnostic_footer(footer);
+        assert!(
+            rendered.contains("/home/user/my (project)/file"),
+            "path with embedded parens should be preserved: {rendered}"
+        );
+        assert!(
+            rendered.contains("(read)"),
+            "access type should be preserved: {rendered}"
+        );
     }
 
     #[test]

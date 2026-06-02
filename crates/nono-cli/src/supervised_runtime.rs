@@ -235,6 +235,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     } else {
         None
     };
+    let supervisor_network_audit_events = audit_state
+        .as_ref()
+        .map(|_| std::sync::Mutex::new(Vec::new()));
     if let Some(recorder_mutex) = audit_recorder.as_ref() {
         let mut recorder = recorder_mutex
             .lock()
@@ -254,6 +257,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         open_url_origins: &proxy.open_url_origins,
         open_url_allow_localhost: proxy.open_url_allow_localhost,
         audit_recorder: audit_recorder.as_ref(),
+        network_audit_events: supervisor_network_audit_events.as_ref(),
         redaction_policy,
         allow_launch_services_active: proxy.allow_launch_services_active,
         #[cfg(target_os = "linux")]
@@ -265,6 +269,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy_bind_ports: match caps.network_mode() {
             nono::NetworkMode::ProxyOnly { bind_ports, .. } => bind_ports.clone(),
             _ => Vec::new(),
+        },
+        #[cfg(target_os = "linux")]
+        unix_socket_allowlist: caps.unix_socket_capabilities(),
+        #[cfg(target_os = "linux")]
+        linux_network_notify_mode: if config.seccomp_proxy_fallback {
+            exec_strategy::LinuxNetworkNotifyMode::ProxyOnly
+        } else {
+            exec_strategy::LinuxNetworkNotifyMode::AfUnixOnly
         },
     };
 
@@ -296,6 +308,7 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         audit_snapshot_state,
         audit_tracked_paths,
         audit_recorder: audit_recorder.as_ref(),
+        supervisor_network_audit_events: supervisor_network_audit_events.as_ref(),
         audit_integrity_enabled: !rollback.no_audit_integrity,
         proxy_handle,
         executable_identity,

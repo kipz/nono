@@ -52,7 +52,7 @@ fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
             refresh_url_match: "/v1/oauth/token".to_string(),
         },
         inject_header: "Authorization".to_string(),
-        credential_format: "Bearer {}".to_string(),
+        credential_format: Some("Bearer {}".to_string()),
         path_pattern: None,
         path_replacement: None,
         query_param_name: None,
@@ -79,7 +79,7 @@ pub(crate) struct ActiveProxyRuntime {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveProxySettings {
     pub(crate) network_profile: Option<String>,
-    pub(crate) allow_domain: Vec<String>,
+    pub(crate) allow_domain: Vec<crate::profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
 }
 
@@ -177,7 +177,7 @@ pub(crate) fn resolve_effective_proxy_settings(
         .clone()
         .or_else(|| prepared.network_profile.clone());
     let mut allow_domain = prepared.allow_domain.clone();
-    allow_domain.extend(args.allow_proxy.clone());
+    allow_domain.extend(args.allow_proxy.iter().map(|s| parse_allow_domain_arg(s)));
     let mut credentials = prepared.credentials.clone();
     credentials.extend(args.proxy_credential.clone());
 
@@ -185,6 +185,32 @@ pub(crate) fn resolve_effective_proxy_settings(
         network_profile,
         allow_domain,
         credentials,
+    }
+}
+
+/// Parse a `--allow-domain` CLI argument into an `AllowDomainEntry`.
+///
+/// Accepts either:
+/// - A plain hostname: `github.com` → `Plain("github.com")`
+/// - A URL with a path pattern: `https://github.com/atko-cic/**` →
+///   `WithEndpoints { domain: "github.com", endpoints: [{method: "*", path: "/atko-cic/**"}] }`
+fn parse_allow_domain_arg(input: &str) -> crate::profile::AllowDomainEntry {
+    if let Ok(parsed) = url::Url::parse(input) {
+        let domain = parsed.host_str().unwrap_or(input).to_string();
+        let path = parsed.path();
+        if path.is_empty() || path == "/" {
+            crate::profile::AllowDomainEntry::Plain(domain)
+        } else {
+            crate::profile::AllowDomainEntry::WithEndpoints {
+                domain,
+                endpoints: vec![nono_proxy::config::EndpointRule {
+                    method: "*".to_string(),
+                    path: path.to_string(),
+                }],
+            }
+        }
+    } else {
+        crate::profile::AllowDomainEntry::Plain(input.to_string())
     }
 }
 
@@ -221,17 +247,29 @@ pub(crate) fn build_proxy_config_from_flags(
         }
     }
 
-    let routes = network_policy::resolve_credentials(
+    let mut routes = network_policy::resolve_credentials(
         &net_policy,
         &all_credentials,
         &proxy.custom_credentials,
         workdir,
     )?;
+
+    let (mut plain_hosts, endpoint_routes) =
+        network_policy::partition_allow_domain(&net_policy, &proxy.allow_domain)?;
+    // Endpoint-restricted domains need filter allowlist access so the proxy
+    // can reach upstream after TLS interception (h2 checks the filter at
+    // connection setup, before per-stream route matching).
+    for route in &endpoint_routes {
+        if let Some(ref hp) = route.upstream.strip_prefix("https://") {
+            plain_hosts.push(hp.to_string());
+        } else if let Some(ref hp) = route.upstream.strip_prefix("http://") {
+            plain_hosts.push(hp.to_string());
+        }
+    }
+    routes.extend(endpoint_routes);
     resolved.routes = routes;
 
-    let expanded_allow_domain =
-        network_policy::expand_proxy_allow(&net_policy, &proxy.allow_domain);
-    let mut proxy_config = network_policy::build_proxy_config(&resolved, &expanded_allow_domain);
+    let mut proxy_config = network_policy::build_proxy_config(&resolved, &plain_hosts);
 
     if let Some(ref addr) = proxy.upstream_proxy {
         proxy_config.external_proxy = Some(nono_proxy::config::ExternalProxyConfig {
@@ -603,6 +641,59 @@ mod tests {
                 route.credential_key.is_none(),
                 "OauthCapture routes carry no pre-loaded credential"
             );
+        }
+    }
+
+    #[test]
+    fn test_parse_allow_domain_arg_plain_hostname() {
+        let entry = parse_allow_domain_arg("github.com");
+        assert_eq!(
+            entry,
+            crate::profile::AllowDomainEntry::Plain("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_allow_domain_arg_url_with_path() {
+        let entry = parse_allow_domain_arg("https://github.com/atko-cic/**");
+        match entry {
+            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                assert_eq!(domain, "github.com");
+                assert_eq!(endpoints.len(), 1);
+                assert_eq!(endpoints[0].method, "*");
+                assert_eq!(endpoints[0].path, "/atko-cic/**");
+            }
+            _ => panic!("expected WithEndpoints, got: {:?}", entry),
+        }
+    }
+
+    #[test]
+    fn test_parse_allow_domain_arg_url_root_is_plain() {
+        let entry = parse_allow_domain_arg("https://api.example.com/");
+        assert_eq!(
+            entry,
+            crate::profile::AllowDomainEntry::Plain("api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_allow_domain_arg_url_no_path_is_plain() {
+        let entry = parse_allow_domain_arg("https://api.example.com");
+        assert_eq!(
+            entry,
+            crate::profile::AllowDomainEntry::Plain("api.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_allow_domain_arg_deep_path() {
+        let entry = parse_allow_domain_arg("https://github.com/org/repo/tree/**");
+        match entry {
+            crate::profile::AllowDomainEntry::WithEndpoints { domain, endpoints } => {
+                assert_eq!(domain, "github.com");
+                assert_eq!(endpoints[0].path, "/org/repo/tree/**");
+            }
+            _ => panic!("expected WithEndpoints"),
         }
     }
 }

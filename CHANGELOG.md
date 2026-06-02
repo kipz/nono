@@ -1,9 +1,327 @@
 # Changelog
 
+## [0.59.0] - 2026-05-27
+
+### Bug Fixes
+
+- *(proxy)* Enforce endpoint rules before credential selection in TLS intercept
+
+- Formatting
+
+- Tighten up overflow checks
+
+- Use rfind for access mode spliting; add test
+
+- Annotate suppressed denials and style save prompt paths (#984)
+
+- Restore jsonc-parser dep
+
+- Use fully qualified pack name in Quick Start example
+
+- Correct Quick Start profile reference in README
+
+
+### Dependencies
+
+- *(deps)* Bump shlex from 1.3.0 to 2.0.1
+
+
+### Documentation
+
+- Note [save skipped] annotation in suppress_save_prompt sections
+
+
+### Features
+
+- *(cli)* Allow-domain accepts URL with path for endpoint restrictions
+
+- *(cli)* Support fine-grained method+path restrictions in allow_domain (#960)
+
+- *(cli)* Centralize timeout constants and make user-facing timeouts configurable
+
+
+### Refactoring
+
+- *(profile)* Extract opencode profile from built-ins
+
+
+### Diagnostic
+
+- Pre-compute canonical denial paths to avoid repeated fs I/O
+
+## [0.58.0] - 2026-05-26
+
+### Bug Fixes
+
+- Set accepted listener connections to blocking mode
+
+- Include URL listener in supervisor loop keep-alive conditions
+
+- Keep supervisor loop alive when child closes direct IPC socket
+
+- Increase supervisor listener read timeout to 5s for URL open
+
+- Address review comments on supervisor socket IPC
+
+- Add read timeout on accepted listener connections
+
+- Grant UnixSocketCapability for supervisor socket in child sandbox
+
+- Replace fd-based IPC with named socket for URL open helpers (#959)
+
+- *(proxy)* Preserve upstream error and sanitise 502 reason line
+
+- *(proxy)* Return 502 with audit entry on upstream connect failure
+
+- *(pack-update-hint)* Make state file writes atomic
+
+- *(policy)* Address review comments on java_runtime group
+
+- *(keystore)* Use Zeroizing<String> for Bitwarden item fields and in-place truncation
+
+- Review fixes
+
+- *(macos)* Emit platform rules after user write allows
+
+- Add user docs for *.json/*.jsonc
+
+- *(sandbox)* Use \$PWD to capture symlink CWD without --workdir
+
+- *(sandbox)* Preserve symlink path when adding CWD capability on macOS
+
+
+### CI/CD
+
+- *(release)* Reorder artifact attestation job
+
+- *(attestation)* Add release artifact attestation
+
+- *(pr-summary)* Apply automatic pr and size labels
+
+- *(pr-summary)* Add pull request summary workflow
+
+
+### Dependencies
+
+- *(deps)* Bump rcgen from 0.13.2 to 0.14.8
+
+- *(deps)* Bump docker/build-push-action from 7.1.0 to 7.2.0
+
+- *(deps)* Bump actions/attest-build-provenance
+
+- *(deps)* Bump docker/login-action from 4.1.0 to 4.2.0
+
+- *(deps)* Bump docker/setup-buildx-action from 4.0.0 to 4.1.0
+
+- *(deps)* Bump similar from 3.1.0 to 3.1.1
+
+- *(deps)* Bump serde_json from 1.0.149 to 1.0.150
+
+- *(deps)* Bump landlock from 0.4.4 to 0.4.5
+
+- *(deps)* Update sigstore crates to 0.8.0
+
+
+### Documentation
+
+- Add session_hooks to profiles-groups page
+
+- Update profile authoring with binary path
+
+- *(readme)* Remove terminal demo gif
+
+- *(readme)* Refine project description and quick start
+
+
+### Features
+
+- Session lifecycle hooks (#954)
+
+- *(policy)* Add java_runtime group and java-dev profile
+
+- Add Bitwarden credential source (bw:// URI scheme)
+
+- *(profile)* Allow profiles to specify a target binary
+
+- *(profile)* Add JSONC support for profile files
+
+
+### Refactoring
+
+- *(pack-hints)* Refresh in detached process to avoid threads
+
+- *(hook_runtime)* Gate module unix-only, drop dead non-unix branches
+
+- Use chained if let for conditional statements
+
+
+### Testing
+
+- Lock ENV_LOCK in test_all_groups_no_deny_within_allow_overlap
+
+
+### Style
+
+- Format debug message for line length
+
+## [0.57.0] - 2026-05-19
+
+### Bug Fixes
+
+- *(profile)* Fix fmt and test assertion after shadow-check refactor
+
+- *(profile)* Handle versioned package refs in fast path
+
+- *(profiles)* Block profile init when name shadows builtin or pack profile
+
+- *(profiles)* Address review points on shadow-check PR
+
+
+### Dependencies
+
+- *(deps)* Bump aws-lc-rs from 1.16.3 to 1.17.0
+
+
+### Features
+
+- *(profile)* Refine profile name resolution and init validation
+
+- *(profiles)* Expand shadowing checks to include pack profiles
+
+## [0.56.0] - 2026-05-18
+
+### Bug Fixes
+
+- *(startup)* Use SIGKILL consistently and remove dead prompt infrastructure
+
+
+### CI/CD
+
+- Add standalone homebrew-bump workflow; pin to AvesAlight fork for 3xx redirect fix
+
+
+### Documentation
+
+- *(cli)* Clarify startup timeout definition of interactive
+
+
+### Features
+
+- *(cli)* Expand startup timeout interactive detection
+
+- *(cli)* Add option to configure process startup timeout
+
+
+### Refactoring
+
+- *(cli)* Simplify startup timeout check
+
+- *(cli-exec-strategy)* Simplify startup timeout checks
+
+- *(cli)* Require alt-screen for startup timeout
+
+## [0.55.0] - 2026-05-17
+
+
+### Security
+- Sandbox escape on Linux via D-Bus ([GHSA-27vp-2mmc-vmh3](https://github.com/always-further/nono/security/advisories/GHSA-27vp-2mmc-vmh3)) — reported by @cgwalters
+
+GHSA-27vp-2mmc-vmh3 
+
+### Bug Fixes
+
+- *(cli)* Unify macOS exact-path grant restore
+
+- *(cli)* Preserve macOS future-file grants in why --self
+
+- *(pty)* Forward bare ESC immediately in filter_client_input
+
+- *(docker)* Pin Alpine version and add --platform to musl Dockerfiles
+
+- *(musl)* Use as _ for TIOCSCTTY ioctl cast to support all platforms
+
+- *(musl)* Fix libc::Ioctl type mismatches for x86_64-unknown-linux-musl target
+
+- Code review
+
+- *(proxy)* Honor explicit credential_format on custom inject headers
+
+- *(profile-verification)* Strengthen profile and pack verification checks
+
+- *(sandbox)* Correctly resolve af_unix socket paths for seccomp
+
+- Preserve child output without trailing newline (#881)
+
+
+### Dependencies
+
+- *(deps)* Bump clap_complete from 4.6.3 to 4.6.5
+
+
+### Documentation
+
+- *(cli-security-model)* Correct typo in nono description
+
+- *(cli)* Correct grammar in security model doc
+
+- *(cli-security)* Add isolation scope and deployment model
+
+- *(installation)* Add makepkg instructions and Note disclaimer
+
+- *(installation)* Add Arch Linux (AUR) section
+
+- *(capability)* Clarify linux signal mode behavior with landlock
+
+
+### Features
+
+- *(macos)* Treat open_port 0 as localhost:* outbound
+
+- *(package)* Prevent artifact install path conflicts
+
+- *(profile)* Ensure source pack is included for verification
+
+- *(profiles)* Verify pack signer identities
+
+- *(linux)* Implement af_unix pathname mediation
+
+- *(sandbox)* Add explicit allowlist for pathname af_unix sockets
+
+- *(unix-socket)* Record explicit scope for grants
+
+- *(cli)* Add recursive unix socket directory grants
+
+- *(landlock)* Add landlock v6 signal and abstract unix socket scoping
+
+
+### Miscellaneous
+
+- Drop changelog update for issue 943
+
+
+### Refactoring
+
+- *(package)* Base installs on package manifest
+
+- *(supervisor)* Refine ipc denial reporting and audit timestamps
+
+
+### Testing
+
+- *(integration-tests)* Use CARGO_TARGET_DIR in runner
+
+- *(supervisor-linux)* Add unix listener for connect capability test
+
+
+### Cli
+
+- Quiet Landlock deny-overlap diagnostics on Linux
+
 ## Unreleased
 
 ### Bug Fixes
 
+- *(pty)* Forward bare ESC immediately instead of buffering for CSI-u detach match, fixing ESC key in TUI apps inside tmux with `extended-keys-format csi-u` (#941)
 - *(sandbox/macos)* Mediation sockets now reachable when `network.allow_domain` is set. Seatbelt classifies AF_UNIX `connect(2)` as `network-outbound`; under `NetworkMode::ProxyOnly` the base `(deny network*)` blocked the audit/mediation shim's connect to `<session_dir>/{mediation,control,audit}.sock`. Adds a directory-scoped `UnixSocketCapability` for the session dir alongside the existing `FsCapability`. Fixes #33.
 
 ### Features

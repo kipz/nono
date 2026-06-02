@@ -7,7 +7,7 @@ use landlock::{
     ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath,
     PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, Scope,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
@@ -479,6 +479,14 @@ pub fn apply_with_abi(caps: &CapabilitySet, abi: &DetectedAbi) -> Result<Seccomp
     info!("Using Landlock ABI {:?}", target_abi);
     let scopes = requested_scopes(caps, abi)?;
 
+    if !matches!(caps.network_mode(), NetworkMode::AllowAll) && caps.localhost_ports().contains(&0)
+    {
+        return Err(NonoError::SandboxInit(
+            "open_port 0 (localhost TCP wildcard) is macOS-only; on Linux use explicit ports or a network profile."
+                .to_string(),
+        ));
+    }
+
     // Determine which access rights to handle based on ABI
     let handled_fs = AccessFs::from_all(target_abi);
 
@@ -844,8 +852,10 @@ const SECCOMP_FILTER_FLAG_NEW_LISTENER: libc::c_uint = 1 << 3;
 const SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV: libc::c_uint = 1 << 4;
 
 // ioctl request codes for seccomp notifications
-const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc0502100 as libc::Ioctl;
-const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc0182101 as libc::Ioctl;
+// Cast via u32 first: on glibc Ioctl=c_ulong (u64) this widens safely;
+// on musl Ioctl=c_int (i32) the u32→i32 bit-reinterpret is a valid cast.
+const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc0502100u32 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc0182101u32 as libc::Ioctl;
 const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::Ioctl = 0x40082102 as libc::Ioctl;
 const SECCOMP_IOCTL_NOTIF_ADDFD: libc::Ioctl = 0x40182103 as libc::Ioctl;
 
@@ -1557,8 +1567,9 @@ pub fn respond_notif_errno(notify_fd: std::os::fd::RawFd, notif_id: u64, errno: 
 
 /// Continue a seccomp notification, letting the child's original syscall run.
 ///
-/// This preserves the original syscall semantics exactly. It is safe only when
-/// the syscall is already authorized by the sandbox's allow-list.
+/// This resumes the original syscall with its original userspace arguments.
+/// Do not use it after making an authorization decision from child-controlled
+/// pointer memory unless the policy accepts the resulting TOCTOU window.
 pub fn continue_notif(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
     let resp = SeccompNotifResp {
         id: notif_id,
@@ -1608,15 +1619,14 @@ pub fn deny_notif(notify_fd: std::os::fd::RawFd, notif_id: u64) -> Result<()> {
 /// Kind of AF_UNIX socket, determined from `sun_path` and `addrlen`.
 ///
 /// See `unix(7)`. This distinction matters for policy because only
-/// [`UnixSocketKind::Pathname`] sockets are governed by filesystem rules.
-/// Abstract and unnamed sockets live in a separate namespace that Landlock's
-/// filesystem rules cannot reach, so the supervisor must decide them
-/// explicitly.
+/// [`UnixSocketKind::Pathname`] sockets can be matched against filesystem
+/// paths. Abstract and unnamed sockets live in a separate namespace, so the
+/// supervisor must decide them explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnixSocketKind {
     /// Filesystem-backed: `sun_path` is a null-terminated filesystem path
     /// (e.g. `/tmp/test.sock`). Access is governed by filesystem permissions
-    /// and — in our case — by Landlock's filesystem rules.
+    /// and nono's pathname socket capability allowlist.
     Pathname,
     /// Linux abstract namespace: `sun_path[0] == '\0'` and bytes `[1..]` form
     /// the abstract name. Not backed by any filesystem, so Landlock's
@@ -1662,6 +1672,9 @@ pub struct SockaddrInfo {
     /// For `AF_UNIX`: kind of socket (pathname / abstract / unnamed). `None`
     /// for non-UNIX address families.
     pub unix_kind: Option<UnixSocketKind>,
+    /// For pathname `AF_UNIX`: filesystem path from `sockaddr_un.sun_path`.
+    /// `None` for non-UNIX, abstract, unnamed, or unclassified sockets.
+    pub unix_path: Option<PathBuf>,
 }
 
 /// Seccomp network fallback mode determined during sandbox apply.
@@ -1719,8 +1732,8 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
 ///
 /// - `AF_INET`/`AF_INET6`: allow connect to `localhost:proxy_port`;
 ///   allow bind on ports in the configured bind-ports list; deny others.
-/// - pathname `AF_UNIX` (#685): allow both connect and bind. Landlock's
-///   filesystem rules are the upstream gate on which paths are reachable.
+/// - pathname `AF_UNIX`: route to the supervisor, which checks the explicit
+///   Unix socket capability allowlist against the requested path.
 /// - abstract/unnamed `AF_UNIX`: deny (see `decide_network_notification`).
 ///
 /// `has_bind_ports` is retained for API compatibility but no longer
@@ -1759,9 +1772,9 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
 
     // bind() always routes to USER_NOTIF so the supervisor can make the
-    // per-family decision (deny AF_INET to non-allowed TCP ports; allow
-    // pathname AF_UNIX per issue #685). The previous variant took a
-    // has_bind_ports short-circuit to ERRNO when no TCP bind ports were
+    // per-family decision (deny AF_INET to non-allowed TCP ports; check
+    // pathname AF_UNIX against the explicit socket allowlist). The previous
+    // variant took a has_bind_ports short-circuit to ERRNO when no TCP bind ports were
     // configured, which unconditionally failed AF_UNIX bind — a real
     // regression that only manifested on Landlock V2 kernels (where this
     // seccomp fallback fires). The has_bind_ports parameter is retained
@@ -1927,6 +1940,55 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     ]
 }
 
+/// Build a BPF filter for opt-in pathname AF_UNIX mediation.
+///
+/// The filter routes `connect()` and `bind()` to the supervisor so it can
+/// inspect `sockaddr_un` paths. Everything else is allowed by this filter:
+/// TCP policy remains Landlock's job on V4+ kernels.
+///
+/// Instruction layout:
+/// ```text
+///  0: ld  [nr]
+///  1: jeq SYS_CONNECT jt=+2 (-> 4: notify)
+///  2: jeq SYS_BIND    jt=+1 (-> 4: notify)
+///  3: ret ALLOW
+///  4: ret USER_NOTIF
+/// ```
+fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
+    vec![
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_NR_OFFSET,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 2,
+            jf: 0,
+            k: SYS_CONNECT as u32,
+        },
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: SYS_BIND as u32,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
+    ]
+}
+
 /// Install a seccomp-notify BPF filter for proxy-only network mode.
 ///
 /// Returns the notify fd that the supervisor must poll for connect/bind
@@ -1939,9 +2001,23 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
 ///
 /// Returns an error if the seccomp syscall fails.
 pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
+    install_seccomp_notify_filter(&build_seccomp_proxy_filter(has_bind_ports), "proxy filter")
+}
 
-    let filter = build_seccomp_proxy_filter(has_bind_ports);
+/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation.
+///
+/// # Errors
+///
+/// Returns an error if the seccomp syscall fails.
+pub fn install_seccomp_af_unix_filter() -> Result<std::os::fd::OwnedFd> {
+    install_seccomp_notify_filter(&build_seccomp_af_unix_filter(), "AF_UNIX mediation filter")
+}
+
+fn install_seccomp_notify_filter(
+    filter: &[SockFilterInsn],
+    label: &str,
+) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
 
     let prog = SockFprog {
         len: filter.len() as u16,
@@ -1988,8 +2064,9 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 
         if ret < 0 {
             return Err(NonoError::SandboxInit(format!(
-                "seccomp(SECCOMP_SET_MODE_FILTER) for proxy filter failed: {}. \
+                "seccomp(SECCOMP_SET_MODE_FILTER) for {} failed: {}. \
                  Requires kernel >= 5.0 with SECCOMP_FILTER_FLAG_NEW_LISTENER.",
+                label,
                 std::io::Error::last_os_error()
             )));
         }
@@ -2010,12 +2087,11 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 ///
 /// # TOCTOU Warning
 ///
-/// For connect/bind, the kernel copies sockaddr into kernel memory via
-/// `move_addr_to_kernel()` before the seccomp filter runs. The userspace
-/// copy we read here may differ from what the kernel uses, but we use
-/// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` which lets the kernel proceed with
-/// its already-copied data. The userspace read is only used for the
-/// allow/deny decision.
+/// Seccomp notification happens at syscall entry, before `connect(2)` or
+/// `bind(2)` copies the sockaddr into kernel memory. The userspace memory
+/// read here is therefore child-controlled and can race with another thread.
+/// Callers must not use `SECCOMP_USER_NOTIF_FLAG_CONTINUE` after authorizing
+/// pointer-derived data unless that TOCTOU window is explicitly acceptable.
 ///
 /// Always call `notif_id_valid()` after reading to verify the notification
 /// is still pending.
@@ -2026,6 +2102,7 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 /// too small to parse.
 pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<SockaddrInfo> {
     use std::io::Read;
+    use std::os::unix::ffi::OsStringExt;
 
     // Minimum size: sa_family (2 bytes)
     if addrlen < 2 {
@@ -2041,9 +2118,20 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
     std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(addr_ptr))
         .map_err(|e| NonoError::SandboxInit(format!("Failed to seek in {}: {}", mem_path, e)))?;
 
-    // Read up to sizeof(sockaddr_in6) = 28 bytes. This covers both IPv4 (16) and IPv6 (28).
-    let read_len = std::cmp::min(addrlen as usize, 28);
-    let mut buf = [0u8; 28];
+    let sockaddr_un_len = std::mem::size_of::<libc::sockaddr_un>();
+    let max_sockaddr_len = sockaddr_un_len.max(28);
+    let requested_len = usize::try_from(addrlen).map_err(|_| {
+        NonoError::SandboxInit(format!("sockaddr length too large to parse: {addrlen}"))
+    })?;
+    const SOCKADDR_STACK_LEN: usize = 128;
+    if max_sockaddr_len > SOCKADDR_STACK_LEN {
+        return Err(NonoError::SandboxInit(format!(
+            "maximum sockaddr length {} exceeds stack buffer {}",
+            max_sockaddr_len, SOCKADDR_STACK_LEN
+        )));
+    }
+    let read_len = std::cmp::min(requested_len, max_sockaddr_len);
+    let mut buf = [0u8; SOCKADDR_STACK_LEN];
     let n = file.read(&mut buf[..read_len]).map_err(|e| {
         NonoError::SandboxInit(format!("Failed to read sockaddr from {}: {}", mem_path, e))
     })?;
@@ -2076,6 +2164,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 port,
                 is_loopback,
                 unix_kind: None,
+                unix_path: None,
             })
         }
         libc::AF_INET6 => {
@@ -2100,17 +2189,40 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
                 port,
                 is_loopback: is_loopback || is_v4_mapped_loopback,
                 unix_kind: None,
+                unix_path: None,
             })
         }
         libc::AF_UNIX => {
+            if requested_len > sockaddr_un_len {
+                return Err(NonoError::SandboxInit(format!(
+                    "sockaddr_un length {} exceeds maximum {}",
+                    requested_len, sockaddr_un_len
+                )));
+            }
             // sun_path starts at offset 2. buf has `n` bytes total; we need
             // addrlen to distinguish unnamed from path-bearing sockets.
             let sun_path_first_byte = if n >= 3 { Some(buf[2]) } else { None };
+            let unix_kind = classify_af_unix(addrlen, sun_path_first_byte);
+            let unix_path = if matches!(unix_kind, UnixSocketKind::Pathname) {
+                let path_bytes = &buf[2..n];
+                let nul_pos = path_bytes
+                    .iter()
+                    .position(|byte| *byte == 0)
+                    .unwrap_or(path_bytes.len());
+                if nul_pos == 0 {
+                    None
+                } else {
+                    Some(std::ffi::OsString::from_vec(path_bytes[..nul_pos].to_vec()).into())
+                }
+            } else {
+                None
+            };
             Ok(SockaddrInfo {
                 family,
                 port: 0,
                 is_loopback: true, // Unix sockets are always local
-                unix_kind: Some(classify_af_unix(addrlen, sun_path_first_byte)),
+                unix_kind: Some(unix_kind),
+                unix_path,
             })
         }
         _ => Ok(SockaddrInfo {
@@ -2118,6 +2230,7 @@ pub fn read_notif_sockaddr(pid: u32, addr_ptr: u64, addrlen: u64) -> Result<Sock
             port: 0,
             is_loopback: false,
             unix_kind: None,
+            unix_path: None,
         }),
     }
 }
@@ -3106,6 +3219,19 @@ mod tests {
         );
     }
 
+    /// Rejects `open_port: [0]` on Linux for any restricted network mode (not Landlock-only).
+    #[test]
+    fn test_reject_localhost_port_wildcard_zero_on_linux() {
+        let Ok(detected) = detect_abi() else {
+            return;
+        };
+        let mut caps = CapabilitySet::new().block_network();
+        caps.add_localhost_port(0);
+        let err = apply_with_abi(&caps, &detected).expect_err("port 0 wildcard must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("macOS-only"), "unexpected error: {msg}");
+    }
+
     #[test]
     fn test_seccomp_network_fallback_mode_proxy_only() {
         let caps = CapabilitySet::new().proxy_only(8080);
@@ -3197,12 +3323,25 @@ mod tests {
     }
 
     #[test]
+    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_only() {
+        let filter = build_seccomp_af_unix_filter();
+        assert_eq!(filter.len(), 5);
+        assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
+        assert_eq!(filter[1].k, SYS_CONNECT as u32);
+        assert_eq!(filter[2].k, SYS_BIND as u32);
+        assert_eq!(filter[3].k, SECCOMP_RET_ALLOW);
+        assert_eq!(filter[4].k, SECCOMP_RET_USER_NOTIF);
+    }
+
+    #[test]
     fn test_sockaddr_info_ipv4_loopback() {
         let info = SockaddrInfo {
             family: libc::AF_INET as u16,
             port: 8080,
             is_loopback: true,
             unix_kind: None,
+            unix_path: None,
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 8080);
@@ -3215,6 +3354,7 @@ mod tests {
             port: 443,
             is_loopback: true,
             unix_kind: None,
+            unix_path: None,
         };
         assert!(info.is_loopback);
     }
@@ -3226,6 +3366,7 @@ mod tests {
             port: 80,
             is_loopback: false,
             unix_kind: None,
+            unix_path: None,
         };
         assert!(!info.is_loopback);
     }
@@ -3237,6 +3378,7 @@ mod tests {
             port: 0,
             is_loopback: true,
             unix_kind: Some(UnixSocketKind::Pathname),
+            unix_path: Some(PathBuf::from("/tmp/test.sock")),
         };
         assert!(info.is_loopback);
         assert_eq!(info.port, 0);

@@ -201,7 +201,15 @@ pub fn setup(
             continue;
         };
         write_shim_source(&shim_sources_dir, &resolved.name, &resolved.real_path);
+        // Push the as-found path (which::which may return a symlink).
+        // Also push the canonicalized target so that exec via the real binary
+        // path is blocked even when the agent bypasses the symlink.
         blocked_binaries.push(resolved.real_path.clone());
+        if let Ok(canonical) = resolved.real_path.canonicalize() {
+            if canonical != resolved.real_path {
+                blocked_binaries.push(canonical);
+            }
+        }
         resolved_commands.push(resolved);
     }
 

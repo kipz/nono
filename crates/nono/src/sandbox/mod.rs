@@ -31,9 +31,10 @@ pub use linux::is_wsl2;
 pub use linux::{
     OpenHow, SYS_BIND, SYS_CONNECT, SYS_OPENAT, SYS_OPENAT2, SeccompData, SeccompNetFallback,
     SeccompNotif, SockaddrInfo, UnixSocketKind, classify_access_from_flags, classify_af_unix,
-    continue_notif, deny_notif, inject_fd, install_seccomp_notify, install_seccomp_proxy_filter,
-    notif_id_valid, probe_seccomp_block_network_support, read_notif_path, read_notif_sockaddr,
-    read_open_how, recv_notif, resolve_notif_path, respond_notif_errno, validate_openat2_size,
+    continue_notif, deny_notif, inject_fd, install_seccomp_af_unix_filter, install_seccomp_notify,
+    install_seccomp_proxy_filter, notif_id_valid, probe_seccomp_block_network_support,
+    read_notif_path, read_notif_sockaddr, read_open_how, recv_notif, resolve_notif_path,
+    respond_notif_errno, validate_openat2_size,
 };
 
 /// Information about sandbox support on this platform

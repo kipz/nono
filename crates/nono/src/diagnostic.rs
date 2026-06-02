@@ -31,6 +31,8 @@ pub enum DenialReason {
     RateLimited,
     /// Approval backend returned an error
     BackendError,
+    /// Pathname Unix socket was denied by IPC mediation
+    UnixSocketDenied,
 }
 
 /// Record of a denied access attempt during a supervised session.
@@ -42,6 +44,19 @@ pub struct DenialRecord {
     pub access: AccessMode,
     /// Why it was denied
     pub reason: DenialReason,
+}
+
+/// Record of a denied IPC attempt during a supervised session.
+#[derive(Debug, Clone)]
+pub struct IpcDenialRecord {
+    /// IPC resource that was denied, e.g. `/run/user/1000/bus` or `unix:<abstract>`.
+    pub target: String,
+    /// Operation attempted, e.g. `connect` or `bind`.
+    pub operation: String,
+    /// Why it was denied.
+    pub reason: String,
+    /// Suggested CLI flag when this denial can be fixed by an explicit grant.
+    pub suggested_flag: Option<String>,
 }
 
 /// Best-effort sandbox violation recovered from OS-native logging.
@@ -616,6 +631,7 @@ pub struct DiagnosticFormatter<'a> {
     caps: &'a CapabilitySet,
     mode: DiagnosticMode,
     denials: &'a [DenialRecord],
+    ipc_denials: &'a [IpcDenialRecord],
     sandbox_violations: &'a [SandboxViolation],
     /// Paths that are write-protected due to trust verification
     protected_paths: &'a [PathBuf],
@@ -637,6 +653,16 @@ pub struct DiagnosticFormatter<'a> {
     session_id: Option<String>,
     /// Policy explanations for denied paths, resolved from `query_path`.
     policy_explanations: Vec<PolicyExplanation>,
+    /// Paths suppressed from the save-profile prompt (from `suppress_save_prompt`
+    /// profile field or `--suppress-save-prompt` CLI flag). Used to annotate
+    /// denied paths with `[save skipped]` so the diagnostic footer is
+    /// self-explanatory without requiring the user to cross-reference their profile.
+    suppressed_paths: &'a [PathBuf],
+    /// Canonicalized forms of the denied paths, parallel to `denials`. When
+    /// provided, used in place of on-demand `try_canonicalize` calls inside the
+    /// render loop so filesystem I/O is done once (by the caller, after the
+    /// child exits) rather than once per denial per render method.
+    canonical_denial_paths: Vec<PathBuf>,
 }
 
 impl<'a> DiagnosticFormatter<'a> {
@@ -647,6 +673,7 @@ impl<'a> DiagnosticFormatter<'a> {
             caps,
             mode: DiagnosticMode::Standard,
             denials: &[],
+            ipc_denials: &[],
             sandbox_violations: &[],
             protected_paths: &[],
             primary_verdict: None,
@@ -658,6 +685,8 @@ impl<'a> DiagnosticFormatter<'a> {
             current_dir: None,
             session_id: None,
             policy_explanations: Vec::new(),
+            suppressed_paths: &[],
+            canonical_denial_paths: Vec::new(),
         }
     }
 
@@ -672,6 +701,28 @@ impl<'a> DiagnosticFormatter<'a> {
     #[must_use]
     pub fn with_denials(mut self, denials: &'a [DenialRecord]) -> Self {
         self.denials = denials;
+        self
+    }
+
+    /// Set paths suppressed from the save-profile prompt.
+    #[must_use]
+    pub fn with_suppressed_paths(mut self, paths: &'a [PathBuf]) -> Self {
+        self.suppressed_paths = paths;
+        self
+    }
+
+    /// Set pre-canonicalized forms of the denied paths to avoid repeated
+    /// calling of `try_canonicalize` at render time.
+    #[must_use]
+    pub fn with_canonical_denial_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.canonical_denial_paths = paths;
+        self
+    }
+
+    /// Add IPC denial records from a supervised session.
+    #[must_use]
+    pub fn with_ipc_denials(mut self, denials: &'a [IpcDenialRecord]) -> Self {
+        self.ipc_denials = denials;
         self
     }
 
@@ -1069,14 +1120,17 @@ impl<'a> DiagnosticFormatter<'a> {
         let primary_verdict = self.primary_observation_verdict();
         let has_observation = self.has_error_observation();
 
+        let has_ipc_denials = !self.ipc_denials.is_empty();
+
         if self.denials.is_empty()
+            && !has_ipc_denials
             && matches!(
                 primary_verdict.as_ref(),
                 Some(ErrorVerdict::MissingPath(_)) | Some(ErrorVerdict::NonSandboxFailure(_))
             )
         {
             lines.push(format_command_failed_not_sandbox_line(exit_code));
-        } else if exit_code == 0 && has_observation && self.denials.is_empty() {
+        } else if exit_code == 0 && has_observation && self.denials.is_empty() && !has_ipc_denials {
             lines.push(format_command_succeeded_with_stderr_line());
         } else {
             lines.extend(self.format_exit_explanation(exit_code));
@@ -1097,7 +1151,14 @@ impl<'a> DiagnosticFormatter<'a> {
             .collect();
         all_denials.extend(self.observed_denials_matching_logged_paths(&all_denials));
 
-        if all_denials.is_empty() {
+        if !self.ipc_denials.is_empty() {
+            self.format_ipc_denial_guidance(&mut lines);
+            if !all_denials.is_empty() || !non_fs_violations.is_empty() {
+                lines.push("[nono]".to_string());
+            }
+        }
+
+        if all_denials.is_empty() && self.ipc_denials.is_empty() {
             // No denials from either source.
             if !non_fs_violations.is_empty() {
                 // Non-filesystem violations (mach-lookup, signal, etc.) —
@@ -1121,7 +1182,7 @@ impl<'a> DiagnosticFormatter<'a> {
             self.format_grant_help(&mut lines);
             lines.push("[nono]".to_string());
             self.format_follow_up_guidance(&mut lines, None);
-        } else {
+        } else if !all_denials.is_empty() {
             // Deduplicate by path, merging access modes. Classification into
             // actionable vs. policy-blocked is done by the consolidated
             // formatter using policy_explanations when available.
@@ -1350,11 +1411,40 @@ impl<'a> DiagnosticFormatter<'a> {
     ) {
         const MAX_INLINE_LIST: usize = 10;
 
-        let total = denials.len();
+        let (unix_socket_denials, path_denials): (Vec<&DenialRecord>, Vec<&DenialRecord>) = denials
+            .iter()
+            .partition(|denial| denial.reason == DenialReason::UnixSocketDenied);
+
+        if !unix_socket_denials.is_empty() {
+            let total = unix_socket_denials.len();
+            let plural_s = if total == 1 { "" } else { "s" };
+            lines.push(format!(
+                "[nono] IPC denial: {} pathname Unix socket{} blocked.",
+                total, plural_s
+            ));
+            for (idx, denial) in unix_socket_denials.iter().enumerate() {
+                if idx >= MAX_INLINE_LIST {
+                    lines.push(format!("[nono]   ... and {} more", total - idx));
+                    break;
+                }
+                lines.push(format!("[nono]   {}", denial.path.display()));
+            }
+            let flags: Vec<String> = unix_socket_denials
+                .iter()
+                .map(|d| self.suggested_flag_for_denial(d))
+                .collect();
+            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+        }
+
+        if path_denials.is_empty() {
+            return;
+        }
+
+        let total = path_denials.len();
         let mut actionable: Vec<&DenialRecord> = Vec::new();
         let mut policy_blocked: Vec<&DenialRecord> = Vec::new();
 
-        for denial in denials {
+        for denial in &path_denials {
             if self.is_denial_policy_blocked(denial) {
                 policy_blocked.push(denial);
             } else {
@@ -1368,15 +1458,22 @@ impl<'a> DiagnosticFormatter<'a> {
             total, plural_s
         ));
 
-        for (idx, denial) in denials.iter().enumerate() {
+        for (idx, denial) in path_denials.iter().enumerate() {
             if idx >= MAX_INLINE_LIST {
                 lines.push(format!("[nono]   … and {} more", total - idx));
                 break;
             }
-            let suffix = if self.is_denial_policy_blocked(denial) {
-                "  [permanently restricted]"
+            let mut labels: Vec<&str> = Vec::new();
+            if self.is_denial_policy_blocked(denial) {
+                labels.push("permanently restricted");
+            }
+            if self.is_denial_suppressed(denial) {
+                labels.push("save skipped");
+            }
+            let suffix = if labels.is_empty() {
+                String::new()
             } else {
-                ""
+                format!("  [{}]", labels.join(", "))
             };
             lines.push(format!(
                 "[nono]   {} ({}){}",
@@ -1414,6 +1511,64 @@ impl<'a> DiagnosticFormatter<'a> {
         }
     }
 
+    fn format_ipc_denial_guidance(&self, lines: &mut Vec<String>) {
+        const MAX_INLINE_LIST: usize = 10;
+
+        let total = self.ipc_denials.len();
+        let plural_s = if total == 1 { "" } else { "s" };
+        lines.push(format!(
+            "[nono] IPC denial: {} Unix socket operation{} blocked.",
+            total, plural_s
+        ));
+        for (idx, denial) in self.ipc_denials.iter().enumerate() {
+            if idx >= MAX_INLINE_LIST {
+                lines.push(format!("[nono]   ... and {} more", total - idx));
+                break;
+            }
+            lines.push(format!(
+                "[nono]   {} {} ({})",
+                denial.operation, denial.target, denial.reason
+            ));
+        }
+
+        let flags: Vec<&str> = self
+            .ipc_denials
+            .iter()
+            .filter_map(|denial| denial.suggested_flag.as_deref())
+            .collect();
+        if !flags.is_empty() {
+            lines.push(format!("[nono] Fix: {}", flags.join(" ")));
+        }
+    }
+
+    /// Return the canonical form of `denial.path`, using the pre-computed
+    /// parallel vec when available to avoid repeated filesystem I/O.
+    fn canonical_for_denial<'b>(&'b self, denial: &DenialRecord) -> std::borrow::Cow<'b, Path> {
+        if let Some(canonical) = self
+            .denials
+            .iter()
+            .position(|d| d.path == denial.path)
+            .and_then(|i| self.canonical_denial_paths.get(i))
+        {
+            return std::borrow::Cow::Borrowed(canonical.as_path());
+        }
+        std::borrow::Cow::Owned(crate::try_canonicalize(&denial.path))
+    }
+
+    /// Return true when the denied path is in the caller-supplied suppression
+    /// list (i.e. `suppress_save_prompt` entries). Such paths are still denied
+    /// by the sandbox — this only controls whether they appear in the save
+    /// prompt and how they are labelled in the diagnostic footer.
+    fn is_denial_suppressed(&self, denial: &DenialRecord) -> bool {
+        if self.suppressed_paths.is_empty() {
+            return false;
+        }
+        let canonical = self.canonical_for_denial(denial);
+        self.suppressed_paths
+            .iter()
+            .any(|suppressed| canonical.starts_with(suppressed))
+    }
+
     /// Return true when the denial cannot be fixed by a path flag alone —
     /// i.e. the path is blocked by the sensitive-path policy and requires a
     /// profile with `filesystem.bypass_protection`.
@@ -1434,6 +1589,15 @@ impl<'a> DiagnosticFormatter<'a> {
     /// explanation's `suggested_flag` (which knows about parent-directory
     /// canonicalization) and falls back to a local computation otherwise.
     fn suggested_flag_for_denial(&self, denial: &DenialRecord) -> String {
+        if denial.reason == DenialReason::UnixSocketDenied {
+            let flag = if denial.access.contains(AccessMode::Write) {
+                "--allow-unix-socket-bind"
+            } else {
+                "--allow-unix-socket"
+            };
+            return format!("{} {}", flag, denial.path.display());
+        }
+
         if let Some(flag) = self
             .policy_explanations
             .iter()
@@ -1971,6 +2135,7 @@ fn stricter_reason(a: DenialReason, b: DenialReason) -> DenialReason {
     fn rank(r: &DenialReason) -> u8 {
         match r {
             DenialReason::PolicyBlocked => 5,
+            DenialReason::UnixSocketDenied => 5,
             DenialReason::InsufficientAccess => 4,
             DenialReason::UserDenied => 3,
             DenialReason::RateLimited => 2,
@@ -3114,6 +3279,26 @@ mod tests {
     }
 
     #[test]
+    fn test_supervised_unix_socket_denial_uses_ipc_guidance() {
+        let caps = make_test_caps();
+        let denials = vec![DenialRecord {
+            path: PathBuf::from("/run/user/1000/bus"),
+            access: AccessMode::Read,
+            reason: DenialReason::UnixSocketDenied,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains("IPC denial: 1 pathname Unix socket blocked."));
+        assert!(output.contains("/run/user/1000/bus"));
+        assert!(output.contains("Fix: --allow-unix-socket /run/user/1000/bus"));
+        assert!(!output.contains("No path denials were observed"));
+        assert!(!output.contains("--read /run/user/1000/bus"));
+    }
+
+    #[test]
     fn test_supervised_user_denied() {
         let caps = make_test_caps();
         let dir = tempdir().expect("tempdir should be created");
@@ -3538,5 +3723,138 @@ mod tests {
         let output = formatter.format_footer(42);
 
         assert!(output.contains("Command exited with code 42."));
+    }
+
+    #[test]
+    fn suppressed_denial_annotated_with_save_skipped() {
+        let caps = make_test_caps();
+        let denied = PathBuf::from("/tmp/suppressed-file");
+        let other = PathBuf::from("/tmp/other-file");
+        let suppressed = crate::try_canonicalize(&denied);
+
+        let denials = vec![
+            DenialRecord {
+                path: denied.clone(),
+                access: AccessMode::Read,
+                reason: DenialReason::RateLimited,
+            },
+            DenialRecord {
+                path: other.clone(),
+                access: AccessMode::Read,
+                reason: DenialReason::RateLimited,
+            },
+        ];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials)
+            .with_suppressed_paths(std::slice::from_ref(&suppressed));
+        let output = formatter.format_footer(1);
+
+        // The suppressed path gets the [save skipped] annotation.
+        assert!(
+            output.contains("[save skipped]"),
+            "expected [save skipped] in:\n{output}"
+        );
+        // The non-suppressed path does not.
+        let other_line = output
+            .lines()
+            .find(|l| l.contains("other-file"))
+            .unwrap_or("");
+        assert!(
+            !other_line.contains("[save skipped]"),
+            "non-suppressed path should not have [save skipped]: {other_line}"
+        );
+    }
+
+    #[test]
+    fn suppressed_denial_without_suppressed_paths_has_no_annotation() {
+        let caps = make_test_caps();
+        let denied = PathBuf::from("/tmp/some-file");
+        let denials = vec![DenialRecord {
+            path: denied,
+            access: AccessMode::Read,
+            reason: DenialReason::RateLimited,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials);
+        let output = formatter.format_footer(1);
+
+        assert!(
+            !output.contains("[save skipped]"),
+            "no suppressed paths set — [save skipped] should not appear:\n{output}"
+        );
+    }
+
+    #[test]
+    fn permanently_restricted_and_suppressed_shows_both_labels() {
+        let caps = make_test_caps();
+        let denied = PathBuf::from("/tmp/restricted-and-suppressed");
+        let suppressed = crate::try_canonicalize(&denied);
+
+        // PolicyBlocked reason + a policy explanation with reason "sensitive_path"
+        // causes is_denial_policy_blocked() to return true.
+        let explanation = PolicyExplanation {
+            path: denied.clone(),
+            access: AccessMode::Read,
+            reason: "sensitive_path".to_string(),
+            details: None,
+            policy_source: None,
+            suggested_flag: None,
+        };
+        let denials = vec![DenialRecord {
+            path: denied,
+            access: AccessMode::Read,
+            reason: DenialReason::PolicyBlocked,
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials)
+            .with_policy_explanations(vec![explanation])
+            .with_suppressed_paths(std::slice::from_ref(&suppressed));
+        let output = formatter.format_footer(1);
+
+        let line = output
+            .lines()
+            .find(|l| l.contains("restricted-and-suppressed"))
+            .unwrap_or("");
+        assert!(
+            line.contains("permanently restricted"),
+            "expected 'permanently restricted' in: {line}"
+        );
+        assert!(
+            line.contains("save skipped"),
+            "expected 'save skipped' in: {line}"
+        );
+    }
+
+    #[test]
+    fn suppressed_denial_uses_precomputed_canonical_path() {
+        // Verify that when `with_canonical_denial_paths` is supplied the
+        // pre-computed value is used for suppression matching instead of the
+        // raw denial path. We supply a canonical path that differs from the
+        // raw path (simulating symlink resolution) and assert that suppression
+        // is triggered against the canonical form.
+        let caps = make_test_caps();
+        let raw_path = PathBuf::from("/tmp/link-to-suppressed");
+        let canonical_path = PathBuf::from("/tmp/real-suppressed-target");
+
+        let denials = vec![DenialRecord {
+            path: raw_path.clone(),
+            access: AccessMode::Read,
+            reason: DenialReason::RateLimited,
+        }];
+        // Suppress the canonical path, not the raw symlink path.
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_denials(&denials)
+            .with_suppressed_paths(std::slice::from_ref(&canonical_path))
+            .with_canonical_denial_paths(vec![canonical_path.clone()]);
+        let output = formatter.format_footer(1);
+
+        assert!(
+            output.contains("[save skipped]"),
+            "suppression via precomputed canonical path should annotate [save skipped]:\n{output}"
+        );
     }
 }

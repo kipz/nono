@@ -195,6 +195,22 @@ pub struct CommandSandbox {
     /// Default: false. macOS only; ignored on other platforms.
     #[serde(default)]
     pub keychain_access: bool,
+    /// If true, the per-command Seatbelt profile permits arbitrary process spawn
+    /// (`(allow process-exec*)`). Use for commands with broad helper sprawl —
+    /// `git` (git-lfs, credential helpers, hooks, gpg), `aws` (credential_process
+    /// plugins), `kubectl` (exec credential plugins), `aws-vault` (wraps a child
+    /// process by design), etc.
+    ///
+    /// Default: false. Per-command sandboxes deny `process-exec*` by default;
+    /// only the binary's own path, the nono-shim (for re-mediation of other
+    /// mediated commands), and `allow_commands` targets are permitted. This is
+    /// the gate that closes child-process exfiltration escapes such as ssh's
+    /// `ProxyCommand`: a per-command sandbox that grants `~/.ssh` read access
+    /// cannot spawn an arbitrary shell that would inherit the same grants.
+    ///
+    /// macOS only; ignored on other platforms.
+    #[serde(default)]
+    pub allow_process_exec: bool,
 }
 
 /// Simple network config for per-command sandbox profiles.
@@ -403,15 +419,18 @@ mod tests {
     #[test]
     fn test_caller_policy_distinguishes_null_vs_empty_allowed_parents() {
         // Field absent: any parent allowed.
-        let p1: CallerPolicy = serde_json::from_str(r#"{ "agent_allowed": true }"#).unwrap();
+        let p1: CallerPolicy =
+            serde_json::from_str(r#"{ "agent_allowed": true }"#).expect("deserialize p1");
         assert!(p1.allowed_parents.is_none());
 
         // Empty array: no mediated parent allowed.
-        let p2: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": [] }"#).unwrap();
+        let p2: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": [] }"#).expect("deserialize p2");
         assert_eq!(p2.allowed_parents.as_deref(), Some(&[][..]));
 
         // Listed: only the named parents allowed.
-        let p3: CallerPolicy = serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).unwrap();
+        let p3: CallerPolicy =
+            serde_json::from_str(r#"{ "allowed_parents": ["git"] }"#).expect("deserialize p3");
         assert_eq!(
             p3.allowed_parents.as_deref(),
             Some(&["git".to_string()][..])

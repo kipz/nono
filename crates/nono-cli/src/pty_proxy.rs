@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use crate::timeouts;
+
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
@@ -234,6 +236,9 @@ pub struct PtyProxy {
     pending_detach_escape: Vec<u8>,
     /// In-band detach requested from the attached client.
     detach_requested: bool,
+    /// Ctrl-Z (0x1a) intercepted from the attached client; signals the
+    /// supervisor to pause the child and suspend itself via SIGTSTP.
+    job_control_requested: bool,
 }
 
 /// Open a PTY pair, inheriting the current terminal's window size.
@@ -279,7 +284,7 @@ pub unsafe fn setup_child_pty(slave_fd: RawFd) {
     // ioctl/dup2/close operate on raw fd integers — nix's IO-safe wrappers
     // require AsFd/OwnedFd which aren't available for STDIN_FILENO et al.
     unsafe {
-        if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+        if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
             child_setup_pty_fatal(b"nono: ioctl(TIOCSCTTY) failed while configuring child PTY\n");
         }
 
@@ -361,6 +366,7 @@ impl PtyProxy {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            job_control_requested: false,
         })
     }
 
@@ -471,7 +477,7 @@ impl PtyProxy {
                     return false;
                 }
 
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = stream.set_read_timeout(Some(timeouts::ATTACH_SOCKET_READ_TIMEOUT));
                 let mut request_kind = [0u8; 1];
                 match stream.read_exact(&mut request_kind) {
                     Ok(()) => {}
@@ -781,6 +787,13 @@ impl PtyProxy {
         std::mem::take(&mut self.detach_requested)
     }
 
+    /// Returns true once for each Ctrl-Z job-control request intercepted from
+    /// the attached client.  The caller is responsible for stopping the child
+    /// and suspending itself via SIGTSTP.
+    pub fn take_job_control_request(&mut self) -> bool {
+        std::mem::take(&mut self.job_control_requested)
+    }
+
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
     /// Returns true when a terminal-backed client was paused and must later
@@ -799,7 +812,10 @@ impl PtyProxy {
         }
     }
 
-    /// Re-enter raw mode and redraw the current PTY screen after a prompt.
+    /// Re-enter raw mode and replay the screen after a job-control suspension.
+    ///
+    /// Call this after the supervisor returns from `raise(SIGTSTP)` to undo
+    /// what [`Self::pause_terminal_for_prompt`] did.
     pub fn resume_terminal_after_prompt(&mut self) {
         if !self
             .client
@@ -808,16 +824,10 @@ impl PtyProxy {
         {
             return;
         }
-
         self.saved_termios = set_terminal_raw();
-        // The replay bytes from `attach_replay_bytes` now include the
-        // alt-screen entry escape themselves when the child is in alt-screen,
-        // so no separate `enter_attach_screen()` call is needed. Staying in
-        // normal-screen mode for non-TUI sessions preserves the outer
-        // terminal's scrollback and mouse-wheel handling.
         let replay = self.attach_replay_bytes();
-        if let Some(client) = self.client.as_ref() {
-            let _ = write_all_fd(client.write_fd(), &replay);
+        if !replay.is_empty() {
+            let _ = write_all_fd(libc::STDOUT_FILENO, &replay);
         }
     }
 
@@ -887,7 +897,7 @@ impl PtyProxy {
         unsafe {
             let _ = libc::ioctl(
                 self.master.as_raw_fd(),
-                libc::TIOCSWINSZ as libc::c_ulong,
+                libc::TIOCSWINSZ,
                 winsize as *const Winsize,
             );
         }
@@ -981,6 +991,15 @@ impl PtyProxy {
             .any(|ch| !ch.is_whitespace())
     }
 
+    /// Returns true once the child has entered alt-screen mode. This is the
+    /// reliable signal that a TUI has become interactive. Plain log lines or
+    /// startup banners written to the PTY do not activate alt-screen and do
+    /// not count, so a process that prints output and then hangs is still
+    /// subject to the startup timeout.
+    pub fn is_interactive(&self) -> bool {
+        self.screen.alternate_screen_active()
+    }
+
     fn attach_replay_bytes(&self) -> Vec<u8> {
         let plaintext = self.screen.render_plaintext();
         let raw_scrollback_present = !self.scrollback.is_empty();
@@ -1035,7 +1054,7 @@ impl PtyProxy {
     }
     fn filter_client_input(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut forwarded = Vec::with_capacity(bytes.len());
-        for &byte in bytes {
+        for (i, &byte) in bytes.iter().enumerate() {
             if self.maybe_consume_enhanced_detach_byte(byte, &mut forwarded) {
                 continue;
             }
@@ -1058,7 +1077,12 @@ impl PtyProxy {
                 continue;
             }
 
-            if self.should_start_enhanced_detach_match(byte) {
+            // Only buffer \x1b for enhanced CSI-u detach matching when '['
+            // immediately follows in the same read batch. A bare ESC with no
+            // '[' following is a standalone Escape key and must be forwarded immediately.
+            if self.should_start_enhanced_detach_match(byte)
+                && bytes.get(i + 1).copied() == Some(b'[')
+            {
                 self.pending_detach_escape.push(byte);
                 continue;
             }
@@ -1070,6 +1094,19 @@ impl PtyProxy {
                     self.pending_detach_match_len = 1;
                     continue;
                 }
+            }
+
+            // Intercept Ctrl-Z (0x1a) for PTY-level job control.  The outer
+            // terminal is in raw mode (ISIG cleared), so \x1a is a plain byte
+            // rather than a kernel-generated SIGTSTP.  We consume it here and
+            // signal the supervisor loop to stop the child and suspend itself.
+            if byte == 0x1a {
+                debug!(
+                    "PTY proxy: intercepted Ctrl-Z, setting job_control_requested for session {}",
+                    self.session_id
+                );
+                self.job_control_requested = true;
+                continue;
             }
 
             forwarded.push(byte);
@@ -2101,7 +2138,7 @@ where
         Ok(()) => run_attach_loop(
             sock_fd,
             resize_socket.as_ref(),
-            Some(Duration::from_millis(250)),
+            Some(timeouts::ATTACH_STDIN_DELAY),
             &mut alt_screen_tracker,
         ),
         Err(e) => Err(e),
@@ -2197,12 +2234,12 @@ pub fn attach_to_session(session_id: &str) -> Result<()> {
             // The supervisor may have been mid-shutdown. Wait briefly and
             // retry once so we can distinguish "exited just now" from a
             // persistent problem.
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(timeouts::ATTACH_RETRY_DELAY);
             connect_to_session(session_id)?
         }
         other => other?,
     };
-    wait_for_attach_ready(stream.as_raw_fd(), 1000)?;
+    wait_for_attach_ready(stream.as_raw_fd(), timeouts::pty_attach_timeout_ms())?;
     attach_to_stream(stream, Some(session_id))
 }
 
@@ -2429,6 +2466,7 @@ mod tests {
             pending_detach_match_len: 0,
             pending_detach_escape: Vec::new(),
             detach_requested: false,
+            job_control_requested: false,
         }
     }
 
@@ -2727,6 +2765,27 @@ mod tests {
     }
 
     #[test]
+    fn filter_client_input_forwards_bare_esc_immediately() {
+        // Regression test for issue #941: bare ESC must be forwarded right away,
+        // not buffered waiting for a possible CSI-u detach sequence.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1b");
+        assert_eq!(forwarded, b"\x1b");
+        assert!(proxy.pending_detach_escape.is_empty());
+        assert!(!proxy.take_detach_request());
+    }
+
+    #[test]
+    fn filter_client_input_forwards_esc_not_paired_with_next_key() {
+        // ESC followed by a non-'[' byte must both be forwarded as-is, not
+        // delayed and reordered into an Alt+key sequence.
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1ba");
+        assert_eq!(forwarded, b"\x1ba");
+        assert!(!proxy.take_detach_request());
+    }
+
+    #[test]
     fn filter_client_input_detaches_on_default_sequence() {
         let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
         let forwarded = proxy.filter_client_input(&DEFAULT_DETACH_SEQUENCE);
@@ -2902,5 +2961,46 @@ mod tests {
 
         assert!(proxy.proxy_master_to_client());
         assert!(proxy.client.is_none());
+    }
+
+    #[test]
+    fn filter_client_input_intercepts_ctrl_z_standalone() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        assert!(forwarded.is_empty(), "ctrl-z should not be forwarded");
+        assert!(proxy.take_job_control_request());
+    }
+
+    #[test]
+    fn filter_client_input_intercepts_ctrl_z_embedded() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        let forwarded = proxy.filter_client_input(b"ab\x1acd");
+        assert_eq!(forwarded, b"abcd", "only ctrl-z should be consumed");
+        assert!(proxy.take_job_control_request());
+    }
+
+    #[test]
+    fn filter_client_input_take_job_control_resets() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.filter_client_input(b"\x1a");
+        assert!(proxy.take_job_control_request());
+        assert!(
+            !proxy.take_job_control_request(),
+            "flag should be cleared after take"
+        );
+    }
+
+    #[test]
+    fn filter_client_input_ctrl_z_does_not_interfere_with_detach_sequence() {
+        // If \x1a is the detach-sequence prefix, the detach state machine consumes it.
+        let mut proxy = build_test_proxy(&[0x1a, b'd']);
+        let forwarded = proxy.filter_client_input(b"\x1a");
+        // Partially matched detach — not forwarded, but also not a job-control request
+        assert!(forwarded.is_empty());
+        assert!(
+            !proxy.take_job_control_request(),
+            "partial detach match should not set job_control"
+        );
+        assert!(!proxy.take_detach_request());
     }
 }

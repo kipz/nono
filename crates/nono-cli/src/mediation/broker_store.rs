@@ -458,7 +458,7 @@ impl BrokerStore for KeystoreBrokerStore {
             }
         };
 
-        if stored_path != exe_path.to_string_lossy().as_ref() {
+        if stored_path != exe_path.to_string_lossy().as_ref() as &str {
             tracing::info!(
                 "nono binary path changed ({stored_path} → {}); deleting stale broker entry",
                 exe_path.display()

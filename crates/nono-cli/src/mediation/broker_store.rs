@@ -323,6 +323,11 @@ fn save_with_nono_acl(service: &str, account: &str, payload: &Zeroizing<String>)
     // SAFETY: dict is a valid CFDictionaryRef.
     let status = unsafe { SecItemAdd(dict.as_concrete_TypeRef(), std::ptr::null_mut()) };
     if status != 0 {
+        if is_locked_keychain_status(status) {
+            return Err(NonoError::KeystoreAccess(locked_keychain_message(
+                "save", service, account, status,
+            )));
+        }
         return Err(NonoError::KeystoreAccess(format!(
             "SecItemAdd for {service}/{account}: OSStatus {status}"
         )));
@@ -331,10 +336,49 @@ fn save_with_nono_acl(service: &str, account: &str, payload: &Zeroizing<String>)
     Ok(())
 }
 
+/// macOS OSStatus codes that indicate the keychain is locked or the
+/// caller cannot present UI to unlock it. The default login keychain
+/// is auto-unlocked at login but locks again after sleep and is
+/// generally not unlocked under SSH. We treat all three as the same
+/// failure mode for the user.
+///
+/// Codes are not re-exported as constants by `security-framework-sys`;
+/// see <https://developer.apple.com/documentation/security/1542001-security_framework_result_codes>
+/// for the canonical list.
+#[cfg(target_os = "macos")]
+const LOCKED_KEYCHAIN_STATUSES: &[i32] = &[
+    -25308, // errSecInteractionNotAllowed: UI required but not allowed (SSH/headless).
+    -25293, // errSecAuthFailed: authentication failed (keychain locked).
+    -25304, // errSecNotAvailable: no keychain is available (rare; defensive).
+];
+
+/// Whether `status` denotes a locked-keychain condition.
+#[cfg(target_os = "macos")]
+fn is_locked_keychain_status(status: i32) -> bool {
+    LOCKED_KEYCHAIN_STATUSES.contains(&status)
+}
+
+/// Single user-facing message for any locked-keychain situation.
+/// Surfaced through both load (via the error) and save (via `warn!`).
+#[cfg(target_os = "macos")]
+fn locked_keychain_message(op: &str, service: &str, account: &str, status: i32) -> String {
+    format!(
+        "broker record {op} for {service}/{account} blocked: keychain is locked \
+         (OSStatus {status}). Common causes: SSH session, post-sleep without GUI \
+         unlock, or Keychain Access set to lock on inactivity. Cross-session \
+         resume is disabled until the login keychain is unlocked."
+    )
+}
+
 /// Load the raw JSON string for `service`/`account` using an in-process
 /// Security framework call. Running in the nono process ensures the
 /// nono-only ACL is satisfied silently — no `security` CLI subprocess,
 /// no prompts.
+///
+/// A locked-keychain condition (SSH, post-sleep, etc.) returns
+/// [`NonoError::KeystoreAccess`] with an actionable message rather than
+/// a generic error so the user understands why cross-session resume is
+/// not working this run. `build_broker` falls back to in-memory.
 #[cfg(target_os = "macos")]
 fn load_in_process(service: &str, account: &str) -> Result<Option<String>> {
     use security_framework::os::macos::passwords::find_generic_password;
@@ -353,6 +397,13 @@ fn load_in_process(service: &str, account: &str) -> Result<Option<String>> {
             use security_framework_sys::base::errSecItemNotFound;
             if e.code() == errSecItemNotFound {
                 Ok(None)
+            } else if is_locked_keychain_status(e.code()) {
+                Err(NonoError::KeystoreAccess(locked_keychain_message(
+                    "load",
+                    service,
+                    account,
+                    e.code(),
+                )))
             } else {
                 Err(NonoError::KeystoreAccess(format!(
                     "broker record load from {service}/{account}: {e}"
@@ -686,5 +737,63 @@ mod tests {
 
         store.clear().unwrap();
         assert!(store.load().unwrap().is_none(), "cleared store is empty");
+    }
+
+    // ── Locked-keychain detection ────────────────────────────────────────
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn locked_keychain_status_recognised_for_known_codes() {
+        assert!(
+            is_locked_keychain_status(-25308),
+            "errSecInteractionNotAllowed must be classified as locked"
+        );
+        assert!(
+            is_locked_keychain_status(-25293),
+            "errSecAuthFailed must be classified as locked"
+        );
+        assert!(
+            is_locked_keychain_status(-25304),
+            "errSecNotAvailable must be classified as locked"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn locked_keychain_status_rejects_other_codes() {
+        // errSecItemNotFound is the no-entry sentinel, not a locked state.
+        assert!(!is_locked_keychain_status(-25300));
+        // OSStatus 0 is success.
+        assert!(!is_locked_keychain_status(0));
+        // Random unrelated error.
+        assert!(!is_locked_keychain_status(-1));
+        // errSecParam (-50) — wrong arguments, not locked.
+        assert!(!is_locked_keychain_status(-50));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn locked_keychain_message_is_actionable() {
+        // The user-facing message must name the failure mode and the
+        // typical cause (SSH/sleep) so the user knows the cross-session
+        // resume regression is environmental, not a nono bug. Keep this
+        // test in sync with the actual prose so a future edit that
+        // drops the actionable parts trips here.
+        let msg = locked_keychain_message("load", "nono", "claude_oauth_broker", -25308);
+        assert!(msg.contains("locked"), "msg must say what happened: {msg}");
+        assert!(msg.contains("SSH"), "msg must list a common cause: {msg}");
+        assert!(
+            msg.contains("Cross-session resume is disabled"),
+            "msg must explain the consequence: {msg}"
+        );
+        assert!(
+            msg.contains("-25308"),
+            "msg must include the OSStatus for debuggability: {msg}"
+        );
+        // The credential itself must not leak through this path.
+        assert!(
+            !msg.contains("sk-ant-"),
+            "msg must not contain any real token: {msg}"
+        );
     }
 }

@@ -17,8 +17,8 @@ use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -189,39 +189,39 @@ pub async fn apply(
     }
 
     // If the request comes from within a per-command sandbox (via allow_commands),
-    // skip intercepts — credentials flow between trusted sub-processes, not to the agent.
-    // The sandbox context nonce is unforgeable (only the server can issue valid nonces).
-    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT") {
-        if let Some(parent_name) = broker.resolve(ctx_nonce) {
-            if let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name) {
-                if let Some(ref sb) = parent_cmd.sandbox {
-                    if sb.allow_commands.contains(&request.command) {
-                        debug!(
-                            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
-                            request.command, &**parent_name
-                        );
-                        // No per-command sandbox — same as the capture path.
-                        // The real binary needs full access to system resources
-                        // (e.g. Keychain, vault) to fetch credentials. Security
-                        // comes from the parent's sandbox, not the child's.
-                        // Stream stdio directly through the shim's fds.
-                        let result = exec_passthrough(
-                            cmd,
-                            &request.args,
-                            &request.env,
-                            &broker,
-                            None,
-                            ctx,
-                            commands,
-                            Some((stdin_fd, stdout_fd, stderr_fd)),
-                            request.cwd.as_deref(),
-                        )
-                        .await;
-                        return (result, "passthrough");
-                    }
-                }
-            }
-        }
+    // skip intercepts — credentials flow between trusted sub-processes, not to the
+    // agent. The sandbox context nonce is unforgeable (only the server can issue
+    // valid nonces).
+    //
+    // The child's own per-command sandbox is still applied. Skipping it here would
+    // let a parent with `allow_commands: ["ssh"]` invoke ssh entirely unsandboxed,
+    // re-opening the ProxyCommand exfil class that the process-exec default-deny
+    // is designed to close (issue #249). The child's sandbox already grants the
+    // filesystem access the child needs (~/.ssh for ssh, ~/.vault-token for
+    // ddtool, etc.), so applying it here doesn't break the credential flow.
+    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
+        && let Some(parent_name) = broker.resolve(ctx_nonce)
+        && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
+        && let Some(ref sb) = parent_cmd.sandbox
+        && sb.allow_commands.contains(&request.command)
+    {
+        debug!(
+            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
+            request.command, &**parent_name
+        );
+        let result = exec_passthrough(
+            cmd,
+            &request.args,
+            &request.env,
+            &broker,
+            cmd.sandbox.clone(),
+            ctx,
+            commands,
+            Some((stdin_fd, stdout_fd, stderr_fd)),
+            request.cwd.as_deref(),
+        )
+        .await;
+        return (result, "passthrough");
     }
 
     // Check intercept rules in order
@@ -701,7 +701,10 @@ async fn exec_passthrough(
     // with the broker's resolved value, so headers like
     // `Authorization: Bearer nono_...` expand to the real token before the
     // exec'd command sees them.
-    let args: Vec<String> = args.iter().map(|a| promote_nonces_in_str(a, broker)).collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| promote_nonces_in_str(a, broker))
+        .collect();
 
     let real_path = cmd.real_path.clone();
     let cmd_name = cmd.name.clone();
@@ -732,31 +735,52 @@ async fn exec_passthrough(
         })
         .unwrap_or_default();
 
+    // Collect full real binary paths for allow_commands targets so they can be
+    // exec'd directly (bypassing the shim) inside this command's sandbox when
+    // process-exec is restricted by default.
+    let allowed_binary_real_paths: Vec<std::path::PathBuf> = sandbox
+        .as_ref()
+        .map(|sb| &sb.allow_commands)
+        .filter(|ac| !ac.is_empty())
+        .map(|allow_cmds| {
+            allow_cmds
+                .iter()
+                .filter_map(|name| {
+                    all_commands
+                        .iter()
+                        .find(|c| c.name == *name)
+                        .map(|c| c.real_path.clone())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Start a per-command proxy if allowed_hosts is configured (and block is not set).
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
     let mut proxy_port: Option<u16> = None;
 
-    if let Some(ref sb) = sandbox {
-        if !sb.network.allowed_hosts.is_empty() && !sb.network.block {
-            let proxy_config = nono_proxy::ProxyConfig {
-                allowed_hosts: sb.network.allowed_hosts.clone(),
-                ..Default::default()
-            };
-            match nono_proxy::start(proxy_config).await {
-                Ok(handle) => {
-                    for (k, v) in handle.env_vars() {
-                        env.insert(k, v);
-                    }
-                    proxy_port = Some(handle.port);
-                    proxy_handle = Some(handle);
+    if let Some(ref sb) = sandbox
+        && !sb.network.allowed_hosts.is_empty()
+        && !sb.network.block
+    {
+        let proxy_config = nono_proxy::ProxyConfig {
+            allowed_hosts: sb.network.allowed_hosts.clone(),
+            ..Default::default()
+        };
+        match nono_proxy::start(proxy_config).await {
+            Ok(handle) => {
+                for (k, v) in handle.env_vars() {
+                    env.insert(k, v);
                 }
-                Err(e) => {
-                    return ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!("nono-mediation: failed to start network proxy: {}\n", e),
-                        exit_code: 1,
-                    };
-                }
+                proxy_port = Some(handle.port);
+                proxy_handle = Some(handle);
+            }
+            Err(e) => {
+                return ShimResponse {
+                    stdout: String::new(),
+                    stderr: format!("nono-mediation: failed to start network proxy: {}\n", e),
+                    exit_code: 1,
+                };
             }
         }
     }
@@ -834,10 +858,10 @@ async fn exec_passthrough(
             // system paths (e.g. ~/dd/devtools/bin/gh). Use the ORIGINAL (pre-canonicalize)
             // parent so FsCapability emits Seatbelt rules for both the symlink path and the
             // resolved canonical path — Seatbelt checks paths as-accessed (pre-resolution).
-            if let Some(parent) = real_path.parent() {
-                if parent.exists() {
-                    caps = caps.allow_path(parent, nono::AccessMode::Read)?;
-                }
+            if let Some(parent) = real_path.parent()
+                && parent.exists()
+            {
+                caps = caps.allow_path(parent, nono::AccessMode::Read)?;
             }
 
             // Allow the shim directory and the nono-shim binary so that subprocesses
@@ -852,6 +876,30 @@ async fn exec_passthrough(
             // their real binaries directly (bypassing the shim).
             for dir in &allowed_binary_dirs {
                 caps = caps.allow_path(dir, nono::AccessMode::Read)?;
+            }
+
+            // Process-spawn gating.
+            //
+            // By default a per-command sandbox cannot spawn child processes via
+            // process-exec. This closes the ssh ProxyCommand exfil class where a
+            // Seatbelt child inherits ssh's fs_read access to ~/.ssh and uses
+            // /bin/sh -c to smuggle private keys out via the network. Commands
+            // that legitimately shell out to helpers (git, gh, aws, kubectl, etc.)
+            // must opt in with `allow_process_exec: true` in their CommandSandbox.
+            // See docs/cli/features/profile-authoring.mdx § "Per-command Sandboxes".
+            //
+            // Even when restricted, the command must be able to launch itself and
+            // any binaries it declares via `allow_commands` — those run directly
+            // inside this command's sandbox, bypassing the shim.
+            if !sb.allow_process_exec {
+                caps = caps.restrict_process_exec();
+                caps = caps.allow_exec_path(&real_path);
+                if let Some(ref real_shim) = real_shim_binary {
+                    caps = caps.allow_exec_path(real_shim);
+                }
+                for bin in &allowed_binary_real_paths {
+                    caps = caps.allow_exec_path(bin);
+                }
             }
 
             // Add command-specific configured paths. `~` and `$VAR` tokens
@@ -880,13 +928,13 @@ async fn exec_passthrough(
             // keychain without exposing them to the agent (the token flows through
             // the command's internal auth, not stdout).
             #[cfg(target_os = "macos")]
-            if sb.keychain_access {
-                if let Ok(home) = std::env::var("HOME") {
-                    let login = format!("{}/Library/Keychains/login.keychain-db", home);
-                    let metadata = format!("{}/Library/Keychains/metadata.keychain-db", home);
-                    caps = add_sandbox_file(caps, &login, nono::AccessMode::Read, &cmd_name)?;
-                    caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
-                }
+            if sb.keychain_access
+                && let Ok(home) = std::env::var("HOME")
+            {
+                let login = format!("{}/Library/Keychains/login.keychain-db", home);
+                let metadata = format!("{}/Library/Keychains/metadata.keychain-db", home);
+                caps = add_sandbox_file(caps, &login, nono::AccessMode::Read, &cmd_name)?;
+                caps = add_sandbox_file(caps, &metadata, nono::AccessMode::Read, &cmd_name)?;
             }
 
             if sb.network.block {
@@ -1336,9 +1384,9 @@ fn substitute_one_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mediation::CallerPolicy;
     use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
     use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
-    use crate::mediation::CallerPolicy;
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
@@ -2179,11 +2227,12 @@ mod tests {
             JsonCaptureOutcome::Rewritten(s) => s,
             JsonCaptureOutcome::FailClosed(msg) => panic!("missing path must not fail-closed: {msg}"),
         };
-        let parsed: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten JSON parses");
         assert!(
             parsed["claudeAiOauth"]["accessToken"]
                 .as_str()
-                .unwrap()
+                .expect("accessToken is a string")
                 .starts_with("nono_")
         );
     }
@@ -2250,10 +2299,14 @@ mod tests {
             other => panic!("expected Rewritten, got: {other:?}"),
         };
 
-        let p1: serde_json::Value = serde_json::from_str(&first).unwrap();
-        let p2: serde_json::Value = serde_json::from_str(&second).unwrap();
-        let n1 = p1["claudeAiOauth"]["accessToken"].as_str().unwrap();
-        let n2 = p2["claudeAiOauth"]["accessToken"].as_str().unwrap();
+        let p1: serde_json::Value = serde_json::from_str(&first).expect("first JSON parses");
+        let p2: serde_json::Value = serde_json::from_str(&second).expect("second JSON parses");
+        let n1 = p1["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("p1 accessToken string");
+        let n2 = p2["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("p2 accessToken string");
         assert!(n1.starts_with("nono_"));
         assert!(n2.starts_with("nono_"));
         assert_ne!(n1, n2, "each call must mint a fresh nonce");
@@ -2344,7 +2397,10 @@ mod tests {
         // Substring promotion: unknown nonces are passed through verbatim
         // rather than discarded. The sandbox can probe shape but cannot recover
         // any issued nonce this way.
-        assert_eq!(env.get("MY_TOKEN").map(|s| s.as_str()), Some(unknown.as_str()));
+        assert_eq!(
+            env.get("MY_TOKEN").map(|s| s.as_str()),
+            Some(unknown.as_str())
+        );
     }
 
     // --- Filtered shim dir tests ---
@@ -2936,6 +2992,324 @@ mod tests {
         );
     }
 
+    // --- allow_process_exec tests ---
+
+    /// Default per-command sandbox (allow_process_exec: false) blocks subprocess
+    /// spawning at the Seatbelt layer. This closes the ssh ProxyCommand exfil
+    /// class — a sandbox that grants ~/.ssh fs_read cannot launch /bin/sh to
+    /// smuggle key material out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_per_command_sandbox_denies_subprocess_by_default() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: false,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        // /bin/sh runs (its path is allowed via real_path) but cannot launch
+        // /usr/bin/true; sh reports non-zero exit.
+        assert_ne!(
+            resp.exit_code, 0,
+            "expected sh to fail launching /usr/bin/true under deny-by-default; stdout={} stderr={}",
+            resp.stdout, resp.stderr
+        );
+    }
+
+    /// `allow_process_exec: true` lifts the deny so a command can shell out to
+    /// helpers freely. Used by trusted commands with helper sprawl (git, gh, aws,
+    /// kubectl, etc.) where enumerating every helper is impractical.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_per_command_sandbox_allows_subprocess_when_opted_in() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: true,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(
+            resp.exit_code, 0,
+            "expected sh -c /usr/bin/true to succeed with allow_process_exec=true; stderr={}",
+            resp.stderr
+        );
+    }
+
+    /// `allow_commands` targets are exec-allowed inside the caller's sandbox
+    /// even when `allow_process_exec: false`. Verifies the bypass-the-shim
+    /// design: the listed binary is run directly with no re-mediation.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_allow_commands_binary_is_exec_allowed_when_restricted() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        // build_filtered_shim_dir requires fake shim files in shim_dir, and
+        // creates the filtered dir as a sibling — so shim_dir's parent must
+        // be writable. Use a tempdir.
+        let session_dir = tempfile::tempdir().expect("create temp dir");
+        let shim_dir = session_dir.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        for name in &["testcmd", "myhelper"] {
+            let p = shim_dir.join(name);
+            std::fs::write(&p, "fake-shim").expect("write shim");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let other = ResolvedCommand {
+            name: "myhelper".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec!["myhelper".to_string()],
+                keychain_access: false,
+                allow_process_exec: false,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["/usr/bin/true".to_string()],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, action_type) = apply_capture(
+            req,
+            &[cmd, other],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: &shim_dir,
+                shim_sources_dir: &shim_dir,
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action_type, "passthrough");
+        assert_eq!(
+            resp.exit_code, 0,
+            "expected allow_commands target to be exec-allowed even under restrict; stderr={}",
+            resp.stderr
+        );
+    }
+
+    /// Regression: `allow_process_exec: true` does not bypass the filesystem sandbox.
+    ///
+    /// git (and similar commands) carry `allow_process_exec: true` so they can run
+    /// hooks and credential helpers. The risk is that a subprocess spawned by git
+    /// (e.g. ssh via a ProxyCommand) could read sensitive files such as `~/.ssh`
+    /// private keys. This test verifies that even with `allow_process_exec: true`,
+    /// the per-command filesystem grants still bound what subprocesses can read.
+    ///
+    /// We write a sentinel file to `$HOME` (outside system_read_macos paths like
+    /// /tmp and /var) and verify a subprocess spawned inside a sandbox that does not
+    /// grant `$HOME` read access cannot exfiltrate it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_allow_process_exec_does_not_bypass_fs_sandbox() {
+        use crate::mediation::CommandSandbox;
+        use crate::mediation::NetworkConfig;
+
+        let sentinel_value = "NONO_FS_SENTINEL_12345";
+
+        // Hold ENV_LOCK while reading HOME: other tests (rollback_runtime,
+        // exec_strategy) temporarily set HOME to a /tmp path while holding
+        // this lock. If we read HOME concurrently without the lock we may get
+        // a temp path that is inside system_read_macos (/tmp, /var) and the
+        // sentinel would be readable, causing a false failure.
+        let sentinel_path: String = {
+            let _lock = crate::test_env::ENV_LOCK.lock().expect("env lock");
+            let home = std::env::var("HOME").expect("HOME must be set");
+            // If HOME is a temp dir (set by a parallel test) the sentinel
+            // would land in a system-readable location — skip the test.
+            if home.starts_with("/tmp")
+                || home.starts_with("/private/tmp")
+                || home.starts_with("/var")
+            {
+                return;
+            }
+            let dir = format!("{}/.nono-test-regression-{}", home, std::process::id());
+            std::fs::create_dir_all(&dir).expect("create sentinel dir");
+            let path = format!("{}/secret", dir);
+            std::fs::write(&path, sentinel_value).expect("write sentinel");
+            path
+            // lock drops here
+        };
+        let sentinel_dir = std::path::Path::new(&sentinel_path)
+            .parent()
+            .expect("sentinel has parent")
+            .to_path_buf();
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+            intercepts: vec![],
+            sandbox: Some(CommandSandbox {
+                network: NetworkConfig {
+                    block: true,
+                    allowed_hosts: vec![],
+                },
+                fs_read: vec![],
+                fs_read_file: vec![],
+                fs_write: vec![],
+                fs_write_file: vec![],
+                allow_commands: vec![],
+                keychain_access: false,
+                allow_process_exec: true,
+            }),
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("cat '{}' 2>/dev/null; echo done", sentinel_path),
+            ],
+            session_token: String::new(),
+            env: HashMap::new(),
+            pid: 0,
+            cwd: None,
+        };
+
+        let broker = make_broker();
+        let (resp, _action_type) = apply_capture(
+            req,
+            &[cmd],
+            Arc::clone(&broker),
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+            },
+            always_allow(),
+        )
+        .await;
+
+        let _ = std::fs::remove_dir_all(&sentinel_dir);
+
+        assert!(
+            !resp.stdout.contains(sentinel_value),
+            "subprocess with allow_process_exec: true read a file outside fs_read grants \
+             (git ProxyCommand bypass); stdout={}",
+            resp.stdout
+        );
+    }
+
     // --- Streaming passthrough fd-protocol tests ---
 
     /// Pipe binary data (every byte 0x00..=0xFF, including 0xFF) through the
@@ -3172,10 +3546,7 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
         let arg = format!("X-Token: {}", nonce);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "X-Token: real-token"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "X-Token: real-token");
     }
 
     #[test]
@@ -3184,10 +3555,7 @@ mod tests {
         let a = broker.issue(Zeroizing::new("AAA".to_string()));
         let b = broker.issue(Zeroizing::new("BBB".to_string()));
         let arg = format!("first={} second={}", a, b);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "first=AAA second=BBB"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "first=AAA second=BBB");
     }
 
     #[test]
@@ -3217,16 +3585,16 @@ mod tests {
         let broker = TokenBroker::new();
         let nonce = broker.issue(Zeroizing::new("XYZ".to_string()));
         let arg = format!("prefix-{}-suffix", nonce);
-        assert_eq!(
-            promote_nonces_in_str(&arg, &broker),
-            "prefix-XYZ-suffix"
-        );
+        assert_eq!(promote_nonces_in_str(&arg, &broker), "prefix-XYZ-suffix");
     }
 
     #[test]
     fn promote_nonces_no_match_returns_original() {
         let broker = TokenBroker::new();
-        assert_eq!(promote_nonces_in_str("plain string", &broker), "plain string");
+        assert_eq!(
+            promote_nonces_in_str("plain string", &broker),
+            "plain string"
+        );
         assert_eq!(promote_nonces_in_str("", &broker), "");
     }
 

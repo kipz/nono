@@ -205,7 +205,9 @@ pub fn setup(
                 if !command_names.contains(&allowed.as_str()) {
                     tracing::warn!(
                         "mediation: command '{}' lists '{}' in allow_commands but '{}' is not a mediated command",
-                        entry.name, allowed, allowed
+                        entry.name,
+                        allowed,
+                        allowed
                     );
                 }
             }
@@ -219,10 +221,10 @@ pub fn setup(
         // Also push the canonicalized target so that exec via the real binary
         // path is blocked even when the agent bypasses the symlink.
         blocked_binaries.push(resolved.real_path.clone());
-        if let Ok(canonical) = resolved.real_path.canonicalize() {
-            if canonical != resolved.real_path {
-                blocked_binaries.push(canonical);
-            }
+        if let Ok(canonical) = resolved.real_path.canonicalize()
+            && canonical != resolved.real_path
+        {
+            blocked_binaries.push(canonical);
         }
         resolved_commands.push(resolved);
     }
@@ -739,9 +741,10 @@ mod tests {
     #[test]
     fn test_session_dir_path_has_pid() {
         let path = session_dir_path();
-        assert!(path
-            .to_string_lossy()
-            .contains(&std::process::id().to_string()));
+        assert!(
+            path.to_string_lossy()
+                .contains(&std::process::id().to_string())
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 use super::admin::AdminModeStatus;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
-use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
+use super::policy::{ShimRequest, ShimResponse, admin_passthrough, apply};
 use super::session::ResolvedCommand;
 use super::{AuditEvent, SessionAuditInfo};
 use nix::libc;
@@ -339,10 +339,10 @@ async fn recv_three_fds(
             let mut fds = [-1i32; 3];
             // SAFETY: CMSG_DATA points at the fd payload for this header.
             unsafe {
-                for i in 0..n {
+                for (i, fd) in fds.iter_mut().enumerate().take(n) {
                     std::ptr::copy_nonoverlapping(
                         libc::CMSG_DATA(cmsg).add(i * fd_size),
-                        (&mut fds[i] as *mut RawFd).cast::<u8>(),
+                        (fd as *mut RawFd).cast::<u8>(),
                         fd_size,
                     );
                 }
@@ -432,9 +432,8 @@ fn bind_socket_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixListen
     })?;
 
     let old_umask = unsafe { libc::umask(0o077) };
-    let std_listener = std::os::unix::net::UnixListener::bind(path).map_err(|e| {
+    let std_listener = std::os::unix::net::UnixListener::bind(path).inspect_err(|_e| {
         unsafe { libc::umask(old_umask) };
-        e
     });
     unsafe { libc::umask(old_umask) };
 
@@ -456,9 +455,8 @@ fn bind_dgram_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixDatagra
     })?;
 
     let old_umask = unsafe { libc::umask(0o077) };
-    let std_sock = std::os::unix::net::UnixDatagram::bind(path).map_err(|e| {
+    let std_sock = std::os::unix::net::UnixDatagram::bind(path).inspect_err(|_e| {
         unsafe { libc::umask(old_umask) };
-        e
     });
     unsafe { libc::umask(old_umask) };
 
@@ -510,10 +508,9 @@ fn append_audit_log(audit_log_dir: &Path, event: &AuditEvent) {
         .append(true)
         .mode(0o600)
         .open(&log_path)
+        && let Ok(line) = serde_json::to_string(event)
     {
-        if let Ok(line) = serde_json::to_string(event) {
-            let _ = writeln!(f, "{}", line);
-        }
+        let _ = writeln!(f, "{}", line);
     }
 }
 
@@ -607,11 +604,11 @@ fn scrub_nono_tokens(s: &str) -> String {
 }
 
 fn scrub_url_credentials(value: &str) -> String {
-    if let Ok(mut u) = url::Url::parse(value) {
-        if u.password().is_some() {
-            let _ = u.set_password(Some("[redacted]"));
-            return u.to_string();
-        }
+    if let Ok(mut u) = url::Url::parse(value)
+        && u.password().is_some()
+    {
+        let _ = u.set_password(Some("[redacted]"));
+        return u.to_string();
     }
     value.to_string()
 }

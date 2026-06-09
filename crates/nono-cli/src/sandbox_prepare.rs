@@ -433,6 +433,7 @@ pub(crate) struct PreparedSandbox {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) bypass_protection_paths: Vec<PathBuf>,
     pub(crate) ignored_denial_paths: Vec<PathBuf>,
+    pub(crate) suppressed_system_service_operations: Vec<String>,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
@@ -1068,6 +1069,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 open_url_allow_localhost: false,
                 bypass_protection_paths: Vec::new(),
                 ignored_denial_paths: Vec::new(),
+                suppressed_system_service_operations: Vec::new(),
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
@@ -1103,6 +1105,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_parent_of_protected: profile_allow_parent_of_protected,
         bypass_protection_paths,
         ignored_denial_paths,
+        suppressed_system_service_operations,
         allowed_env_vars: profile_allowed_env_vars,
         denied_env_vars: profile_denied_env_vars,
     } = prepared_profile;
@@ -1379,6 +1382,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             open_url_allow_localhost,
             bypass_protection_paths,
             ignored_denial_paths,
+            suppressed_system_service_operations,
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,

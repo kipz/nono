@@ -149,10 +149,10 @@ where
 {
     for &key in API_KEY_ENV_VARS {
         // The profile would deny this var to the child anyway — skip it.
-        if let Some(denied) = denied_env_vars {
-            if is_env_var_denied(key, denied) {
-                continue;
-            }
+        if let Some(denied) = denied_env_vars
+            && is_env_var_denied(key, denied)
+        {
+            continue;
         }
         if let Some(value) = env_reader(key)
             && !value.is_empty()

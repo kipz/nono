@@ -374,6 +374,90 @@ fn delete_broker_entry_in_process(service: &str, account: &str) {
     }
 }
 
+/// Read the `claudeAiOauth.accessToken` field from claude's own
+/// `Claude Code-credentials` keychain entry, if present.
+///
+/// Used by [`super::broker::TokenBroker::with_store_and_reader`] to
+/// detect stale broker records (the user `/logout`-ed inside claude
+/// but our persisted record still holds the real refresh token).
+///
+/// All failure modes (keychain missing, locked, malformed JSON, no
+/// access token in the envelope) collapse to `None` — the caller
+/// treats both "no entry" and "couldn't read entry" identically:
+/// drop the broker record and force a re-login. This is the
+/// conservative choice: better to drop a live record than to leak a
+/// real token because we couldn't tell.
+#[cfg(target_os = "macos")]
+pub fn current_claude_access_token() -> Option<String> {
+    use security_framework::os::macos::passwords::find_generic_password;
+
+    let account = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
+    let service = claude_credentials_service_name()?;
+
+    let (password_bytes, _item) = find_generic_password(None, &service, &account).ok()?;
+    let raw = std::str::from_utf8(password_bytes.as_ref()).ok()?;
+    let envelope: serde_json::Value = serde_json::from_str(raw).ok()?;
+    envelope
+        .get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Derive the macOS keychain service name claude uses for its OAuth
+/// credentials. Mirrors the `sandbox_prepare::claude_keychain_service_name`
+/// logic (custom-oauth, staging/local toggles, explicit
+/// `CLAUDE_CONFIG_DIR` hash suffix) so this module stays self-contained
+/// without depending on `sandbox_prepare`.
+#[cfg(target_os = "macos")]
+fn claude_credentials_service_name() -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let (config_dir, explicit) = if let Some(custom) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        (std::path::PathBuf::from(custom), true)
+    } else {
+        let home = std::env::var_os("HOME")?;
+        (std::path::PathBuf::from(home).join(".claude"), false)
+    };
+
+    let suffix = claude_oauth_suffix();
+    let dir_hash = if explicit {
+        let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
+        let prefix = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("-{prefix}")
+    } else {
+        String::new()
+    };
+    Some(format!("Claude Code{suffix}-credentials{dir_hash}"))
+}
+
+#[cfg(target_os = "macos")]
+fn claude_oauth_suffix() -> &'static str {
+    if std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some() {
+        return "-custom-oauth";
+    }
+    if std::env::var("USER_TYPE").ok().as_deref() == Some("ant") {
+        let truthy = |key: &str| {
+            std::env::var(key).ok().is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        };
+        if truthy("USE_LOCAL_OAUTH") {
+            return "-local-oauth";
+        }
+        if truthy("USE_STAGING_OAUTH") {
+            return "-staging-oauth";
+        }
+    }
+    ""
+}
+
 // ── KeystoreBrokerStore ───────────────────────────────────────────────────────
 
 /// macOS Keychain-backed store. Not available on other platforms.

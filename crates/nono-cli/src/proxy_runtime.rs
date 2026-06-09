@@ -550,9 +550,13 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
 fn build_broker() -> TokenBroker {
     #[cfg(target_os = "macos")]
     {
-        use crate::mediation::broker_store::KeystoreBrokerStore;
+        use crate::mediation::broker_store::{KeystoreBrokerStore, current_claude_access_token};
         let store = std::sync::Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
-        match TokenBroker::with_store(store) {
+        // Pass the production reader so `with_store_and_reader` can
+        // detect orphaned broker records (e.g. user `/logout`-ed
+        // inside claude but our persisted record still holds the
+        // real refresh token).
+        match TokenBroker::with_store_and_reader(store, Box::new(current_claude_access_token)) {
             Ok(broker) => return broker,
             Err(e) => {
                 tracing::warn!(

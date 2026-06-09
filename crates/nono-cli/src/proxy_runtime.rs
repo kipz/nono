@@ -298,7 +298,6 @@ pub(crate) fn start_proxy_runtime(
     caps: &mut CapabilitySet,
     workdir: &std::path::Path,
     program: &OsStr,
-    silent: bool,
 ) -> Result<ActiveProxyRuntime> {
     if !proxy.active {
         return Ok(ActiveProxyRuntime {
@@ -339,15 +338,15 @@ pub(crate) fn start_proxy_runtime(
             }
         }
         let broker = Arc::new(build_broker());
-        // Pre-flight: detect any existing real Anthropic credential in
-        // the user's keychain / config / env and swap it for a broker-
-        // issued nonce before claude reads it. Without this the OAuth-
-        // capture feature is silently a no-op for already-authenticated
-        // users — see crates/nono-cli/src/oauth_preflight.rs.
+        // Pre-flight: fail closed if an API-key credential is already
+        // configured (env var, ~/.claude.json primaryApiKey, or the
+        // macOS "Claude Code" keychain entry without the
+        // "-credentials" suffix). The OAuth-capture path translates
+        // `Authorization: Bearer nono_<hex>` on egress; an API key would
+        // 401 against every request inside the CONNECT tunnel.
         oauth_preflight::run_oauth_preflight(
             broker.as_ref(),
             program,
-            silent,
             proxy.denied_env_vars.as_deref(),
         )?;
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;

@@ -1,20 +1,12 @@
-//! Pre-flight checks for `oauth_capture: true`.
-//!
-//! ### macOS
+//! Pre-flight checks for `oauth_capture: true`. macOS only.
 //!
 //! Protection of the macOS `Claude Code-credentials` keychain entry is
 //! handled by the mediation shim's `capture` action with `format: "json"`
 //! (see `docs/plans/2026-06-03-mediation-based-oauth-capture.md`). This
-//! module no longer rewrites the keychain; profile authors configure
-//! the substitution declaratively. Pre-flight on macOS only checks
-//! for fail-closed conditions — namely the presence of an API-key
-//! surface that the OAuth-capture path cannot translate.
-//!
-//! ### Linux
-//!
-//! `~/.claude/.credentials.json` is the only credential store on Linux
-//! (no keychain). The file is rewritten in place to hold nonces. This
-//! path is unchanged from the original PR-40 design.
+//! module does not rewrite the keychain; profile authors configure the
+//! substitution declaratively. Pre-flight only checks for fail-closed
+//! conditions — namely the presence of an API-key surface that the
+//! OAuth-capture path cannot translate.
 //!
 //! ### API-key surfaces (fail-closed)
 //!
@@ -35,10 +27,6 @@ use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::debug;
-#[cfg(any(test, not(target_os = "macos")))]
-use tracing::info;
-#[cfg(any(test, not(target_os = "macos")))]
-use zeroize::Zeroizing;
 
 /// API-key environment variables. The proxy does not rewrite
 /// `x-api-key: nono_<hex>` headers inside the CONNECT tunnel, so
@@ -54,7 +42,7 @@ const API_KEY_ENV_VARS: &[&str] = &[
 #[derive(Debug, Default)]
 pub(crate) struct PreflightOutcome;
 
-/// Run the pre-flight rewrite if the target program is `claude` and
+/// Run the pre-flight check if the target program is `claude` and
 /// OAuth capture is active. For any other program this is a quiet
 /// no-op — pre-flight is a Claude-Code-specific feature.
 ///
@@ -62,9 +50,8 @@ pub(crate) struct PreflightOutcome;
 /// env var the profile would strip before the child sees it is excluded
 /// from the fail-closed check.
 pub(crate) fn run_oauth_preflight(
-    broker: &TokenBroker,
+    _broker: &TokenBroker,
     program: &OsStr,
-    silent: bool,
     denied_env_vars: Option<&[String]>,
 ) -> Result<PreflightOutcome> {
     if !program_is_claude(program) {
@@ -83,13 +70,6 @@ pub(crate) fn run_oauth_preflight(
         )));
     }
 
-    // macOS: keychain protection is delivered by the mediation shim's
-    // `capture` action; no preflight write happens here.
-    // Linux: rewrite .credentials.json so plugins reading the file see
-    // nonces. Env vars are handled by the profile's denied_env_vars at
-    // exec time.
-    rewrite_credentials_file(broker, silent)?;
-
     Ok(PreflightOutcome)
 }
 
@@ -99,14 +79,6 @@ fn program_is_claude(program: &OsStr) -> bool {
         .and_then(OsStr::to_str)
         .map(|name| name == "claude")
         .unwrap_or(false)
-}
-
-#[cfg(any(test, not(target_os = "macos")))]
-fn log_capture(silent: bool, surface: &str) {
-    info!("oauth_capture pre-flight: captured existing credential from {surface}");
-    if !silent {
-        eprintln!("  [nono] OAuth capture: replaced real token in {surface} with nono_ nonce");
-    }
 }
 
 /// Returns `Some(reason)` if an API-key credential is present anywhere
@@ -217,184 +189,6 @@ fn detect_api_key_keychain_macos() -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Rewrite `~/.claude/.credentials.json` on Linux (the only credential
-/// store on that platform). On macOS `load_claude_oauth_state()` reads
-/// the keychain first and never reaches the file once the keychain holds
-/// nonces, so sweeping it would be redundant.
-#[cfg(not(target_os = "macos"))]
-fn rewrite_credentials_file(broker: &TokenBroker, silent: bool) -> Result<()> {
-    let config_dir = match claude_config_dir_cross_platform() {
-        Some(dir) => dir,
-        None => return Ok(()),
-    };
-    rewrite_credentials_file_at(&config_dir, broker, silent)
-}
-
-#[cfg(target_os = "macos")]
-fn rewrite_credentials_file(_broker: &TokenBroker, _silent: bool) -> Result<()> {
-    Ok(())
-}
-
-/// Test-friendly variant: rewrite `<config_dir>/.credentials.json`. The
-/// production code path resolves `config_dir` from `CLAUDE_CONFIG_DIR`
-/// or `~/.claude`; tests inject a path directly so they don't have to
-/// mutate process-global env vars (which race under cargo's parallel
-/// test runner).
-#[cfg(any(test, not(target_os = "macos")))]
-fn rewrite_credentials_file_at(
-    config_dir: &Path,
-    broker: &TokenBroker,
-    silent: bool,
-) -> Result<()> {
-    let path = config_dir.join(".credentials.json");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(r) => r,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(NonoError::SandboxInit(format!(
-                "oauth_capture pre-flight: could not read {}: {err}",
-                path.display()
-            )));
-        }
-    };
-
-    let mut parsed: Value = serde_json::from_str(&raw).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: {} is not valid JSON: {err}",
-            path.display()
-        ))
-    })?;
-
-    let oauth = match parsed
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("claudeAiOauth"))
-        .and_then(Value::as_object_mut)
-    {
-        Some(obj) => obj,
-        None => return Ok(()),
-    };
-
-    let access = oauth
-        .get("accessToken")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let refresh = oauth
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-
-    if access.as_deref().is_none_or(str::is_empty)
-        || access.as_deref().is_some_and(|v| v.starts_with("nono_"))
-    {
-        return Ok(());
-    }
-
-    let access_token = access.ok_or_else(|| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: {} has no accessToken to capture",
-            path.display()
-        ))
-    })?;
-
-    let (access_nonce, refresh_nonce) = match refresh.as_deref() {
-        Some(real_refresh) if !real_refresh.is_empty() && !real_refresh.starts_with("nono_") => {
-            // Two independent `issue` calls — same behaviour the broker's
-            // former `capture_oauth_pair` had now that durable persistence
-            // is gone.
-            let access_nonce = broker.issue(Zeroizing::new(access_token));
-            let refresh_nonce = broker.issue(Zeroizing::new(real_refresh.to_string()));
-            (access_nonce, refresh_nonce)
-        }
-        _ => {
-            let access_nonce = broker.issue(Zeroizing::new(access_token));
-            let refresh_nonce = refresh.unwrap_or_default();
-            (access_nonce, refresh_nonce)
-        }
-    };
-
-    oauth.insert(
-        "accessToken".to_string(),
-        Value::String(access_nonce.clone()),
-    );
-    if !refresh_nonce.is_empty() {
-        oauth.insert("refreshToken".to_string(), Value::String(refresh_nonce));
-    }
-
-    let rewritten = serde_json::to_string(&parsed).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: could not re-serialise {}: {err}",
-            path.display()
-        ))
-    })?;
-
-    atomic_write(&path, &rewritten)?;
-    log_capture(silent, &format!("file {}", path.display()));
-    Ok(())
-}
-
-/// Atomic file replace preserving owner-only permissions on Unix. Writes
-/// to a sibling `.tmp` file, fsyncs, then renames into place.
-#[cfg(any(test, not(target_os = "macos")))]
-fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    use std::io::Write;
-
-    let parent = path.parent().ok_or_else(|| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: {} has no parent directory",
-            path.display()
-        ))
-    })?;
-    let tmp = parent.join(format!(".credentials.json.nono-{}", std::process::id()));
-
-    let mut open_opts = std::fs::OpenOptions::new();
-    open_opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_opts.mode(0o600);
-    }
-
-    let mut file = open_opts.open(&tmp).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: could not open {} for write: {err}",
-            tmp.display()
-        ))
-    })?;
-    file.write_all(content.as_bytes()).map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: write to {} failed: {err}",
-            tmp.display()
-        ))
-    })?;
-    file.sync_all().map_err(|err| {
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: fsync {} failed: {err}",
-            tmp.display()
-        ))
-    })?;
-    drop(file);
-
-    std::fs::rename(&tmp, path).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: rename {} -> {} failed: {err}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    Ok(())
-}
-
-/// Resolve the Claude config directory the same way `claude` itself does.
-/// Returns `None` if `HOME` is unset (very rare, like an empty CI env).
-#[cfg(not(target_os = "macos"))]
-fn claude_config_dir_cross_platform() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-        return Some(PathBuf::from(value));
-    }
-    dirs::home_dir().map(|h| h.join(".claude"))
-}
-
 // --- macOS keychain helpers (duplicated thin wrappers around the same
 //     ones in `sandbox_prepare`; kept private here so this module stays
 //     self-contained and re-usable in tests without dragging the full
@@ -501,7 +295,7 @@ mod tests {
         // Even with a real-token-bearing env var, pre-flight skips when
         // the program isn't claude. (Other binaries don't read these.)
         let broker = TokenBroker::new();
-        run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), true, None).unwrap();
+        run_oauth_preflight(&broker, OsStr::new("/usr/bin/codex"), None).unwrap();
     }
 
     #[test]
@@ -516,105 +310,6 @@ mod tests {
         assert!(!global_config_has_primary_api_key(r#"{}"#).unwrap());
         assert!(!global_config_has_primary_api_key(r#"{"primaryApiKey":null}"#).unwrap());
         assert!(global_config_has_primary_api_key("not json").is_err());
-    }
-
-    fn write_credentials_at(config_dir: &Path, contents: &str) -> PathBuf {
-        std::fs::create_dir_all(config_dir).unwrap();
-        let path = config_dir.join(".credentials.json");
-        std::fs::write(&path, contents).unwrap();
-        path
-    }
-
-    #[test]
-    fn rewrite_credentials_file_replaces_real_pair_with_nonces() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        let path = write_credentials_at(
-            &config_dir,
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-real-access","refreshToken":"sk-ant-ort01-real-refresh","subscriptionType":"max"}}"#,
-        );
-
-        let broker = TokenBroker::new();
-        rewrite_credentials_file_at(&config_dir, &broker, true).unwrap();
-
-        let rewritten = std::fs::read_to_string(&path).unwrap();
-        let parsed: Value = serde_json::from_str(&rewritten).unwrap();
-        let oauth = parsed.get("claudeAiOauth").unwrap();
-        let new_access = oauth.get("accessToken").unwrap().as_str().unwrap();
-        let new_refresh = oauth.get("refreshToken").unwrap().as_str().unwrap();
-        assert!(
-            new_access.starts_with("nono_"),
-            "access not nonced: {new_access}"
-        );
-        assert!(
-            new_refresh.starts_with("nono_"),
-            "refresh not nonced: {new_refresh}"
-        );
-        assert_ne!(new_access, new_refresh);
-        assert_eq!(
-            oauth.get("subscriptionType").unwrap().as_str().unwrap(),
-            "max",
-            "non-oauth fields must be preserved across rewrite"
-        );
-
-        assert_eq!(
-            broker.resolve(new_access).unwrap().as_str(),
-            "sk-ant-oat01-real-access"
-        );
-        assert_eq!(
-            broker.resolve(new_refresh).unwrap().as_str(),
-            "sk-ant-ort01-real-refresh"
-        );
-    }
-
-    #[test]
-    fn rewrite_credentials_file_is_idempotent_when_nonces_already_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        let original = r#"{"claudeAiOauth":{"accessToken":"nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","refreshToken":"nono_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#;
-        let path = write_credentials_at(&config_dir, original);
-
-        let broker = TokenBroker::new();
-        rewrite_credentials_file_at(&config_dir, &broker, true).unwrap();
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, original, "nonce-bearing file must be left untouched");
-    }
-
-    #[test]
-    fn rewrite_credentials_file_handles_missing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        std::fs::create_dir_all(&config_dir).unwrap();
-
-        let broker = TokenBroker::new();
-        rewrite_credentials_file_at(&config_dir, &broker, true).unwrap();
-    }
-
-    #[test]
-    fn rewrite_credentials_file_returns_err_on_malformed_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        write_credentials_at(&config_dir, "not json at all");
-
-        let broker = TokenBroker::new();
-        let err = rewrite_credentials_file_at(&config_dir, &broker, true).unwrap_err();
-        assert!(err.to_string().contains("not valid JSON"), "got: {err}");
-    }
-
-    #[test]
-    #[allow(non_snake_case)]
-    fn rewrite_credentials_file_no_claudeAiOauth_object_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        let original = r#"{"otherField":"value"}"#;
-        let path = write_credentials_at(&config_dir, original);
-
-        let broker = TokenBroker::new();
-        rewrite_credentials_file_at(&config_dir, &broker, true).unwrap();
-
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, original);
     }
 
     /// Helper: build an env-reader closure from a static slice of pairs.
@@ -712,37 +407,6 @@ mod tests {
         assert!(
             detect_primary_api_key_in_file(&path).unwrap().is_none(),
             "missing file must not be an error"
-        );
-    }
-
-    #[test]
-    fn rewrite_credentials_file_only_access_token_uses_issue_not_capture_pair() {
-        // If the file only has accessToken (no refresh), we still mint a
-        // nonce for the access token via `issue` and leave the refresh
-        // slot untouched (or empty). `capture_oauth_pair` wouldn't be a
-        // good fit because it always persists a pair to the broker store;
-        // single-token surfaces just get a session-scoped resolve.
-        let tmp = tempfile::tempdir().unwrap();
-        let config_dir = tmp.path().join(".claude");
-        let path = write_credentials_at(
-            &config_dir,
-            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-only"}}"#,
-        );
-
-        let broker = TokenBroker::new();
-        rewrite_credentials_file_at(&config_dir, &broker, true).unwrap();
-
-        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let oauth = after.get("claudeAiOauth").unwrap();
-        let new_access = oauth.get("accessToken").unwrap().as_str().unwrap();
-        assert!(new_access.starts_with("nono_"));
-        assert_eq!(
-            broker.resolve(new_access).unwrap().as_str(),
-            "sk-ant-oat01-only"
-        );
-        assert!(
-            oauth.get("refreshToken").is_none(),
-            "must not invent a refresh slot we didn't have"
         );
     }
 }

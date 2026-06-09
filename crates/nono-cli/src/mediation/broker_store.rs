@@ -14,7 +14,7 @@
 //! previous session, so the keychain entry the sandboxed claude reads
 //! continues to resolve.
 //!
-//! ## Keychain ACL
+//! ## Keychain ACL (LOAD-BEARING INVARIANT)
 //!
 //! The broker entry is created with a strict trusted-application ACL
 //! listing only the nono binary by path. `securityd` enforces this by
@@ -24,6 +24,23 @@
 //! the persisted real tokens unreachable from the agent even though
 //! shadowfax's profile grants the agent broad Mach IPC access to
 //! securityd.
+//!
+//! **This is the entire reason persistence is safe.** If the ACL is
+//! ever wide (e.g. created via `keyring::set_password`, which uses an
+//! "any application may access" default, or via `SecItemAdd` without
+//! `kSecAttrAccess`), the agent reads the real OAuth tokens directly.
+//! Every save path through this module MUST go through
+//! [`save_with_nono_acl`], which:
+//! 1. Calls [`create_nono_access`] with `current_exe()` to build a
+//!    `SecAccessRef` listing only nono's binary.
+//! 2. Sets the resulting access on the new entry via
+//!    `kSecAttrAccess` before calling `SecItemAdd`.
+//!
+//! Future maintainers: do not introduce a new save path that bypasses
+//! [`save_with_nono_acl`]. In particular, do not use
+//! `keyring::set_password` for the broker entry on macOS — the keyring
+//! crate's apple-native backend creates entries with the default ACL.
+//! `keyring` is intentionally not imported by this module's macOS code.
 //!
 //! All Security framework operations run in-process (the nono binary,
 //! which is in the ACL). No `security` CLI subprocess is used, removing
@@ -795,5 +812,113 @@ mod tests {
             !msg.contains("sk-ant-"),
             "msg must not contain any real token: {msg}"
         );
+    }
+
+    // ── ACL invariant ────────────────────────────────────────────────────
+    //
+    // The module-level docstring states that every save MUST go through
+    // `save_with_nono_acl`, which always calls `create_nono_access` with
+    // `current_exe()`. The tests below exercise that constructor for both
+    // success and failure paths. The full "the resulting keychain entry's
+    // ACL contains exactly nono and no other apps" round-trip is gated
+    // behind `#[ignore]` because it requires writing to the user's
+    // keychain — see `acl_round_trip_manual_only` for manual
+    // verification before release.
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn create_nono_access_succeeds_for_current_exe() {
+        // The happy path: the running binary always exists on disk, so
+        // `SecTrustedApplicationCreateFromPath` resolves it and
+        // `SecAccessCreate` returns an access object. This is the path
+        // every save in production takes; if this test ever fails, the
+        // production save path is broken and persistence reverts to
+        // in-memory only (build_broker's fallback).
+        let exe = std::env::current_exe().expect("test binary path");
+        let access = create_nono_access(&exe).expect("ACL build must succeed for current exe");
+        // The SecAccess type is opaque from Rust without further FFI, but
+        // having a non-null wrapper is sufficient to prove
+        // SecAccessCreate returned successfully — anything else would
+        // have been returned as Err above.
+        drop(access);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn create_nono_access_fails_for_nonexistent_path() {
+        // `SecTrustedApplicationCreateFromPath` requires the path to
+        // resolve to a real binary on disk. A nonexistent path must
+        // surface as Err rather than silently producing a SecAccess
+        // tied to a dangling reference. This is the safety check that
+        // prevents a future bug (e.g. resolving a relative path that
+        // doesn't exist) from creating a permissive-by-accident entry.
+        let bogus = std::path::Path::new("/this/path/does/not/exist/nono-bogus-test");
+        let result = create_nono_access(bogus);
+        assert!(
+            result.is_err(),
+            "ACL build must fail for nonexistent path; got Ok"
+        );
+    }
+
+    /// Manual ACL round-trip integration test.
+    ///
+    /// Writes a record to a unique test-only keychain entry, reads it
+    /// back, and asserts the save/load path works against the real
+    /// macOS Security framework.
+    ///
+    /// **Gated behind `#[ignore]`** because:
+    /// - It writes to the user's login keychain.
+    /// - Even with cleanup, an interruption leaves a stray entry the
+    ///   user can find in Keychain Access.app.
+    /// - Most CI environments do not have an unlocked login keychain
+    ///   available.
+    ///
+    /// Run manually before a release that changes anything in
+    /// `save_with_nono_acl`, `create_nono_access`, or the macOS FFI
+    /// bindings:
+    ///
+    /// ```bash
+    /// cargo test -p nono-cli --bin nono \
+    ///     mediation::broker_store::tests::acl_round_trip_manual_only \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// TODO: extend with the full ACL walk
+    /// (`SecAccessCopyACLList` → `SecACLCopyContents` →
+    /// `SecTrustedApplicationCopyData`) and assert exactly one trusted
+    /// app whose data matches `current_exe()`. Until that lands, this
+    /// test only proves the save/load round-trip works at all — not
+    /// that the ACL contains the right thing. Use Keychain Access.app
+    /// to manually inspect the entry's access control list during the
+    /// manual run window.
+    #[test]
+    #[ignore = "writes to login keychain; run manually before release"]
+    #[cfg(target_os = "macos")]
+    fn acl_round_trip_manual_only() {
+        // Unique service/account so we don't collide with the real
+        // broker entry under the same login keychain.
+        let service = format!("nono-acl-roundtrip-test-{}", std::process::id());
+        let account = "test_acl_roundtrip";
+
+        let record = PersistedRecord {
+            access_nonce: "nono_test_access".to_string(),
+            refresh_nonce: "nono_test_refresh".to_string(),
+            access_token: Zeroizing::new("not-a-real-token-access".to_string()),
+            refresh_token: Zeroizing::new("not-a-real-token-refresh".to_string()),
+        };
+        let store = KeystoreBrokerStore::new(service.clone(), account.to_string());
+
+        // Save → load round-trip.
+        store.save(&record).expect("save under unique service");
+        let loaded = store
+            .load()
+            .expect("load after save")
+            .expect("loaded record present");
+        assert_eq!(loaded.access_nonce, "nono_test_access");
+        assert_eq!(loaded.access_token.as_str(), "not-a-real-token-access");
+
+        // Clean up so the entry doesn't linger.
+        store.clear().expect("clear after roundtrip");
+        assert!(store.load().expect("post-clear load").is_none());
     }
 }

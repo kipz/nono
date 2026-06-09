@@ -117,9 +117,7 @@ fn log_capture(silent: bool, surface: &str) {
 /// the profile would strip from the child's env is excluded from the
 /// check — it won't reach the child regardless.
 fn detect_blocking_api_key_surface(denied_env_vars: Option<&[String]>) -> Result<Option<String>> {
-    if let Some(reason) =
-        detect_api_key_env_var_from(|k| std::env::var_os(k), denied_env_vars)
-    {
+    if let Some(reason) = detect_api_key_env_var_from(|k| std::env::var_os(k), denied_env_vars) {
         return Ok(Some(reason));
     }
 
@@ -143,7 +141,10 @@ fn detect_blocking_api_key_surface(denied_env_vars: Option<&[String]>) -> Result
 /// Test-friendly: scan `API_KEY_ENV_VARS` against an injected env reader,
 /// skipping any var the profile's deny list would strip before the child
 /// sees it.
-fn detect_api_key_env_var_from<F>(env_reader: F, denied_env_vars: Option<&[String]>) -> Option<String>
+fn detect_api_key_env_var_from<F>(
+    env_reader: F,
+    denied_env_vars: Option<&[String]>,
+) -> Option<String>
 where
     F: Fn(&str) -> Option<std::ffi::OsString>,
 {

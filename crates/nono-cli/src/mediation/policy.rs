@@ -9,10 +9,10 @@
 //! 5. If not matched: execs the real binary. `nono_<64-hex>` substrings inside both argv and
 //!    env-var values are replaced with the broker's real value before exec.
 
+use super::CaptureFormat;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
-use super::CaptureFormat;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -309,8 +309,8 @@ pub async fn apply(
                     match format {
                         None => {
                             // Default: treat stdout as one opaque credential.
-                            let nonce = broker
-                                .issue(Zeroizing::new(result.stdout.trim().to_string()));
+                            let nonce =
+                                broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
                             (
                                 ShimResponse {
                                     stdout: format!("{}\n", nonce),
@@ -2225,7 +2225,9 @@ mod tests {
         let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
         let rewritten = match outcome {
             JsonCaptureOutcome::Rewritten(s) => s,
-            JsonCaptureOutcome::FailClosed(msg) => panic!("missing path must not fail-closed: {msg}"),
+            JsonCaptureOutcome::FailClosed(msg) => {
+                panic!("missing path must not fail-closed: {msg}")
+            }
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&rewritten).expect("rewritten JSON parses");
@@ -2319,6 +2321,251 @@ mod tests {
         assert_eq!(
             broker.resolve(n2).map(|s| s.as_str().to_string()),
             Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+    }
+
+    // --- End-to-end JSON-format Capture via `apply` ---
+    //
+    // The unit tests above exercise `rewrite_json_secrets` in isolation.
+    // These tests drive the full dispatcher: a `ResolvedAction::Capture`
+    // with `format: Some(Json)` + `secret_paths`, running through `apply`
+    // via `apply_capture`. Catches regressions where the helper works but
+    // the dispatch arm in `apply` drops `format`/`secret_paths` or
+    // forwards them incorrectly.
+
+    /// Shell-escape a JSON literal so it survives `sh -c "echo '<literal>'"`.
+    /// Only escapes single quotes; the keychain envelope is otherwise
+    /// quote-safe under single quotes.
+    fn sh_single_quote(literal: &str) -> String {
+        format!("'{}'", literal.replace('\'', r"'\''"))
+    }
+
+    #[tokio::test]
+    async fn end_to_end_json_capture_substitutes_anthropic_paths() {
+        // Sim the macOS `security find-generic-password ... Claude
+        // Code-credentials` call: a script that emits a keychain-shaped
+        // JSON envelope on stdout. The intercept rule routes it through
+        // the JSON-format Capture path. Verify the dispatcher actually
+        // produces nonces in the response and the broker holds the
+        // real values.
+        let envelope = keychain_envelope_with_slack();
+        let script = format!("printf '%s' {}", sh_single_quote(envelope));
+
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec![
+                    "find-generic-password".to_string(),
+                    "chris".to_string(),
+                    "Claude Code-credentials".to_string(),
+                ],
+                action: ResolvedAction::Capture {
+                    script: Some(script),
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec![
+                        "claudeAiOauth.accessToken".to_string(),
+                        "claudeAiOauth.refreshToken".to_string(),
+                    ],
+                },
+                exit_code: 0,
+                admin: false,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "chris".to_string(),
+                "Claude Code-credentials".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let broker = make_broker();
+        let (resp, action) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+
+        assert_eq!(
+            action, "capture",
+            "must dispatch to capture, not passthrough"
+        );
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&resp.stdout).expect("response stdout parses as JSON");
+        let new_access = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("accessToken in response");
+        let new_refresh = parsed["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .expect("refreshToken in response");
+
+        assert!(
+            new_access.starts_with("nono_"),
+            "access not nonced: {new_access}"
+        );
+        assert!(
+            new_refresh.starts_with("nono_"),
+            "refresh not nonced: {new_refresh}"
+        );
+        assert_eq!(
+            broker.resolve(new_access).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(new_refresh).map(|s| s.as_str().to_string()),
+            Some("sk-ant-ort01-real-anthropic-refresh".to_string())
+        );
+
+        // The whole MCP subtree must pass through unchanged. This is the
+        // load-bearing assertion for the plugin-compat goal: future MCP
+        // plugins land under `mcpOAuth.<key>` and must not be nonced.
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["accessToken"].as_str(),
+            Some("real-slack-oauth-bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn end_to_end_json_capture_malformed_stdout_fail_closed() {
+        // Capture script emits non-JSON. The dispatcher must surface the
+        // fail-closed message and exit non-zero — and crucially must NOT
+        // return the raw stdout, which would leak the real credential.
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec!["find-generic-password".to_string()],
+                action: ResolvedAction::Capture {
+                    script: Some("printf 'sk-ant-oat01-SECRET-LEAK'".to_string()),
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec!["claudeAiOauth.accessToken".to_string()],
+                },
+                exit_code: 0,
+                admin: false,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+
+        assert_ne!(resp.exit_code, 0, "malformed JSON must exit non-zero");
+        assert!(
+            !resp.stdout.contains("sk-ant-oat01-SECRET-LEAK"),
+            "raw stdout (real credential) must not appear in response: {}",
+            resp.stdout
+        );
+        assert!(
+            !resp.stderr.contains("sk-ant-oat01-SECRET-LEAK"),
+            "raw stdout (real credential) must not leak via stderr: {}",
+            resp.stderr
+        );
+        assert!(
+            resp.stderr.contains("not valid JSON"),
+            "stderr must explain fail-closed reason: {}",
+            resp.stderr
+        );
+    }
+
+    // --- Argument-ordering regression: `security find-generic-password` ---
+    //
+    // `security find-generic-password` accepts both `<account> <service>`
+    // and `<service> <account>` positionals (it figures out which is
+    // which from `-a`/`-s` flags or from the option order). The
+    // shadowfax profile pre-pivot covers both literal orderings under
+    // separate `approve` rules; the mediation pivot must keep both
+    // routed to the JSON-format capture, otherwise an agent could pick
+    // the un-mediated ordering and leak. These tests pin
+    // `subcommand_matches` against the two real-world shapes so a
+    // future change to the matcher cannot silently break protection.
+
+    #[test]
+    fn args_ordering_user_then_service_matches() {
+        // `security find-generic-password $USER Claude Code-credentials`
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_service_then_user_matches() {
+        // `security find-generic-password Claude Code-credentials $USER`
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_with_interleaved_flags_still_matches() {
+        // Realistic Claude Code call: `security find-generic-password -w
+        // -a chris -s "Claude Code-credentials"`. The `-w`/`-a`/`-s`
+        // flags carry values but `subcommand_matches` filters anything
+        // starting with `-` from positional matching. The "chris" and
+        // service-string values would still appear in the positional
+        // stream and match the prefix.
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "-w".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_wrong_positional_order_does_not_match() {
+        // If the actual argv has user/service in the OPPOSITE order from
+        // the rule's args_prefix, the rule must not match (positional
+        // matching is order-sensitive). This is the negative case that
+        // forces a profile author to ship both orderings explicitly.
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        assert!(
+            !subcommand_matches(&prefix, &args),
+            "rule must NOT match the opposite ordering — both orderings need explicit rules"
         );
     }
 

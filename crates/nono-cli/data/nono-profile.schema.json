@@ -155,7 +155,7 @@
     },
     "oauth_capture": {
       "type": "boolean",
-      "description": "Capture and isolate Anthropic OAuth tokens during `claude /login`. When true, the proxy intercepts the OAuth token endpoint, hands the real `access_token`/`refresh_token` values to an in-memory broker, and substitutes opaque `nono_<hex>` nonces in the response body before it reaches the sandboxed client. The captured pair is also persisted under a nono-controlled keychain entry so a later nono session can rehydrate without forcing a re-login. Default false."
+      "description": "Capture Anthropic OAuth tokens during `claude /login`. When true, the proxy intercepts the Anthropic OAuth token endpoint and substitutes opaque `nono_<hex>` nonces in the response body so real `access_token`/`refresh_token` values never reach the sandboxed client; the proxy resolves nonces back to real bearers on egress. Per-session in-memory broker — cross-session protection for already-authenticated users requires the mediation shim's `capture` rule on the `security` keychain command (`format: \"json\"` with `secret_paths` targeting `claudeAiOauth.*`). Default false."
     }
   },
   "$defs": {

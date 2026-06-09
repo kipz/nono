@@ -535,12 +535,33 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
 
 /// Construct the OAuth-capture broker.
 ///
-/// In-memory only. Cross-session resume is no longer needed: claude's
-/// own keychain entry holds the real OAuth tokens, and the mediation
-/// shim's `capture { format: "json" }` action mints fresh nonces from
-/// the real values on each read — there's nothing to persist between
-/// sessions.
+/// On macOS, attempts to back the broker with a code-signed-ACL keychain
+/// entry under `service="nono", account="claude_oauth_broker"` so the
+/// captured `(access, refresh)` pair survives across nono sessions and a
+/// returning user does not have to `/login` again for every new session.
+/// If keystore init or load fails (locked keychain over SSH, ACL
+/// mismatch after a `cargo install` reinstall, etc.), falls back to an
+/// in-memory broker with a warning rather than refusing to start.
+///
+/// On non-macOS platforms, returns an in-memory-only broker. Linux's
+/// keyring backends have no per-entry ACL so persisting real OAuth
+/// tokens there would expose them to any same-user process, defeating
+/// the protection model.
 fn build_broker() -> TokenBroker {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::mediation::broker_store::KeystoreBrokerStore;
+        let store = std::sync::Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
+        match TokenBroker::with_store(store) {
+            Ok(broker) => return broker,
+            Err(e) => {
+                tracing::warn!(
+                    "OAuth broker keystore unavailable, falling back to in-memory only \
+                     (cross-session resume will not work this run): {e}"
+                );
+            }
+        }
+    }
     TokenBroker::new()
 }
 

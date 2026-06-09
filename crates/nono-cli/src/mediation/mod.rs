@@ -16,6 +16,7 @@
 pub mod admin;
 pub mod approval;
 pub mod broker;
+pub mod broker_store;
 pub mod control;
 pub mod merge;
 pub mod policy;

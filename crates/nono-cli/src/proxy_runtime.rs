@@ -514,28 +514,14 @@ fn prepare_intercept_ca_dir() -> Result<Option<PathBuf>> {
     Ok(Some(dir))
 }
 
-/// Construct the OAuth-capture broker, attempting to back it with a
-/// durable [`crate::mediation::broker_store::KeystoreBrokerStore`] so
-/// captured pairs persist across sessions. On any error initialising
-/// the store (e.g. no keyring backend available, headless Linux without
-/// secret-service), fall back to an in-memory broker and log at warn —
-/// capture still works for this session; only cross-session resume is
-/// lost.
+/// Construct the OAuth-capture broker.
+///
+/// In-memory only. Cross-session resume is no longer needed: claude's
+/// own keychain entry holds the real OAuth tokens, and the mediation
+/// shim's `capture { format: "json" }` action mints fresh nonces from
+/// the real values on each read — there's nothing to persist between
+/// sessions.
 fn build_broker() -> TokenBroker {
-    #[cfg(feature = "system-keyring")]
-    {
-        use crate::mediation::broker_store::KeystoreBrokerStore;
-        let store = Arc::new(KeystoreBrokerStore::default_for_claude_oauth());
-        match TokenBroker::with_store(store) {
-            Ok(broker) => return broker,
-            Err(e) => {
-                warn!(
-                    "OAuth broker keystore backend init failed; using in-memory broker only \
-                     (cross-session OAuth resume disabled this run): {e}"
-                );
-            }
-        }
-    }
     TokenBroker::new()
 }
 

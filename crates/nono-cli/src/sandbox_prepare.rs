@@ -21,8 +21,6 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use tracing::{info, warn};
 
 fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: bool) {
@@ -200,24 +198,18 @@ fn claude_keychain_account_name() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string())
 }
 
+/// In-process keychain read instead of spawning `/usr/bin/security`.
+/// See `oauth_preflight::read_keychain_item` for the rationale — same
+/// dialog-UX reason, and `Command::new("security")` inherits this
+/// process's stdin, which can interleave with the controlling terminal
+/// when a PTY-proxied claude session is running.
 #[cfg(target_os = "macos")]
 fn read_keychain_item(account: &str, service_name: &str) -> Option<String> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-a",
-            account,
-            "-w",
-            "-s",
-            service_name,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    Some(stdout.trim_end_matches(['\r', '\n']).to_string())
+    use security_framework::os::macos::passwords::find_generic_password;
+
+    let (password_bytes, _item) = find_generic_password(None, service_name, account).ok()?;
+    let s = std::str::from_utf8(password_bytes.as_ref()).ok()?;
+    Some(s.to_owned())
 }
 
 #[cfg(target_os = "macos")]

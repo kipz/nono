@@ -12,6 +12,7 @@
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
+use super::CaptureFormat;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -278,7 +279,11 @@ pub async fn apply(
                     },
                     "respond",
                 ),
-                ResolvedAction::Capture { script } => {
+                ResolvedAction::Capture {
+                    script,
+                    format,
+                    secret_paths,
+                } => {
                     let result = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
                         None => {
@@ -301,15 +306,41 @@ pub async fn apply(
                     if result.exit_code != 0 {
                         return (result, "capture");
                     }
-                    let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
-                    (
-                        ShimResponse {
-                            stdout: format!("{}\n", nonce),
-                            stderr: String::new(),
-                            exit_code: 0,
-                        },
-                        "capture",
-                    )
+                    match format {
+                        None => {
+                            // Default: treat stdout as one opaque credential.
+                            let nonce = broker
+                                .issue(Zeroizing::new(result.stdout.trim().to_string()));
+                            (
+                                ShimResponse {
+                                    stdout: format!("{}\n", nonce),
+                                    stderr: String::new(),
+                                    exit_code: 0,
+                                },
+                                "capture",
+                            )
+                        }
+                        Some(CaptureFormat::Json) => {
+                            match rewrite_json_secrets(&result.stdout, secret_paths, &broker) {
+                                JsonCaptureOutcome::Rewritten(json) => (
+                                    ShimResponse {
+                                        stdout: json,
+                                        stderr: String::new(),
+                                        exit_code: 0,
+                                    },
+                                    "capture",
+                                ),
+                                JsonCaptureOutcome::FailClosed(msg) => (
+                                    ShimResponse {
+                                        stdout: String::new(),
+                                        stderr: format!("{msg}\n"),
+                                        exit_code: 1,
+                                    },
+                                    "capture",
+                                ),
+                            }
+                        }
+                    }
                 }
                 ResolvedAction::Approve { script } => {
                     // Run the real binary (or script) and return the actual output.
@@ -1181,6 +1212,127 @@ fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
     out
 }
 
+/// Result of running `format: "json"` substitution on a captured stdout.
+#[derive(Debug)]
+enum JsonCaptureOutcome {
+    /// JSON parsed and substitution succeeded; carries the rewritten stdout.
+    Rewritten(String),
+    /// Operational failure: the stdout could not be processed safely. The
+    /// caller must NOT return the raw stdout — it may contain a real
+    /// credential. The wrapped string is a sandbox-safe error message.
+    FailClosed(String),
+}
+
+/// Run JSON-format substitution on captured stdout.
+///
+/// Parses `raw` as a JSON object, walks each dotted path in `secret_paths`
+/// to a string value, mints a nonce via `broker.issue`, and replaces the
+/// value with the nonce. Returns the rewritten JSON serialised as a String.
+///
+/// **Fail-closed contract**: every error path returns
+/// [`JsonCaptureOutcome::FailClosed`] with a sandbox-safe message rather
+/// than propagating an error that the caller might log alongside the raw
+/// stdout. Specifically:
+///
+/// - Malformed JSON → fail-closed. We never return `raw` unchanged because
+///   `raw` is the real credential the agent must not see.
+/// - A path resolves to a non-string value (number, object, array, bool,
+///   null) → fail-closed. A profile that targets a non-string path is
+///   misconfigured; returning the unmodified JSON would leak any string
+///   credentials siblings the profile *did* expect to nonce.
+/// - A path's parent doesn't exist or isn't an object → treated as
+///   "missing" and silently skipped (matches the documented behaviour
+///   in the design doc).
+///
+/// **Path syntax**: dotted, no escape syntax for keys containing literal
+/// dots (we have no in-tree need for them). `a.b.c` traverses three
+/// nested object keys.
+fn rewrite_json_secrets(
+    raw: &str,
+    secret_paths: &[String],
+    broker: &TokenBroker,
+) -> JsonCaptureOutcome {
+    let mut value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            // Use the line/column reporter from serde_json::Error rather
+            // than its message — the message can echo a snippet of the
+            // input on some inputs, and we must not include `raw` content
+            // in our error.
+            return JsonCaptureOutcome::FailClosed(format!(
+                "nono: capture format=json: stdout is not valid JSON \
+                 (at line {} column {}); refusing to return raw output",
+                e.line(),
+                e.column()
+            ));
+        }
+    };
+
+    for path in secret_paths {
+        match substitute_one_path(&mut value, path, broker) {
+            Ok(()) => {}
+            Err(SubstituteErr::NonString) => {
+                return JsonCaptureOutcome::FailClosed(format!(
+                    "nono: capture format=json: secret_path '{}' resolved \
+                     to a non-string value; refusing to return raw output \
+                     to avoid leaking unrelated string credentials",
+                    path
+                ));
+            }
+            Err(SubstituteErr::MissingPath) => {
+                // Silent skip — documented behaviour.
+            }
+        }
+    }
+
+    match serde_json::to_string(&value) {
+        Ok(s) => JsonCaptureOutcome::Rewritten(s),
+        Err(e) => JsonCaptureOutcome::FailClosed(format!(
+            "nono: capture format=json: could not re-serialise JSON ({}); \
+             refusing to return raw output",
+            e
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum SubstituteErr {
+    /// One of the path segments does not exist or its parent is not an
+    /// object. Caller treats this as a no-op for that path.
+    MissingPath,
+    /// The leaf value at the path is not a JSON string.
+    NonString,
+}
+
+fn substitute_one_path(
+    value: &mut serde_json::Value,
+    dotted: &str,
+    broker: &TokenBroker,
+) -> std::result::Result<(), SubstituteErr> {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    if segments.is_empty() {
+        return Err(SubstituteErr::MissingPath);
+    }
+    let (last, parents) = segments.split_last().unwrap_or((&"", &[]));
+
+    let mut cursor = value;
+    for seg in parents {
+        cursor = match cursor.as_object_mut().and_then(|m| m.get_mut(*seg)) {
+            Some(child) => child,
+            None => return Err(SubstituteErr::MissingPath),
+        };
+    }
+    let obj = cursor.as_object_mut().ok_or(SubstituteErr::MissingPath)?;
+    let entry = match obj.get_mut(*last) {
+        Some(e) => e,
+        None => return Err(SubstituteErr::MissingPath),
+    };
+    let s = entry.as_str().ok_or(SubstituteErr::NonString)?.to_string();
+    let nonce = broker.issue(Zeroizing::new(s));
+    *entry = serde_json::Value::String(nonce);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1830,7 +1982,11 @@ mod tests {
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
-            action: ResolvedAction::Capture { script: None },
+            action: ResolvedAction::Capture {
+                script: None,
+                format: None,
+                secret_paths: Vec::new(),
+            },
             exit_code: 0,
             admin: false,
         }]);
@@ -1880,6 +2036,8 @@ mod tests {
             args_prefix: vec!["auth".to_string()],
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
+                format: None,
+                secret_paths: Vec::new(),
             },
             exit_code: 0,
             admin: false,
@@ -1911,6 +2069,204 @@ mod tests {
         assert!(nonce.starts_with("nono_"), "expected nonce, got: {}", nonce);
         let resolved = broker.resolve(nonce).expect("nonce should be in broker");
         assert_eq!(resolved.as_str(), "my_secret_token");
+    }
+
+    // --- JSON-format capture (`rewrite_json_secrets`) tests ---
+
+    /// Realistic shape of the macOS `Claude Code-credentials` keychain
+    /// envelope: Anthropic OAuth + a Slack MCP entry under `mcpOAuth`.
+    fn keychain_envelope_with_slack() -> &'static str {
+        r#"{
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-real-anthropic-access",
+                "refreshToken": "sk-ant-ort01-real-anthropic-refresh",
+                "expiresAt": 1234567890000,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            },
+            "mcpOAuth": {
+                "abc123serverkey": {
+                    "serverName": "slack",
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "real-slack-oauth-bearer",
+                    "refreshToken": "real-slack-refresh",
+                    "expiresAt": 9876543210000
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn json_capture_substitutes_anthropic_paths_only() {
+        let broker = make_broker();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "claudeAiOauth.refreshToken".to_string(),
+        ];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        let rewritten = match outcome {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            JsonCaptureOutcome::FailClosed(msg) => {
+                panic!("expected Rewritten, got FailClosed: {msg}")
+            }
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten JSON parses");
+
+        // Anthropic tokens replaced with nonces, and those nonces resolve to
+        // the real values via the broker.
+        let new_access = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("access string");
+        let new_refresh = parsed["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .expect("refresh string");
+        assert!(
+            new_access.starts_with("nono_"),
+            "access wasn't nonced: {new_access}"
+        );
+        assert!(
+            new_refresh.starts_with("nono_"),
+            "refresh wasn't nonced: {new_refresh}"
+        );
+        assert_ne!(new_access, new_refresh, "must mint distinct nonces");
+        assert_eq!(
+            broker.resolve(new_access).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(new_refresh).map(|s| s.as_str().to_string()),
+            Some("sk-ant-ort01-real-anthropic-refresh".to_string())
+        );
+
+        // Slack MCP credentials must NOT be substituted — same field name
+        // ("accessToken") but at a path the profile didn't target. This is
+        // the field-path-collision regression test the design doc calls out.
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["accessToken"].as_str(),
+            Some("real-slack-oauth-bearer")
+        );
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["refreshToken"].as_str(),
+            Some("real-slack-refresh")
+        );
+
+        // Non-OAuth fields preserved verbatim.
+        assert_eq!(
+            parsed["claudeAiOauth"]["subscriptionType"].as_str(),
+            Some("max")
+        );
+        assert_eq!(
+            parsed["claudeAiOauth"]["expiresAt"].as_i64(),
+            Some(1234567890000)
+        );
+    }
+
+    #[test]
+    fn json_capture_missing_path_silently_skipped() {
+        // A path that doesn't exist anywhere in the envelope must NOT
+        // fail-closed — it's a documented no-op. Other matched paths
+        // still get substituted.
+        let broker = make_broker();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "nonExistentTopLevel.someField".to_string(),
+            "claudeAiOauth.notARealField".to_string(),
+        ];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        let rewritten = match outcome {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            JsonCaptureOutcome::FailClosed(msg) => panic!("missing path must not fail-closed: {msg}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&rewritten).unwrap();
+        assert!(
+            parsed["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .unwrap()
+                .starts_with("nono_")
+        );
+    }
+
+    #[test]
+    fn json_capture_non_string_value_fail_closed() {
+        // A path that resolves to a non-string (here, a number) must
+        // fail closed rather than return the unmodified envelope.
+        // Otherwise a misconfigured profile would silently expose
+        // sibling string credentials it *did* intend to nonce.
+        let broker = make_broker();
+        let paths = vec!["claudeAiOauth.expiresAt".to_string()];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        match outcome {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                assert!(
+                    msg.contains("non-string"),
+                    "error message must explain why: {msg}"
+                );
+                // Real values must not leak via the error message.
+                assert!(!msg.contains("sk-ant-oat01"));
+                assert!(!msg.contains("real-slack-oauth-bearer"));
+            }
+            JsonCaptureOutcome::Rewritten(s) => {
+                panic!("expected fail-closed for non-string value; got Rewritten: {s}")
+            }
+        }
+    }
+
+    #[test]
+    fn json_capture_malformed_input_fail_closed_no_leak() {
+        // Malformed JSON must fail closed. The raw input string must
+        // never appear in the error message — it may contain real
+        // credentials that the agent must not see via the error path.
+        let broker = make_broker();
+        let raw = r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-secret"} INVALID"#;
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+        match rewrite_json_secrets(raw, &paths, &broker) {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                assert!(msg.contains("not valid JSON"), "msg: {msg}");
+                assert!(
+                    !msg.contains("sk-ant-oat01-secret"),
+                    "error must not leak raw input: {msg}"
+                );
+            }
+            other => panic!("expected fail-closed on malformed JSON, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_capture_each_call_mints_fresh_nonces() {
+        // Idempotence-of-shape, not idempotence-of-output: running the
+        // same substitution twice must produce the same JSON keys but
+        // *different* nonces (the broker mints fresh on each issue()).
+        let broker = make_broker();
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+
+        let first = match rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker) {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            other => panic!("expected Rewritten, got: {other:?}"),
+        };
+        let second = match rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker) {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            other => panic!("expected Rewritten, got: {other:?}"),
+        };
+
+        let p1: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let p2: serde_json::Value = serde_json::from_str(&second).unwrap();
+        let n1 = p1["claudeAiOauth"]["accessToken"].as_str().unwrap();
+        let n2 = p2["claudeAiOauth"]["accessToken"].as_str().unwrap();
+        assert!(n1.starts_with("nono_"));
+        assert!(n2.starts_with("nono_"));
+        assert_ne!(n1, n2, "each call must mint a fresh nonce");
+
+        // Both nonces resolve to the same real value.
+        assert_eq!(
+            broker.resolve(n1).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(n2).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
     }
 
     // --- Env filtering tests ---
@@ -2157,9 +2513,12 @@ mod tests {
 
         // NONO_SHIM_DIR must NOT be the original shims/ directory — it should
         // be the filtered shim dir created by exec_passthrough.
+        // Explicit `&str` cast avoids an inference collision between
+        // stdlib's `AsRef<T> for Cow<'_, T>` and `typed_path`'s
+        // `AsRef<Utf8Path<T>> for Cow<'_, str>`.
+        let shim_dir_str: &str = &shim_dir.to_string_lossy();
         assert_ne!(
-            child_shim_dir,
-            shim_dir.to_string_lossy().as_ref(),
+            child_shim_dir, shim_dir_str,
             "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
         );
 

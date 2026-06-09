@@ -16,7 +16,6 @@
 pub mod admin;
 pub mod approval;
 pub mod broker;
-pub mod broker_store;
 pub mod control;
 pub mod merge;
 pub mod policy;
@@ -119,6 +118,16 @@ pub struct InterceptRule {
     pub action: InterceptAction,
 }
 
+/// Output format hint for the `Capture` action. Selects how stdout is
+/// interpreted before nonces are minted.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureFormat {
+    /// Stdout is a JSON object; nonces are minted at the
+    /// dotted-path locations specified by `secret_paths`.
+    Json,
+}
+
 /// The action to take when an intercept rule fires.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -132,14 +141,41 @@ pub enum InterceptAction {
     },
     /// Capture a credential and return a nonce to the sandbox.
     ///
-    /// If `script` is set, runs `sh -c "<script>"` and captures its stdout.
-    /// If `script` is absent, runs the real binary with the original args.
-    /// The captured stdout (trimmed) is stored in the broker; the nonce is returned.
+    /// **Default mode (opaque stdout)**: If `format` is absent, runs the
+    /// real binary (or `script`) and treats the full trimmed stdout as
+    /// one credential. The broker stores it; a single `nono_<hex>` nonce
+    /// is returned to the sandbox. Downstream commands consume the nonce
+    /// via env-var promotion at exec time.
+    ///
+    /// **JSON-envelope mode** (`format: "json"`): runs the real binary
+    /// or `script`, parses stdout as JSON, mints a separate nonce for
+    /// the value at each `secret_paths` entry, substitutes the nonces
+    /// back into the JSON, and returns the modified JSON as stdout.
+    /// Use this when a single command returns a structured envelope
+    /// containing one or more credentials at known field paths (e.g.
+    /// `security find-generic-password` returning a JSON blob with
+    /// OAuth tokens nested under `claudeAiOauth.accessToken`). Other
+    /// JSON fields pass through unchanged. Downstream consumption is
+    /// via the proxy's HTTP-bearer translation, not env-var promotion.
     Capture {
         /// Optional shell script to run instead of the real binary.
         /// Runs via `sh -c` in the unsandboxed parent. Stdout is the credential.
         #[serde(default)]
         script: Option<String>,
+        /// Output format. Currently only `"json"` is recognized; absent
+        /// means opaque stdout (the original capture semantics).
+        #[serde(default)]
+        format: Option<CaptureFormat>,
+        /// Dotted JSON field paths whose values are minted as separate
+        /// nonces. Required when `format` is `"json"`. Each path must
+        /// resolve to a JSON string; missing paths are silently skipped.
+        ///
+        /// Paths use dots to traverse objects (e.g.
+        /// `claudeAiOauth.accessToken`). Object keys containing dots are
+        /// not supported in this format; we have no in-tree need for
+        /// them and adding escape syntax now would be premature.
+        #[serde(default)]
+        secret_paths: Vec<String>,
     },
     /// Run the real binary and return its actual output (no nonce wrapping).
     ///

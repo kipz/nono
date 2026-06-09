@@ -11,7 +11,8 @@ use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+    CallerPolicy, CaptureFormat, CommandEntry, CommandSandbox, InterceptAction, MediationConfig,
+    SessionAuditInfo,
 };
 use nix::libc;
 use nono::{NonoError, Result};
@@ -24,9 +25,22 @@ use zeroize::Zeroizing;
 /// The action stored in a resolved intercept rule.
 #[derive(Clone, Debug)]
 pub enum ResolvedAction {
-    Respond { stdout: String },
-    Capture { script: Option<String> },
-    Approve { script: Option<String> },
+    Respond {
+        stdout: String,
+    },
+    Capture {
+        script: Option<String>,
+        /// Optional output format. `None` means opaque stdout (single
+        /// nonce wraps the full stdout). `Some(Json)` means parse stdout
+        /// as JSON and mint nonces at `secret_paths`.
+        format: Option<CaptureFormat>,
+        /// Dotted JSON paths to substitute with nonces. Empty unless
+        /// `format` is `Some(Json)`.
+        secret_paths: Vec<String>,
+    },
+    Approve {
+        script: Option<String>,
+    },
 }
 
 /// A resolved intercept rule ready for the mediation server.
@@ -506,12 +520,32 @@ fn resolve_command(
                     },
                     *exit_code,
                 ),
-                InterceptAction::Capture { script } => (
-                    ResolvedAction::Capture {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
+                InterceptAction::Capture {
+                    script,
+                    format,
+                    secret_paths,
+                } => {
+                    // JSON-format capture requires at least one secret path,
+                    // otherwise it's an indistinguishable-from-passthrough
+                    // no-op that would silently return the raw stdout
+                    // unmodified — leaking the credential. Fail closed.
+                    if matches!(format, Some(CaptureFormat::Json)) && secret_paths.is_empty() {
+                        return Err(NonoError::SandboxInit(format!(
+                            "mediation rule for '{}' uses format=json capture but \
+                             secret_paths is empty; refusing to start because this \
+                             would pass real credentials through unmodified",
+                            entry.name
+                        )));
+                    }
+                    (
+                        ResolvedAction::Capture {
+                            script: script.clone(),
+                            format: *format,
+                            secret_paths: secret_paths.clone(),
+                        },
+                        0,
+                    )
+                }
                 InterceptAction::Approve { script } => (
                     ResolvedAction::Approve {
                         script: script.clone(),

@@ -258,6 +258,65 @@ pub fn log_l7_request(
     );
 }
 
+/// Log a successful OAuth credential-capture event.
+///
+/// Emitted by the OAuth body rewriters (response hook in `forward.rs`,
+/// driven from both the TLS-intercept and reverse-proxy paths) every
+/// time real upstream OAuth tokens are swapped for broker-issued
+/// nonces. Capture is privileged — the in-process broker controls
+/// real Anthropic credentials — so each event is recorded at `info!`
+/// level *and* persisted to the audit ring buffer with a stable
+/// `OAUTH_CAPTURE` reason prefix.
+///
+/// `fields_substituted` is the number of token fields rewritten in
+/// this response (1 for access-only or refresh-only, 2 for the full
+/// pair). Token and nonce values are deliberately NOT logged —
+/// neither full nor partial — so the audit trail captures the *act*
+/// of capture without expanding the secret's exposure surface.
+pub fn log_oauth_capture(
+    audit_log: Option<&SharedAuditLog>,
+    mode: ProxyMode,
+    host: &str,
+    port: u16,
+    fields_substituted: u32,
+) {
+    let reason = format!("OAUTH_CAPTURE substituted={}", fields_substituted);
+    info!(
+        target: "nono_proxy::audit",
+        mode = %mode,
+        host = host,
+        port = port,
+        fields_substituted = fields_substituted,
+        decision = "allow",
+        "oauth credential captured"
+    );
+
+    push_event(
+        audit_log,
+        NetworkAuditEvent {
+            timestamp_unix_ms: now_unix_millis(),
+            mode: map_mode(mode),
+            decision: NetworkAuditDecision::Allow,
+            // OAuth capture fires on the response side and has no
+            // managed-credential context; the rich audit fields are
+            // intentionally None so the event is unambiguously a
+            // capture record rather than a credential-injection one.
+            route_id: None,
+            auth_mechanism: None,
+            auth_outcome: None,
+            managed_credential_active: None,
+            injection_mode: None,
+            denial_category: None,
+            target: host.to_string(),
+            port: Some(port),
+            method: None,
+            path: None,
+            status: None,
+            reason: Some(reason),
+        },
+    );
+}
+
 /// Compatibility shim for the previous `log_reverse_proxy` API. New code
 /// should call [`log_l7_request`] directly with the appropriate
 /// [`ProxyMode`] instead.
@@ -312,6 +371,29 @@ mod tests {
         assert_eq!(event.port, Some(443));
         assert_eq!(event.method.as_deref(), Some("CONNECT"));
         assert!(event.timestamp_unix_ms > 0);
+    }
+
+    #[test]
+    fn log_oauth_capture_records_event_with_reason() {
+        let log = new_audit_log();
+
+        log_oauth_capture(Some(&log), ProxyMode::Connect, "claude.ai", 443, 2);
+
+        let events = drain_audit_events(&log);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.mode, NetworkAuditMode::Connect);
+        assert_eq!(event.decision, NetworkAuditDecision::Allow);
+        assert_eq!(event.target, "claude.ai");
+        assert_eq!(event.port, Some(443));
+        assert_eq!(event.reason.as_deref(), Some("OAUTH_CAPTURE substituted=2"));
+        assert!(event.method.is_none());
+    }
+
+    #[test]
+    fn log_oauth_capture_with_no_audit_log_is_noop() {
+        // No panic when audit_log is None — mirrors log_allowed/log_denied.
+        log_oauth_capture(None, ProxyMode::Reverse, "anthropic", 443, 1);
     }
 
     #[test]

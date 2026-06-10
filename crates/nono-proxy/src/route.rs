@@ -19,6 +19,24 @@ use std::sync::Arc;
 use tracing::debug;
 use zeroize::Zeroizing;
 
+/// Reserved route-prefix namespace for nono-internal routes.
+///
+/// Any prefix starting with this string is reserved for nono itself
+/// (e.g. the OAuth-capture intercept routes injected at proxy startup).
+/// User-supplied profiles that try to declare a prefix in this namespace
+/// are rejected at config-load time so a colliding user route cannot
+/// shadow or disable an internal one.
+pub const RESERVED_PREFIX_NAMESPACE: &str = "__nono_";
+
+/// Returns true if `prefix` (raw or with surrounding slashes) lives in
+/// the reserved [`RESERVED_PREFIX_NAMESPACE`].
+#[must_use]
+pub fn is_reserved_prefix(prefix: &str) -> bool {
+    prefix
+        .trim_matches('/')
+        .starts_with(RESERVED_PREFIX_NAMESPACE)
+}
+
 /// Route-level configuration loaded at proxy startup.
 ///
 /// Contains everything needed to forward and filter a request for a route,
@@ -63,6 +81,31 @@ pub struct LoadedRoute {
 
     /// Audit injection mode implied by the managed credential configuration.
     pub managed_injection_mode: Option<NetworkAuditInjectionMode>,
+
+    /// URL-match patterns for OAuth-capture routes.
+    ///
+    /// Populated when [`RouteConfig::inject_mode`] is
+    /// [`crate::config::InjectMode::OauthCapture`]; `None` otherwise.
+    /// Pre-extracted at load time so the response-hook caller (plan
+    /// step 11) doesn't have to pattern-match the inject_mode enum on
+    /// every request to decide whether to invoke the OAuth body
+    /// rewriter.
+    pub oauth_capture_match: Option<OauthCaptureMatch>,
+}
+
+/// URL-match patterns extracted from an `InjectMode::OauthCapture`
+/// route configuration.
+///
+/// Both patterns are compared against the inbound request path inside
+/// the TLS-intercept handler. `token_url_match` typically gates the
+/// initial authorization-code exchange response; `refresh_url_match`
+/// gates refresh-token exchange. The two are independent: identical
+/// strings are valid (Anthropic's endpoint serves both shapes on the
+/// same path, distinguished only by `grant_type` in the request body).
+#[derive(Debug, Clone)]
+pub struct OauthCaptureMatch {
+    pub token_url_match: String,
+    pub refresh_url_match: String,
 }
 
 impl std::fmt::Debug for LoadedRoute {
@@ -77,6 +120,7 @@ impl std::fmt::Debug for LoadedRoute {
                 "requires_managed_credential",
                 &self.requires_managed_credential,
             )
+            .field("oauth_capture_match", &self.oauth_capture_match)
             .field("managed_auth_mechanism", &self.managed_auth_mechanism)
             .field("managed_injection_mode", &self.managed_injection_mode)
             .finish()
@@ -100,6 +144,13 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
             }
             crate::config::InjectMode::UrlPath => NetworkAuditAuthMechanism::PhantomPath,
             crate::config::InjectMode::QueryParam => NetworkAuditAuthMechanism::PhantomQuery,
+            // OauthCapture routes shouldn't carry a credential_key (it's
+            // ignored — see credential.rs warning), so this arm is
+            // unreachable in steady state. Defensive default until plan
+            // step 17 audit hardening adds a dedicated variant.
+            crate::config::InjectMode::OauthCapture { .. } => {
+                NetworkAuditAuthMechanism::PhantomHeader
+            }
         });
     }
 
@@ -117,6 +168,8 @@ fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjection
             crate::config::InjectMode::UrlPath => NetworkAuditInjectionMode::UrlPath,
             crate::config::InjectMode::QueryParam => NetworkAuditInjectionMode::QueryParam,
             crate::config::InjectMode::BasicAuth => NetworkAuditInjectionMode::BasicAuth,
+            // See comment on the auth-mechanism helper above.
+            crate::config::InjectMode::OauthCapture { .. } => NetworkAuditInjectionMode::Header,
         });
     }
 
@@ -178,15 +231,28 @@ impl RouteStore {
             let upstream_host_port = extract_host_port(&route.upstream);
 
             // A route needs L7 visibility if it carries credentials to inject
-            // (`credential_key` or `oauth2`) or if it enforces method/path
-            // rules. Routes without any of these are purely declarative —
-            // they exist to provide a `*_BASE_URL` env var or appear in
-            // `route_upstream_hosts()` — and CONNECT to those still gets
-            // blocked with 403 (the "force SDK cooperation" path).
+            // (`credential_key` or `oauth2`), enforces method/path rules,
+            // or captures OAuth tokens from intercepted responses
+            // (`InjectMode::OauthCapture`). Routes without any of these
+            // are purely declarative — they exist to provide a `*_BASE_URL`
+            // env var or appear in `route_upstream_hosts()` — and CONNECT
+            // to those still gets blocked with 403 (the "force SDK
+            // cooperation" path).
             let requires_managed_credential =
                 route.credential_key.is_some() || route.oauth2.is_some();
-            let requires_intercept =
-                requires_managed_credential || !route.endpoint_rules.is_empty();
+            let oauth_capture_match = match &route.inject_mode {
+                crate::config::InjectMode::OauthCapture {
+                    token_url_match,
+                    refresh_url_match,
+                } => Some(OauthCaptureMatch {
+                    token_url_match: token_url_match.clone(),
+                    refresh_url_match: refresh_url_match.clone(),
+                }),
+                _ => None,
+            };
+            let requires_intercept = requires_managed_credential
+                || !route.endpoint_rules.is_empty()
+                || oauth_capture_match.is_some();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -201,6 +267,7 @@ impl RouteStore {
                     requires_managed_credential,
                     managed_auth_mechanism,
                     managed_injection_mode,
+                    oauth_capture_match,
                 },
             );
         }
@@ -530,6 +597,43 @@ mod tests {
     }
 
     #[test]
+    fn test_is_reserved_prefix_accepts_namespace() {
+        // Bare reserved-namespace names and the canonical OAuth-capture
+        // names must report as reserved.
+        assert!(is_reserved_prefix("__nono_"));
+        assert!(is_reserved_prefix("__nono_oauth_anthropic"));
+        assert!(is_reserved_prefix("__nono_oauth_claudeai"));
+        assert!(is_reserved_prefix("__nono_oauth_platform"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_normalises_slashes() {
+        // The proxy normalises route prefixes by trimming surrounding
+        // slashes; the helper must match that normalisation so a user
+        // cannot bypass the check by writing "/__nono_evil" or
+        // "__nono_evil/".
+        assert!(is_reserved_prefix("/__nono_evil"));
+        assert!(is_reserved_prefix("__nono_evil/"));
+        assert!(is_reserved_prefix("/__nono_evil/"));
+    }
+
+    #[test]
+    fn test_is_reserved_prefix_rejects_lookalikes() {
+        // Common ordinary route names must NOT match.
+        assert!(!is_reserved_prefix(""));
+        assert!(!is_reserved_prefix("openai"));
+        assert!(!is_reserved_prefix("anthropic"));
+        assert!(!is_reserved_prefix("claude-oauth"));
+        // "nono_" without the leading "__" is not in the reserved
+        // namespace; only the double-underscore prefix is reserved.
+        assert!(!is_reserved_prefix("nono_compat"));
+        assert!(!is_reserved_prefix("_nono_one_underscore"));
+        // A single-underscore-prefixed name that *contains* `nono_` as
+        // a substring further in is also not reserved.
+        assert!(!is_reserved_prefix("my_nono_helper"));
+    }
+
+    #[test]
     fn test_load_routes_without_credentials() {
         // Routes without credential_key should still be loaded into RouteStore
         let routes = vec![RouteConfig {
@@ -721,6 +825,7 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            oauth_capture_match: None,
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -764,6 +869,74 @@ mod tests {
             Some(NetworkAuditInjectionMode::Header)
         );
         assert!(!store.has_intercept_route("api.example.com:443"));
+    }
+
+    #[test]
+    fn test_requires_intercept_oauth_capture_only() {
+        // Pure OauthCapture route: no credential_key, no endpoint_rules.
+        // The InjectMode::OauthCapture variant alone must trigger
+        // interception so the TLS-intercept handler can rewrite the
+        // response body.
+        let routes = vec![RouteConfig {
+            prefix: "claude-oauth".to_string(),
+            upstream: "https://claude.ai".to_string(),
+            credential_key: None,
+            inject_mode: crate::config::InjectMode::OauthCapture {
+                token_url_match: "/api/oauth/token".to_string(),
+                refresh_url_match: "/api/oauth/token".to_string(),
+            },
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        let hit = store.lookup_by_upstream("claude.ai:443").unwrap();
+        assert!(store.has_intercept_route("claude.ai:443"));
+        assert!(!hit.1.requires_managed_credential);
+        let oc = hit
+            .1
+            .oauth_capture_match
+            .as_ref()
+            .expect("OauthCapture route must populate oauth_capture_match");
+        assert_eq!(oc.token_url_match, "/api/oauth/token");
+        assert_eq!(oc.refresh_url_match, "/api/oauth/token");
+    }
+
+    #[test]
+    fn test_non_oauth_capture_route_has_no_match() {
+        // Routes whose inject_mode is *not* OauthCapture must not
+        // populate oauth_capture_match — the response hook decides
+        // whether to invoke the rewriter off the presence of this field.
+        let routes = vec![RouteConfig {
+            prefix: "openai".to_string(),
+            upstream: "https://api.openai.com".to_string(),
+            credential_key: Some("openai_api_key".to_string()),
+            inject_mode: crate::config::InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+        let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
+        assert!(hit.1.oauth_capture_match.is_none());
     }
 
     #[test]
@@ -837,6 +1010,7 @@ mod tests {
             requires_managed_credential: true,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
+            oauth_capture_match: None,
         };
         assert!(managed.missing_managed_credential(false, false));
         assert!(!managed.missing_managed_credential(true, false));
@@ -851,6 +1025,7 @@ mod tests {
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
+            oauth_capture_match: None,
         };
         assert!(!l7_only.missing_managed_credential(false, false));
     }

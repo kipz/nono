@@ -23,6 +23,7 @@ use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrat
 use crate::route::RouteStore;
 use crate::token;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -40,6 +41,10 @@ fn auth_mechanism_for_inject_mode(mode: &InjectMode) -> nono::undo::NetworkAudit
         }
         InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+        // OauthCapture is a response-side mode; shouldn't reach request-
+        // path audit mapping. Defensive default until audit hardening
+        // (plan step 17) adds a dedicated audit variant.
+        InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditAuthMechanism::PhantomHeader,
     }
 }
 
@@ -51,6 +56,9 @@ fn audit_injection_mode_for_inject_mode(
         InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
         InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
         InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+        // OauthCapture is response-side; see comment on the auth-mechanism
+        // helper above.
+        InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditInjectionMode::Header,
     }
 }
 
@@ -94,6 +102,10 @@ pub struct ReverseProxyCtx<'a> {
     pub tls_connector: &'a TlsConnector,
     /// Shared network audit sink for session metadata capture
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// Optional in-process credential broker used by OAuth-capture
+    /// routes. `None` when OAuth capture is not configured for this
+    /// proxy session; the capture path is then inert.
+    pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
 }
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
@@ -223,40 +235,69 @@ pub async fn handle_reverse_proxy(
 
     let cred = static_cred;
 
-    // Authenticate the request. Every reverse proxy request must prove
-    // possession of the session token, regardless of whether a credential
-    // is configured — this is the localhost auth boundary.
-    if let Some(cred) = cred {
-        if let Err(e) = validate_phantom_token_for_mode(
-            &cred.proxy_inject_mode,
-            remaining_header,
-            &upstream_path,
-            &cred.proxy_header_name,
-            cred.proxy_path_pattern.as_deref(),
-            cred.proxy_query_param_name.as_deref(),
-            ctx.session_token,
-        ) {
-            let deny_ctx = audit::EventContext {
-                auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
-                denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-                ..managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
-            };
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::Reverse,
-                &deny_ctx,
-                &service,
-                0,
-                &e.to_string(),
-            );
-            send_error(stream, 401, "Unauthorized").await?;
-            return Ok(());
-        }
-    } else if let Err(e) = token::validate_proxy_auth(remaining_header, ctx.session_token) {
+    // Layer 2 OAuth pass-through (request-side). When the route is
+    // OAuth-capture-enabled and a TokenResolver is wired, look for a
+    // credential the sandboxed child sent — Claude Code sends either
+    // `x-api-key: sk-ant-api03-...` (API-key mode) or `Authorization:
+    // Bearer <token>` (OAuth mode, where `<token>` may be a
+    // `nono_<hex>` nonce issued in a previous /login). Resolve `nono_`
+    // nonces back to the real bearer via the broker and remember the
+    // header to inject upstream.
+    //
+    // The route gate (`oauth_capture_match.is_some()`) makes
+    // pass-through opt-in per route rather than per proxy session; a
+    // route without OAuth capture configured won't accept arbitrary
+    // bearers from the child.
+    let oauth_passthrough_cred: Option<(String, Zeroizing<String>)> =
+        match (&route.oauth_capture_match, ctx.token_resolver) {
+            (Some(_), Some(resolver)) => {
+                let configured = cred
+                    .map(|c| c.proxy_header_name.as_str())
+                    .unwrap_or("authorization");
+                let raw = extract_header_value(remaining_header, configured)
+                    .map(|v| (configured.to_string(), v))
+                    .or_else(|| {
+                        extract_header_value(remaining_header, "authorization")
+                            .map(|v| ("authorization".to_string(), v))
+                    })
+                    .or_else(|| {
+                        extract_header_value(remaining_header, "x-api-key")
+                            .map(|v| ("x-api-key".to_string(), v))
+                    });
+                raw.map(|(hname, v)| {
+                    let resolved = if v.starts_with("nono_") {
+                        resolver.resolve(&v).unwrap_or_else(|| Zeroizing::new(v))
+                    } else {
+                        Zeroizing::new(v)
+                    };
+                    (hname, resolved)
+                })
+            }
+            _ => None,
+        };
+
+    // Authenticate the request. Every reverse-proxy request must prove
+    // possession of the session token; this is the localhost auth
+    // boundary. OAuth pass-through skips the phantom-token shape check
+    // (the credential header carries a real bearer, not a phantom) but
+    // still requires Proxy-Authorization to match the session token.
+    if let Err(failure) = authenticate_reverse_proxy_request(
+        oauth_passthrough_cred.is_some(),
+        cred,
+        remaining_header,
+        &upstream_path,
+        ctx.session_token,
+    ) {
         let deny_ctx = audit::EventContext {
             auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
             denial_category: Some(nono::undo::NetworkAuditDenialCategory::AuthenticationFailed),
-            ..proxy_auth_event_ctx(&service)
+            ..if oauth_passthrough_cred.is_some() {
+                proxy_auth_event_ctx(&service)
+            } else if cred.is_some() {
+                managed_ctx.clone().unwrap_or_else(|| route_ctx.clone())
+            } else {
+                proxy_auth_event_ctx(&service)
+            }
         };
         audit::log_denied(
             ctx.audit_log,
@@ -264,9 +305,9 @@ pub async fn handle_reverse_proxy(
             &deny_ctx,
             &service,
             0,
-            &e.to_string(),
+            &failure.error.to_string(),
         );
-        send_error(stream, 407, "Proxy Authentication Required").await?;
+        send_error(stream, failure.status_code, failure.status_msg).await?;
         return Ok(());
     }
 
@@ -356,8 +397,27 @@ pub async fn handle_reverse_proxy(
         }
     };
 
+    // OAuth capture detection (Layer 1 in the reverse-proxy path).
+    // Active when the route's inject_mode is OauthCapture, the request
+    // path matches one of the configured token URLs, and the proxy was
+    // started with a TokenResolver. ANTHROPIC_BASE_URL redirects the
+    // OAuth callback through this plain-HTTP reverse path (rather than
+    // through CONNECT), so the same capture-and-rewrite logic that the
+    // TLS-intercept handler uses must apply here too.
+    let oauth_capture_active = match (&route.oauth_capture_match, ctx.token_resolver) {
+        (Some(oc), Some(_)) => {
+            upstream_path == oc.token_url_match || upstream_path == oc.refresh_url_match
+        }
+        _ => false,
+    };
+
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = filter_headers(remaining_header, strip_header);
+    let mut filtered_headers = filter_headers(remaining_header, strip_header);
+    if oauth_capture_active {
+        // Force identity encoding so the OAuth-rewriter sees plaintext
+        // JSON rather than gzip/br/etc.
+        filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
+    }
     let content_length = extract_content_length(remaining_header);
     let body = match read_request_body(stream, content_length, buffered_body).await? {
         Some(body) => body,
@@ -370,15 +430,38 @@ pub async fn handle_reverse_proxy(
         method, upstream_path_full, version, upstream_authority
     ));
 
-    if let Some(cred) = cred {
-        inject_credential_for_mode(cred, &mut request);
-    }
+    // Inject the upstream credential. In OAuth pass-through mode, forward
+    // the broker-resolved bearer (re-adding `Bearer ` for Authorization);
+    // otherwise inject the static credential the route configured.
+    let suppress_inbound_header: Option<String> =
+        if let Some((ref header_name, ref cred_value)) = oauth_passthrough_cred {
+            if header_name.eq_ignore_ascii_case("authorization") {
+                request.push_str(&format!(
+                    "Authorization: Bearer {}\r\n",
+                    cred_value.as_str()
+                ));
+            } else {
+                request.push_str(&format!("{}: {}\r\n", header_name, cred_value.as_str()));
+            }
+            Some(header_name.to_lowercase())
+        } else {
+            if let Some(cred) = cred {
+                inject_credential_for_mode(cred, &mut request);
+            }
+            None
+        };
 
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {
+        let name_lower = name.to_lowercase();
+        // Suppress the credential header the client sent — we already
+        // injected the resolved bearer (or the static credential) above.
+        if suppress_inbound_header.as_deref() == Some(name_lower.as_str()) {
+            continue;
+        }
         if let (Some(cred), Some(header_lower)) = (cred, auth_header_lower.as_ref())
             && matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
-            && name.to_lowercase() == *header_lower
+            && name_lower == *header_lower
         {
             continue;
         }
@@ -409,8 +492,57 @@ pub async fn handle_reverse_proxy(
         method: &method,
         path: &upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+
+    // Build the OAuth response hook if capture is active. See the
+    // identical block in `tls_intercept/handle.rs::forward_inner_request`
+    // for the design rationale (pass-through-on-error invariant).
+    // Audit logging of capture events (step 17 / commit `6df85cc`) is
+    // wired through `audit::log_oauth_capture` from within this hook so
+    // each successful rewrite emits an `OAUTH_CAPTURE substituted=N`
+    // event into the ring buffer.
+    let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
+        ctx.token_resolver.map(|resolver| {
+            let resolver = Arc::clone(resolver);
+            let audit_log_clone = ctx.audit_log.cloned();
+            let host_for_audit = upstream_host.clone();
+            let port_for_audit = upstream_port;
+            let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
+                    crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+                        audit::log_oauth_capture(
+                            audit_log_clone.as_ref(),
+                            audit::ProxyMode::Reverse,
+                            &host_for_audit,
+                            port_for_audit,
+                            substituted,
+                        );
+                        Some(bytes.to_vec())
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
+                        warn!("oauth-capture (reverse): response not JSON; forwarding unchanged");
+                        None
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
+                        debug!("oauth-capture (reverse): no token fields; forwarding unchanged");
+                        None
+                    }
+                }
+            });
+            hook
+        })
+    } else {
+        None
+    };
+
+    if let Err(e) = forward::forward_request(
+        stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+        response_hook,
+    )
+    .await
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
@@ -590,8 +722,15 @@ async fn handle_oauth2_credential(
         method,
         path: upstream_path,
     };
-    if let Err(e) =
-        forward::forward_request(stream, request.as_bytes(), &body, upstream_spec, audit_ctx).await
+    if let Err(e) = forward::forward_request(
+        stream,
+        request.as_bytes(),
+        &body,
+        upstream_spec,
+        audit_ctx,
+        None,
+    )
+    .await
     {
         warn!("Upstream connection failed: {}", e);
         send_error(stream, 502, "Bad Gateway").await?;
@@ -780,6 +919,30 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
     headers
 }
 
+/// Look up the value of an HTTP header by case-insensitive name, stripping
+/// a leading `Bearer ` token prefix (Authorization-style headers).
+///
+/// Returns the raw header value with surrounding whitespace trimmed, or
+/// `None` if the header is absent. Used by the OAuth-capture Layer 2
+/// pass-through path (`handle_reverse_proxy`) to recover the credential
+/// the sandboxed child sent.
+fn extract_header_value(header_bytes: &[u8], header_name: &str) -> Option<String> {
+    let header_str = std::str::from_utf8(header_bytes).ok()?;
+    let target = format!("{}:", header_name.to_lowercase());
+    for line in header_str.lines() {
+        if line.to_lowercase().starts_with(&target) {
+            let value = line.split_once(':').map(|(_, v)| v.trim())?;
+            // Strip `Bearer ` prefix for Authorization-style headers so
+            // the broker sees the raw token / nonce.
+            if value.len() >= 7 && value[..7].eq_ignore_ascii_case("bearer ") {
+                return Some(value[7..].trim().to_string());
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 /// Extract Content-Length value from raw headers.
 pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
@@ -906,6 +1069,71 @@ async fn send_error(stream: &mut TcpStream, status: u16, reason: &str) -> Result
 
 /// Validate phantom token based on injection mode.
 ///
+/// Auth-decision failure detail returned by [`authenticate_reverse_proxy_request`].
+///
+/// `status_code` / `status_msg` is what the client sees. Phantom-token
+/// failures keep the historical 401; Proxy-Authorization failures
+/// surface as 407.
+struct AuthFailure {
+    error: ProxyError,
+    status_code: u16,
+    status_msg: &'static str,
+}
+
+/// Decide whether a reverse-proxy request is authenticated.
+///
+/// Three gating modes:
+///
+/// 1. **OAuth pass-through** (`oauth_passthrough` = true, with or without
+///    a static credential): the credential header carries an OAuth bearer
+///    (real token or a `nono_<hex>` nonce), so the phantom-token shape
+///    check would be wrong. We still require Proxy-Authorization to
+///    prove the sandboxed-child trust boundary — only that gate keeps
+///    a non-child host from spraying nonces at the proxy.
+/// 2. **Static credential, no pass-through**: phantom-token check on
+///    the credential header. 401 on failure (historical behaviour).
+/// 3. **No credential**: Proxy-Authorization check. 407 on failure.
+fn authenticate_reverse_proxy_request(
+    oauth_passthrough: bool,
+    cred: Option<&LoadedCredential>,
+    remaining_header: &[u8],
+    upstream_path: &str,
+    session_token: &Zeroizing<String>,
+) -> std::result::Result<(), AuthFailure> {
+    if oauth_passthrough {
+        return token::validate_proxy_auth(remaining_header, session_token).map_err(|e| {
+            AuthFailure {
+                error: e,
+                status_code: 407,
+                status_msg: "Proxy Authentication Required",
+            }
+        });
+    }
+
+    if let Some(cred) = cred {
+        return validate_phantom_token_for_mode(
+            &cred.proxy_inject_mode,
+            remaining_header,
+            upstream_path,
+            &cred.proxy_header_name,
+            cred.proxy_path_pattern.as_deref(),
+            cred.proxy_query_param_name.as_deref(),
+            session_token,
+        )
+        .map_err(|e| AuthFailure {
+            error: e,
+            status_code: 401,
+            status_msg: "Unauthorized",
+        });
+    }
+
+    token::validate_proxy_auth(remaining_header, session_token).map_err(|e| AuthFailure {
+        error: e,
+        status_code: 407,
+        status_msg: "Proxy Authentication Required",
+    })
+}
+
 /// Different modes extract the phantom token from different locations:
 /// - `Header`/`BasicAuth`: From the auth header (Authorization, x-api-key, etc.)
 /// - `UrlPath`: From the URL path pattern (e.g., `/bot<token>/getMe`)
@@ -937,6 +1165,16 @@ pub(crate) fn validate_phantom_token_for_mode(
                 ProxyError::HttpParse("query_param mode requires query_param_name".to_string())
             })?;
             validate_phantom_token_in_query(path, param_name, session_token)
+        }
+        InjectMode::OauthCapture { .. } => {
+            // OauthCapture is a TLS-intercept response-side mode and
+            // does not gate reverse-proxy traffic. Reject defensively
+            // so misconfigured routes (OauthCapture used outside the
+            // CONNECT/intercept path) fail loudly instead of silently
+            // letting requests through unauthenticated.
+            Err(ProxyError::HttpParse(
+                "oauth_capture inject_mode is not valid on a reverse-proxy route".to_string(),
+            ))
         }
     }
 }
@@ -1049,6 +1287,9 @@ pub(crate) fn transform_path_for_mode(
             })?;
             transform_query_param(path, param_name, credential)
         }
+        InjectMode::OauthCapture { .. } => Err(ProxyError::HttpParse(
+            "oauth_capture inject_mode is not valid on a reverse-proxy route".to_string(),
+        )),
     }
 }
 
@@ -1204,6 +1445,8 @@ pub(crate) fn strip_proxy_artifacts(
         }
         // Header and BasicAuth modes don't embed artifacts in the URL path.
         InjectMode::Header | InjectMode::BasicAuth => path.to_string(),
+        // OauthCapture is response-only; the request path is unchanged.
+        InjectMode::OauthCapture { .. } => path.to_string(),
     }
 }
 
@@ -1307,6 +1550,11 @@ pub(crate) fn inject_credential_for_mode(cred: &LoadedCredential, request: &mut 
         InjectMode::UrlPath | InjectMode::QueryParam => {
             // Credential is already injected into the URL path/query
             // No header injection needed
+        }
+        InjectMode::OauthCapture { .. } => {
+            // OauthCapture has no static credential to inject — the
+            // body rewriter on the response side handles capture, and
+            // there is no inbound nonce to swap to a real token here.
         }
     }
 }
@@ -1901,5 +2149,144 @@ mod tests {
             transform_path_for_mode(&InjectMode::Header, &cleaned, None, None, None, &credential)
                 .unwrap();
         assert_eq!(transformed, "/api/v1/pods?limit=100");
+    }
+
+    // ----- OAuth Layer 2 helpers ---------------------------------------
+
+    #[test]
+    fn extract_header_value_strips_bearer_prefix() {
+        let header = b"Authorization: Bearer some-token\r\nContent-Type: application/json\r\n\r\n";
+        assert_eq!(
+            extract_header_value(header, "authorization").as_deref(),
+            Some("some-token")
+        );
+    }
+
+    #[test]
+    fn extract_header_value_case_insensitive_name() {
+        let header = b"X-API-Key: sk-ant-api03-abc\r\n\r\n";
+        assert_eq!(
+            extract_header_value(header, "x-api-key").as_deref(),
+            Some("sk-ant-api03-abc")
+        );
+    }
+
+    #[test]
+    fn extract_header_value_missing_returns_none() {
+        let header = b"Content-Type: application/json\r\n\r\n";
+        assert!(extract_header_value(header, "authorization").is_none());
+    }
+
+    /// Build a minimal `LoadedCredential` for auth-decision tests.
+    /// `handle_reverse_proxy` is hard to drive end-to-end from a unit
+    /// test (it owns a `TcpStream` and a full HTTP parser), so we cover
+    /// the auth gate via the small pure helper instead.
+    fn loaded_credential_for_auth_test() -> LoadedCredential {
+        LoadedCredential {
+            inject_mode: InjectMode::Header,
+            header_name: "Authorization".to_string(),
+            header_value: Zeroizing::new("Bearer real_upstream_secret".to_string()),
+            raw_credential: Zeroizing::new("real_upstream_secret".to_string()),
+            proxy_header_name: "Authorization".to_string(),
+            proxy_inject_mode: InjectMode::Header,
+            proxy_path_pattern: None,
+            proxy_query_param_name: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+        }
+    }
+
+    #[test]
+    fn oauth_passthrough_requires_session_token_and_returns_407() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_no_proxy_auth =
+            b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Content-Type: application/json\r\n\r\n";
+        let failure = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_no_proxy_auth,
+            "/v1/oauth/token",
+            &session,
+        )
+        .expect_err("missing Proxy-Authorization must be rejected in pass-through mode");
+        assert_eq!(failure.status_code, 407);
+        assert_eq!(failure.status_msg, "Proxy Authentication Required");
+    }
+
+    #[test]
+    fn oauth_passthrough_with_wrong_session_token_returns_407() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_wrong = b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Proxy-Authorization: Bearer not-the-session-token\r\n\r\n";
+        let failure = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_wrong,
+            "/v1/oauth/token",
+            &session,
+        )
+        .expect_err("wrong session token must be rejected");
+        assert_eq!(failure.status_code, 407);
+    }
+
+    #[test]
+    fn oauth_passthrough_with_valid_session_token_passes() {
+        let session = Zeroizing::new("session-secret".to_string());
+        let header_valid = b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\
+              Proxy-Authorization: Basic bm9ubzpzZXNzaW9uLXNlY3JldA==\r\n\r\n";
+        let result = authenticate_reverse_proxy_request(
+            true,
+            None,
+            header_valid,
+            "/v1/oauth/token",
+            &session,
+        );
+        assert!(
+            result.is_ok(),
+            "valid session token must pass in pass-through mode"
+        );
+    }
+
+    #[test]
+    fn oauth_passthrough_with_static_credential_still_requires_proxy_auth() {
+        // Even when a static credential is configured on the route, OAuth
+        // pass-through skips the phantom-token shape check on the cred
+        // header — Proxy-Authorization remains the auth proof.
+        let session = Zeroizing::new("session-secret".to_string());
+        let cred = loaded_credential_for_auth_test();
+        let header_no_proxy_auth =
+            b"Authorization: Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+        let failure = authenticate_reverse_proxy_request(
+            true,
+            Some(&cred),
+            header_no_proxy_auth,
+            "/v1/oauth/token",
+            &session,
+        )
+        .expect_err(
+            "OAuth pass-through with a static credential must still require Proxy-Authorization",
+        );
+        assert_eq!(failure.status_code, 407);
+    }
+
+    #[test]
+    fn non_passthrough_with_credential_uses_phantom_token_check() {
+        // Regression guard: the static-credential auth path keeps phantom-
+        // token validation and the historical 401 on failure.
+        let session = Zeroizing::new("session-secret".to_string());
+        let cred = loaded_credential_for_auth_test();
+        let header_wrong_phantom_token = b"Authorization: Bearer wrong-phantom-token\r\n\r\n";
+        let failure = authenticate_reverse_proxy_request(
+            false,
+            Some(&cred),
+            header_wrong_phantom_token,
+            "/v1/messages",
+            &session,
+        )
+        .expect_err("wrong phantom token must be rejected");
+        assert_eq!(failure.status_code, 401);
+        assert_eq!(failure.status_msg, "Unauthorized");
     }
 }

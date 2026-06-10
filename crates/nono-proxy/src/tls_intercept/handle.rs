@@ -44,6 +44,10 @@ pub struct InterceptCtx<'a> {
     pub tls_connector: &'a tokio_rustls::TlsConnector,
     pub filter: &'a ProxyFilter,
     pub audit_log: Option<&'a audit::SharedAuditLog>,
+    /// Optional in-process credential broker used by OAuth-capture
+    /// routes. `None` when OAuth capture is not configured for this
+    /// proxy session; the capture path is then inert.
+    pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
 }
 
 /// Handle a CONNECT request that matched a route requiring L7 visibility.
@@ -344,6 +348,12 @@ where
                     InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                     InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    // OauthCapture is response-side and shouldn't reach
+                    // here; plan step 17 audit hardening adds the proper
+                    // variant.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditInjectionMode::Header
+                    }
                 }),
                 denial_category: Some(nono::undo::NetworkAuditDenialCategory::HostDenied),
                 ..audit::EventContext::default()
@@ -356,10 +366,52 @@ where
         return Ok(());
     }
 
+    // --- Detect OAuth capture (Layer 1 response-body rewrite) ---
+    //
+    // Route flagged with `InjectMode::OauthCapture` + inbound path
+    // matches one of the configured token/refresh URLs + the proxy
+    // session was started with a `TokenResolver`. When all three hold,
+    // we set up `oauth_capture_active` so:
+    //   1. Accept-Encoding is stripped from the upstream request (so the
+    //      upstream returns plaintext JSON we can parse), and
+    //   2. a response-body rewriter is supplied to `forward_request`
+    //      which swaps `access_token` / `refresh_token` for nonces
+    //      minted by the broker.
+    let oauth_capture_active = match (route, ctx.token_resolver) {
+        (Some(rt), Some(_resolver)) => rt
+            .oauth_capture_match
+            .as_ref()
+            .is_some_and(|oc| path == oc.token_url_match || path == oc.refresh_url_match),
+        _ => false,
+    };
+
     // --- Read body (Content-Length only; chunked is rare in API requests
     // and matches the existing reverse-proxy contract). ---
     let strip_header = cred.map(|c| c.proxy_header_name.as_str()).unwrap_or("");
-    let filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    let mut filtered_headers = reverse::filter_headers(&header_bytes, strip_header);
+    if oauth_capture_active {
+        // Force identity encoding so the OAuth-rewriter sees plaintext
+        // JSON rather than gzip/br/etc. Pass-through-on-error keeps
+        // /login working if the upstream returns non-JSON anyway.
+        filtered_headers.retain(|(name, _)| !name.eq_ignore_ascii_case("accept-encoding"));
+    }
+    // Layer 1.2: nonce → real Bearer translation inside the CONNECT
+    // tunnel. The Layer 1 response rewriter swaps real OAuth tokens
+    // for `nono_<hex>` nonces in the OAuth callback body, so the
+    // sandboxed client subsequently uses nonces. The Anthropic Console
+    // flow's immediate follow-up `POST /api/oauth/claude_cli/create_api_key`
+    // travels through this same CONNECT tunnel — it'd reach Anthropic
+    // with the nonce as Authorization and get 401. Translate to the
+    // real bearer here, gated on the route being OAuth-capture-enabled.
+    // Note this fires on *any* path within the tunnel (not just the
+    // configured token URLs), since the client may send authenticated
+    // API calls to many paths and they all need translation.
+    if let (Some(_), Some(resolver)) = (
+        &route.and_then(|r| r.oauth_capture_match.as_ref()),
+        ctx.token_resolver,
+    ) {
+        rewrite_bearer_header(&mut filtered_headers, resolver.as_ref());
+    }
     let content_length = reverse::extract_content_length(&header_bytes);
     let body = match reverse::read_request_body(tls_stream, content_length, &buffered).await? {
         Some(b) => b,
@@ -415,6 +467,11 @@ where
                 }
                 InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
                 InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                // OauthCapture is response-side; defensive default
+                // until plan step 17 adds a dedicated variant.
+                InjectMode::OauthCapture { .. } => {
+                    nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                }
             }),
             auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
             managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
@@ -423,6 +480,9 @@ where
                 InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                 InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                 InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                // OauthCapture is response-side; see comment on the
+                // deeper-indented arm above.
+                InjectMode::OauthCapture { .. } => nono::undo::NetworkAuditInjectionMode::Header,
             }),
             denial_category: None,
         },
@@ -430,12 +490,63 @@ where
         method: &method,
         path: &path,
     };
+
+    // Build the OAuth response hook if capture is active. The closure
+    // owns an `Arc<dyn TokenResolver>` clone so it can mint nonces
+    // when the upstream response arrives. Pass-through-on-error: when
+    // `rewrite_oauth_json_body` returns `NotJson` or `NoTokenFields`,
+    // the hook returns `None` and `forward_request` forwards the
+    // original bytes unchanged.
+    //
+    // Audit logging of capture events (step 17 / commit `6df85cc`) is
+    // wired through `audit::log_oauth_capture` from within this hook
+    // so each successful rewrite emits an `OAUTH_CAPTURE substituted=N`
+    // event into the ring buffer (with no token/nonce material).
+    let response_hook: Option<forward::ResponseBodyRewriter<'_>> = if oauth_capture_active {
+        ctx.token_resolver.map(|resolver| {
+            let resolver = Arc::clone(resolver);
+            let audit_log_clone = ctx.audit_log.cloned();
+            let host_for_audit = ctx.host.to_string();
+            let port_for_audit = ctx.port;
+            let hook: forward::ResponseBodyRewriter<'_> = Box::new(move |body: &[u8]| {
+                match crate::oauth_rewrite::rewrite_oauth_json_body(body, resolver.as_ref()) {
+                    crate::oauth_rewrite::OauthRewriteOutcome::Rewritten { bytes, substituted } => {
+                        audit::log_oauth_capture(
+                            audit_log_clone.as_ref(),
+                            audit::ProxyMode::ConnectIntercept,
+                            &host_for_audit,
+                            port_for_audit,
+                            substituted,
+                        );
+                        Some(bytes.to_vec())
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NotJson => {
+                        warn!(
+                            "oauth-capture (tls_intercept): response not JSON; forwarding unchanged"
+                        );
+                        None
+                    }
+                    crate::oauth_rewrite::OauthRewriteOutcome::NoTokenFields => {
+                        debug!(
+                            "oauth-capture (tls_intercept): no token fields; forwarding unchanged"
+                        );
+                        None
+                    }
+                }
+            });
+            hook
+        })
+    } else {
+        None
+    };
+
     if let Err(e) = forward::forward_request(
         tls_stream,
         request.as_bytes(),
         &body,
         upstream_spec,
         audit_ctx,
+        response_hook,
     )
     .await
     {
@@ -451,6 +562,11 @@ where
                     }
                     InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditAuthMechanism::PhantomQuery,
+                    // OauthCapture is response-side; see comment on the
+                    // shallower-indented arm above.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditAuthMechanism::PhantomHeader
+                    }
                 }),
                 auth_outcome: cred.map(|_| nono::undo::NetworkAuditAuthOutcome::Succeeded),
                 managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
@@ -459,6 +575,12 @@ where
                     InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
                     InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
                     InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
+                    // OauthCapture is response-side and shouldn't reach
+                    // here; plan step 17 audit hardening adds the proper
+                    // variant.
+                    InjectMode::OauthCapture { .. } => {
+                        nono::undo::NetworkAuditInjectionMode::Header
+                    }
                 }),
                 denial_category: Some(
                     nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed,
@@ -489,6 +611,52 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
     ))
 }
 
+/// Translate a `Bearer nono_<hex>` Authorization value in `filtered_headers`
+/// to the broker-resolved real bearer. Mirrors the resolver-then-Bearer-
+/// prefix logic the reverse proxy already does at its own egress
+/// boundary (`reverse.rs` Layer 2); the TLS intercept is the second
+/// egress and needs the same treatment for follow-up API calls that
+/// travel inside the same CONNECT tunnel.
+///
+/// No-op when:
+/// - no Authorization header is present
+/// - the value is not a `Bearer ` token (other auth schemes)
+/// - the token does not begin with `nono_` (real bearers pass through)
+/// - the broker doesn't know the nonce (cross-session, broker cleared)
+fn rewrite_bearer_header(
+    filtered_headers: &mut [(String, String)],
+    resolver: &(dyn crate::broker::TokenResolver + 'static),
+) {
+    for (name, value) in filtered_headers.iter_mut() {
+        if !name.eq_ignore_ascii_case("authorization") {
+            continue;
+        }
+        let token = match value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+        {
+            Some(t) => t.trim().to_string(),
+            None => return,
+        };
+        if !token.starts_with("nono_") {
+            return;
+        }
+        let resolved = match resolver.resolve(&token) {
+            Some(real) => real,
+            None => {
+                debug!(
+                    "tls_intercept: nonce {}... not in broker; forwarding raw",
+                    &token[..12.min(token.len())]
+                );
+                return;
+            }
+        };
+        *value = format!("Bearer {}", resolved.as_str());
+        debug!("tls_intercept: translated nonce Bearer to real upstream token");
+        return;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -506,5 +674,105 @@ mod tests {
     fn parse_request_line_rejects_malformed() {
         assert!(parse_request_line("malformed").is_err());
         assert!(parse_request_line("").is_err());
+    }
+
+    /// Test fake `TokenResolver` with a fixed nonce → real mapping.
+    /// Avoids constructing a full `TokenBroker` for these unit tests.
+    struct FakeResolver {
+        nonce: &'static str,
+        real: &'static str,
+    }
+    impl crate::broker::TokenResolver for FakeResolver {
+        fn issue(&self, _: zeroize::Zeroizing<String>) -> String {
+            unreachable!("not used by these tests")
+        }
+        fn resolve(&self, nonce: &str) -> Option<zeroize::Zeroizing<String>> {
+            if nonce == self.nonce {
+                Some(zeroize::Zeroizing::new(self.real.to_string()))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_bearer_header_translates_nonce_to_real() {
+        let resolver = FakeResolver {
+            nonce: "nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            real: "sk-ant-oat01-deadbeef",
+        };
+        let mut headers = vec![(
+            "Authorization".to_string(),
+            "Bearer nono_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        )];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, "Bearer sk-ant-oat01-deadbeef");
+    }
+
+    #[test]
+    fn rewrite_bearer_header_passes_through_unknown_nonce() {
+        // Unknown nonce (broker cleared, cross-session, etc.) — leave
+        // untouched so the upstream's own auth error surfaces verbatim.
+        let resolver = FakeResolver {
+            nonce: "nono_known",
+            real: "real",
+        };
+        let original = "Bearer nono_unknown_nonce_value";
+        let mut headers = vec![("Authorization".to_string(), original.to_string())];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, original);
+    }
+
+    #[test]
+    fn rewrite_bearer_header_leaves_real_tokens_alone() {
+        // Real OAuth bearers (no `nono_` prefix) must pass through —
+        // e.g. when a route is OAuth-capture-configured but a client
+        // happens to have a non-broker token.
+        let resolver = FakeResolver {
+            nonce: "nono_x",
+            real: "real_x",
+        };
+        let original = "Bearer sk-ant-oat01-realtoken";
+        let mut headers = vec![("Authorization".to_string(), original.to_string())];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, original);
+    }
+
+    #[test]
+    fn rewrite_bearer_header_no_authorization_header_is_noop() {
+        let resolver = FakeResolver {
+            nonce: "nono_x",
+            real: "real_x",
+        };
+        let mut headers: Vec<(String, String)> =
+            vec![("Content-Type".to_string(), "application/json".to_string())];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, "application/json");
+    }
+
+    #[test]
+    fn rewrite_bearer_header_handles_lowercase_bearer() {
+        // HTTP allows mixed-case scheme tokens; the helper must
+        // normalise to canonical `Bearer ` on output.
+        let resolver = FakeResolver {
+            nonce: "nono_lc",
+            real: "real_lc",
+        };
+        let mut headers = vec![("Authorization".to_string(), "bearer nono_lc".to_string())];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, "Bearer real_lc");
+    }
+
+    #[test]
+    fn rewrite_bearer_header_case_insensitive_header_name() {
+        // Some clients send the Authorization header in lowercase
+        // ("authorization:") — must still match.
+        let resolver = FakeResolver {
+            nonce: "nono_x",
+            real: "real_x",
+        };
+        let mut headers = vec![("authorization".to_string(), "Bearer nono_x".to_string())];
+        rewrite_bearer_header(&mut headers, &resolver);
+        assert_eq!(headers[0].1, "Bearer real_x");
     }
 }

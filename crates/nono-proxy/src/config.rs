@@ -22,6 +22,41 @@ pub enum InjectMode {
     QueryParam,
     /// Use HTTP Basic Authentication (credential format: "username:password")
     BasicAuth,
+    /// Capture OAuth tokens from a TLS-intercepted response.
+    ///
+    /// Used together with `tls_intercept: true` (Layer 1 of
+    /// `2026-04-27-capture-anthropic-auth.md`). When the
+    /// TLS-intercept dispatcher sees a response whose request URL
+    /// path matches `token_url_match` or `refresh_url_match`, the
+    /// body rewriter parses the JSON, hands `access_token` /
+    /// `refresh_token` to the broker via [`crate::broker::TokenResolver::issue`],
+    /// and substitutes the resulting `nono_<hex>` nonces back into the
+    /// response body before forwarding to the sandboxed client.
+    ///
+    /// This variant does *not* take a `credential_key`; the secret is
+    /// captured at runtime, not pre-loaded from the keystore. Routes
+    /// using `OAuthCapture` should leave `credential_key` unset.
+    ///
+    /// JSON shape (externally tagged):
+    /// ```json
+    /// {
+    ///   "oauth_capture": {
+    ///     "token_url_match": "/api/oauth/token",
+    ///     "refresh_url_match": "/api/oauth/token"
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// The two patterns are matched independently; identical strings
+    /// are valid (the same upstream endpoint often serves both initial
+    /// authorization-code exchange and refresh-token exchange,
+    /// distinguished only by `grant_type` in the request body).
+    OauthCapture {
+        /// URL path the initial token-issuance response is captured on.
+        token_url_match: String,
+        /// URL path the refresh-token response is captured on.
+        refresh_url_match: String,
+    },
 }
 
 /// Configuration for the proxy server.
@@ -883,6 +918,75 @@ mod tests {
         let route: RouteConfig = serde_json::from_str(json).unwrap();
         assert!(route.oauth2.is_none());
         assert!(route.credential_key.is_some());
+    }
+
+    #[test]
+    fn test_inject_mode_unit_variants_use_snake_case_strings() {
+        // Sanity-check that adding the OauthCapture struct variant did
+        // not change the JSON shape of the existing unit variants.
+        let header: InjectMode = serde_json::from_str(r#""header""#).unwrap();
+        assert_eq!(header, InjectMode::Header);
+        let url_path: InjectMode = serde_json::from_str(r#""url_path""#).unwrap();
+        assert_eq!(url_path, InjectMode::UrlPath);
+        let query_param: InjectMode = serde_json::from_str(r#""query_param""#).unwrap();
+        assert_eq!(query_param, InjectMode::QueryParam);
+        let basic_auth: InjectMode = serde_json::from_str(r#""basic_auth""#).unwrap();
+        assert_eq!(basic_auth, InjectMode::BasicAuth);
+    }
+
+    #[test]
+    fn test_inject_mode_oauth_capture_deserializes_from_externally_tagged_json() {
+        let json = r#"{
+            "oauth_capture": {
+                "token_url_match": "/api/oauth/token",
+                "refresh_url_match": "/api/oauth/token"
+            }
+        }"#;
+        let mode: InjectMode = serde_json::from_str(json).unwrap();
+        match mode {
+            InjectMode::OauthCapture {
+                token_url_match,
+                refresh_url_match,
+            } => {
+                assert_eq!(token_url_match, "/api/oauth/token");
+                assert_eq!(refresh_url_match, "/api/oauth/token");
+            }
+            other => panic!("expected OauthCapture, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_inject_mode_oauth_capture_round_trips() {
+        // Profile-save flows should not silently drop the patterns.
+        let original = InjectMode::OauthCapture {
+            token_url_match: "/api/oauth/token".to_string(),
+            refresh_url_match: "/api/oauth/refresh".to_string(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let round_tripped: InjectMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn test_route_config_with_oauth_capture_inject_mode() {
+        // No `tls_intercept` field — upstream's primitive derives
+        // intercept eligibility from route content via
+        // `LoadedRoute::requires_intercept` (route.rs:188-189). Once
+        // step 10 of the plan extends the predicate to include
+        // `OauthCapture`, this route shape is what enables interception.
+        let json = r#"{
+            "prefix": "claude-oauth",
+            "upstream": "https://claude.ai",
+            "inject_mode": {
+                "oauth_capture": {
+                    "token_url_match": "/api/oauth/token",
+                    "refresh_url_match": "/api/oauth/token"
+                }
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.credential_key.is_none());
+        assert!(matches!(route.inject_mode, InjectMode::OauthCapture { .. }));
     }
 
     #[test]

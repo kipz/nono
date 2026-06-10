@@ -2569,6 +2569,285 @@ mod tests {
         );
     }
 
+    // --- End-to-end broker-refusal via `apply` -------------------------------
+    //
+    // These tests build a `ResolvedCommand` that mirrors what
+    // `mediation::broker_protection::oauth_capture_mediation_rules()` plus
+    // the profile→resolved transformation would produce. Then drive
+    // `ShimRequest`s through `apply` and assert the response. The point is
+    // to verify the matcher actually catches each argv shape the agent
+    // could realistically use, not just that the rule structure is correct
+    // (which the unit tests in `broker_protection` already cover).
+
+    /// Account name of the broker entry. Mirrors
+    /// `broker_protection::BROKER_ACCOUNT`. Kept inline to avoid a `use`
+    /// that drags the whole module into scope for one constant.
+    const BROKER_ACCOUNT: &str = "claude_oauth_broker";
+    const BROKER_SERVICE: &str = "nono";
+
+    /// Build a `ResolvedCommand` matching the production-shape entry
+    /// `broker_protection::inject_into` would produce, modulo the
+    /// profile→resolved transformation which is a 1:1 mapping for
+    /// `Respond` actions.
+    fn broker_refusal_resolved_command() -> ResolvedCommand {
+        let make = |args_prefix: Vec<String>| ResolvedIntercept {
+            args_prefix,
+            action: ResolvedAction::Respond {
+                stdout: String::new(),
+            },
+            exit_code: 44,
+            admin: false,
+        };
+        ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/security"),
+            intercepts: vec![
+                // Service-first ordering.
+                make(vec![
+                    "find-generic-password".to_string(),
+                    BROKER_SERVICE.to_string(),
+                    BROKER_ACCOUNT.to_string(),
+                ]),
+                // Account-first ordering.
+                make(vec![
+                    "find-generic-password".to_string(),
+                    BROKER_ACCOUNT.to_string(),
+                    BROKER_SERVICE.to_string(),
+                ]),
+            ],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        }
+    }
+
+    fn broker_request(args: Vec<&str>) -> ShimRequest {
+        ShimRequest {
+            command: "security".to_string(),
+            args: args.into_iter().map(str::to_string).collect(),
+            session_token: String::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Helper: assert the response is the canonical "not found" — empty
+    /// stdout, exit 44, and the dispatcher routed through `respond`.
+    fn assert_refused(resp: ShimResponse, action: &str) {
+        assert_eq!(
+            action, "respond",
+            "must dispatch to respond, not passthrough"
+        );
+        assert_eq!(
+            resp.exit_code, 44,
+            "must return errSecItemNotFound exit code"
+        );
+        assert!(
+            resp.stdout.is_empty(),
+            "stdout must be empty to avoid leaking entry contents (got: {:?})",
+            resp.stdout
+        );
+        assert!(
+            !resp.stdout.contains(BROKER_ACCOUNT),
+            "stdout must not echo the account name"
+        );
+        assert!(
+            !resp.stderr.contains(BROKER_ACCOUNT),
+            "stderr must not echo the account name"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_blocks_service_first_argv() {
+        // `security find-generic-password -s nono -a claude_oauth_broker -w`
+        // The -s, -a, -w tokens are filtered by `subcommand_matches`; the
+        // remaining positionals match the first injected rule.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-s",
+            BROKER_SERVICE,
+            "-a",
+            BROKER_ACCOUNT,
+            "-w",
+        ]);
+        let (resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_refused(resp, action);
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_blocks_account_first_argv() {
+        // `security find-generic-password -a claude_oauth_broker -s nono`
+        // Account positional appears before service. Catches the second
+        // injected rule, not the first. If only one rule had been injected
+        // an attacker could pick this ordering and bypass.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-a",
+            BROKER_ACCOUNT,
+            "-s",
+            BROKER_SERVICE,
+        ]);
+        let (resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_refused(resp, action);
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_blocks_with_interleaved_flags() {
+        // Flag-bouquet variant: `-w -s nono -a claude_oauth_broker -g`. The
+        // matcher filters all `-`-prefixed tokens regardless of position,
+        // so the rule still matches.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-w",
+            "-s",
+            BROKER_SERVICE,
+            "-a",
+            BROKER_ACCOUNT,
+            "-g",
+        ]);
+        let (resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_refused(resp, action);
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_blocks_with_trailing_keychain_positional() {
+        // `security find-generic-password -s nono -a claude_oauth_broker login.keychain-db`
+        // The optional `[keychain]` positional comes after the service/
+        // account values. `args_prefix` is a PREFIX check, so the extra
+        // trailing token doesn't break the match.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-s",
+            BROKER_SERVICE,
+            "-a",
+            BROKER_ACCOUNT,
+            "-w",
+            "/Users/christine.le/Library/Keychains/login.keychain-db",
+        ]);
+        let (resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_refused(resp, action);
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_does_not_block_other_security_services() {
+        // Negative coverage: the rule must NOT block reads of OTHER
+        // service/account pairs the user might legitimately have under the
+        // shared `service="nono"`. E.g. nono's credential-injection
+        // feature persists API keys under `service="nono", account="openai_api_key"`.
+        // Those reads must fall through to passthrough.
+        //
+        // `cmd` is configured with `real_path: /usr/bin/true`, so the
+        // passthrough exec succeeds with empty stdout. The point of the
+        // test is that the dispatcher routed it to passthrough rather
+        // than refusing.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-s",
+            BROKER_SERVICE,
+            "-a",
+            "openai_api_key",
+        ]);
+        let (_resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(
+            action, "passthrough",
+            "non-broker service/account combos must fall through to passthrough, not be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_does_not_block_claude_code_credentials() {
+        // Specifically: shadowfax's `Claude Code-credentials` rule must
+        // not be displaced. A request matching THAT shape (different
+        // account/service) must fall through.
+        let req = broker_request(vec![
+            "find-generic-password",
+            "chris",
+            "Claude Code-credentials",
+            "-w",
+        ]);
+        let (_resp, action) = apply_capture(
+            req,
+            &[broker_refusal_resolved_command()],
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(
+            action, "passthrough",
+            "Claude Code-credentials reads must fall through, not be refused by our rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_refusal_fires_before_profile_declared_passthrough() {
+        // Merge-semantics correctness via `apply`: when both the
+        // auto-injected refusal rule AND a profile-declared rule are
+        // present on the same `security` CommandEntry, the auto-injected
+        // rule must fire FIRST (Prepend semantics from
+        // `broker_protection::inject_into`).
+        //
+        // Constructs a ResolvedCommand with the broker-refusal rule
+        // followed by a permissive profile-declared passthrough rule that
+        // would otherwise match anything starting with "find-generic-password".
+        // (In practice the profile would be more specific; this is a
+        // pathological case that proves order matters.)
+        let mut cmd = broker_refusal_resolved_command();
+        cmd.intercepts.push(ResolvedIntercept {
+            args_prefix: vec!["find-generic-password".to_string()],
+            action: ResolvedAction::Respond {
+                stdout: "profile-said-ok".to_string(),
+            },
+            exit_code: 0,
+            admin: false,
+        });
+
+        let req = broker_request(vec![
+            "find-generic-password",
+            "-s",
+            BROKER_SERVICE,
+            "-a",
+            BROKER_ACCOUNT,
+        ]);
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+
+        assert_refused(resp, action);
+    }
+
     // --- Env filtering tests ---
 
     #[test]

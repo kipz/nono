@@ -1344,7 +1344,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         return Err(NonoError::NoCapabilities);
     }
 
-    let profile_mediation = loaded_profile
+    let mut profile_mediation = loaded_profile
         .as_ref()
         .map(|p| p.mediation.clone())
         .unwrap_or_default();
@@ -1352,6 +1352,15 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.oauth_capture)
         .unwrap_or(false);
+
+    // Auto-inject the broker-refusal mediation rule when oauth_capture is
+    // active. Closes the realistic subprocess-access path to the OAuth
+    // broker keychain entry. See `mediation::broker_protection` for the
+    // protection model and the 2026-06-09 manual security review that
+    // motivated this.
+    if profile_oauth_capture {
+        crate::mediation::broker_protection::inject_into(&mut profile_mediation);
+    }
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();

@@ -14,21 +14,38 @@
 //! previous session, so the keychain entry the sandboxed claude reads
 //! continues to resolve.
 //!
-//! ## Keychain ACL (LOAD-BEARING INVARIANT)
+//! ## Protection model: two layers, neither alone sufficient
 //!
-//! The broker entry is created with a strict trusted-application ACL
-//! listing only the nono binary by path. `securityd` enforces this by
-//! code signature — any other process (the sandboxed claude, the
-//! `security` CLI, plugins reading the keychain directly via
-//! `SecItemCopyMatching`) gets denied silently. This is what makes
-//! the persisted real tokens unreachable from the agent even though
-//! shadowfax's profile grants the agent broad Mach IPC access to
-//! securityd.
+//! The broker entry persists real OAuth tokens. Two mechanisms keep them
+//! unreachable from a prompt-injected agent:
 //!
-//! **This is the entire reason persistence is safe.** If the ACL is
-//! ever wide (e.g. created via `keyring::set_password`, which uses an
-//! "any application may access" default, or via `SecItemAdd` without
-//! `kSecAttrAccess`), the agent reads the real OAuth tokens directly.
+//! ### Primary: mediation refusal at the subprocess layer
+//!
+//! When a profile sets `oauth_capture: true`, nono auto-injects a mediation
+//! rule that refuses subprocess `security find-generic-password` reads of
+//! this entry (`mediation::broker_protection`). The shim returns
+//! `errSecItemNotFound` in the unsandboxed parent process before any call
+//! reaches macOS securityd. No dialog. No Allow button. No social-engineering
+//! surface. This is the protection the realistic threat model relies on.
+//!
+//! ### Defense-in-depth: legacy ACL on the keychain entry
+//!
+//! The entry is also created with a `SecAccess` ACL listing only the nono
+//! binary in the trusted-apps list. This catches attempts that bypass the
+//! mediation shim — most notably a binary linked against Security framework
+//! that calls `SecItemCopyMatching` via Mach IPC directly. But the legacy
+//! ACL does NOT silently deny non-trusted callers: it triggers a system
+//! dialog ("X wants to access key 'nono' in your keychain") the user can
+//! click Allow on. So this layer is visible alerting against the Mach-IPC
+//! bypass, not silent denial.
+//!
+//! Manual security testing on 2026-06-09 confirmed this distinction. Earlier
+//! versions of this module's docstring claimed the ACL silently denies;
+//! that was wrong. The mediation rule is what produces silent denial; the
+//! ACL produces visible prompts as defense-in-depth.
+//!
+//! ### Invariant
+//!
 //! Every save path through this module MUST go through
 //! [`save_with_nono_acl`], which:
 //! 1. Calls [`create_nono_access`] with `current_exe()` to build a
@@ -41,6 +58,8 @@
 //! `keyring::set_password` for the broker entry on macOS — the keyring
 //! crate's apple-native backend creates entries with the default ACL.
 //! `keyring` is intentionally not imported by this module's macOS code.
+//! Dropping the ACL would not break the primary mediation protection but
+//! would lose the defense-in-depth layer against Mach IPC.
 //!
 //! All Security framework operations run in-process (the nono binary,
 //! which is in the ACL). No `security` CLI subprocess is used, removing
@@ -193,7 +212,12 @@ mod macos_ffi {
 }
 
 /// Build a `SecAccess` that only lists the nono binary as a trusted
-/// application — `securityd` will silently deny any other caller.
+/// application. `securityd` silently allows reads from nono and presents
+/// a system dialog ("X wants to access key 'nono' in your keychain")
+/// for any other caller. The dialog is defense-in-depth against direct
+/// Mach IPC bypasses of the mediation shim — primary protection comes
+/// from `mediation::broker_protection`, which refuses subprocess reads
+/// in the parent before they reach securityd at all.
 #[cfg(target_os = "macos")]
 fn create_nono_access(
     exe_path: &std::path::Path,

@@ -9,6 +9,7 @@
 //! 5. If not matched: execs the real binary. `nono_<64-hex>` substrings inside both argv and
 //!    env-var values are replaced with the broker's real value before exec.
 
+use super::CaptureFormat;
 use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::session::{ResolvedAction, ResolvedCommand};
@@ -66,6 +67,10 @@ pub struct ShimResponse {
 /// Bundles the per-session paths and token needed by `apply` and `exec_passthrough`.
 pub struct SessionCtx<'a> {
     pub shim_dir: &'a std::path::Path,
+    /// Directory of source-path sidecar files. Forwarded to the mediated
+    /// subprocess as `NONO_SHIM_SOURCES_DIR` so nono-shim can resolve real
+    /// binaries reliably without re-walking PATH at exec time.
+    pub shim_sources_dir: &'a std::path::Path,
     pub socket_path: &'a std::path::Path,
     pub session_token: &'a str,
     /// Working directory of the nono session (the parent launch cwd or
@@ -274,7 +279,11 @@ pub async fn apply(
                     },
                     "respond",
                 ),
-                ResolvedAction::Capture { script } => {
+                ResolvedAction::Capture {
+                    script,
+                    format,
+                    secret_paths,
+                } => {
                     let result = match script {
                         Some(sh) => exec_script(sh, &request.env, &broker).await,
                         None => {
@@ -297,15 +306,41 @@ pub async fn apply(
                     if result.exit_code != 0 {
                         return (result, "capture");
                     }
-                    let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
-                    (
-                        ShimResponse {
-                            stdout: format!("{}\n", nonce),
-                            stderr: String::new(),
-                            exit_code: 0,
-                        },
-                        "capture",
-                    )
+                    match format {
+                        None => {
+                            // Default: treat stdout as one opaque credential.
+                            let nonce =
+                                broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
+                            (
+                                ShimResponse {
+                                    stdout: format!("{}\n", nonce),
+                                    stderr: String::new(),
+                                    exit_code: 0,
+                                },
+                                "capture",
+                            )
+                        }
+                        Some(CaptureFormat::Json) => {
+                            match rewrite_json_secrets(&result.stdout, secret_paths, &broker) {
+                                JsonCaptureOutcome::Rewritten(json) => (
+                                    ShimResponse {
+                                        stdout: json,
+                                        stderr: String::new(),
+                                        exit_code: 0,
+                                    },
+                                    "capture",
+                                ),
+                                JsonCaptureOutcome::FailClosed(msg) => (
+                                    ShimResponse {
+                                        stdout: String::new(),
+                                        stderr: format!("{msg}\n"),
+                                        exit_code: 1,
+                                    },
+                                    "capture",
+                                ),
+                            }
+                        }
+                    }
                 }
                 ResolvedAction::Approve { script } => {
                     // Run the real binary (or script) and return the actual output.
@@ -632,6 +667,14 @@ async fn exec_passthrough(
     // this, shims in the filtered dir would skip the wrong directory and find
     // themselves again, causing infinite exec recursion (EAGAIN).
     env.insert("NONO_SHIM_DIR".to_string(), shim_dir_str.clone());
+
+    // Forward NONO_SHIM_SOURCES_DIR — points to the session-level sidecar dir
+    // (not filtered per-command), so nono-shim can resolve real binaries by
+    // looking up the recorded source path before falling back to PATH.
+    env.insert(
+        "NONO_SHIM_SOURCES_DIR".to_string(),
+        ctx.shim_sources_dir.to_string_lossy().to_string(),
+    );
 
     // Inject mediation socket path and session token so the shim binaries
     // invoked by the exec'd command can authenticate to the mediation server.
@@ -1217,6 +1260,127 @@ fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
     out
 }
 
+/// Result of running `format: "json"` substitution on a captured stdout.
+#[derive(Debug)]
+enum JsonCaptureOutcome {
+    /// JSON parsed and substitution succeeded; carries the rewritten stdout.
+    Rewritten(String),
+    /// Operational failure: the stdout could not be processed safely. The
+    /// caller must NOT return the raw stdout — it may contain a real
+    /// credential. The wrapped string is a sandbox-safe error message.
+    FailClosed(String),
+}
+
+/// Run JSON-format substitution on captured stdout.
+///
+/// Parses `raw` as a JSON object, walks each dotted path in `secret_paths`
+/// to a string value, mints a nonce via `broker.issue`, and replaces the
+/// value with the nonce. Returns the rewritten JSON serialised as a String.
+///
+/// **Fail-closed contract**: every error path returns
+/// [`JsonCaptureOutcome::FailClosed`] with a sandbox-safe message rather
+/// than propagating an error that the caller might log alongside the raw
+/// stdout. Specifically:
+///
+/// - Malformed JSON → fail-closed. We never return `raw` unchanged because
+///   `raw` is the real credential the agent must not see.
+/// - A path resolves to a non-string value (number, object, array, bool,
+///   null) → fail-closed. A profile that targets a non-string path is
+///   misconfigured; returning the unmodified JSON would leak any string
+///   credentials siblings the profile *did* expect to nonce.
+/// - A path's parent doesn't exist or isn't an object → treated as
+///   "missing" and silently skipped (matches the documented behaviour
+///   in the design doc).
+///
+/// **Path syntax**: dotted, no escape syntax for keys containing literal
+/// dots (we have no in-tree need for them). `a.b.c` traverses three
+/// nested object keys.
+fn rewrite_json_secrets(
+    raw: &str,
+    secret_paths: &[String],
+    broker: &TokenBroker,
+) -> JsonCaptureOutcome {
+    let mut value: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            // Use the line/column reporter from serde_json::Error rather
+            // than its message — the message can echo a snippet of the
+            // input on some inputs, and we must not include `raw` content
+            // in our error.
+            return JsonCaptureOutcome::FailClosed(format!(
+                "nono: capture format=json: stdout is not valid JSON \
+                 (at line {} column {}); refusing to return raw output",
+                e.line(),
+                e.column()
+            ));
+        }
+    };
+
+    for path in secret_paths {
+        match substitute_one_path(&mut value, path, broker) {
+            Ok(()) => {}
+            Err(SubstituteErr::NonString) => {
+                return JsonCaptureOutcome::FailClosed(format!(
+                    "nono: capture format=json: secret_path '{}' resolved \
+                     to a non-string value; refusing to return raw output \
+                     to avoid leaking unrelated string credentials",
+                    path
+                ));
+            }
+            Err(SubstituteErr::MissingPath) => {
+                // Silent skip — documented behaviour.
+            }
+        }
+    }
+
+    match serde_json::to_string(&value) {
+        Ok(s) => JsonCaptureOutcome::Rewritten(s),
+        Err(e) => JsonCaptureOutcome::FailClosed(format!(
+            "nono: capture format=json: could not re-serialise JSON ({}); \
+             refusing to return raw output",
+            e
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum SubstituteErr {
+    /// One of the path segments does not exist or its parent is not an
+    /// object. Caller treats this as a no-op for that path.
+    MissingPath,
+    /// The leaf value at the path is not a JSON string.
+    NonString,
+}
+
+fn substitute_one_path(
+    value: &mut serde_json::Value,
+    dotted: &str,
+    broker: &TokenBroker,
+) -> std::result::Result<(), SubstituteErr> {
+    let segments: Vec<&str> = dotted.split('.').collect();
+    if segments.is_empty() {
+        return Err(SubstituteErr::MissingPath);
+    }
+    let (last, parents) = segments.split_last().unwrap_or((&"", &[]));
+
+    let mut cursor = value;
+    for seg in parents {
+        cursor = match cursor.as_object_mut().and_then(|m| m.get_mut(*seg)) {
+            Some(child) => child,
+            None => return Err(SubstituteErr::MissingPath),
+        };
+    }
+    let obj = cursor.as_object_mut().ok_or(SubstituteErr::MissingPath)?;
+    let entry = match obj.get_mut(*last) {
+        Some(e) => e,
+        None => return Err(SubstituteErr::MissingPath),
+    };
+    let s = entry.as_str().ok_or(SubstituteErr::NonString)?.to_string();
+    let nonce = broker.issue(Zeroizing::new(s));
+    *entry = serde_json::Value::String(nonce);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,6 +1514,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1365,6 +1530,7 @@ mod tests {
     fn ctx() -> SessionCtx<'static> {
         SessionCtx {
             shim_dir: std::path::Path::new("/tmp"),
+            shim_sources_dir: std::path::Path::new("/tmp"),
             socket_path: std::path::Path::new("/tmp/test.sock"),
             session_token: "test_token",
             workdir: std::path::Path::new("/tmp"),
@@ -1593,6 +1759,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1627,6 +1794,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1662,6 +1830,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1695,6 +1864,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1729,6 +1899,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1764,6 +1935,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1858,7 +2030,11 @@ mod tests {
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
             args_prefix: vec!["auth".to_string()],
-            action: ResolvedAction::Capture { script: None },
+            action: ResolvedAction::Capture {
+                script: None,
+                format: None,
+                secret_paths: Vec::new(),
+            },
             exit_code: 0,
             admin: false,
         }]);
@@ -1882,6 +2058,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1907,6 +2084,8 @@ mod tests {
             args_prefix: vec!["auth".to_string()],
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
+                format: None,
+                secret_paths: Vec::new(),
             },
             exit_code: 0,
             admin: false,
@@ -1925,6 +2104,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -1937,6 +2117,456 @@ mod tests {
         assert!(nonce.starts_with("nono_"), "expected nonce, got: {}", nonce);
         let resolved = broker.resolve(nonce).expect("nonce should be in broker");
         assert_eq!(resolved.as_str(), "my_secret_token");
+    }
+
+    // --- JSON-format capture (`rewrite_json_secrets`) tests ---
+
+    /// Realistic shape of the macOS `Claude Code-credentials` keychain
+    /// envelope: Anthropic OAuth + a Slack MCP entry under `mcpOAuth`.
+    fn keychain_envelope_with_slack() -> &'static str {
+        r#"{
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-real-anthropic-access",
+                "refreshToken": "sk-ant-ort01-real-anthropic-refresh",
+                "expiresAt": 1234567890000,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            },
+            "mcpOAuth": {
+                "abc123serverkey": {
+                    "serverName": "slack",
+                    "serverUrl": "https://mcp.slack.com/mcp",
+                    "accessToken": "real-slack-oauth-bearer",
+                    "refreshToken": "real-slack-refresh",
+                    "expiresAt": 9876543210000
+                }
+            }
+        }"#
+    }
+
+    #[test]
+    fn json_capture_substitutes_anthropic_paths_only() {
+        let broker = make_broker();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "claudeAiOauth.refreshToken".to_string(),
+        ];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        let rewritten = match outcome {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            JsonCaptureOutcome::FailClosed(msg) => {
+                panic!("expected Rewritten, got FailClosed: {msg}")
+            }
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten JSON parses");
+
+        // Anthropic tokens replaced with nonces, and those nonces resolve to
+        // the real values via the broker.
+        let new_access = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("access string");
+        let new_refresh = parsed["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .expect("refresh string");
+        assert!(
+            new_access.starts_with("nono_"),
+            "access wasn't nonced: {new_access}"
+        );
+        assert!(
+            new_refresh.starts_with("nono_"),
+            "refresh wasn't nonced: {new_refresh}"
+        );
+        assert_ne!(new_access, new_refresh, "must mint distinct nonces");
+        assert_eq!(
+            broker.resolve(new_access).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(new_refresh).map(|s| s.as_str().to_string()),
+            Some("sk-ant-ort01-real-anthropic-refresh".to_string())
+        );
+
+        // Slack MCP credentials must NOT be substituted — same field name
+        // ("accessToken") but at a path the profile didn't target. This is
+        // the field-path-collision regression test the design doc calls out.
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["accessToken"].as_str(),
+            Some("real-slack-oauth-bearer")
+        );
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["refreshToken"].as_str(),
+            Some("real-slack-refresh")
+        );
+
+        // Non-OAuth fields preserved verbatim.
+        assert_eq!(
+            parsed["claudeAiOauth"]["subscriptionType"].as_str(),
+            Some("max")
+        );
+        assert_eq!(
+            parsed["claudeAiOauth"]["expiresAt"].as_i64(),
+            Some(1234567890000)
+        );
+    }
+
+    #[test]
+    fn json_capture_missing_path_silently_skipped() {
+        // A path that doesn't exist anywhere in the envelope must NOT
+        // fail-closed — it's a documented no-op. Other matched paths
+        // still get substituted.
+        let broker = make_broker();
+        let paths = vec![
+            "claudeAiOauth.accessToken".to_string(),
+            "nonExistentTopLevel.someField".to_string(),
+            "claudeAiOauth.notARealField".to_string(),
+        ];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        let rewritten = match outcome {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            JsonCaptureOutcome::FailClosed(msg) => {
+                panic!("missing path must not fail-closed: {msg}")
+            }
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rewritten).expect("rewritten JSON parses");
+        assert!(
+            parsed["claudeAiOauth"]["accessToken"]
+                .as_str()
+                .expect("accessToken is a string")
+                .starts_with("nono_")
+        );
+    }
+
+    #[test]
+    fn json_capture_non_string_value_fail_closed() {
+        // A path that resolves to a non-string (here, a number) must
+        // fail closed rather than return the unmodified envelope.
+        // Otherwise a misconfigured profile would silently expose
+        // sibling string credentials it *did* intend to nonce.
+        let broker = make_broker();
+        let paths = vec!["claudeAiOauth.expiresAt".to_string()];
+        let outcome = rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker);
+        match outcome {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                assert!(
+                    msg.contains("non-string"),
+                    "error message must explain why: {msg}"
+                );
+                // Real values must not leak via the error message.
+                assert!(!msg.contains("sk-ant-oat01"));
+                assert!(!msg.contains("real-slack-oauth-bearer"));
+            }
+            JsonCaptureOutcome::Rewritten(s) => {
+                panic!("expected fail-closed for non-string value; got Rewritten: {s}")
+            }
+        }
+    }
+
+    #[test]
+    fn json_capture_malformed_input_fail_closed_no_leak() {
+        // Malformed JSON must fail closed. The raw input string must
+        // never appear in the error message — it may contain real
+        // credentials that the agent must not see via the error path.
+        let broker = make_broker();
+        let raw = r#"{"claudeAiOauth": {"accessToken": "sk-ant-oat01-secret"} INVALID"#;
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+        match rewrite_json_secrets(raw, &paths, &broker) {
+            JsonCaptureOutcome::FailClosed(msg) => {
+                assert!(msg.contains("not valid JSON"), "msg: {msg}");
+                assert!(
+                    !msg.contains("sk-ant-oat01-secret"),
+                    "error must not leak raw input: {msg}"
+                );
+            }
+            other => panic!("expected fail-closed on malformed JSON, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_capture_each_call_mints_fresh_nonces() {
+        // Idempotence-of-shape, not idempotence-of-output: running the
+        // same substitution twice must produce the same JSON keys but
+        // *different* nonces (the broker mints fresh on each issue()).
+        let broker = make_broker();
+        let paths = vec!["claudeAiOauth.accessToken".to_string()];
+
+        let first = match rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker) {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            other => panic!("expected Rewritten, got: {other:?}"),
+        };
+        let second = match rewrite_json_secrets(keychain_envelope_with_slack(), &paths, &broker) {
+            JsonCaptureOutcome::Rewritten(s) => s,
+            other => panic!("expected Rewritten, got: {other:?}"),
+        };
+
+        let p1: serde_json::Value = serde_json::from_str(&first).expect("first JSON parses");
+        let p2: serde_json::Value = serde_json::from_str(&second).expect("second JSON parses");
+        let n1 = p1["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("p1 accessToken string");
+        let n2 = p2["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("p2 accessToken string");
+        assert!(n1.starts_with("nono_"));
+        assert!(n2.starts_with("nono_"));
+        assert_ne!(n1, n2, "each call must mint a fresh nonce");
+
+        // Both nonces resolve to the same real value.
+        assert_eq!(
+            broker.resolve(n1).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(n2).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+    }
+
+    // --- End-to-end JSON-format Capture via `apply` ---
+    //
+    // The unit tests above exercise `rewrite_json_secrets` in isolation.
+    // These tests drive the full dispatcher: a `ResolvedAction::Capture`
+    // with `format: Some(Json)` + `secret_paths`, running through `apply`
+    // via `apply_capture`. Catches regressions where the helper works but
+    // the dispatch arm in `apply` drops `format`/`secret_paths` or
+    // forwards them incorrectly.
+
+    /// Shell-escape a JSON literal so it survives `sh -c "echo '<literal>'"`.
+    /// Only escapes single quotes; the keychain envelope is otherwise
+    /// quote-safe under single quotes.
+    fn sh_single_quote(literal: &str) -> String {
+        format!("'{}'", literal.replace('\'', r"'\''"))
+    }
+
+    #[tokio::test]
+    async fn end_to_end_json_capture_substitutes_anthropic_paths() {
+        // Sim the macOS `security find-generic-password ... Claude
+        // Code-credentials` call: a script that emits a keychain-shaped
+        // JSON envelope on stdout. The intercept rule routes it through
+        // the JSON-format Capture path. Verify the dispatcher actually
+        // produces nonces in the response and the broker holds the
+        // real values.
+        let envelope = keychain_envelope_with_slack();
+        let script = format!("printf '%s' {}", sh_single_quote(envelope));
+
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec![
+                    "find-generic-password".to_string(),
+                    "chris".to_string(),
+                    "Claude Code-credentials".to_string(),
+                ],
+                action: ResolvedAction::Capture {
+                    script: Some(script),
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec![
+                        "claudeAiOauth.accessToken".to_string(),
+                        "claudeAiOauth.refreshToken".to_string(),
+                    ],
+                },
+                exit_code: 0,
+                admin: false,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec![
+                "find-generic-password".to_string(),
+                "chris".to_string(),
+                "Claude Code-credentials".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let broker = make_broker();
+        let (resp, action) =
+            apply_capture(req, &[cmd], Arc::clone(&broker), &ctx(), always_allow()).await;
+
+        assert_eq!(
+            action, "capture",
+            "must dispatch to capture, not passthrough"
+        );
+        assert_eq!(resp.exit_code, 0, "stderr={}", resp.stderr);
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&resp.stdout).expect("response stdout parses as JSON");
+        let new_access = parsed["claudeAiOauth"]["accessToken"]
+            .as_str()
+            .expect("accessToken in response");
+        let new_refresh = parsed["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .expect("refreshToken in response");
+
+        assert!(
+            new_access.starts_with("nono_"),
+            "access not nonced: {new_access}"
+        );
+        assert!(
+            new_refresh.starts_with("nono_"),
+            "refresh not nonced: {new_refresh}"
+        );
+        assert_eq!(
+            broker.resolve(new_access).map(|s| s.as_str().to_string()),
+            Some("sk-ant-oat01-real-anthropic-access".to_string())
+        );
+        assert_eq!(
+            broker.resolve(new_refresh).map(|s| s.as_str().to_string()),
+            Some("sk-ant-ort01-real-anthropic-refresh".to_string())
+        );
+
+        // The whole MCP subtree must pass through unchanged. This is the
+        // load-bearing assertion for the plugin-compat goal: future MCP
+        // plugins land under `mcpOAuth.<key>` and must not be nonced.
+        assert_eq!(
+            parsed["mcpOAuth"]["abc123serverkey"]["accessToken"].as_str(),
+            Some("real-slack-oauth-bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn end_to_end_json_capture_malformed_stdout_fail_closed() {
+        // Capture script emits non-JSON. The dispatcher must surface the
+        // fail-closed message and exit non-zero — and crucially must NOT
+        // return the raw stdout, which would leak the real credential.
+        let cmd = ResolvedCommand {
+            name: "security".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            intercepts: vec![ResolvedIntercept {
+                args_prefix: vec!["find-generic-password".to_string()],
+                action: ResolvedAction::Capture {
+                    script: Some("printf 'sk-ant-oat01-SECRET-LEAK'".to_string()),
+                    format: Some(CaptureFormat::Json),
+                    secret_paths: vec!["claudeAiOauth.accessToken".to_string()],
+                },
+                exit_code: 0,
+                admin: false,
+            }],
+            sandbox: None,
+            caller_policy: CallerPolicy::default(),
+        };
+
+        let req = ShimRequest {
+            command: "security".to_string(),
+            args: vec!["find-generic-password".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, _action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+
+        assert_ne!(resp.exit_code, 0, "malformed JSON must exit non-zero");
+        assert!(
+            !resp.stdout.contains("sk-ant-oat01-SECRET-LEAK"),
+            "raw stdout (real credential) must not appear in response: {}",
+            resp.stdout
+        );
+        assert!(
+            !resp.stderr.contains("sk-ant-oat01-SECRET-LEAK"),
+            "raw stdout (real credential) must not leak via stderr: {}",
+            resp.stderr
+        );
+        assert!(
+            resp.stderr.contains("not valid JSON"),
+            "stderr must explain fail-closed reason: {}",
+            resp.stderr
+        );
+    }
+
+    // --- Argument-ordering regression: `security find-generic-password` ---
+    //
+    // `security find-generic-password` accepts both `<account> <service>`
+    // and `<service> <account>` positionals (it figures out which is
+    // which from `-a`/`-s` flags or from the option order). The
+    // shadowfax profile pre-pivot covers both literal orderings under
+    // separate `approve` rules; the mediation pivot must keep both
+    // routed to the JSON-format capture, otherwise an agent could pick
+    // the un-mediated ordering and leak. These tests pin
+    // `subcommand_matches` against the two real-world shapes so a
+    // future change to the matcher cannot silently break protection.
+
+    #[test]
+    fn args_ordering_user_then_service_matches() {
+        // `security find-generic-password $USER Claude Code-credentials`
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_service_then_user_matches() {
+        // `security find-generic-password Claude Code-credentials $USER`
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_with_interleaved_flags_still_matches() {
+        // Realistic Claude Code call: `security find-generic-password -w
+        // -a chris -s "Claude Code-credentials"`. The `-w`/`-a`/`-s`
+        // flags carry values but `subcommand_matches` filters anything
+        // starting with `-` from positional matching. The "chris" and
+        // service-string values would still appear in the positional
+        // stream and match the prefix.
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "-w".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        assert!(subcommand_matches(&prefix, &args));
+    }
+
+    #[test]
+    fn args_ordering_wrong_positional_order_does_not_match() {
+        // If the actual argv has user/service in the OPPOSITE order from
+        // the rule's args_prefix, the rule must not match (positional
+        // matching is order-sensitive). This is the negative case that
+        // forces a profile author to ship both orderings explicitly.
+        let prefix = vec![
+            "find-generic-password".to_string(),
+            "chris".to_string(),
+            "Claude Code-credentials".to_string(),
+        ];
+        let args = vec![
+            "find-generic-password".to_string(),
+            "Claude Code-credentials".to_string(),
+            "chris".to_string(),
+        ];
+        assert!(
+            !subcommand_matches(&prefix, &args),
+            "rule must NOT match the opposite ordering — both orderings need explicit rules"
+        );
     }
 
     // --- Env filtering tests ---
@@ -2112,7 +2742,9 @@ mod tests {
 
         let session_dir = tempfile::tempdir().expect("create temp dir");
         let shim_dir = session_dir.path().join("shims");
+        let shim_sources_dir = session_dir.path().join("shim-sources");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
+        std::fs::create_dir_all(&shim_sources_dir).expect("create shim sources dir");
 
         // Create fake shim files (need to exist for build_filtered_shim_dir)
         for name in &["gh", "ddtool"] {
@@ -2163,6 +2795,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: &shim_dir,
+                shim_sources_dir: &shim_sources_dir,
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2183,9 +2816,12 @@ mod tests {
 
         // NONO_SHIM_DIR must NOT be the original shims/ directory — it should
         // be the filtered shim dir created by exec_passthrough.
+        // Explicit `&str` cast avoids an inference collision between
+        // stdlib's `AsRef<T> for Cow<'_, T>` and `typed_path`'s
+        // `AsRef<Utf8Path<T>> for Cow<'_, str>`.
+        let shim_dir_str: &str = &shim_dir.to_string_lossy();
         assert_ne!(
-            child_shim_dir,
-            shim_dir.to_string_lossy().as_ref() as &str,
+            child_shim_dir, shim_dir_str,
             "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
         );
 
@@ -2202,6 +2838,21 @@ mod tests {
             "PATH should start with NONO_SHIM_DIR ({}), got: {}",
             child_shim_dir,
             child_path
+        );
+
+        // NONO_SHIM_SOURCES_DIR is propagated unchanged from the SessionCtx —
+        // it must not be filtered per-command, since the sidecar files only
+        // exist at the session level.
+        let sources_line = resp
+            .stdout
+            .lines()
+            .find(|l| l.starts_with("NONO_SHIM_SOURCES_DIR="))
+            .expect("NONO_SHIM_SOURCES_DIR not found in env output");
+        let child_sources_dir = sources_line.trim_start_matches("NONO_SHIM_SOURCES_DIR=");
+        assert_eq!(
+            child_sources_dir,
+            shim_sources_dir.to_string_lossy(),
+            "NONO_SHIM_SOURCES_DIR must point to the session-level sources dir"
         );
     }
 
@@ -2249,6 +2900,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2313,6 +2965,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2382,6 +3035,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2446,6 +3100,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2506,6 +3161,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2567,6 +3223,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2630,6 +3287,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2693,6 +3351,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2775,6 +3434,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: &shim_dir,
+                shim_sources_dir: &shim_dir,
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2878,6 +3538,7 @@ mod tests {
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -2949,6 +3610,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -3018,6 +3680,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
@@ -3091,6 +3754,7 @@ mod tests {
             make_broker(),
             &SessionCtx {
                 shim_dir: std::path::Path::new("/tmp"),
+                shim_sources_dir: std::path::Path::new("/tmp"),
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),

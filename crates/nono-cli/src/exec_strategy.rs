@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
+pub(crate) use env_sanitization::is_env_var_denied;
 use env_sanitization::should_skip_env_var;
 pub(crate) use env_sanitization::validate_env_var_patterns;
 

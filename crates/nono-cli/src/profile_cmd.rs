@@ -1150,6 +1150,15 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         }
     }
 
+    if profile.oauth_capture {
+        println!();
+        println!(
+            "  {} {}",
+            theme::fg("OAuth capture:", t.subtext).bold(),
+            theme::fg("enabled", t.text)
+        );
+    }
+
     Ok(())
 }
 
@@ -1323,6 +1332,10 @@ fn profile_to_json(
 
     if !profile.unsafe_macos_seatbelt_rules.is_empty() {
         val["unsafe_macos_seatbelt_rules"] = serde_json::json!(profile.unsafe_macos_seatbelt_rules);
+    }
+
+    if profile.oauth_capture {
+        val["oauth_capture"] = serde_json::json!(true);
     }
 
     val
@@ -3092,6 +3105,10 @@ fn resolve_to_manifest(
             profile::InjectMode::UrlPath => manifest::InjectMode::UrlPath,
             profile::InjectMode::QueryParam => manifest::InjectMode::QueryParam,
             profile::InjectMode::BasicAuth => manifest::InjectMode::BasicAuth,
+            // OauthCapture is not representable in the capability-manifest
+            // schema (it has no static credential to declare); skip the
+            // route entirely, consistent with the OAuth2 `None` skip below.
+            profile::InjectMode::OauthCapture { .. } => continue,
         };
 
         let endpoint_rules: Vec<manifest::EndpointRule> = cred

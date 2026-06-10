@@ -235,7 +235,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         output::print_supervised_info(flags.silent, rollback.requested, proxy.active);
     }
 
-    let active_proxy = start_proxy_runtime(proxy, &mut caps, &flags.workdir)?;
+    let active_proxy = start_proxy_runtime(
+        proxy,
+        &mut caps,
+        &flags.workdir,
+        resolved_program.as_os_str(),
+    )?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
 
@@ -394,10 +399,24 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
 
     // Inject mediation env vars: session token, socket path, and prepend shim dir to PATH.
     let mediation_path_value;
-    if mediation_handle.is_some() {
+    let mediation_commands_str;
+    let mediation_audit_socket_str;
+    let mediation_sources_dir_str;
+    if let Some(ref handle) = mediation_handle {
         env_vars.push(("NONO_SESSION_TOKEN", &mediation_token_str));
         env_vars.push(("NONO_MEDIATION_SOCKET", &mediation_socket_str));
         env_vars.push(("NONO_SHIM_DIR", &mediation_path_str));
+        // Source-path sidecars: nono-shim consults <NONO_SHIM_SOURCES_DIR>/<name>
+        // before falling back to a PATH walk, so resolution is stable across
+        // intermediate shells that munge PATH (e.g. husky pre-commit hooks).
+        mediation_sources_dir_str = handle.shim_sources_dir.display().to_string();
+        env_vars.push(("NONO_SHIM_SOURCES_DIR", &mediation_sources_dir_str));
+        // Tell shims which commands use full mediation vs audit-only passthrough.
+        mediation_commands_str = handle.mediated_commands.join(",");
+        env_vars.push(("NONO_MEDIATED_COMMANDS", &mediation_commands_str));
+        // Audit socket for fire-and-forget command logging.
+        mediation_audit_socket_str = handle.audit_socket_path.display().to_string();
+        env_vars.push(("NONO_AUDIT_SOCKET", &mediation_audit_socket_str));
         // Prepend the mediation shim directory to PATH so the agent resolves
         // mediated commands to our shims instead of the real binaries.
         let current_path = std::env::var("PATH").unwrap_or_default();

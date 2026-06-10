@@ -190,6 +190,23 @@ pub fn resolve_credentials(
         return Ok(Vec::new());
     }
 
+    // Reject service names that sit in the reserved nono-internal
+    // prefix namespace (e.g. "__nono_oauth_*"). User profiles cannot
+    // declare credentials here because the resulting route prefix would
+    // shadow nono-injected internal routes such as the OAuth-capture
+    // intercept routes.
+    for name in service_names {
+        if nono_proxy::is_reserved_prefix(name) {
+            return Err(NonoError::ConfigParse(format!(
+                "credential service name '{}' uses the reserved '{}' \
+                 prefix namespace; that namespace is reserved for \
+                 nono-internal routes. Pick a different name.",
+                name,
+                nono_proxy::RESERVED_PREFIX_NAMESPACE
+            )));
+        }
+    }
+
     // Validate all requested services exist in either custom or built-in
     for name in service_names {
         if !custom_credentials.contains_key(name) && !policy.credentials.contains_key(name) {
@@ -548,6 +565,32 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nonexistent_service"));
         assert!(err.contains("Unknown credential service"));
+    }
+
+    #[test]
+    fn test_resolve_credentials_rejects_reserved_prefix() {
+        // Names in the `__nono_` namespace are reserved for nono-internal
+        // routes; resolve_credentials must reject them before any
+        // built-in / custom lookup so that a user route cannot shadow an
+        // internal one (e.g. the OAuth-capture intercept routes).
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+        let result = resolve_credentials(
+            &policy,
+            &["__nono_oauth_evil".to_string()],
+            &HashMap::new(),
+            test_workdir(),
+        );
+        let err = result.expect_err("reserved-prefix service name must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved"),
+            "error should mention the reserved namespace, got: {msg}"
+        );
+        assert!(
+            msg.contains("__nono_oauth_evil"),
+            "error should name the offending service, got: {msg}"
+        );
     }
 
     #[test]

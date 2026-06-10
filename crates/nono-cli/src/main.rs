@@ -36,6 +36,7 @@ mod macos_trust;
 mod mediation;
 mod migration;
 mod network_policy;
+mod oauth_preflight;
 mod open_url_runtime;
 mod output;
 mod pack_update_hint;
@@ -290,6 +291,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            oauth_capture: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);
@@ -342,6 +344,7 @@ mod tests {
             allowed_env_vars: None,
             denied_env_vars: None,
             mediation: mediation::MediationConfig::default(),
+            oauth_capture: false,
         };
 
         let effective = resolve_effective_proxy_settings(&args, &prepared);

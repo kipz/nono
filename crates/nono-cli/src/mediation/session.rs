@@ -11,7 +11,8 @@ use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
 use super::broker::TokenBroker;
 use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
+    CallerPolicy, CaptureFormat, CommandEntry, CommandSandbox, InterceptAction, MediationConfig,
+    SessionAuditInfo,
 };
 use nix::libc;
 use nono::{NonoError, Result};
@@ -24,9 +25,22 @@ use zeroize::Zeroizing;
 /// The action stored in a resolved intercept rule.
 #[derive(Clone, Debug)]
 pub enum ResolvedAction {
-    Respond { stdout: String },
-    Capture { script: Option<String> },
-    Approve { script: Option<String> },
+    Respond {
+        stdout: String,
+    },
+    Capture {
+        script: Option<String>,
+        /// Optional output format. `None` means opaque stdout (single
+        /// nonce wraps the full stdout). `Some(Json)` means parse stdout
+        /// as JSON and mint nonces at `secret_paths`.
+        format: Option<CaptureFormat>,
+        /// Dotted JSON paths to substitute with nonces. Empty unless
+        /// `format` is `Some(Json)`.
+        secret_paths: Vec<String>,
+    },
+    Approve {
+        script: Option<String>,
+    },
 }
 
 /// A resolved intercept rule ready for the mediation server.
@@ -56,6 +70,11 @@ pub struct ResolvedCommand {
 pub struct SessionHandle {
     /// Directory containing shim symlinks (must be prepended to child PATH).
     pub shim_dir: PathBuf,
+    /// Directory of source-path sidecar files written at session start. Each
+    /// entry `<name>` contains the absolute path of the real binary `name`
+    /// resolved to. nono-shim reads these to find real binaries reliably even
+    /// when PATH has been munged in nested shells.
+    pub shim_sources_dir: PathBuf,
     /// Real path of the nono-shim binary (needed for sandbox file-read allow rules).
     pub shim_binary: PathBuf,
     /// Path of the Unix socket the mediation server listens on.
@@ -74,6 +93,10 @@ pub struct SessionHandle {
     pub control_socket_path: PathBuf,
     /// Shared admin mode state (for passing to admin_commands query).
     pub admin_state: AdminState,
+    /// Command names that use full request-response mediation (vs audit-only).
+    pub mediated_commands: Vec<String>,
+    /// Path to the audit datagram socket for fire-and-forget command logging.
+    pub audit_socket_path: PathBuf,
     /// Latch set to the sandboxed process PID after the sandboxed process is forked.
     /// Callers must call `latch.set(sandboxed_pid)` in their post-fork callback.
     pub sandboxed_pid_latch: Arc<OnceLock<u32>>,
@@ -125,13 +148,27 @@ pub fn setup(
 
     let session_dir = session_dir_path();
     let shim_dir = session_dir.join("shims");
+    let shim_sources_dir = session_dir.join("shim-sources");
     let socket_path = session_dir.join("mediation.sock");
     let control_socket_path = session_dir.join("control.sock");
+    let audit_socket_path = session_dir.join("audit.sock");
 
     std::fs::create_dir_all(&shim_dir).map_err(|e| {
         NonoError::SandboxInit(format!(
             "mediation: failed to create shim dir {}: {}",
             shim_dir.display(),
+            e
+        ))
+    })?;
+
+    // Sidecar dir holding `shim-sources/<name>` files. Each file records the
+    // absolute path of the real binary that `<name>` resolved to at session
+    // start, so nono-shim can find it again at exec time without re-walking
+    // PATH (which can be munged by intermediate shells like husky hooks).
+    std::fs::create_dir_all(&shim_sources_dir).map_err(|e| {
+        NonoError::SandboxInit(format!(
+            "mediation: failed to create shim sources dir {}: {}",
+            shim_sources_dir.display(),
             e
         ))
     })?;
@@ -179,17 +216,57 @@ pub fn setup(
         let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary, &workdir)? else {
             continue;
         };
+        write_shim_source(&shim_sources_dir, &resolved.name, &resolved.real_path);
         // Push the as-found path (which::which may return a symlink).
         // Also push the canonicalized target so that exec via the real binary
         // path is blocked even when the agent bypasses the symlink.
         blocked_binaries.push(resolved.real_path.clone());
-        if let Ok(canonical) = resolved.real_path.canonicalize() {
-            if canonical != resolved.real_path {
-                blocked_binaries.push(canonical);
-            }
+        if let Ok(canonical) = resolved.real_path.canonicalize()
+            && canonical != resolved.real_path
+        {
+            blocked_binaries.push(canonical);
         }
         resolved_commands.push(resolved);
     }
+
+    // -------------------------------------------------------------------------
+    // Universal audit shims: symlink all PATH executables not already mediated
+    // -------------------------------------------------------------------------
+    let mediated_commands: Vec<String> = resolved_commands.iter().map(|c| c.name.clone()).collect();
+
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let dir_path = Path::new(dir);
+            if !dir_path.is_dir() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir_path) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let shim_path = shim_dir.join(&name);
+                    // Already shimmed (mediated command or earlier PATH entry)
+                    if shim_path.exists() || shim_path.symlink_metadata().is_ok() {
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                    if std::os::unix::fs::symlink(&shim_binary, &shim_path).is_err() {
+                        continue;
+                    }
+                    if let Some(name_str) = name.to_str() {
+                        write_shim_source(&shim_sources_dir, name_str, &entry.path());
+                    }
+                }
+            }
+        }
+    }
+    debug!(
+        "Mediation: created universal audit shims in {} (source paths in {})",
+        shim_dir.display(),
+        shim_sources_dir.display()
+    );
 
     // -------------------------------------------------------------------------
     // Generate session authentication token and control token
@@ -283,8 +360,10 @@ pub fn setup(
     let broker_clone = Arc::clone(&broker);
     let token_arc: Arc<str> = Arc::from(session_token.as_str());
     let shim_dir_clone = shim_dir.clone();
+    let shim_sources_dir_clone = shim_sources_dir.clone();
     let admin_clone = admin_state.clone();
     let gate_clone = Arc::clone(&approval_gate);
+    let audit_sock = audit_socket_path.clone();
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
     let audit_info_for_server = Arc::clone(&audit_info_arc);
     runtime.spawn(async move {
@@ -294,8 +373,10 @@ pub fn setup(
             broker_clone,
             token_arc,
             shim_dir_clone,
+            shim_sources_dir_clone,
             admin_clone,
             gate_clone,
+            audit_sock,
             audit_log_dir,
             workdir,
             audit_info_for_server,
@@ -329,6 +410,7 @@ pub fn setup(
 
     Ok(Some(SessionHandle {
         shim_dir,
+        shim_sources_dir,
         shim_binary,
         socket_path,
         session_dir,
@@ -337,9 +419,26 @@ pub fn setup(
         session_token,
         control_socket_path,
         admin_state,
+        mediated_commands,
+        audit_socket_path,
         sandboxed_pid_latch,
         _runtime: runtime,
     }))
+}
+
+/// Write the source sidecar `<sources_dir>/<name>` containing the absolute
+/// real binary path. Best-effort: a write failure is logged but does not
+/// abort session setup, since nono-shim falls back to a PATH walk if the
+/// sidecar is missing.
+fn write_shim_source(sources_dir: &Path, name: &str, real_path: &Path) {
+    let sidecar = sources_dir.join(name);
+    if let Err(e) = std::fs::write(&sidecar, real_path.display().to_string()) {
+        tracing::warn!(
+            "mediation: failed to write shim source sidecar {}: {}",
+            sidecar.display(),
+            e
+        );
+    }
 }
 
 /// Resolve a command entry: find the real binary, create the shim symlink.
@@ -423,12 +522,32 @@ fn resolve_command(
                     },
                     *exit_code,
                 ),
-                InterceptAction::Capture { script } => (
-                    ResolvedAction::Capture {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
+                InterceptAction::Capture {
+                    script,
+                    format,
+                    secret_paths,
+                } => {
+                    // JSON-format capture requires at least one secret path,
+                    // otherwise it's an indistinguishable-from-passthrough
+                    // no-op that would silently return the raw stdout
+                    // unmodified — leaking the credential. Fail closed.
+                    if matches!(format, Some(CaptureFormat::Json)) && secret_paths.is_empty() {
+                        return Err(NonoError::SandboxInit(format!(
+                            "mediation rule for '{}' uses format=json capture but \
+                             secret_paths is empty; refusing to start because this \
+                             would pass real credentials through unmodified",
+                            entry.name
+                        )));
+                    }
+                    (
+                        ResolvedAction::Capture {
+                            script: script.clone(),
+                            format: *format,
+                            secret_paths: secret_paths.clone(),
+                        },
+                        0,
+                    )
+                }
                 InterceptAction::Approve { script } => (
                     ResolvedAction::Approve {
                         script: script.clone(),
@@ -712,5 +831,27 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    #[test]
+    fn test_write_shim_source_creates_sidecar_with_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_path = PathBuf::from("/opt/homebrew/bin/yarn");
+        write_shim_source(tmp.path(), "yarn", &real_path);
+
+        let sidecar = tmp.path().join("yarn");
+        assert!(sidecar.is_file(), "sidecar file should exist");
+        let content = std::fs::read_to_string(&sidecar).expect("read sidecar");
+        assert_eq!(content, real_path.display().to_string());
+    }
+
+    #[test]
+    fn test_write_shim_source_overwrites_existing_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_shim_source(tmp.path(), "yarn", &PathBuf::from("/old/yarn"));
+        write_shim_source(tmp.path(), "yarn", &PathBuf::from("/new/yarn"));
+
+        let content = std::fs::read_to_string(tmp.path().join("yarn")).expect("read sidecar");
+        assert_eq!(content, "/new/yarn");
     }
 }

@@ -445,6 +445,19 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    // Reject names in the reserved nono-internal namespace. The
+    // resulting route prefix would otherwise shadow nono's own
+    // injected routes (e.g. the OAuth-capture intercept routes).
+    if nono_proxy::is_reserved_prefix(name) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential name '{}' uses the reserved '{}' prefix \
+             namespace; that namespace is reserved for nono-internal \
+             routes. Pick a different name.",
+            name,
+            nono_proxy::RESERVED_PREFIX_NAMESPACE
+        )));
+    }
+
     // Mutual exclusion: credential_key and auth cannot both be set
     if cred.credential_key.is_some() && cred.auth.is_some() {
         return Err(NonoError::ProfileParse(format!(
@@ -525,6 +538,21 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
             InjectMode::BasicAuth => {
                 // No additional required fields for basic_auth mode
                 // Credential value is expected to be "username:password" format
+            }
+            InjectMode::OauthCapture { .. } => {
+                // OauthCapture is reserved for the CLI's synthetic
+                // Anthropic intercept routes (see
+                // `proxy_runtime::oauth_capture_routes`). Surface it as
+                // a `custom_credentials.inject_mode` in a profile would
+                // give an arbitrary user-defined route response-rewrite
+                // behaviour, which is not a supported user-facing
+                // feature. Reject loudly rather than silently accept.
+                return Err(NonoError::ProfileParse(format!(
+                    "custom credential '{name}' uses inject_mode \
+                     'oauth_capture', which is reserved for the CLI's \
+                     built-in Anthropic OAuth-capture routes. Set \
+                     `oauth_capture: true` at the profile level instead."
+                )));
             }
         }
     }
@@ -650,6 +678,16 @@ fn validate_proxy_override(name: &str, cred: &CustomCredentialDef) -> Result<()>
                     param_name, name
                 )));
             }
+        }
+        InjectMode::OauthCapture { .. } => {
+            // See note on the parallel arm in `validate_credential`:
+            // OauthCapture is rejected on the custom-credential path
+            // upstream of this point, so we never reach here with it.
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{name}' proxy override uses \
+                 inject_mode 'oauth_capture', which is reserved for \
+                 the CLI's built-in Anthropic OAuth-capture routes."
+            )));
         }
     }
 
@@ -1628,6 +1666,21 @@ pub struct Profile {
     /// Command mediation policy: intercept commands, inject credentials.
     #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
+    /// Capture and isolate Anthropic OAuth tokens during `claude /login`.
+    ///
+    /// When `true`, the proxy intercepts the OAuth token endpoint, hands
+    /// real `access_token` / `refresh_token` values to an in-memory
+    /// broker, and substitutes opaque `nono_<hex>` nonces in the response
+    /// body before it reaches the sandboxed client. The captured pair is
+    /// also persisted under a nono-controlled keychain entry so a later
+    /// nono session can rehydrate without forcing a re-login.
+    ///
+    /// Default `false` to preserve existing behaviour. When `false`, the
+    /// proxy startup path is identical to the pre-OAuth-capture build:
+    /// no intercept routes installed, no broker wired, real tokens flow
+    /// to the keychain unchanged.
+    #[serde(default)]
+    pub oauth_capture: bool,
 }
 
 #[derive(Deserialize)]
@@ -1693,6 +1746,8 @@ struct ProfileDeserialize {
     unsafe_macos_seatbelt_rules: Vec<String>,
     #[serde(default)]
     mediation: crate::mediation::MediationConfig,
+    #[serde(default)]
+    oauth_capture: bool,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1729,6 +1784,7 @@ impl From<ProfileDeserialize> for Profile {
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             mediation: raw.mediation,
+            oauth_capture: raw.oauth_capture,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2713,6 +2769,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &child.unsafe_macos_seatbelt_rules,
         ),
         mediation: crate::mediation::merge::merge_mediation(base.mediation, child.mediation),
+        // OAuth capture: child's value wins when set true; otherwise inherit
+        // the base. There is no "explicitly off" form — `false` means
+        // "no opinion, use base" so a derived profile cannot silently
+        // disable a base profile's enabled capture.
+        oauth_capture: child.oauth_capture || base.oauth_capture,
     }
 }
 
@@ -4110,6 +4171,34 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_custom_credential_rejects_reserved_prefix() {
+        // Names in the `__nono_` namespace are reserved for nono-internal
+        // routes (e.g. OAuth-capture intercept routes). User profiles
+        // must not declare credentials there.
+        let cred = header_cred_builder();
+        let result = validate_custom_credential("__nono_oauth_evil", &cred);
+        let err = result.expect_err("reserved-prefix names must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reserved"),
+            "error should mention the reserved namespace, got: {msg}"
+        );
+        assert!(
+            msg.contains("__nono_"),
+            "error should name the reserved prefix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_credential_allows_underscored_non_reserved() {
+        // A name that contains `nono` but not the `__nono_` prefix is
+        // not in the reserved namespace and must be accepted.
+        let cred = header_cred_builder();
+        assert!(validate_custom_credential("my_nono_helper", &cred).is_ok());
+        assert!(validate_custom_credential("nono_compat", &cred).is_ok());
+    }
+
+    #[test]
     fn test_validate_custom_credential_http_loopback_allowed() {
         let mut cred = header_cred_builder();
         cred.upstream = "http://127.0.0.1:8080/api".to_string();
@@ -4907,6 +4996,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
+            oauth_capture: false,
         }
     }
 
@@ -4989,6 +5079,7 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
+            oauth_capture: false,
         }
     }
 

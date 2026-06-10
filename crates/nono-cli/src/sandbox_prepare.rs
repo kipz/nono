@@ -21,8 +21,6 @@ use std::collections::HashMap;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "macos")]
-use std::process::Command;
 use tracing::{info, warn};
 
 fn print_allow_domain_port_warnings(entries: &[String], context: &str, silent: bool) {
@@ -200,24 +198,18 @@ fn claude_keychain_account_name() -> String {
     std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string())
 }
 
+/// In-process keychain read instead of spawning `/usr/bin/security`.
+/// See `oauth_preflight::read_keychain_item` for the rationale — same
+/// dialog-UX reason, and `Command::new("security")` inherits this
+/// process's stdin, which can interleave with the controlling terminal
+/// when a PTY-proxied claude session is running.
 #[cfg(target_os = "macos")]
 fn read_keychain_item(account: &str, service_name: &str) -> Option<String> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-a",
-            account,
-            "-w",
-            "-s",
-            service_name,
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    Some(stdout.trim_end_matches(['\r', '\n']).to_string())
+    use security_framework::os::macos::passwords::find_generic_password;
+
+    let (password_bytes, _item) = find_generic_password(None, service_name, account).ok()?;
+    let s = std::str::from_utf8(password_bytes.as_ref()).ok()?;
+    Some(s.to_owned())
 }
 
 #[cfg(target_os = "macos")]
@@ -354,14 +346,17 @@ pub(crate) fn should_auto_enable_claude_launch_services(
 
     match load_claude_oauth_state() {
         Ok(Some(oauth)) => {
+            // A `nono_`-prefixed value is an OAuth-capture broker nonce, not a
+            // real token — treat it the same as "no credential" so LaunchServices
+            // gets auto-enabled and the user can complete a fresh /login.
             let has_access = oauth
                 .access_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             let has_refresh = oauth
                 .refresh_token
                 .as_deref()
-                .is_some_and(|value| !value.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty() && !v.starts_with("nono_"));
             !has_access || !has_refresh
         }
         Ok(None) => true,
@@ -443,6 +438,11 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
+    /// Profile-driven opt-in for the OAuth-capture proxy path. When true,
+    /// the proxy installs intercept routes for the Anthropic OAuth token
+    /// endpoints, wires the broker, and rewrites response bodies to
+    /// substitute real tokens with `nono_<hex>` nonces.
+    pub(crate) oauth_capture: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1073,6 +1073,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
+                oauth_capture: false,
             },
             args,
             silent,
@@ -1149,6 +1150,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         };
 
         precreate(&home_path.join(".claude.json.lock"), false);
+        precreate(&home_path.join(".cache/claude"), true);
         precreate(&home_path.join(".cache/claude-cli-nodejs"), true);
 
         // Claude Code writes ~/.claude.json atomically via temp files named
@@ -1346,6 +1348,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.mediation.clone())
         .unwrap_or_default();
+    let profile_oauth_capture = loaded_profile
+        .as_ref()
+        .map(|p| p.oauth_capture)
+        .unwrap_or(false);
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();
@@ -1380,6 +1386,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,
+            oauth_capture: profile_oauth_capture,
         },
         args,
         silent,

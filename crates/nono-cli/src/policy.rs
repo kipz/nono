@@ -187,6 +187,7 @@ impl ProfileDef {
             unsafe_macos_seatbelt_rules: self.unsafe_macos_seatbelt_rules.clone(),
             mediation: self.mediation.clone(),
             oauth_capture: self.oauth_capture,
+            apikey_gateway: None,
         }
     }
 }

@@ -443,6 +443,11 @@ pub(crate) struct PreparedSandbox {
     /// endpoints, wires the broker, and rewrites response bodies to
     /// substitute real tokens with `nono_<hex>` nonces.
     pub(crate) oauth_capture: bool,
+    /// Profile-driven opt-in for the apiKeyHelper gateway proxy path.
+    /// When set, a broker-backed reverse-proxy route is synthesised at
+    /// proxy start and `ANTHROPIC_BASE_URL` is overridden in the child
+    /// env to point at it. See `Profile::apikey_gateway`.
+    pub(crate) apikey_gateway: Option<crate::profile::ApiKeyGatewayConfig>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1074,6 +1079,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
                 oauth_capture: false,
+                apikey_gateway: None,
             },
             args,
             silent,
@@ -1352,6 +1358,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.oauth_capture)
         .unwrap_or(false);
+    let profile_apikey_gateway = loaded_profile
+        .as_ref()
+        .and_then(|p| p.apikey_gateway.clone());
 
     // Auto-inject the broker-refusal mediation rule when oauth_capture is
     // active. Closes the realistic subprocess-access path to the OAuth
@@ -1396,6 +1405,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,
             oauth_capture: profile_oauth_capture,
+            apikey_gateway: profile_apikey_gateway,
         },
         args,
         silent,

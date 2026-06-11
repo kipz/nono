@@ -85,6 +85,16 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) allow_launch_services_active: bool,
     pub(crate) oauth_capture: bool,
+    /// Profile-driven apiKeyHelper gateway opt-in. When present, the
+    /// proxy synthesises a broker-backed route at the configured URL
+    /// and overrides `ANTHROPIC_BASE_URL` to point at it. See
+    /// `Profile::apikey_gateway`.
+    pub(crate) apikey_gateway: Option<crate::profile::ApiKeyGatewayConfig>,
+    /// Resolved mediation config (commands + env policy). Carried here
+    /// so the apiKeyHelper-coverage preflight can verify a covering
+    /// `capture` rule exists for the host's helper argv before the
+    /// child is exec'd.
+    pub(crate) mediation: crate::mediation::MediationConfig,
     /// Env-var deny patterns from the resolved profile. Pre-flight uses
     /// this to skip the API-key fail-closed check for vars the profile
     /// would strip before the child sees them.

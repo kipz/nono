@@ -27,6 +27,69 @@ const OAUTH_PREFIX_CLAUDEAI: &str = "__nono_oauth_claudeai";
 /// here per binary analysis of the Claude Code CLI.
 const OAUTH_PREFIX_PLATFORM: &str = "__nono_oauth_platform";
 
+/// Prefix for the apiKeyHelper gateway reverse-proxy route.
+///
+/// Sits in the reserved [`nono_proxy::RESERVED_PREFIX_NAMESPACE`] so a
+/// user profile cannot declare a colliding route and silently shadow
+/// the bearer-translation path.
+const APIKEY_GATEWAY_PREFIX: &str = "__nono_apikey_gateway";
+
+/// Synthesise a single broker-backed reverse-proxy route for the
+/// configured apiKeyHelper gateway.
+///
+/// The route's `inject_mode` is [`nono_proxy::config::InjectMode::OauthCapture`]
+/// with **sentinel** URL-match strings that no real gateway request
+/// path equals. This is a deliberate reuse:
+///
+/// - `InjectMode::OauthCapture` is the only way today to set
+///   `LoadedRoute::oauth_capture_match` to `Some(_)`, which is the
+///   gate the reverse-proxy passthrough block in
+///   `nono_proxy::reverse::handle_reverse_proxy_request` checks to
+///   decide whether to resolve `nono_<hex>` bearers via the
+///   `TokenResolver`. Using it here repurposes that gate as a
+///   generic "this route is broker-backed" flag without introducing
+///   a new RouteConfig field.
+///
+/// - Response-side OAuth capture only fires when the request path
+///   matches `token_url_match` or `refresh_url_match` exactly. The
+///   sentinels here cannot match a real Anthropic-API path
+///   (`/v1/messages` etc.), so the response-body rewriter never
+///   activates for this route. Even if a malicious client crafted
+///   a request whose path equalled the sentinel, the rewriter would
+///   merely look for `access_token` / `refresh_token` fields in the
+///   gateway's reply and substitute nonces — it cannot leak the real
+///   bearer (which is injected by the request path, not the response
+///   path).
+fn apikey_gateway_route(
+    cfg: &crate::profile::ApiKeyGatewayConfig,
+) -> nono_proxy::config::RouteConfig {
+    use nono_proxy::config::{InjectMode, RouteConfig};
+    RouteConfig {
+        prefix: APIKEY_GATEWAY_PREFIX.to_string(),
+        upstream: cfg.url.clone(),
+        credential_key: None,
+        inject_mode: InjectMode::OauthCapture {
+            // Sentinel strings that cannot equal any real upstream
+            // path. Containing a non-URL character (space) further
+            // guarantees no well-formed client request can match.
+            token_url_match: "__nono_apikey_gateway sentinel — no capture".to_string(),
+            refresh_url_match: "__nono_apikey_gateway sentinel — no capture".to_string(),
+        },
+        inject_header: "Authorization".to_string(),
+        credential_format: Some("Bearer {}".to_string()),
+        path_pattern: None,
+        path_replacement: None,
+        query_param_name: None,
+        proxy: None,
+        env_var: None,
+        endpoint_rules: vec![],
+        tls_ca: None,
+        tls_client_cert: None,
+        tls_client_key: None,
+        oauth2: None,
+    }
+}
+
 /// Synthesise the three Anthropic OAuth-capture routes the CLI injects
 /// when OAuth capture is active.
 ///
@@ -156,6 +219,8 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
         oauth_capture: prepared.oauth_capture,
+        apikey_gateway: prepared.apikey_gateway.clone(),
+        mediation: prepared.mediation.clone(),
         denied_env_vars: prepared.denied_env_vars.clone(),
         #[cfg(target_os = "macos")]
         trust_proxy_ca: args.trust_proxy_ca,
@@ -329,12 +394,40 @@ pub(crate) fn start_proxy_runtime(
     // session-scoped `TokenBroker` handed to the proxy as
     // `Arc<dyn TokenResolver>`.
     let oauth_capture_active = proxy.oauth_capture;
-    let proxy_runtime = if oauth_capture_active {
-        // Idempotent: skip any route whose prefix already exists (the
-        // operator may have wired it declaratively).
-        for route in oauth_capture_routes() {
-            if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
-                proxy_config.routes.push(route);
+    let apikey_gateway_active = proxy.apikey_gateway.is_some();
+    // The TokenBroker is wired into the proxy runtime whenever ANY
+    // broker-using feature is active. Both `oauth_capture` and
+    // `apikey_gateway` need it for bearer translation; without the
+    // resolver, the reverse-proxy passthrough at
+    // `nono_proxy::reverse::handle_reverse_proxy_request` will not
+    // resolve `nono_<hex>` values.
+    let broker_required = oauth_capture_active || apikey_gateway_active;
+    let proxy_runtime = if broker_required {
+        // OAuth-capture-only routes (Anthropic OAuth token endpoints).
+        // Only inject when oauth_capture is active — apikey_gateway
+        // mode has no `/login` flow to capture.
+        if oauth_capture_active {
+            // Idempotent: skip any route whose prefix already exists (the
+            // operator may have wired it declaratively).
+            for route in oauth_capture_routes() {
+                if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
+                    proxy_config.routes.push(route);
+                }
+            }
+        }
+        // apiKeyHelper gateway: broker-backed reverse-proxy route that
+        // translates `Authorization: Bearer nono_<hex>` to the real
+        // helper-issued bearer on egress. The mediation `capture` rule
+        // on the helper binary is what mints the nonces in the first
+        // place.
+        if let Some(ref gateway_cfg) = proxy.apikey_gateway {
+            let gateway_route = apikey_gateway_route(gateway_cfg);
+            if !proxy_config
+                .routes
+                .iter()
+                .any(|r| r.prefix == gateway_route.prefix)
+            {
+                proxy_config.routes.push(gateway_route);
             }
         }
         let broker = Arc::new(build_broker());
@@ -344,16 +437,32 @@ pub(crate) fn start_proxy_runtime(
         // "-credentials" suffix). The OAuth-capture path translates
         // `Authorization: Bearer nono_<hex>` on egress; an API key would
         // 401 against every request inside the CONNECT tunnel.
+        //
+        // apikey_gateway preflight checks that the host's
+        // `apiKeyHelper` (if any) has a covering `capture` mediation
+        // rule in the resolved profile — otherwise the real bearer
+        // would flow into the sandbox uncaptured.
         oauth_preflight::run_oauth_preflight(
             broker.as_ref(),
             program,
             proxy.denied_env_vars.as_deref(),
+            proxy.apikey_gateway.as_ref(),
+            &proxy.mediation,
         )?;
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
-        info!(
-            "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
-            oauth_capture_routes().len(),
-        );
+        if oauth_capture_active && apikey_gateway_active {
+            info!(
+                "OAuth capture + apiKeyHelper gateway both active; wired TokenBroker, {} intercept routes, 1 gateway route",
+                oauth_capture_routes().len(),
+            );
+        } else if oauth_capture_active {
+            info!(
+                "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
+                oauth_capture_routes().len(),
+            );
+        } else {
+            info!("apiKeyHelper gateway enabled; wired TokenBroker and 1 gateway route");
+        }
         nono_proxy::ProxyRuntime {
             token_resolver: Some(resolver),
         }
@@ -479,6 +588,22 @@ pub(crate) fn start_proxy_runtime(
 
     for (key, value) in handle.credential_env_vars(&proxy_config) {
         env_vars.push((key, value));
+    }
+
+    // apiKeyHelper gateway: override `ANTHROPIC_BASE_URL` so the
+    // sandboxed Claude Code reaches the broker-backed reverse-proxy
+    // route at `http://127.0.0.1:<port>/__nono_apikey_gateway` instead
+    // of the real gateway hostname. The proxy resolves any `nono_<hex>`
+    // bearer to the real helper token on egress and forwards over TLS
+    // to the configured upstream. Pushed AFTER `credential_env_vars`
+    // so any auto-emitted `__NONO_APIKEY_GATEWAY_BASE_URL` from the
+    // route iteration is shadowed by the explicit ANTHROPIC_BASE_URL
+    // entry (env var assembly uses last-write-wins downstream).
+    if apikey_gateway_active {
+        env_vars.push((
+            "ANTHROPIC_BASE_URL".to_string(),
+            format!("http://127.0.0.1:{}/{}", port, APIKEY_GATEWAY_PREFIX),
+        ));
     }
 
     std::mem::forget(rt);

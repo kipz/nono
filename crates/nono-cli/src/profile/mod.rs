@@ -1681,6 +1681,51 @@ pub struct Profile {
     /// to the keychain unchanged.
     #[serde(default)]
     pub oauth_capture: bool,
+    /// Reverse-proxy a Claude Code `apiKeyHelper` token through the
+    /// in-process `TokenBroker`.
+    ///
+    /// When set, nono:
+    /// - synthesises a broker-backed reverse-proxy route pointed at
+    ///   [`ApiKeyGatewayConfig::url`];
+    /// - overrides `ANTHROPIC_BASE_URL` in the child env to that route;
+    /// - wires the in-process `TokenBroker` (same primitive
+    ///   `oauth_capture` uses) so a `nono_<hex>` value in the
+    ///   `Authorization` header is resolved to the real bearer on egress;
+    /// - at preflight, refuses to start if the host's Claude Code
+    ///   `apiKeyHelper` is declared but no `mediation.commands` rule
+    ///   covers [`ApiKeyGatewayConfig::helper_argv_prefix`].
+    ///
+    /// Pair with a `mediation.commands` entry on the helper binary
+    /// (e.g. `auth-helper`) so the mediation shim captures the helper's
+    /// stdout into the broker before claude ever sees the real bearer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apikey_gateway: Option<ApiKeyGatewayConfig>,
+}
+
+/// Configuration for [`Profile::apikey_gateway`].
+///
+/// See the field docstring for the full design. In summary: nono mints
+/// a broker-backed reverse-proxy route at `url`, sets
+/// `ANTHROPIC_BASE_URL` in the child env to point at it, and verifies a
+/// matching mediation rule covers the host's `apiKeyHelper` argv.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ApiKeyGatewayConfig {
+    /// Upstream URL the broker-issued bearer is forwarded to.
+    ///
+    /// Example: `"https://gateway.example.com"`.
+    pub url: String,
+    /// argv prefix of the host's Claude Code `apiKeyHelper`, checked
+    /// at preflight so the mediation rule's coverage is verified before
+    /// the sandboxed child is exec'd.
+    ///
+    /// Example: `["auth", "token", "example-scope"]` for
+    /// `auth-helper auth token example-scope --datacenter <region>`.
+    /// The leading binary name (`auth-helper`) is **not** part of this
+    /// prefix — preflight resolves it from the host's settings.json
+    /// `apiKeyHelper` field directly.
+    #[serde(default)]
+    pub helper_argv_prefix: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -1748,6 +1793,8 @@ struct ProfileDeserialize {
     mediation: crate::mediation::MediationConfig,
     #[serde(default)]
     oauth_capture: bool,
+    #[serde(default)]
+    apikey_gateway: Option<ApiKeyGatewayConfig>,
 }
 
 impl From<ProfileDeserialize> for Profile {
@@ -1785,6 +1832,7 @@ impl From<ProfileDeserialize> for Profile {
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             mediation: raw.mediation,
             oauth_capture: raw.oauth_capture,
+            apikey_gateway: raw.apikey_gateway,
         };
 
         // Drain legacy keys into canonical sections (no-op unless the legacy
@@ -2774,6 +2822,11 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         // "no opinion, use base" so a derived profile cannot silently
         // disable a base profile's enabled capture.
         oauth_capture: child.oauth_capture || base.oauth_capture,
+        // apikey_gateway: child wins when present (Option<T> with `.or()`
+        // semantics). A child profile cannot silently disable a base
+        // profile's gateway because there is no "explicitly off" form
+        // expressible without dropping the field entirely.
+        apikey_gateway: child.apikey_gateway.or(base.apikey_gateway),
     }
 }
 
@@ -4997,6 +5050,7 @@ mod tests {
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
             oauth_capture: false,
+            apikey_gateway: None,
         }
     }
 
@@ -5080,6 +5134,7 @@ mod tests {
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
             oauth_capture: false,
+            apikey_gateway: None,
         }
     }
 

@@ -243,6 +243,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     )?;
     let proxy_env_vars = active_proxy.env_vars;
     let proxy_handle = active_proxy.handle;
+    let shared_broker = active_proxy.broker;
 
     // Build session audit context before mediation setup.
     // session_id and session_name must be consistent between the mediation audit
@@ -269,8 +270,12 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     // reference `$WORKDIR` / `$VAR` resolve against the same directory the
     // main sandbox uses. `audit_info` stamps session/PID context on every
     // audit entry.
-    let mediation_handle =
-        crate::mediation::session::setup(&flags.mediation, flags.workdir.clone(), audit_info)?;
+    let mediation_handle = crate::mediation::session::setup(
+        &flags.mediation,
+        flags.workdir.clone(),
+        audit_info,
+        shared_broker,
+    )?;
 
     // If mediation is active, add shim directory and binary to sandbox rules.
     let mediation_path_str;

@@ -127,6 +127,14 @@ impl Drop for SessionHandle {
 ///
 /// Returns `None` when `config.is_active()` is false (nothing to do).
 ///
+/// `shared_broker` lets the caller pre-build the `TokenBroker` (typically
+/// when the proxy needs the same broker for its `Arc<dyn TokenResolver>`
+/// egress-side resolution) and share its `Arc` here so nonces minted by
+/// the mediation shim's `capture` action are visible to the proxy on the
+/// egress side. `None` means "construct a fresh in-memory broker" — the
+/// historical behaviour for command-mediation-only sessions with no
+/// proxy involvement.
+///
 /// # Errors
 /// Returns an error if a command cannot be resolved, or the session directory /
 /// symlinks cannot be created.
@@ -134,6 +142,7 @@ pub fn setup(
     config: &MediationConfig,
     workdir: PathBuf,
     audit_info: SessionAuditInfo,
+    shared_broker: Option<Arc<TokenBroker>>,
 ) -> Result<Option<SessionHandle>> {
     if !config.is_active() {
         return Ok(None);
@@ -281,9 +290,15 @@ pub fn setup(
     let control_token = super::control::generate_token();
 
     // -------------------------------------------------------------------------
-    // Create token broker (session-scoped)
+    // Create token broker (session-scoped). When the proxy has already
+    // built a broker (because it needs one for `Arc<dyn TokenResolver>`
+    // egress resolution), reuse that same `Arc` here so nonces minted by
+    // `capture` intercepts on the mediation server's side land in the
+    // map the proxy will query on egress. Without this sharing, the two
+    // sides have disjoint nonce maps and every gateway call 401s with
+    // a "nonce not in broker; forwarding raw" debug line.
     // -------------------------------------------------------------------------
-    let broker = Arc::new(TokenBroker::new());
+    let broker = shared_broker.unwrap_or_else(|| Arc::new(TokenBroker::new()));
 
     // -------------------------------------------------------------------------
     // Create admin state
@@ -733,7 +748,7 @@ mod tests {
             nono_pid: std::process::id(),
             sandboxed_pid: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
-        let result = setup(&config, PathBuf::from("/tmp"), dummy_audit)
+        let result = setup(&config, PathBuf::from("/tmp"), dummy_audit, None)
             .expect("setup should not fail for inactive config");
         assert!(result.is_none());
     }

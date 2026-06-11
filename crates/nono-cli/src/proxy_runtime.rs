@@ -137,6 +137,15 @@ fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
 pub(crate) struct ActiveProxyRuntime {
     pub(crate) env_vars: Vec<(String, String)>,
     pub(crate) handle: Option<nono_proxy::server::ProxyHandle>,
+    /// The session-scoped `TokenBroker` shared with the proxy as
+    /// `Arc<dyn TokenResolver>`. When `Some`, the mediation server
+    /// MUST be initialised with this same Arc (rather than a fresh
+    /// `TokenBroker::new()`), otherwise nonces minted by the mediation
+    /// shim's `capture` action live in a different map than the one
+    /// the proxy queries on egress, and resolution silently fails with
+    /// a 401 on every request. See `start_proxy_runtime` for the build
+    /// site and `execution_runtime::run` for the hand-off into mediation.
+    pub(crate) broker: Option<Arc<TokenBroker>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -368,6 +377,7 @@ pub(crate) fn start_proxy_runtime(
         return Ok(ActiveProxyRuntime {
             env_vars: Vec::new(),
             handle: None,
+            broker: None,
         });
     }
 
@@ -402,7 +412,10 @@ pub(crate) fn start_proxy_runtime(
     // `nono_proxy::reverse::handle_reverse_proxy_request` will not
     // resolve `nono_<hex>` values.
     let broker_required = oauth_capture_active || apikey_gateway_active;
-    let proxy_runtime = if broker_required {
+    let (proxy_runtime, shared_broker_for_mediation): (
+        nono_proxy::ProxyRuntime,
+        Option<Arc<TokenBroker>>,
+    ) = if broker_required {
         // OAuth-capture-only routes (Anthropic OAuth token endpoints).
         // Only inject when oauth_capture is active — apikey_gateway
         // mode has no `/login` flow to capture.
@@ -449,6 +462,17 @@ pub(crate) fn start_proxy_runtime(
             proxy.apikey_gateway.as_ref(),
             &proxy.mediation,
         )?;
+        // Two clones of the same broker `Arc`: the proxy holds it as
+        // `Arc<dyn TokenResolver>` (trait object, opaque); the mediation
+        // server needs `Arc<TokenBroker>` (concrete, for `issue` /
+        // `capture_oauth_pair` direct calls). They MUST point at the same
+        // underlying broker — otherwise nonces minted by the mediation
+        // shim's `capture` action live in a different map than the one
+        // the proxy queries on egress, and resolution silently fails.
+        // (Found the hard way: 401s on every gateway request even when
+        // mediation appeared to mint nonces successfully — see the
+        // 2026-06-11 apikey_gateway debug session.)
+        let shared_broker: Arc<TokenBroker> = Arc::clone(&broker);
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
         if oauth_capture_active && apikey_gateway_active {
             info!(
@@ -463,11 +487,14 @@ pub(crate) fn start_proxy_runtime(
         } else {
             info!("apiKeyHelper gateway enabled; wired TokenBroker and 1 gateway route");
         }
-        nono_proxy::ProxyRuntime {
-            token_resolver: Some(resolver),
-        }
+        (
+            nono_proxy::ProxyRuntime {
+                token_resolver: Some(resolver),
+            },
+            Some(shared_broker),
+        )
     } else {
-        nono_proxy::ProxyRuntime::default()
+        (nono_proxy::ProxyRuntime::default(), None)
     };
     #[cfg(target_os = "macos")]
     if proxy.trust_proxy_ca {
@@ -611,6 +638,7 @@ pub(crate) fn start_proxy_runtime(
     Ok(ActiveProxyRuntime {
         env_vars,
         handle: Some(handle),
+        broker: shared_broker_for_mediation,
     })
 }
 

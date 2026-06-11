@@ -38,7 +38,9 @@
 use crate::exec_strategy::is_env_var_denied;
 use crate::mediation::broker::TokenBroker;
 use crate::mediation::{CaptureFormat, InterceptAction, MediationConfig};
-use crate::profile::ApiKeyGatewayConfig;
+use crate::profile::{
+    CredentialRouteCapture, CredentialRoutePreflight, ManagedCredentialRoute,
+};
 use nono::{NonoError, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -59,88 +61,113 @@ const API_KEY_ENV_VARS: &[&str] = &[
 #[derive(Debug, Default)]
 pub(crate) struct PreflightOutcome;
 
-/// Run the pre-flight check if the target program is `claude` and
-/// OAuth capture is active. For any other program this is a quiet
-/// no-op — pre-flight is a Claude-Code-specific feature.
+/// Run preflight checks declared on each credential route.
 ///
-/// `denied_env_vars` is the profile's env-var deny list. Any API-key
-/// env var the profile would strip before the child sees it is excluded
-/// from the fail-closed check.
-pub(crate) fn run_oauth_preflight(
+/// Iterates `routes`, gathering the union of declared
+/// [`CredentialRoutePreflight`] checks. Each unique check runs once
+/// (de-duped so two routes both declaring `NoStaticApiKeySurfaces`
+/// don't run the host-scan twice).
+///
+/// Preflight is a Claude-Code-specific feature today —
+/// `program_is_claude` is the gate. For other agents the credential
+/// routes still drive proxy/broker behaviour, but route-declared
+/// preflights are skipped.
+///
+/// `denied_env_vars` is the profile's env-var deny list. API-key vars
+/// the profile would strip before the child sees them are excluded
+/// from the API-key surface check.
+pub(crate) fn run_credential_routes_preflight(
     _broker: &TokenBroker,
     program: &OsStr,
     denied_env_vars: Option<&[String]>,
-    apikey_gateway: Option<&ApiKeyGatewayConfig>,
+    routes: &[ManagedCredentialRoute],
     mediation: &MediationConfig,
 ) -> Result<PreflightOutcome> {
     if !program_is_claude(program) {
-        debug!("oauth_capture: target program is not claude; skipping pre-flight");
+        debug!("credential_routes: target program is not claude; skipping preflight");
         return Ok(PreflightOutcome);
     }
 
-    // apikey_gateway and existing API-key surfaces are NOT mutually
-    // exclusive in shape: apikey_gateway expects Claude Code's
-    // `apiKeyHelper` to mint a fresh bearer each TTL window, so there
-    // should *not* be a static API-key surface lingering on the host.
-    // The fail-closed check still fires unconditionally — if the user
-    // has both apikey_gateway and a static ANTHROPIC_API_KEY env, the
-    // static one would win in Claude Code's resolution order and the
-    // proxy's bearer-translation path would never trigger.
-    if let Some(reason) = detect_blocking_api_key_surface(denied_env_vars)? {
-        return Err(NonoError::SandboxInit(format!(
-            "oauth_capture/apikey_gateway is enabled but an API-key credential is already configured: {reason}. \
-             The broker-backed proxy path translates Authorization: Bearer tokens; \
-             x-api-key requests inside the CONNECT tunnel would fail authentication. \
-             Either clear the API key (unset the env var, delete the keychain entry, \
-             or remove `primaryApiKey` from ~/.claude.json) and re-run, or remove \
-             `oauth_capture`/`apikey_gateway` from your profile to use API-key auth as-is."
-        )));
-    }
+    let mut ran_no_static = false;
+    let mut ran_helper_check = false;
 
-    if let Some(gateway_cfg) = apikey_gateway {
-        run_apikey_gateway_preflight(gateway_cfg, mediation)?;
+    for route in routes {
+        for check in &route.preflight {
+            match check {
+                CredentialRoutePreflight::NoStaticApiKeySurfaces => {
+                    if ran_no_static {
+                        continue;
+                    }
+                    ran_no_static = true;
+                    if let Some(reason) = detect_blocking_api_key_surface(denied_env_vars)? {
+                        return Err(NonoError::SandboxInit(format!(
+                            "credential_routes preflight: an API-key credential is already configured on the host: {reason}. \
+                             Broker-backed routes translate `Authorization: Bearer` / `x-api-key` headers carrying \
+                             `nono_<hex>` nonces; a static API key would short-circuit Claude Code's auth resolution \
+                             before the broker path runs. Either clear the API key (unset the env var, delete the \
+                             keychain entry, or remove `primaryApiKey` from ~/.claude.json) and re-run, or remove the \
+                             credential route from your profile to use API-key auth as-is."
+                        )));
+                    }
+                }
+                CredentialRoutePreflight::ClaudeCodeApiKeyHelperConfigured => {
+                    if ran_helper_check {
+                        continue;
+                    }
+                    ran_helper_check = true;
+                    run_helper_command_preflight(route, mediation)?;
+                }
+            }
+        }
     }
 
     Ok(PreflightOutcome)
 }
 
 /// Verify that the host's Claude Code `apiKeyHelper` is covered by a
-/// mediation `capture` rule.
+/// mediation `capture` rule that matches the credential route's
+/// `HelperCommand` capture configuration.
 ///
-/// Read `~/.claude/settings.json` (and `CLAUDE_CONFIG_DIR` overrides if
+/// Reads `~/.claude/settings.json` (and `CLAUDE_CONFIG_DIR` overrides if
 /// set). If `apiKeyHelper` is declared, shell-split its value and
-/// compare the resulting argv against the configured
-/// `helper_argv_prefix` from the profile's [`ApiKeyGatewayConfig`].
-/// Fail closed unless the helper's first token resolves to a binary
-/// name that has a matching `mediation.commands` entry with an
-/// `args_prefix` that is a prefix of the helper's positional args.
-///
-/// Beyond the helper-vs-profile shape check, the resolved
-/// `MediationConfig` is searched for a `Capture` intercept rule
-/// targeting the helper's binary name with an `args_prefix` that is a
-/// prefix of the helper's positional args. Without a covering rule the
-/// real bearer would flow into the sandbox uncaptured.
-fn run_apikey_gateway_preflight(
-    gateway_cfg: &ApiKeyGatewayConfig,
+/// compare the resulting argv against the route's `args_prefix`.
+/// Then verify the resolved `MediationConfig` has a `Capture` rule
+/// covering the helper. Without a covering rule the real bearer would
+/// flow into the sandbox uncaptured.
+fn run_helper_command_preflight(
+    route: &ManagedCredentialRoute,
     mediation: &MediationConfig,
 ) -> Result<()> {
+    let (expected_command, expected_args_prefix) = match &route.capture {
+        CredentialRouteCapture::HelperCommand {
+            command,
+            args_prefix,
+        } => (command.clone(), args_prefix.clone()),
+        CredentialRouteCapture::OauthIntercept { .. } => {
+            // ClaudeCodeApiKeyHelperConfigured doesn't apply to OAuth
+            // intercept routes; skip silently. (Legacy shim never
+            // attaches this preflight to an OAuth route, but a hand-
+            // authored credential_routes entry might.)
+            return Ok(());
+        }
+    };
     let (config_dir, _explicit) = claude_config_dir_pair()
-        .map_err(|msg| NonoError::SandboxInit(format!("apikey_gateway preflight: {msg}")))?;
+        .map_err(|msg| NonoError::SandboxInit(format!("helper_command preflight: {msg}")))?;
     let settings_path = config_dir.join("settings.json");
     let helper = match read_apikey_helper(&settings_path)? {
         Some(value) => value,
         None => {
-            // No apiKeyHelper declared. apikey_gateway is still meaningful
-            // (the override of ANTHROPIC_BASE_URL routes through the
-            // broker for any bearer the agent already holds), but the
-            // common case is that the user does declare it. Warn loudly
-            // rather than fail — the operator may be testing the
-            // gateway path with a different bearer source.
+            // No apiKeyHelper declared on the host. The route's
+            // delivery still translates bearers the sandboxed agent
+            // already possesses (e.g. from a separate capture), but
+            // the common case is that the user does declare a
+            // helper. Warn loudly rather than fail.
             tracing::warn!(
-                "apikey_gateway is enabled but no `apiKeyHelper` is declared in {}. \
-                 The gateway route will only translate bearers the sandboxed agent \
-                 already possesses (e.g. via a separate mediation capture). \
-                 If you intend the helper to mint bearers, add it to settings.json.",
+                "credential route '{}' declares a HelperCommand capture but no `apiKeyHelper` \
+                 is declared in {}. The route will only translate bearers the sandboxed agent \
+                 already possesses (e.g. via a separate mediation capture). If you intend the \
+                 helper to mint bearers, add it to settings.json.",
+                route.name,
                 settings_path.display()
             );
             return Ok(());
@@ -148,14 +175,14 @@ fn run_apikey_gateway_preflight(
     };
     let helper_argv = shell_split(&helper).ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: could not parse apiKeyHelper '{helper}' as a shell command \
+            "helper_command preflight: could not parse apiKeyHelper '{helper}' as a shell command \
              (quote/escape sequences may be malformed). Refusing to start because the helper-coverage \
              check cannot run."
         ))
     })?;
     if helper_argv.is_empty() {
         return Err(NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: apiKeyHelper '{helper}' parses to an empty argv. \
+            "helper_command preflight: apiKeyHelper '{helper}' parses to an empty argv. \
              Refusing to start."
         )));
     }
@@ -171,30 +198,46 @@ fn run_apikey_gateway_preflight(
         .map(|s| s.as_str())
         .collect();
 
-    if gateway_cfg.helper_argv_prefix.is_empty() {
+    // Validate the host's helper binary matches the route's
+    // `command` when one was declared. The legacy `apikey_gateway`
+    // shim passes an empty `command` ("ask preflight") so this check
+    // is skipped for legacy configs — preflight just trusts whatever
+    // binary the host has. New `credential_routes` entries should
+    // always declare `command` explicitly.
+    if !expected_command.is_empty() && helper_bin != expected_command {
         return Err(NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: apiKeyHelper '{helper}' is declared in settings.json \
-             but apikey_gateway.helper_argv_prefix is empty in the profile. \
-             Declare the expected positional-args prefix so the coverage check can run, \
-             e.g. helper_argv_prefix: [\"auth\", \"token\", \"example-scope\"]."
+            "helper_command preflight: route '{}' expects helper binary '{}' but the host's \
+             apiKeyHelper resolves to '{}'. Either fix the profile or update settings.json so the \
+             two agree.",
+            route.name, expected_command, helper_bin
         )));
     }
-    // The configured helper_argv_prefix must be a prefix of the
-    // helper's positional args. Treating it as a strict prefix rather
-    // than substring guards against an `apiKeyHelper` that quietly
-    // changes binary or subcommand without the profile being updated.
-    let matches = helper_positionals.len() >= gateway_cfg.helper_argv_prefix.len()
+
+    if expected_args_prefix.is_empty() {
+        return Err(NonoError::SandboxInit(format!(
+            "helper_command preflight: apiKeyHelper '{helper}' is declared in settings.json \
+             but credential route '{}' has an empty args_prefix. Declare the expected \
+             positional-args prefix so the coverage check can run, e.g. [\"auth\", \"token\", \
+             \"example-scope\"].",
+            route.name
+        )));
+    }
+    // The configured args_prefix must be a prefix of the helper's
+    // positional args. Treating it as a strict prefix rather than
+    // substring guards against an `apiKeyHelper` that quietly changes
+    // binary or subcommand without the profile being updated.
+    let matches = helper_positionals.len() >= expected_args_prefix.len()
         && helper_positionals
             .iter()
-            .zip(gateway_cfg.helper_argv_prefix.iter())
+            .zip(expected_args_prefix.iter())
             .all(|(actual, expected)| *actual == expected.as_str());
     if !matches {
         return Err(NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: apiKeyHelper '{helper}' (positional args {helper_positionals:?}) \
-             does NOT match the configured helper_argv_prefix {:?}. \
-             Either fix the profile's helper_argv_prefix to match the deployed helper, \
-             or update settings.json so the helper invocation aligns with the profile.",
-            gateway_cfg.helper_argv_prefix
+            "helper_command preflight: apiKeyHelper '{helper}' (positional args {helper_positionals:?}) \
+             does NOT match the route's args_prefix {:?}. Either fix the profile's args_prefix \
+             to match the deployed helper, or update settings.json so the helper invocation \
+             aligns with the profile.",
+            expected_args_prefix
         )));
     }
 
@@ -218,8 +261,8 @@ fn run_apikey_gateway_preflight(
     });
     if covering_rule.is_none() {
         return Err(NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: no `mediation.commands` rule covers the host's \
-             apiKeyHelper. Helper binary '{helper_bin}', positional args {helper_positionals:?}. \
+            "helper_command preflight: no `mediation.commands` rule covers the host's apiKeyHelper. \
+             Helper binary '{helper_bin}', positional args {helper_positionals:?}. \
              Add a CommandEntry to the profile, e.g.:\n\
              \n\
              {{\n  \
@@ -230,14 +273,14 @@ fn run_apikey_gateway_preflight(
                }}]\n\
              }}\n\
              Refusing to start because the real bearer would otherwise reach the sandbox.",
-            gateway_cfg.helper_argv_prefix
+            expected_args_prefix
         )));
     }
 
     info!(
-        "apikey_gateway preflight: helper '{}' positional argv {:?} matches helper_argv_prefix {:?} \
-         and is covered by mediation rule",
-        helper_bin, helper_positionals, gateway_cfg.helper_argv_prefix
+        "helper_command preflight: route '{}' helper '{}' positional argv {:?} matches \
+         args_prefix {:?} and is covered by mediation rule",
+        route.name, helper_bin, helper_positionals, expected_args_prefix
     );
     Ok(())
 }
@@ -538,16 +581,30 @@ mod tests {
     }
 
     #[test]
-    fn run_oauth_preflight_no_op_when_target_is_not_claude() {
+    fn run_credential_routes_preflight_no_op_when_target_is_not_claude() {
         // Even with a real-token-bearing env var, pre-flight skips when
         // the program isn't claude. (Other binaries don't read these.)
         let broker = TokenBroker::new();
         let mediation = MediationConfig::default();
-        run_oauth_preflight(
+        let routes = vec![ManagedCredentialRoute {
+            name: "test".to_string(),
+            upstream: "https://example.com".to_string(),
+            capture: CredentialRouteCapture::OauthIntercept {
+                token_url_match: "/x".to_string(),
+                refresh_url_match: "/x".to_string(),
+            },
+            delivery: crate::profile::CredentialRouteDelivery::Direct,
+            bearer: crate::profile::CredentialRouteBearer {
+                header: "authorization".to_string(),
+                format: "Bearer {}".to_string(),
+            },
+            preflight: vec![CredentialRoutePreflight::NoStaticApiKeySurfaces],
+        }];
+        run_credential_routes_preflight(
             &broker,
             OsStr::new("/usr/bin/codex"),
             None,
-            None,
+            &routes,
             &mediation,
         )
         .unwrap();
@@ -738,8 +795,25 @@ mod tests {
         assert!(!is_args_prefix_match(&prefix, &too_short));
     }
 
+    fn helper_route(args_prefix: Vec<String>) -> ManagedCredentialRoute {
+        ManagedCredentialRoute {
+            name: "test_helper".to_string(),
+            upstream: "https://gateway.example.com".to_string(),
+            capture: CredentialRouteCapture::HelperCommand {
+                command: "auth-helper".to_string(),
+                args_prefix,
+            },
+            delivery: crate::profile::CredentialRouteDelivery::Direct,
+            bearer: crate::profile::CredentialRouteBearer {
+                header: "x-api-key".to_string(),
+                format: "{}".to_string(),
+            },
+            preflight: vec![CredentialRoutePreflight::ClaudeCodeApiKeyHelperConfigured],
+        }
+    }
+
     #[test]
-    fn apikey_gateway_preflight_passes_with_matching_rule() {
+    fn helper_command_preflight_passes_with_matching_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -753,25 +827,22 @@ mod tests {
             cfg_dir.to_str().expect("tempdir path is UTF-8"),
         )]);
 
-        let gateway = ApiKeyGatewayConfig {
-            url: "https://gateway.example.com".to_string(),
-            helper_argv_prefix: vec![
-                "auth".to_string(),
-                "token".to_string(),
-                "example-scope".to_string(),
-            ],
-        };
+        let route = helper_route(vec![
+            "auth".to_string(),
+            "token".to_string(),
+            "example-scope".to_string(),
+        ]);
         let mediation = MediationConfig {
             commands: vec![example_capture_rule()],
             env: Default::default(),
         };
 
-        let res = run_apikey_gateway_preflight(&gateway, &mediation);
+        let res = run_helper_command_preflight(&route, &mediation);
         assert!(res.is_ok(), "preflight should pass: {:?}", res.err());
     }
 
     #[test]
-    fn apikey_gateway_preflight_fails_without_mediation_rule() {
+    fn helper_command_preflight_fails_without_mediation_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -785,17 +856,14 @@ mod tests {
             cfg_dir.to_str().expect("tempdir path is UTF-8"),
         )]);
 
-        let gateway = ApiKeyGatewayConfig {
-            url: "https://gateway.example.com".to_string(),
-            helper_argv_prefix: vec![
-                "auth".to_string(),
-                "token".to_string(),
-                "example-scope".to_string(),
-            ],
-        };
+        let route = helper_route(vec![
+            "auth".to_string(),
+            "token".to_string(),
+            "example-scope".to_string(),
+        ]);
         let empty = MediationConfig::default();
 
-        let err = run_apikey_gateway_preflight(&gateway, &empty)
+        let err = run_helper_command_preflight(&route, &empty)
             .expect_err("should fail without covering mediation rule");
         assert!(
             err.to_string().contains("no `mediation.commands` rule"),
@@ -804,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn apikey_gateway_preflight_fails_on_argv_mismatch() {
+    fn helper_command_preflight_fails_on_argv_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -818,20 +886,17 @@ mod tests {
             cfg_dir.to_str().expect("tempdir path is UTF-8"),
         )]);
 
-        let gateway = ApiKeyGatewayConfig {
-            url: "https://gateway.example.com".to_string(),
-            helper_argv_prefix: vec![
-                "auth".to_string(),
-                "token".to_string(),
-                "example-scope".to_string(),
-            ],
-        };
+        let route = helper_route(vec![
+            "auth".to_string(),
+            "token".to_string(),
+            "example-scope".to_string(),
+        ]);
         let mediation = MediationConfig {
             commands: vec![example_capture_rule()],
             env: Default::default(),
         };
 
-        let err = run_apikey_gateway_preflight(&gateway, &mediation)
+        let err = run_helper_command_preflight(&route, &mediation)
             .expect_err("should fail on argv mismatch");
         assert!(
             err.to_string().contains("does NOT match"),

@@ -12,126 +12,172 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-/// Prefix for the OAuth-capture intercept route targeting
-/// `api.anthropic.com`. Lives in the reserved `__nono_` namespace
-/// (see [`nono_proxy::RESERVED_PREFIX_NAMESPACE`]) so user profiles
-/// cannot declare a colliding prefix and silently shadow the capture
-/// path.
-const OAUTH_PREFIX_ANTHROPIC: &str = "__nono_oauth_anthropic";
+/// Prefix used for `OauthIntercept`-capture routes targeting the
+/// Anthropic OAuth hostnames. Sits in the reserved `__nono_`
+/// namespace (see [`nono_proxy::RESERVED_PREFIX_NAMESPACE`]) so user
+/// profiles cannot declare a colliding prefix and silently shadow the
+/// capture path. Suffixed at synthesis time with the route name to
+/// keep prefixes unique across multiple OAuth-intercept routes (e.g.
+/// Anthropic + Codex OAuth both active in the same session).
+const RESERVED_PREFIX: &str = "__nono_";
 
-/// Prefix for the OAuth-capture intercept route targeting `claude.ai`.
-const OAUTH_PREFIX_CLAUDEAI: &str = "__nono_oauth_claudeai";
+/// The three hostnames the legacy Anthropic `OauthIntercept` capture
+/// always synthesised intercepts for. Binary analysis
+/// (`strings claude | grep TOKEN_URL`) confirms `TOKEN_URL =
+/// "https://platform.claude.com/v1/oauth/token"`, but Claude Code
+/// also talks to `claude.ai` and `api.anthropic.com` — intercepting
+/// all three catches the exchange regardless of which OAuth server
+/// handles it.
+///
+/// Kept here as a hard-coded set rather than driving it off
+/// `CredentialRouteCapture::OauthIntercept { ... }` because the three
+/// hostnames are fundamentally an Anthropic-OAuth implementation
+/// detail. A future Codex or other-provider OAuth-intercept entry
+/// would either (a) add a parallel constant for that provider's
+/// hostname triad, or (b) extend the schema to declare hostnames
+/// explicitly. For now, `OauthIntercept` capture means "Anthropic".
+const OAUTH_ANTHROPIC_HOSTS: [&str; 3] = [
+    "https://api.anthropic.com",
+    "https://claude.ai",
+    "https://platform.claude.com",
+];
 
-/// Prefix for the OAuth-capture intercept route targeting
-/// `platform.claude.com`. The PKCE token exchange (Layer 1.2) lands
-/// here per binary analysis of the Claude Code CLI.
-const OAUTH_PREFIX_PLATFORM: &str = "__nono_oauth_platform";
+/// Sentinel URL-match strings used for `HelperCommand`-capture routes
+/// (no response-body capture happens here — the credential enters the
+/// broker via the mediation shim, not via TLS-intercept rewriting).
+/// Containing a non-URL character (space) further guarantees no
+/// well-formed client request can match.
+///
+/// We reuse `InjectMode::OauthCapture` for these routes because it's
+/// the only `RouteConfig` variant that sets
+/// `LoadedRoute::oauth_capture_match = Some(_)`, which is the gate
+/// the reverse-proxy passthrough block in `reverse.rs` checks to
+/// decide whether to resolve `nono_<hex>` bearers via the
+/// `TokenResolver`. Sentinels guarantee the response-side capture
+/// stays dormant; the broker-resolution gate is the only behavior
+/// we want from `OauthCapture` here.
+const HELPER_CAPTURE_SENTINEL: &str = "__nono_helper_capture sentinel — no response capture";
 
-/// Prefix for the apiKeyHelper gateway reverse-proxy route.
+/// Synthesise one or more `nono_proxy::config::RouteConfig` entries
+/// for a single [`crate::profile::ManagedCredentialRoute`].
 ///
-/// Sits in the reserved [`nono_proxy::RESERVED_PREFIX_NAMESPACE`] so a
-/// user profile cannot declare a colliding route and silently shadow
-/// the bearer-translation path.
-const APIKEY_GATEWAY_PREFIX: &str = "__nono_apikey_gateway";
-
-/// Synthesise a single broker-backed reverse-proxy route for the
-/// configured apiKeyHelper gateway.
-///
-/// The route's `inject_mode` is [`nono_proxy::config::InjectMode::OauthCapture`]
-/// with **sentinel** URL-match strings that no real gateway request
-/// path equals. This is a deliberate reuse:
-///
-/// - `InjectMode::OauthCapture` is the only way today to set
-///   `LoadedRoute::oauth_capture_match` to `Some(_)`, which is the
-///   gate the reverse-proxy passthrough block in
-///   `nono_proxy::reverse::handle_reverse_proxy_request` checks to
-///   decide whether to resolve `nono_<hex>` bearers via the
-///   `TokenResolver`. Using it here repurposes that gate as a
-///   generic "this route is broker-backed" flag without introducing
-///   a new RouteConfig field.
-///
-/// - Response-side OAuth capture only fires when the request path
-///   matches `token_url_match` or `refresh_url_match` exactly. The
-///   sentinels here cannot match a real Anthropic-API path
-///   (`/v1/messages` etc.), so the response-body rewriter never
-///   activates for this route. Even if a malicious client crafted
-///   a request whose path equalled the sentinel, the rewriter would
-///   merely look for `access_token` / `refresh_token` fields in the
-///   gateway's reply and substitute nonces — it cannot leak the real
-///   bearer (which is injected by the request path, not the response
-///   path).
-fn apikey_gateway_route(
-    cfg: &crate::profile::ApiKeyGatewayConfig,
-) -> nono_proxy::config::RouteConfig {
+/// `OauthIntercept` capture expands to three intercept routes (one
+/// per Anthropic OAuth hostname); `HelperCommand` capture expands to
+/// a single broker-backed reverse-proxy route at the route's
+/// `upstream`. Per-route prefix uses the route's `name` field —
+/// callers ensure uniqueness across routes.
+fn synthesize_proxy_routes(
+    route: &crate::profile::ManagedCredentialRoute,
+) -> Vec<nono_proxy::config::RouteConfig> {
+    use crate::profile::CredentialRouteCapture;
     use nono_proxy::config::{InjectMode, RouteConfig};
-    RouteConfig {
-        prefix: APIKEY_GATEWAY_PREFIX.to_string(),
-        upstream: cfg.url.clone(),
-        credential_key: None,
-        inject_mode: InjectMode::OauthCapture {
-            // Sentinel strings that cannot equal any real upstream
-            // path. Containing a non-URL character (space) further
-            // guarantees no well-formed client request can match.
-            token_url_match: "__nono_apikey_gateway sentinel — no capture".to_string(),
-            refresh_url_match: "__nono_apikey_gateway sentinel — no capture".to_string(),
-        },
-        inject_header: "Authorization".to_string(),
-        credential_format: Some("Bearer {}".to_string()),
-        path_pattern: None,
-        path_replacement: None,
-        query_param_name: None,
-        proxy: None,
-        env_var: None,
-        endpoint_rules: vec![],
-        tls_ca: None,
-        tls_client_cert: None,
-        tls_client_key: None,
-        oauth2: None,
+
+    let bearer_header = &route.bearer.header;
+    let bearer_format = &route.bearer.format;
+    let make = |prefix: String,
+                upstream: String,
+                inject_mode: InjectMode|
+     -> RouteConfig {
+        RouteConfig {
+            prefix,
+            upstream,
+            credential_key: None,
+            inject_mode,
+            inject_header: bearer_header.clone(),
+            credential_format: Some(bearer_format.clone()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+        }
+    };
+
+    match &route.capture {
+        CredentialRouteCapture::OauthIntercept {
+            token_url_match,
+            refresh_url_match,
+        } => OAUTH_ANTHROPIC_HOSTS
+            .iter()
+            .map(|host| {
+                let host_slug = host
+                    .trim_start_matches("https://")
+                    .replace('.', "_");
+                make(
+                    format!("{}oauth_{}_{}", RESERVED_PREFIX, host_slug, route.name),
+                    (*host).to_string(),
+                    InjectMode::OauthCapture {
+                        token_url_match: token_url_match.clone(),
+                        refresh_url_match: refresh_url_match.clone(),
+                    },
+                )
+            })
+            .collect(),
+        CredentialRouteCapture::HelperCommand { .. } => {
+            // For `Direct` delivery, the agent hits `upstream`
+            // directly and the proxy CONNECT-intercepts. For
+            // `Redirected` delivery, the env-override is applied
+            // elsewhere (`apply_delivery_env_overrides`) and the
+            // route's `prefix` is what the agent's overridden base
+            // URL resolves to.
+            let _ = &route.delivery; // delivery is applied separately
+            vec![make(
+                format!("{}gw_{}", RESERVED_PREFIX, route.name),
+                route.upstream.clone(),
+                InjectMode::OauthCapture {
+                    token_url_match: HELPER_CAPTURE_SENTINEL.to_string(),
+                    refresh_url_match: HELPER_CAPTURE_SENTINEL.to_string(),
+                },
+            )]
+        }
     }
 }
 
-/// Synthesise the three Anthropic OAuth-capture routes the CLI injects
-/// when OAuth capture is active.
-///
-/// Binary analysis (`strings claude | grep TOKEN_URL`) confirms:
-///   TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-///
-/// The PKCE code exchange (POST /v1/oauth/token) goes to
-/// `platform.claude.com`, NOT `api.anthropic.com` or `claude.ai`. All
-/// three hosts are intercepted so we catch the exchange regardless of
-/// which OAuth server handles it.
-///
-/// Each prefix sits in the reserved `__nono_` namespace; user-supplied
-/// routes with that prefix are rejected by the loader, so a user
-/// profile cannot silently shadow the OAuth-capture path.
-fn oauth_capture_routes() -> Vec<nono_proxy::config::RouteConfig> {
-    use nono_proxy::config::{InjectMode, RouteConfig};
-    let make = |prefix: &str, upstream: &str| RouteConfig {
-        prefix: prefix.to_string(),
-        upstream: upstream.to_string(),
-        credential_key: None,
-        inject_mode: InjectMode::OauthCapture {
-            token_url_match: "/v1/oauth/token".to_string(),
-            refresh_url_match: "/v1/oauth/token".to_string(),
-        },
-        inject_header: "Authorization".to_string(),
-        credential_format: Some("Bearer {}".to_string()),
-        path_pattern: None,
-        path_replacement: None,
-        query_param_name: None,
-        proxy: None,
-        env_var: None,
-        endpoint_rules: vec![],
-        tls_ca: None,
-        tls_client_cert: None,
-        tls_client_key: None,
-        oauth2: None,
-    };
-    vec![
-        make(OAUTH_PREFIX_ANTHROPIC, "https://api.anthropic.com"),
-        make(OAUTH_PREFIX_CLAUDEAI, "https://claude.ai"),
-        make(OAUTH_PREFIX_PLATFORM, "https://platform.claude.com"),
-    ]
+/// Build the env-var overrides this route applies to the sandboxed
+/// child. For `Direct` delivery, returns nothing. For `Redirected`
+/// delivery, expands the `$ROUTE_BASE_URL` sentinel in each override
+/// value to the per-route base URL the proxy serves.
+fn build_route_env_overrides(
+    route: &crate::profile::ManagedCredentialRoute,
+    proxy_port: u16,
+) -> Vec<(String, String)> {
+    use crate::profile::CredentialRouteDelivery;
+
+    match &route.delivery {
+        CredentialRouteDelivery::Direct => Vec::new(),
+        CredentialRouteDelivery::Redirected { env_overrides } => {
+            let proxy_routes = synthesize_proxy_routes(route);
+            // For `HelperCommand` we synthesise exactly one route; for
+            // `OauthIntercept` we synthesise three but `Redirected`
+            // doesn't make sense there (the agent dials the real
+            // hostname). Pick the first prefix — the only one a
+            // sensible `Redirected` config produces.
+            let prefix = proxy_routes
+                .first()
+                .map(|r| r.prefix.as_str())
+                .unwrap_or("");
+            let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, prefix);
+            env_overrides
+                .iter()
+                .map(|o| (o.name.clone(), o.value.replace("$ROUTE_BASE_URL", &base_url)))
+                .collect()
+        }
+    }
+}
+
+/// Returns true if any route in the list uses `OauthIntercept`
+/// capture — used to decide whether to inject the broker-protection
+/// mediation rule and other OAuth-specific bits.
+fn any_oauth_intercept(routes: &[crate::profile::ManagedCredentialRoute]) -> bool {
+    use crate::profile::CredentialRouteCapture;
+    routes
+        .iter()
+        .any(|r| matches!(r.capture, CredentialRouteCapture::OauthIntercept { .. }))
 }
 
 pub(crate) struct ActiveProxyRuntime {
@@ -227,8 +273,7 @@ pub(crate) fn prepare_proxy_launch_options(
         open_url_origins: prepared.open_url_origins.clone(),
         open_url_allow_localhost: prepared.open_url_allow_localhost,
         allow_launch_services_active: prepared.allow_launch_services_active,
-        oauth_capture: prepared.oauth_capture,
-        apikey_gateway: prepared.apikey_gateway.clone(),
+        credential_routes: prepared.credential_routes.clone(),
         mediation: prepared.mediation.clone(),
         denied_env_vars: prepared.denied_env_vars.clone(),
         #[cfg(target_os = "macos")]
@@ -392,74 +437,50 @@ pub(crate) fn start_proxy_runtime(
         proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
     }
 
-    // OAuth-capture wiring (plan step 15). Opt-in via the profile's
-    // `oauth_capture` field (default false). When unset, proxy startup
-    // is identical to the pre-OAuth-capture build: no broker, no
-    // synthetic routes, real OAuth tokens flow to the keychain
-    // unchanged. CA materialisation and `NODE_EXTRA_CA_CERTS` env
-    // injection are handled by upstream's `intercept_ca_dir` +
+    // Unified credential-route wiring. The legacy per-feature paths
+    // (`oauth_capture: true`, `apikey_gateway: {...}`) have already
+    // been folded into `proxy.credential_routes` by
+    // `crate::profile::resolve_credential_routes`. From here on we
+    // iterate the unified representation: each entry expands to one
+    // or more proxy routes (via `synthesize_proxy_routes`) and zero or
+    // more env-var overrides applied to the child (via
+    // `build_route_env_overrides`).
+    //
+    // CA materialisation and `NODE_EXTRA_CA_CERTS` env injection are
+    // handled by upstream's `intercept_ca_dir` +
     // `ProxyHandle::env_vars()` whenever any route trips
-    // `requires_intercept` — this block only adds the OAuth-specific
-    // bits: synthetic routes for the Anthropic hosts and a
-    // session-scoped `TokenBroker` handed to the proxy as
-    // `Arc<dyn TokenResolver>`.
-    let oauth_capture_active = proxy.oauth_capture;
-    let apikey_gateway_active = proxy.apikey_gateway.is_some();
-    // The TokenBroker is wired into the proxy runtime whenever ANY
-    // broker-using feature is active. Both `oauth_capture` and
-    // `apikey_gateway` need it for bearer translation; without the
-    // resolver, the reverse-proxy passthrough at
-    // `nono_proxy::reverse::handle_reverse_proxy_request` will not
-    // resolve `nono_<hex>` values.
-    let broker_required = oauth_capture_active || apikey_gateway_active;
+    // `requires_intercept` — this block only adds the broker-specific
+    // bits: synthetic routes and a session-scoped `TokenBroker`
+    // handed to the proxy as `Arc<dyn TokenResolver>`.
+    let broker_required = !proxy.credential_routes.is_empty();
+    let has_oauth_intercept_route = any_oauth_intercept(&proxy.credential_routes);
     let (proxy_runtime, shared_broker_for_mediation): (
         nono_proxy::ProxyRuntime,
         Option<Arc<TokenBroker>>,
     ) = if broker_required {
-        // OAuth-capture-only routes (Anthropic OAuth token endpoints).
-        // Only inject when oauth_capture is active — apikey_gateway
-        // mode has no `/login` flow to capture.
-        if oauth_capture_active {
-            // Idempotent: skip any route whose prefix already exists (the
-            // operator may have wired it declaratively).
-            for route in oauth_capture_routes() {
-                if !proxy_config.routes.iter().any(|r| r.prefix == route.prefix) {
-                    proxy_config.routes.push(route);
+        for route in &proxy.credential_routes {
+            for synthesised in synthesize_proxy_routes(route) {
+                // Idempotent: skip any prefix already declared (the
+                // operator may have wired it via raw network-policy
+                // routes; conflict-free reuse is fine).
+                if !proxy_config
+                    .routes
+                    .iter()
+                    .any(|r| r.prefix == synthesised.prefix)
+                {
+                    proxy_config.routes.push(synthesised);
                 }
             }
         }
-        // apiKeyHelper gateway: broker-backed reverse-proxy route that
-        // translates `Authorization: Bearer nono_<hex>` to the real
-        // helper-issued bearer on egress. The mediation `capture` rule
-        // on the helper binary is what mints the nonces in the first
-        // place.
-        if let Some(ref gateway_cfg) = proxy.apikey_gateway {
-            let gateway_route = apikey_gateway_route(gateway_cfg);
-            if !proxy_config
-                .routes
-                .iter()
-                .any(|r| r.prefix == gateway_route.prefix)
-            {
-                proxy_config.routes.push(gateway_route);
-            }
-        }
         let broker = Arc::new(build_broker());
-        // Pre-flight: fail closed if an API-key credential is already
-        // configured (env var, ~/.claude.json primaryApiKey, or the
-        // macOS "Claude Code" keychain entry without the
-        // "-credentials" suffix). The OAuth-capture path translates
-        // `Authorization: Bearer nono_<hex>` on egress; an API key would
-        // 401 against every request inside the CONNECT tunnel.
-        //
-        // apikey_gateway preflight checks that the host's
-        // `apiKeyHelper` (if any) has a covering `capture` mediation
-        // rule in the resolved profile — otherwise the real bearer
-        // would flow into the sandbox uncaptured.
-        oauth_preflight::run_oauth_preflight(
+        // Pre-flight: fail closed on any preconditions the routes
+        // declared (no static API-key surface, apiKeyHelper coverage,
+        // etc.).
+        oauth_preflight::run_credential_routes_preflight(
             broker.as_ref(),
             program,
             proxy.denied_env_vars.as_deref(),
-            proxy.apikey_gateway.as_ref(),
+            &proxy.credential_routes,
             &proxy.mediation,
         )?;
         // Two clones of the same broker `Arc`: the proxy holds it as
@@ -474,19 +495,10 @@ pub(crate) fn start_proxy_runtime(
         // 2026-06-11 apikey_gateway debug session.)
         let shared_broker: Arc<TokenBroker> = Arc::clone(&broker);
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
-        if oauth_capture_active && apikey_gateway_active {
-            info!(
-                "OAuth capture + apiKeyHelper gateway both active; wired TokenBroker, {} intercept routes, 1 gateway route",
-                oauth_capture_routes().len(),
-            );
-        } else if oauth_capture_active {
-            info!(
-                "OAuth capture enabled; injecting {} Anthropic intercept routes and wiring TokenBroker",
-                oauth_capture_routes().len(),
-            );
-        } else {
-            info!("apiKeyHelper gateway enabled; wired TokenBroker and 1 gateway route");
-        }
+        info!(
+            "Credential routes wired: {} entries, TokenBroker shared with mediation",
+            proxy.credential_routes.len()
+        );
         (
             nono_proxy::ProxyRuntime {
                 token_resolver: Some(resolver),
@@ -551,14 +563,15 @@ pub(crate) fn start_proxy_runtime(
             );
         }
     }
-    // OAuth capture requires the sandboxed child to bind a localhost
-    // port for the browser-redirect callback server (Claude Code 2.1.x
-    // spawns one for the OAuth flow). Inject a sentinel bind port (0)
-    // when capture is active and the operator hasn't already granted
-    // one. On macOS, Seatbelt's `(allow network-bind)` is blanket — it
-    // can't filter by port — so any non-empty bind_ports list suffices
-    // to enable bind() at all.
-    let bind_ports = if oauth_capture_active && proxy.allow_bind_ports.is_empty() {
+    // OAuth-intercept capture requires the sandboxed child to bind a
+    // localhost port for the browser-redirect callback server (Claude
+    // Code 2.1.x spawns one for the OAuth `/login` flow). Inject a
+    // sentinel bind port (0) when any OAuth-intercept route is active
+    // and the operator hasn't already granted one. On macOS, Seatbelt's
+    // `(allow network-bind)` is blanket — it can't filter by port — so
+    // any non-empty bind_ports list suffices to enable bind() at all.
+    // `HelperCommand` capture has no `/login` flow and doesn't need this.
+    let bind_ports = if has_oauth_intercept_route && proxy.allow_bind_ports.is_empty() {
         vec![0]
     } else {
         proxy.allow_bind_ports.clone()
@@ -617,20 +630,18 @@ pub(crate) fn start_proxy_runtime(
         env_vars.push((key, value));
     }
 
-    // apiKeyHelper gateway: override `ANTHROPIC_BASE_URL` so the
-    // sandboxed Claude Code reaches the broker-backed reverse-proxy
-    // route at `http://127.0.0.1:<port>/__nono_apikey_gateway` instead
-    // of the real gateway hostname. The proxy resolves any `nono_<hex>`
-    // bearer to the real helper token on egress and forwards over TLS
-    // to the configured upstream. Pushed AFTER `credential_env_vars`
-    // so any auto-emitted `__NONO_APIKEY_GATEWAY_BASE_URL` from the
-    // route iteration is shadowed by the explicit ANTHROPIC_BASE_URL
-    // entry (env var assembly uses last-write-wins downstream).
-    if apikey_gateway_active {
-        env_vars.push((
-            "ANTHROPIC_BASE_URL".to_string(),
-            format!("http://127.0.0.1:{}/{}", port, APIKEY_GATEWAY_PREFIX),
-        ));
+    // Per-credential-route env-var overrides (e.g.
+    // `ANTHROPIC_BASE_URL` for the legacy `apikey_gateway` path,
+    // `OPENAI_BASE_URL` for an OpenAI gateway, etc.). Pushed AFTER
+    // `credential_env_vars` so any auto-emitted `<PREFIX>_BASE_URL`
+    // from the route iteration is shadowed by the credential-route's
+    // explicit override (env var assembly uses last-write-wins
+    // downstream). Routes with `Direct` delivery contribute nothing
+    // here — the agent already targets the real hostname.
+    for route in &proxy.credential_routes {
+        for (key, value) in build_route_env_overrides(route, port) {
+            env_vars.push((key, value));
+        }
     }
 
     std::mem::forget(rt);
@@ -791,14 +802,36 @@ mod tests {
         Ok(())
     }
 
+    pub(super) fn oauth_intercept_route() -> crate::profile::ManagedCredentialRoute {
+        use crate::profile::{
+            CredentialRouteBearer, CredentialRouteCapture, CredentialRouteDelivery,
+            ManagedCredentialRoute,
+        };
+        ManagedCredentialRoute {
+            name: "test_anthropic".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            capture: CredentialRouteCapture::OauthIntercept {
+                token_url_match: "/v1/oauth/token".to_string(),
+                refresh_url_match: "/v1/oauth/token".to_string(),
+            },
+            delivery: CredentialRouteDelivery::Direct,
+            bearer: CredentialRouteBearer {
+                header: "authorization".to_string(),
+                format: "Bearer {}".to_string(),
+            },
+            preflight: vec![],
+        }
+    }
+
     #[test]
-    fn oauth_capture_routes_targets_three_hosts() {
+    fn synthesize_oauth_intercept_targets_three_hosts() {
         // Binary analysis of Claude Code 2.1.x shows the OAuth code-
         // exchange `TOKEN_URL` lives at platform.claude.com, but the
         // agent also talks to api.anthropic.com and claude.ai. All
         // three must have OAuth-capture routes so capture fires
         // regardless of which host the client picks.
-        let routes = oauth_capture_routes();
+        let route = oauth_intercept_route();
+        let routes = synthesize_proxy_routes(&route);
         let upstreams: Vec<&str> = routes.iter().map(|r| r.upstream.as_str()).collect();
         assert!(upstreams.contains(&"https://api.anthropic.com"));
         assert!(upstreams.contains(&"https://claude.ai"));
@@ -807,21 +840,22 @@ mod tests {
     }
 
     #[test]
-    fn oauth_capture_routes_use_inject_mode_oauth_capture() {
+    fn synthesize_oauth_intercept_uses_inject_mode_oauth_capture() {
         // Every synthesised route must carry the OauthCapture inject
         // mode so `LoadedRoute::requires_intercept` trips and the
         // dispatcher TLS-terminates the CONNECT for these hosts.
-        for route in oauth_capture_routes() {
+        let route = oauth_intercept_route();
+        for proxy_route in synthesize_proxy_routes(&route) {
             assert!(
                 matches!(
-                    route.inject_mode,
+                    proxy_route.inject_mode,
                     nono_proxy::config::InjectMode::OauthCapture { .. }
                 ),
                 "route '{}' must use OauthCapture inject_mode",
-                route.prefix
+                proxy_route.prefix
             );
             assert!(
-                route.credential_key.is_none(),
+                proxy_route.credential_key.is_none(),
                 "OauthCapture routes carry no pre-loaded credential"
             );
         }
@@ -882,26 +916,29 @@ mod tests {
 }
 
 #[cfg(test)]
-mod oauth_capture_routes_tests {
+mod credential_route_synthesis_tests {
+    use super::tests::*;
     use super::*;
 
     #[test]
-    fn oauth_capture_routes_use_reserved_namespace() {
+    fn oauth_intercept_routes_use_reserved_namespace() {
         // Sanity-check: every injected route sits in the reserved
         // namespace so a user route with the same prefix is rejected at
         // config load and cannot shadow a capture route.
-        for route in oauth_capture_routes() {
+        let route = oauth_intercept_route();
+        for proxy_route in synthesize_proxy_routes(&route) {
             assert!(
-                nono_proxy::is_reserved_prefix(&route.prefix),
+                nono_proxy::is_reserved_prefix(&proxy_route.prefix),
                 "OAuth-capture route prefix {:?} must use the reserved namespace",
-                route.prefix
+                proxy_route.prefix
             );
         }
     }
 
     #[test]
-    fn oauth_capture_routes_distinct_prefixes() {
-        let routes = oauth_capture_routes();
+    fn oauth_intercept_routes_distinct_prefixes() {
+        let route = oauth_intercept_route();
+        let routes = synthesize_proxy_routes(&route);
         let mut prefixes: Vec<_> = routes.iter().map(|r| r.prefix.clone()).collect();
         prefixes.sort();
         prefixes.dedup();

@@ -438,16 +438,12 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
-    /// Profile-driven opt-in for the OAuth-capture proxy path. When true,
-    /// the proxy installs intercept routes for the Anthropic OAuth token
-    /// endpoints, wires the broker, and rewrites response bodies to
-    /// substitute real tokens with `nono_<hex>` nonces.
-    pub(crate) oauth_capture: bool,
-    /// Profile-driven opt-in for the apiKeyHelper gateway proxy path.
-    /// When set, a broker-backed reverse-proxy route is synthesised at
-    /// proxy start and `ANTHROPIC_BASE_URL` is overridden in the child
-    /// env to point at it. See `Profile::apikey_gateway`.
-    pub(crate) apikey_gateway: Option<crate::profile::ApiKeyGatewayConfig>,
+    /// Resolved credential routes. Both `oauth_capture` and
+    /// `apikey_gateway` legacy fields have already been translated into
+    /// entries here by `crate::profile::resolve_credential_routes` —
+    /// downstream consumers (proxy startup, preflight) only need to
+    /// handle this representation.
+    pub(crate) credential_routes: Vec<crate::profile::ManagedCredentialRoute>,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -1078,8 +1074,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 mediation: crate::mediation::MediationConfig::default(),
-                oauth_capture: false,
-                apikey_gateway: None,
+                credential_routes: Vec::new(),
             },
             args,
             silent,
@@ -1358,9 +1353,14 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.oauth_capture)
         .unwrap_or(false);
-    let profile_apikey_gateway = loaded_profile
+    // Resolve credential_routes from the unified primitive plus the
+    // legacy `oauth_capture` / `apikey_gateway` shorthand fields. From
+    // here on, downstream code only deals with the unified
+    // representation — see `crate::profile::resolve_credential_routes`.
+    let profile_credential_routes = loaded_profile
         .as_ref()
-        .and_then(|p| p.apikey_gateway.clone());
+        .map(crate::profile::resolve_credential_routes)
+        .unwrap_or_default();
 
     // Auto-inject the broker-refusal mediation rule when oauth_capture is
     // active. Closes the realistic subprocess-access path to the OAuth
@@ -1404,8 +1404,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             mediation: profile_mediation,
-            oauth_capture: profile_oauth_capture,
-            apikey_gateway: profile_apikey_gateway,
+            credential_routes: profile_credential_routes,
         },
         args,
         silent,

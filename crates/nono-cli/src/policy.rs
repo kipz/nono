@@ -188,6 +188,7 @@ impl ProfileDef {
             mediation: self.mediation.clone(),
             oauth_capture: self.oauth_capture,
             apikey_gateway: None,
+            credential_routes: Vec::new(),
         }
     }
 }

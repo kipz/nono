@@ -406,10 +406,10 @@ The `mediation.commands[].sandbox` field applies a scoped Seatbelt/Landlock sand
       {
         "name": "kubectl",
         "sandbox": {
-          "fs_read": ["~/.kube", "~/.config/ddtool"],
-          "fs_write": ["~/.config/ddtool"],
-          "allow_commands": ["ddtool"],
-          "network": { "allowed_hosts": ["*.staging.dog"] }
+          "fs_read": ["~/.kube", "~/.config/my-tool"],
+          "fs_write": ["~/.config/my-tool"],
+          "allow_commands": ["my-tool"],
+          "network": { "allowed_hosts": ["*.staging.example.com"] }
         }
       }
     ]

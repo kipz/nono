@@ -185,7 +185,7 @@ caching/refresh/shadowing logic.
 
 v1 ships fire-and-forget refresh: the current request fails with 401,
 the refresh kicks off, the next request succeeds. Users see one bad
-response every ~2h (when the ddtool token expires).
+response every TTL cycle (e.g. ~2h for a typical short-lived token).
 
 The cleaner UX is retry-in-place: when upstream returns 401 on a
 provisioned route, refresh synchronously, rebuild the request with
@@ -214,8 +214,8 @@ works for unknown-TTL sources without configuration.
 ### Multi-source per route
 
 A route could declare multiple credential sources (try X, fall back
-to Y). Useful for "use the cached ~/.dd/auth.json if fresh, else
-re-run ddtool." Schema would change `source: ProvisionSource` to
+to Y). Useful for "use a cached credential file if fresh, else
+re-run the helper." Schema would change `source: ProvisionSource` to
 `sources: Vec<ProvisionSource>`.
 
 Deferred: no real-world need yet.
@@ -255,7 +255,7 @@ Deferred: no real-world need yet.
   command names it doesn't itself declare?** Today it only shadows the
   exact command name in the route's source. If a user has
   `apiKeyHelper: "different-helper foo"` AND a `proxy_provisioned_credential`
-  route on `ddtool`, claude runs `different-helper foo` unsupervised
+  route on `my-tool`, claude runs `different-helper foo` unsupervised
   (mediation rule doesn't match). `different-helper` could return any
   value claude then uses. Not a security issue (the proxy substitutes
   on egress regardless), but potentially confusing.
@@ -299,24 +299,24 @@ Deferred: no real-world need yet.
 
 ## Test profile (live verification target)
 
-`claude-code-with-ddtool-gateway.json` shipped alongside this PR
-defines both `oauth_intercept` (Anthropic /login) and
-`proxy_provisioned_credential` (ddtool gateway) routes in one profile.
+`claude-code-with-gateway.json` shipped alongside this PR defines
+both `oauth_intercept` (Anthropic /login) and
+`proxy_provisioned_credential` (example gateway) routes in one profile.
 Live verification:
 
 ```bash
 # Mode A — gateway path (default)
-export ANTHROPIC_BASE_URL=https://ai-gateway.us1.ddbuild.io
-~/.cargo/bin/nono run --profile $(pwd)/claude-code-with-ddtool-gateway.json -- \
+export ANTHROPIC_BASE_URL=https://gateway.example.com
+~/.cargo/bin/nono run --profile $(pwd)/claude-code-with-gateway.json -- \
   claude -p "What is 17 * 23?"
 # Expected: 391, exit 0
-# Proxy log: "provisioning credential for route 'ddtool_gateway' from ddtool"
-# Proxy log: "substituted inbound 'x-api-key' with proxy-provisioned credential for route 'ddtool_gateway'"
-# Proxy log: "POST /v1/messages?beta=true status=200" against ai-gateway.us1.ddbuild.io
+# Proxy log: "provisioning credential for route 'example_gateway' from my-tool"
+# Proxy log: "substituted inbound 'x-api-key' with proxy-provisioned credential for route 'example_gateway'"
+# Proxy log: "POST /v1/messages?beta=true status=200" against gateway.example.com
 
 # Mode B — direct /login (breakglass)
 unset ANTHROPIC_BASE_URL
-~/.cargo/bin/nono run --profile $(pwd)/claude-code-with-ddtool-gateway.json -- claude
+~/.cargo/bin/nono run --profile $(pwd)/claude-code-with-gateway.json -- claude
 # Inside REPL: /login, complete browser flow, then "What is 5 + 12?"
 # Expected: 17
 # Proxy log: oauth_intercept routes capture the OAuth response

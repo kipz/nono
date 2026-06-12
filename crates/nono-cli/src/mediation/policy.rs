@@ -198,7 +198,7 @@ pub async fn apply(
     // re-opening the ProxyCommand exfil class that the process-exec default-deny
     // is designed to close (issue #249). The child's sandbox already grants the
     // filesystem access the child needs (~/.ssh for ssh, ~/.vault-token for
-    // ddtool, etc.), so applying it here doesn't break the credential flow.
+    // vault, etc.), so applying it here doesn't break the credential flow.
     if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
         && let Some(parent_name) = broker.resolve(ctx_nonce)
         && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
@@ -495,7 +495,7 @@ pub async fn admin_passthrough(
 ///
 /// Flags (args starting with `-`) are ignored, allowing matches regardless of
 /// flag placement. E.g. `["auth", "github", "token"]` matches both
-/// `ddtool auth github token` and `ddtool --debug auth github token`.
+/// `my-tool auth github token` and `my-tool --debug auth github token`.
 pub fn subcommand_matches(prefix: &[String], args: &[String]) -> bool {
     if prefix.is_empty() {
         return true;
@@ -2939,7 +2939,7 @@ mod tests {
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
 
         // Create fake shim files
-        for name in &["gh", "ddtool", "kubectl"] {
+        for name in &["gh", "my-tool", "kubectl"] {
             std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
         }
 
@@ -2952,8 +2952,8 @@ mod tests {
                 caller_policy: CallerPolicy::default(),
             },
             ResolvedCommand {
-                name: "ddtool".to_string(),
-                real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
+                name: "my-tool".to_string(),
+                real_path: PathBuf::from("/usr/local/bin/my-tool"),
                 intercepts: vec![],
                 sandbox: None,
                 caller_policy: CallerPolicy::default(),
@@ -2967,15 +2967,15 @@ mod tests {
             },
         ];
 
-        let allow_commands = vec!["ddtool".to_string()];
+        let allow_commands = vec!["my-tool".to_string()];
 
         let (filtered_dir, _guard) = build_filtered_shim_dir(&shim_dir, &allow_commands, &commands)
             .expect("build filtered shim dir");
 
-        // ddtool should NOT be in the filtered dir (it's allowed)
+        // my-tool should NOT be in the filtered dir (it's allowed)
         assert!(
-            !filtered_dir.join("ddtool").exists(),
-            "ddtool should be excluded from filtered shim dir"
+            !filtered_dir.join("my-tool").exists(),
+            "my-tool should be excluded from filtered shim dir"
         );
         // gh and kubectl should be symlinked
         assert!(
@@ -2994,7 +2994,7 @@ mod tests {
         let shim_dir = session_dir.path().join("shims");
         std::fs::create_dir_all(&shim_dir).expect("create shim dir");
 
-        for name in &["gh", "ddtool"] {
+        for name in &["gh", "my-tool"] {
             std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
         }
 
@@ -3006,7 +3006,7 @@ mod tests {
             .expect("build filtered shim dir");
 
         assert!(filtered_dir.join("gh").exists());
-        assert!(filtered_dir.join("ddtool").exists());
+        assert!(filtered_dir.join("my-tool").exists());
     }
 
     /// When `allow_commands` is set, `exec_passthrough` creates a filtered shim dir
@@ -3026,7 +3026,7 @@ mod tests {
         std::fs::create_dir_all(&shim_sources_dir).expect("create shim sources dir");
 
         // Create fake shim files (need to exist for build_filtered_shim_dir)
-        for name in &["gh", "ddtool"] {
+        for name in &["gh", "my-tool"] {
             let p = shim_dir.join(name);
             std::fs::write(&p, "fake-shim").expect("write shim");
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
@@ -3044,17 +3044,17 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec!["ddtool".to_string()],
+                allow_commands: vec!["my-tool".to_string()],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
             caller_policy: CallerPolicy::default(),
         };
 
-        // Provide a ddtool entry so build_filtered_shim_dir can find its real path.
-        let ddtool_cmd = ResolvedCommand {
-            name: "ddtool".to_string(),
-            real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
+        // Provide a my-tool entry so build_filtered_shim_dir can find its real path.
+        let my_tool_cmd = ResolvedCommand {
+            name: "my-tool".to_string(),
+            real_path: PathBuf::from("/usr/local/bin/my-tool"),
             intercepts: vec![],
             sandbox: None,
             caller_policy: CallerPolicy::default(),
@@ -3070,7 +3070,7 @@ mod tests {
         let broker = make_broker();
         let (resp, _action_type) = apply_capture(
             req,
-            &[cmd, ddtool_cmd],
+            &[cmd, my_tool_cmd],
             Arc::clone(&broker),
             &SessionCtx {
                 shim_dir: &shim_dir,

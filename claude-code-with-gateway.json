@@ -2,7 +2,7 @@
   "meta": {
     "name": "claude-credential-routes-smoke",
     "version": "3.0.0",
-    "description": "credential_routes schema with two routes: (1) Anthropic /login (oauth_intercept, direct) and (2) ddtool gateway (proxy_provisioned_credential, direct). The gateway route provisions the ddtool token in the proxy parent at startup. egress_headers injects org-id and other gateway-required headers that Claude Code does not reliably forward in CONNECT mode."
+    "description": "credential_routes schema with two routes: (1) Anthropic /login (oauth_intercept, direct) and (2) example gateway (proxy_provisioned_credential, direct). The gateway route provisions the access token in the proxy parent at startup. egress_headers injects org-id and other gateway-required headers that Claude Code does not reliably forward in CONNECT mode."
   },
   "extends": "default",
   "credential_routes": [
@@ -24,14 +24,14 @@
       ]
     },
     {
-      "name": "ddtool_gateway",
-      "upstream": "https://ai-gateway.us1.ddbuild.io",
+      "name": "example_gateway",
+      "upstream": "https://gateway.example.com",
       "capture": {
         "type": "proxy_provisioned_credential",
         "source": {
           "type": "command",
-          "command": "ddtool",
-          "args": ["auth", "token", "rapid-ai-platform", "--datacenter", "us1.ddbuild.io"]
+          "command": "my-tool",
+          "args": ["auth", "token", "example-scope"]
         }
       },
       "delivery": { "type": "direct" },
@@ -63,7 +63,7 @@
   },
   "network": {
     "allow_domain": [
-      "ai-gateway.us1.ddbuild.io",
+      "gateway.example.com",
       "claude.ai",
       "platform.claude.com",
       "api.anthropic.com",
@@ -74,7 +74,7 @@
   },
   "workdir": { "access": "readwrite" },
   "filesystem": {
-    "allow": ["/", "~/.cache/datadog"],
+    "allow": ["/", "~/.cache/example"],
     "bypass_protection": ["~/Library/Keychains"]
   },
   "mediation": {

@@ -268,7 +268,7 @@ Intercept specific CLI commands inside the sandbox and apply policy before they 
 
 **Per-command sandboxing:** each mediated command can optionally restrict the filesystem paths and network access it is allowed when the parent execs it in passthrough. This is an opt-in, per-command setting.
 
-**Allowed commands (`allow_commands`):** when a mediated command (e.g. `gh`) runs inside its per-command sandbox, subprocesses normally route through shims. `allow_commands` lets specific commands (e.g. `ddtool`) execute directly as real binaries inside that sandbox. A filtered shim directory is created containing shims only for commands _not_ in the allow list. The allowed commands' binary directories are added to PATH and granted read access in the Seatbelt profile. Their output stays within the per-command sandbox — network restrictions prevent credential leakage.
+**Allowed commands (`allow_commands`):** when a mediated command (e.g. `gh`) runs inside its per-command sandbox, subprocesses normally route through shims. `allow_commands` lets specific commands (e.g. `my-tool`) execute directly as real binaries inside that sandbox. A filtered shim directory is created containing shims only for commands _not_ in the allow list. The allowed commands' binary directories are added to PATH and granted read access in the Seatbelt profile. Their output stays within the per-command sandbox — network restrictions prevent credential leakage.
 
 **Socket security:** the mediation socket is protected by two layers. The session directory is created `0700` and the socket itself `0600`, so other local users cannot connect. Within the same user, a 256-bit random session token is injected into the sandboxed child as `NONO_SESSION_TOKEN`; every shim request must include it. Requests exceeding 1 MiB are dropped before allocation; requests with a missing or incorrect token are dropped after reading.
 
@@ -396,7 +396,7 @@ If the user denies the prompt, the shim returns exit code 126 and a "was not app
 
 #### Example: Per-Command Sandbox with `allow_commands`
 
-Restrict `gh` to GitHub hosts only, but let it call `ddtool` directly inside its sandbox to fetch a token from the macOS Keychain. The `ddtool` binary runs as a real process (not through the shim) inside `gh`'s network-restricted sandbox — the token is used internally and never leaks to the primary sandbox.
+Restrict `gh` to GitHub hosts only, but let it call `my-tool` directly inside its sandbox to fetch a token from the macOS Keychain. The `my-tool` binary runs as a real process (not through the shim) inside `gh`'s network-restricted sandbox — the token is used internally and never leaks to the primary sandbox.
 
 ```json
 {
@@ -413,11 +413,11 @@ Restrict `gh` to GitHub hosts only, but let it call `ddtool` directly inside its
             "allowed_hosts": ["github.com", "*.github.com", "api.github.com"]
           },
           "fs_read": ["~/.config/gh", "~/Library/Keychains/login.keychain-db"],
-          "allow_commands": ["ddtool"]
+          "allow_commands": ["my-tool"]
         }
       },
       {
-        "name": "ddtool",
+        "name": "my-tool",
         "intercept": [
           { "args_prefix": ["auth", "github", "token"], "action": { "type": "capture" } }
         ]
@@ -431,9 +431,9 @@ How this works:
 
 1. Agent calls `gh api user` — the shim forwards it to the mediation server.
 2. The server execs the real `gh` binary inside a per-command Seatbelt sandbox (network restricted to `github.com`).
-3. The `gh` wrapper internally calls `ddtool auth github token` — because `ddtool` is in `allow_commands`, it resolves to the real binary (no shim), reads the Keychain, and returns the token.
+3. The `gh` wrapper internally calls `my-tool auth github token` — because `my-tool` is in `allow_commands`, it resolves to the real binary (no shim), reads the Keychain, and returns the token.
 4. The wrapper sets `GH_TOKEN` and calls the real `gh` binary, which hits the GitHub API through the allowlisted proxy.
-5. At the top level, `ddtool auth github token` called directly by the agent still routes through the shim and returns a nonce — credentials are never exposed to the sandbox.
+5. At the top level, `my-tool auth github token` called directly by the agent still routes through the shim and returns a nonce — credentials are never exposed to the sandbox.
 
 #### Example: Full Profile
 
@@ -469,11 +469,11 @@ Combining all capabilities — credential capture, static responses, admin-gated
             "allowed_hosts": ["github.com", "*.github.com", "api.github.com"]
           },
           "fs_read": ["~/.config/gh", "~/Library/Keychains/login.keychain-db"],
-          "allow_commands": ["ddtool"]
+          "allow_commands": ["my-tool"]
         }
       },
       {
-        "name": "ddtool",
+        "name": "my-tool",
         "intercept": [
           {
             "args_prefix": ["auth", "github", "token"],

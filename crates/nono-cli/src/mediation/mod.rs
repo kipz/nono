@@ -109,7 +109,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InterceptRule {
     /// The leading positional args that must match (flags are ignored during matching).
-    /// E.g. `["auth", "github", "token"]` matches `ddtool --debug auth github token`.
+    /// E.g. `["auth", "github", "token"]` matches `my-tool --debug auth github token`.
     pub args_prefix: Vec<String>,
     /// If true, the user must authenticate via a native macOS biometric/password dialog
     /// before the action is executed. Requires `nono-approve` to be installed alongside nono.
@@ -364,11 +364,11 @@ mod tests {
     #[test]
     fn test_command_sandbox_allow_commands_deserializes() {
         let json = r#"{
-            "allow_commands": ["ddtool", "kubectl"],
+            "allow_commands": ["my-tool", "kubectl"],
             "network": { "block": true }
         }"#;
         let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
-        assert_eq!(sb.allow_commands, vec!["ddtool", "kubectl"]);
+        assert_eq!(sb.allow_commands, vec!["my-tool", "kubectl"]);
         assert!(sb.network.block);
     }
 
@@ -390,13 +390,13 @@ mod tests {
         let json = r#"{
             "fs_read": ["~/.config/gh"],
             "fs_read_file": ["~/.gitconfig", "~/.vault-token"],
-            "fs_write": ["~/.config/ddtool"],
+            "fs_write": ["~/.config/my-tool"],
             "fs_write_file": ["~/.vault-token"]
         }"#;
         let sb: CommandSandbox = serde_json::from_str(json).expect("deserialize");
         assert_eq!(sb.fs_read, vec!["~/.config/gh"]);
         assert_eq!(sb.fs_read_file, vec!["~/.gitconfig", "~/.vault-token"]);
-        assert_eq!(sb.fs_write, vec!["~/.config/ddtool"]);
+        assert_eq!(sb.fs_write, vec!["~/.config/my-tool"]);
         assert_eq!(sb.fs_write_file, vec!["~/.vault-token"]);
     }
 

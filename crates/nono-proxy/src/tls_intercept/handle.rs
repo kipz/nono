@@ -636,8 +636,9 @@ where
     // with 401/403. The current request still completes with the
     // upstream's failure status (no in-place retry in v1 — see design
     // doc), but the next request on this route will see the fresh
-    // credential. With ddtool's ~2h TTL, this means the user sees one
-    // failed request per token expiry; subsequent prompts succeed.
+    // credential. With a typical short-lived token (e.g. ~2h TTL), this
+    // means the user sees one failed request per token expiry;
+    // subsequent prompts succeed.
     let forward_result = forward::forward_request(
         tls_stream,
         request.as_bytes(),

@@ -1,6 +1,6 @@
 //! Token broker for the phantom token pattern.
 //!
-//! Short-lived credentials (ddtool service tokens, STS, kubelogin OIDC,
+//! Short-lived credentials (service tokens, STS, kubelogin OIDC,
 //! and OAuth tokens captured by the proxy's TLS-intercept layer) are
 //! stored here under a `nono_<hex>` nonce. The nonce is returned to the
 //! sandbox; the real credential never crosses the sandbox boundary.

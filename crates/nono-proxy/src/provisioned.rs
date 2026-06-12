@@ -29,7 +29,7 @@
 //! - The source command runs in the proxy parent. The parent inherits
 //!   the user's environment (modulo any `env` overrides on the
 //!   provision config). The command can read any host-level
-//!   credential (e.g. `~/.dd/auth.json` for `ddtool`).
+//!   credential (e.g. an auth token in `~/.config/my-tool/`).
 //! - The provisioned credential never crosses the sandbox boundary in
 //!   plaintext — only the auto-injected sentinel does.
 //! - The credential is stored in `Zeroizing<String>` so the buffer is

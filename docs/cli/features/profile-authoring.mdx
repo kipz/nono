@@ -451,6 +451,82 @@ Commands that legitimately spawn arbitrary subprocesses — hooks, plugin runner
   Setting `allow_process_exec: true` widens the sandbox back to its pre-v0.59.0 behaviour for that command. Any subprocess the command spawns can exec arbitrary binaries within the sandbox's filesystem grants. Use it only for commands where the set of subprocesses is too dynamic to enumerate in `allow_commands`.
 </Warning>
 
+## Managed Credential Routes
+
+Profiles can declare one or more `credential_routes` entries to route the sandboxed agent's traffic to a specific upstream through nono's proxy, with real bearer credentials held by an in-process broker in the unsandboxed parent. The sandbox only ever sees opaque `nono_<hex>` nonces or a fixed placeholder; the proxy substitutes the real credential on egress.
+
+Each route declares four orthogonal axes:
+
+| Axis | Field | Variants |
+|------|-------|----------|
+| Capture | `capture.type` | `oauth_intercept`, `mediated_helper`, `proxy_provisioned_credential` |
+| Delivery | `delivery.type` | `direct` (agent dials the real hostname, proxy CONNECT-intercepts), `redirected` (agent dials a localhost route, proxy forwards) |
+| Bearer | `bearer` | `{ "header": "authorization", "format": "Bearer {}" }` or any header + value template |
+| Preflight | `preflight` | `no_static_api_key_surfaces`, `claude_code_api_key_helper_configured` |
+
+### Capture variants
+
+- **`oauth_intercept`** — Used when the agent drives a `/login` OAuth flow against the upstream. The proxy TLS-intercepts the OAuth token endpoint, parses the JSON response, mints nonces for `access_token` and `refresh_token`, and substitutes them in the response body before it reaches the agent. Captured pairs persist to the OS keychain (macOS) so cross-session resume works without re-login.
+
+- **`mediated_helper`** — Used when the sandboxed agent invokes a helper command (e.g. Claude Code's `apiKeyHelper`). The mediation shim intercepts the invocation in the unsandboxed parent, runs the real binary there, mints a nonce on stdout, and returns the nonce to the sandbox. The proxy translates the nonce back to the real bearer on egress.
+
+- **`proxy_provisioned_credential`** — Used when the proxy itself should fetch the credential, typically for an enterprise gateway. The proxy parent runs the configured command at startup, caches the result in `Zeroizing<String>`, substitutes it on every egress request to the route's upstream, and refreshes on 401 / 403. The sandbox never invokes the helper; its `apiKeyHelper` path receives only a fixed placeholder. Profile resolution auto-injects a `respond` mediation rule on the source command so the real command does not execute inside the sandbox.
+
+### Example: Anthropic OAuth `/login`
+
+```jsonc
+{
+  "credential_routes": [
+    {
+      "name": "anthropic_oauth",
+      "upstream": "https://api.anthropic.com",
+      "capture": {
+        "type": "oauth_intercept",
+        "token_url_match": "/v1/oauth/token",
+        "refresh_url_match": "/v1/oauth/token"
+      },
+      "delivery": { "type": "direct" },
+      "bearer": { "header": "authorization", "format": "Bearer {}" },
+      "preflight": [{ "type": "no_static_api_key_surfaces" }]
+    }
+  ]
+}
+```
+
+With this route active, `claude /login` triggers the OAuth flow as usual but the real access and refresh tokens are intercepted at the proxy and replaced with nonces before they reach the agent. The agent's keychain entry holds nonces; the broker (with a code-signed ACL on its own keychain entry) holds the real pair.
+
+### Example: enterprise API-key gateway
+
+```jsonc
+{
+  "credential_routes": [
+    {
+      "name": "example_gateway",
+      "upstream": "https://gateway.example.com",
+      "capture": {
+        "type": "proxy_provisioned_credential",
+        "source": {
+          "type": "command",
+          "command": "my-tool",
+          "args": ["auth", "token", "example-scope"]
+        }
+      },
+      "delivery": { "type": "direct" },
+      "bearer": { "header": "x-api-key", "format": "{}" },
+      "egress_headers": { "provider": "anthropic" },
+      "preflight": [{ "type": "no_static_api_key_surfaces" }]
+    }
+  ]
+}
+```
+
+The proxy runs `my-tool auth token example-scope` once at startup, caches the resulting bearer, and substitutes it on every request to `gateway.example.com`. `egress_headers` are added to every outbound request for the route, which is useful for gateway-required metadata the agent does not always forward in CONNECT mode.
+
+### Preflight checks
+
+- **`no_static_api_key_surfaces`** — Refuses to launch if a static API key is already configured on the host (env var, macOS `Claude Code` keychain entry, or `primaryApiKey` in `~/.claude.json`). A static key would short-circuit Claude Code's auth resolution before the broker path runs, so this check fails closed with an actionable error.
+- **`claude_code_api_key_helper_configured`** — Verifies the host's `~/.claude/settings.json` declares an `apiKeyHelper` whose argv matches the `mediated_helper` route's `args_prefix` and that a `mediation.commands` `capture` rule covers it. Without the rule the real bearer would flow into the sandbox uncaptured.
+
 ## Target Binary
 
 User profiles can declare a `binary` field to specify the program that nono should execute. This makes the trailing `-- <command>` optional:

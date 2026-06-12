@@ -211,6 +211,37 @@ After login completes, rerun without `--allow-launch-services` unless you still 
 `--allow-launch-services` lets the sandboxed Claude process ask macOS LaunchServices to open URLs, files, or apps for that session. Use it only for temporary login or setup flows, and prefer running it from a trusted directory.
 </Warning>
 
+### Broker-Mediated OAuth Capture
+
+By default, `claude /login` writes the real OAuth `access_token` and `refresh_token` to Claude Code's keychain entry, where any subprocess of the agent can read them. nono supports an alternative shape where the real tokens never reach the agent: a `credential_routes` entry with `oauth_intercept` capture intercepts the OAuth response inside the proxy, swaps the real tokens for opaque `nono_<hex>` nonces before the response reaches the agent, and translates the nonces back to real bearers on every egress request.
+
+Add the route to your profile:
+
+```jsonc
+{
+  "meta": { "name": "claude-code-broker" },
+  "extends": "claude-code",
+  "credential_routes": [
+    {
+      "name": "anthropic_oauth",
+      "upstream": "https://api.anthropic.com",
+      "capture": {
+        "type": "oauth_intercept",
+        "token_url_match": "/v1/oauth/token",
+        "refresh_url_match": "/v1/oauth/token"
+      },
+      "delivery": { "type": "direct" },
+      "bearer": { "header": "authorization", "format": "Bearer {}" },
+      "preflight": [{ "type": "no_static_api_key_surfaces" }]
+    }
+  ]
+}
+```
+
+The user-visible login flow is unchanged — `claude /login`, complete the browser flow, return to the agent. After the redirect, the agent's keychain entry holds nonces; the broker holds the real pair under a nono-controlled keychain entry with a code-signed ACL. Cross-session resume rehydrates the broker from that entry so subsequent sessions do not require re-login.
+
+See [Managed Credential Routes](/cli/features/profile-authoring#managed-credential-routes) for the full schema and the other capture variants.
+
 ### Adding Custom OAuth2 Origins
 
 If your organization uses a custom identity provider for Claude Code authentication, add its origin to your profile:

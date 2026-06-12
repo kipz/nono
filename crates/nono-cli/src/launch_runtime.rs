@@ -84,13 +84,12 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) open_url_origins: Vec<String>,
     pub(crate) open_url_allow_localhost: bool,
     pub(crate) allow_launch_services_active: bool,
-    /// Resolved credential routes. The unified representation —
-    /// legacy `oauth_capture` and `apikey_gateway` profile fields have
-    /// already been folded into entries here by
-    /// `crate::profile::resolve_credential_routes`. The proxy synthesizes
-    /// per-entry routes (intercepts for `OauthIntercept`, reverse-proxy
-    /// for `HelperCommand`) and applies per-entry delivery (env-var
-    /// overrides). Per-entry preflight checks run before child exec.
+    /// Resolved credential routes from the profile. The proxy
+    /// synthesizes per-entry routes (TLS-intercepts for
+    /// `OauthIntercept`, reverse-proxy for `MediatedHelper` /
+    /// `ProxyProvisionedCredential`) and applies per-entry delivery
+    /// (env-var overrides). Per-entry preflight checks run before
+    /// child exec.
     pub(crate) credential_routes: Vec<crate::profile::ManagedCredentialRoute>,
     /// Resolved mediation config (commands + env policy). Carried here
     /// so the apiKeyHelper-coverage preflight can verify a covering

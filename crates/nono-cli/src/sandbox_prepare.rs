@@ -438,11 +438,9 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     #[allow(dead_code)]
     pub(crate) mediation: crate::mediation::MediationConfig,
-    /// Resolved credential routes. Both `oauth_capture` and
-    /// `apikey_gateway` legacy fields have already been translated into
-    /// entries here by `crate::profile::resolve_credential_routes` —
-    /// downstream consumers (proxy startup, preflight) only need to
-    /// handle this representation.
+    /// Resolved credential routes from the profile, passed to proxy
+    /// startup and preflight as the unified credential-management
+    /// representation.
     pub(crate) credential_routes: Vec<crate::profile::ManagedCredentialRoute>,
 }
 
@@ -1349,25 +1347,24 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.mediation.clone())
         .unwrap_or_default();
-    let profile_oauth_capture = loaded_profile
-        .as_ref()
-        .map(|p| p.oauth_capture)
-        .unwrap_or(false);
-    // Resolve credential_routes from the unified primitive plus the
-    // legacy `oauth_capture` / `apikey_gateway` shorthand fields. From
-    // here on, downstream code only deals with the unified
-    // representation — see `crate::profile::resolve_credential_routes`.
     let profile_credential_routes = loaded_profile
         .as_ref()
-        .map(crate::profile::resolve_credential_routes)
+        .map(|p| p.credential_routes.clone())
         .unwrap_or_default();
 
-    // Auto-inject the broker-refusal mediation rule when oauth_capture is
-    // active. Closes the realistic subprocess-access path to the OAuth
-    // broker keychain entry. See `mediation::broker_protection` for the
-    // protection model and the 2026-06-09 manual security review that
-    // motivated this.
-    if profile_oauth_capture {
+    // Auto-inject the broker-refusal mediation rule whenever any
+    // credential route uses OAuth-intercept capture. Closes the
+    // realistic subprocess-access path to the OAuth broker keychain
+    // entry. See `mediation::broker_protection` for the protection
+    // model and the 2026-06-09 manual security review that motivated
+    // this.
+    let has_oauth_intercept_route = profile_credential_routes.iter().any(|r| {
+        matches!(
+            r.capture,
+            crate::profile::CredentialRouteCapture::OauthIntercept { .. }
+        )
+    });
+    if has_oauth_intercept_route {
         crate::mediation::broker_protection::inject_into(&mut profile_mediation);
     }
     // Auto-inject a `respond` mediation rule for each

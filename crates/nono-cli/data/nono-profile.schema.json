@@ -152,10 +152,6 @@
         }
       },
       "description": "Command mediation and environment policy."
-    },
-    "oauth_capture": {
-      "type": "boolean",
-      "description": "Capture Anthropic OAuth tokens during `claude /login`. When true, the proxy intercepts the Anthropic OAuth token endpoint and substitutes opaque `nono_<hex>` nonces in the response body so real `access_token`/`refresh_token` values never reach the sandboxed client; the proxy resolves nonces back to real bearers on egress. Per-session in-memory broker — cross-session protection for already-authenticated users requires the mediation shim's `capture` rule on the `security` keychain command (`format: \"json\"` with `secret_paths` targeting `claudeAiOauth.*`). Default false."
     }
   },
   "$defs": {

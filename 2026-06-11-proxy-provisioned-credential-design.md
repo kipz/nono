@@ -11,7 +11,7 @@
   TLS-intercepts the response, mints `nono_<hex>` nonces, substitutes them
   into the response body. Claude caches the nonce; on every API call the
   proxy resolves it back to the real OAuth bearer at egress.
-- **`helper_command`** — claude runs an `apiKeyHelper`-style command in
+- **`mediated_helper`** — claude runs an `apiKeyHelper`-style command in
   the sandbox; the mediation shim intercepts in the parent, runs the
   real binary there, mints a nonce, returns the nonce to claude. Same
   egress resolution pattern.
@@ -39,7 +39,7 @@ either the agent or nono. The provider declares one
 ```rust
 enum CredentialRouteCapture {
     OauthIntercept { token_url_match, refresh_url_match },
-    HelperCommand  { command, args_prefix },
+    MediatedHelper { command, args_prefix },
     ProxyProvisionedCredential {
         source: ProvisionSource,
     },
@@ -59,9 +59,9 @@ without renaming the variant. v1 only ships `command`.
 
 ### Lifecycle
 
-1. **Schema resolution** (CLI). At sandbox prep, `resolve_credential_routes`
-   collects all `proxy_provisioned_credential` routes. The CLI synthesises
-   one `nono_proxy::config::RouteConfig` per entry, sets
+1. **Schema resolution** (CLI). At sandbox prep, the CLI collects all
+   `proxy_provisioned_credential` entries from `profile.credential_routes`.
+   It synthesises one `nono_proxy::config::RouteConfig` per entry, sets
    `provisioned_credential_route: Some(name)` so the proxy egress path
    knows to substitute, and translates the CLI's `ProvisionSource` into
    the proxy's `nono_proxy::provisioned::ProvisionSource` (different
@@ -245,13 +245,11 @@ Deferred: no real-world need yet.
   Claude, no schema changes. Verified architecturally; haven't tested
   with Codex yet.
 
-- **What's the upgrade path from `helper_command` to
+- **What's the upgrade path from `mediated_helper` to
   `proxy_provisioned_credential`?** They're not interchangeable — they
   encode different security models. Migration is a profile rewrite,
-  not a code change. The legacy shim in `resolve_credential_routes`
-  still synthesises `helper_command` routes from the legacy
-  `apikey_gateway: {...}` field, so users on the legacy shape keep
-  working.
+  not a code change. Profile authors declare a `credential_routes`
+  entry with the appropriate capture variant explicitly.
 
 - **Should `provisioned_command` shadow apiKeyHelper invocations on
   command names it doesn't itself declare?** Today it only shadows the

@@ -1,46 +1,43 @@
-//! Pre-flight checks for `oauth_capture: true` and `apikey_gateway`.
-//! macOS only for the keychain pieces; the helper-coverage check is
-//! cross-platform.
+//! Per-route preflight checks driven by `credential_routes[].preflight`.
+//! macOS only for the keychain surface scan; the helper-coverage check
+//! is cross-platform.
 //!
 //! Protection of the macOS `Claude Code-credentials` keychain entry is
 //! handled by the mediation shim's `capture` action with `format: "json"`
 //! (see `docs/plans/2026-06-03-mediation-based-oauth-capture.md`). This
 //! module does not rewrite the keychain; profile authors configure the
-//! substitution declaratively. Pre-flight only checks for fail-closed
-//! conditions — namely the presence of a credential surface that the
+//! substitution declaratively. Preflight only checks fail-closed
+//! conditions — namely the presence of a credential surface the
 //! broker-backed proxy path cannot translate, or a configured
 //! `apiKeyHelper` whose argv is not covered by a `capture` mediation
 //! rule.
 //!
-//! ### API-key surfaces (fail-closed)
+//! ### `NoStaticApiKeySurfaces`
 //!
 //! Surfaces that carry an API key are fatal because the proxy's
 //! TLS-intercept translates `Authorization: Bearer nono_<hex>` but not
 //! `x-api-key: nono_<hex>` — the child would 401 on every request. When
-//! any API-key surface is detected pre-flight fails with a clear message:
+//! any API-key surface is detected preflight fails with a clear message:
 //!
 //! - environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`
 //!   (skipped if the profile's `denied_env_vars` would strip them anyway)
 //! - macOS keychain entry `Claude Code` (no `-credentials` suffix)
 //! - `primaryApiKey` field in `~/.claude.json`
 //!
-//! ### apiKeyHelper coverage (apikey_gateway only, fail-closed)
+//! ### `ClaudeCodeApiKeyHelperConfigured`
 //!
-//! When `apikey_gateway` is set, Claude Code is expected to fetch its
-//! bearer via the `apiKeyHelper` command declared in
+//! For a `mediated_helper` capture, Claude Code is expected to fetch
+//! its bearer via the `apiKeyHelper` command declared in
 //! `~/.claude/settings.json`. The mediation shim captures that helper's
 //! stdout into the broker and returns a `nono_<hex>` nonce to the
 //! sandbox. Without a matching `capture` mediation rule, the real
-//! bearer flows into the sandbox uncaptured — defeating the purpose of
-//! `apikey_gateway`. Pre-flight refuses to launch unless a covering
-//! rule is found.
+//! bearer flows into the sandbox uncaptured — defeating the route's
+//! design. Preflight refuses to launch unless a covering rule is found.
 
 use crate::exec_strategy::is_env_var_denied;
 use crate::mediation::broker::TokenBroker;
 use crate::mediation::{CaptureFormat, InterceptAction, MediationConfig};
-use crate::profile::{
-    CredentialRouteCapture, CredentialRoutePreflight, ManagedCredentialRoute,
-};
+use crate::profile::{CredentialRouteCapture, CredentialRoutePreflight, ManagedCredentialRoute};
 use nono::{NonoError, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -112,9 +109,7 @@ pub(crate) fn run_credential_routes_preflight(
                     } else {
                         Some(effective_deny.as_slice())
                     };
-                    if let Some(reason) =
-                        detect_blocking_api_key_surface(effective_deny_slice)?
-                    {
+                    if let Some(reason) = detect_blocking_api_key_surface(effective_deny_slice)? {
                         return Err(NonoError::SandboxInit(format!(
                             "credential_routes preflight: an API-key credential is already configured on the host: {reason}. \
                              Broker-backed routes translate `Authorization: Bearer` / `x-api-key` headers carrying \
@@ -130,7 +125,7 @@ pub(crate) fn run_credential_routes_preflight(
                         continue;
                     }
                     ran_helper_check = true;
-                    run_helper_command_preflight(route, mediation)?;
+                    run_mediated_helper_preflight(route, mediation)?;
                 }
             }
         }
@@ -141,7 +136,7 @@ pub(crate) fn run_credential_routes_preflight(
 
 /// Verify that the host's Claude Code `apiKeyHelper` is covered by a
 /// mediation `capture` rule that matches the credential route's
-/// `HelperCommand` capture configuration.
+/// `MediatedHelper` capture configuration.
 ///
 /// Reads `~/.claude/settings.json` (and `CLAUDE_CONFIG_DIR` overrides if
 /// set). If `apiKeyHelper` is declared, shell-split its value and
@@ -149,12 +144,12 @@ pub(crate) fn run_credential_routes_preflight(
 /// Then verify the resolved `MediationConfig` has a `Capture` rule
 /// covering the helper. Without a covering rule the real bearer would
 /// flow into the sandbox uncaptured.
-fn run_helper_command_preflight(
+fn run_mediated_helper_preflight(
     route: &ManagedCredentialRoute,
     mediation: &MediationConfig,
 ) -> Result<()> {
     let (expected_command, expected_args_prefix) = match &route.capture {
-        CredentialRouteCapture::HelperCommand {
+        CredentialRouteCapture::MediatedHelper {
             command,
             args_prefix,
         } => (command.clone(), args_prefix.clone()),
@@ -172,7 +167,7 @@ fn run_helper_command_preflight(
         }
     };
     let (config_dir, _explicit) = claude_config_dir_pair()
-        .map_err(|msg| NonoError::SandboxInit(format!("helper_command preflight: {msg}")))?;
+        .map_err(|msg| NonoError::SandboxInit(format!("mediated_helper preflight: {msg}")))?;
     let settings_path = config_dir.join("settings.json");
     let helper = match read_apikey_helper(&settings_path)? {
         Some(value) => value,
@@ -183,7 +178,7 @@ fn run_helper_command_preflight(
             // the common case is that the user does declare a
             // helper. Warn loudly rather than fail.
             tracing::warn!(
-                "credential route '{}' declares a HelperCommand capture but no `apiKeyHelper` \
+                "credential route '{}' declares a MediatedHelper capture but no `apiKeyHelper` \
                  is declared in {}. The route will only translate bearers the sandboxed agent \
                  already possesses (e.g. via a separate mediation capture). If you intend the \
                  helper to mint bearers, add it to settings.json.",
@@ -195,14 +190,14 @@ fn run_helper_command_preflight(
     };
     let helper_argv = shell_split(&helper).ok_or_else(|| {
         NonoError::SandboxInit(format!(
-            "helper_command preflight: could not parse apiKeyHelper '{helper}' as a shell command \
+            "mediated_helper preflight: could not parse apiKeyHelper '{helper}' as a shell command \
              (quote/escape sequences may be malformed). Refusing to start because the helper-coverage \
              check cannot run."
         ))
     })?;
     if helper_argv.is_empty() {
         return Err(NonoError::SandboxInit(format!(
-            "helper_command preflight: apiKeyHelper '{helper}' parses to an empty argv. \
+            "mediated_helper preflight: apiKeyHelper '{helper}' parses to an empty argv. \
              Refusing to start."
         )));
     }
@@ -219,14 +214,13 @@ fn run_helper_command_preflight(
         .collect();
 
     // Validate the host's helper binary matches the route's
-    // `command` when one was declared. The legacy `apikey_gateway`
-    // shim passes an empty `command` ("ask preflight") so this check
-    // is skipped for legacy configs — preflight just trusts whatever
-    // binary the host has. New `credential_routes` entries should
-    // always declare `command` explicitly.
+    // `command`. An empty `command` skips this check and trusts
+    // whatever binary the host has — kept for callers that want to
+    // defer binary identity to settings.json rather than declaring it
+    // up front.
     if !expected_command.is_empty() && helper_bin != expected_command {
         return Err(NonoError::SandboxInit(format!(
-            "helper_command preflight: route '{}' expects helper binary '{}' but the host's \
+            "mediated_helper preflight: route '{}' expects helper binary '{}' but the host's \
              apiKeyHelper resolves to '{}'. Either fix the profile or update settings.json so the \
              two agree.",
             route.name, expected_command, helper_bin
@@ -235,7 +229,7 @@ fn run_helper_command_preflight(
 
     if expected_args_prefix.is_empty() {
         return Err(NonoError::SandboxInit(format!(
-            "helper_command preflight: apiKeyHelper '{helper}' is declared in settings.json \
+            "mediated_helper preflight: apiKeyHelper '{helper}' is declared in settings.json \
              but credential route '{}' has an empty args_prefix. Declare the expected \
              positional-args prefix so the coverage check can run, e.g. [\"auth\", \"token\", \
              \"example-scope\"].",
@@ -253,7 +247,7 @@ fn run_helper_command_preflight(
             .all(|(actual, expected)| *actual == expected.as_str());
     if !matches {
         return Err(NonoError::SandboxInit(format!(
-            "helper_command preflight: apiKeyHelper '{helper}' (positional args {helper_positionals:?}) \
+            "mediated_helper preflight: apiKeyHelper '{helper}' (positional args {helper_positionals:?}) \
              does NOT match the route's args_prefix {:?}. Either fix the profile's args_prefix \
              to match the deployed helper, or update settings.json so the helper invocation \
              aligns with the profile.",
@@ -269,19 +263,17 @@ fn run_helper_command_preflight(
             && cmd.intercept.iter().any(|rule| {
                 matches!(
                     rule.action,
-                    InterceptAction::Capture {
-                        format: None,
-                        ..
-                    } | InterceptAction::Capture {
-                        format: Some(CaptureFormat::Json),
-                        ..
-                    }
+                    InterceptAction::Capture { format: None, .. }
+                        | InterceptAction::Capture {
+                            format: Some(CaptureFormat::Json),
+                            ..
+                        }
                 ) && is_args_prefix_match(&rule.args_prefix, &helper_positionals)
             })
     });
     if covering_rule.is_none() {
         return Err(NonoError::SandboxInit(format!(
-            "helper_command preflight: no `mediation.commands` rule covers the host's apiKeyHelper. \
+            "mediated_helper preflight: no `mediation.commands` rule covers the host's apiKeyHelper. \
              Helper binary '{helper_bin}', positional args {helper_positionals:?}. \
              Add a CommandEntry to the profile, e.g.:\n\
              \n\
@@ -298,7 +290,7 @@ fn run_helper_command_preflight(
     }
 
     info!(
-        "helper_command preflight: route '{}' helper '{}' positional argv {:?} matches \
+        "mediated_helper preflight: route '{}' helper '{}' positional argv {:?} matches \
          args_prefix {:?} and is covered by mediation rule",
         route.name, helper_bin, helper_positionals, expected_args_prefix
     );
@@ -357,7 +349,7 @@ fn read_apikey_helper(settings_path: &Path) -> Result<Option<String>> {
         Ok(raw) => {
             let parsed: Value = serde_json::from_str(&raw).map_err(|err| {
                 NonoError::SandboxInit(format!(
-                    "apikey_gateway preflight: could not parse {}: {err}",
+                    "mediated_helper preflight: could not parse {}: {err}",
                     settings_path.display()
                 ))
             })?;
@@ -369,7 +361,7 @@ fn read_apikey_helper(settings_path: &Path) -> Result<Option<String>> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(NonoError::SandboxInit(format!(
-            "apikey_gateway preflight: could not read {}: {err}",
+            "mediated_helper preflight: could not read {}: {err}",
             settings_path.display()
         ))),
     }
@@ -465,7 +457,7 @@ fn detect_primary_api_key_in_file(global_config: &Path) -> Result<Option<String>
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: could not read {}: {err}",
+            "credential_routes preflight: could not read {}: {err}",
             global_config.display()
         ))),
     }
@@ -474,7 +466,7 @@ fn detect_primary_api_key_in_file(global_config: &Path) -> Result<Option<String>
 fn global_config_has_primary_api_key(raw: &str) -> Result<bool> {
     let parsed: Value = serde_json::from_str(raw).map_err(|err| {
         NonoError::SandboxInit(format!(
-            "oauth_capture pre-flight: could not parse ~/.claude.json: {err}"
+            "credential_routes preflight: could not parse ~/.claude.json: {err}"
         ))
     })?;
     Ok(parsed
@@ -489,7 +481,7 @@ fn detect_api_key_keychain_macos() -> Result<Option<String>> {
         Ok(pair) => pair,
         Err(err) => {
             return Err(NonoError::SandboxInit(format!(
-                "oauth_capture pre-flight: {err}"
+                "credential_routes preflight: {err}"
             )));
         }
     };
@@ -743,7 +735,7 @@ mod tests {
         );
     }
 
-    // --- apikey_gateway preflight tests ---
+    // --- mediated_helper preflight tests ---
 
     use crate::mediation::{CommandEntry, InterceptRule};
     use crate::test_env::{ENV_LOCK, EnvVarGuard};
@@ -820,7 +812,7 @@ mod tests {
         ManagedCredentialRoute {
             name: "test_helper".to_string(),
             upstream: "https://gateway.example.com".to_string(),
-            capture: CredentialRouteCapture::HelperCommand {
+            capture: CredentialRouteCapture::MediatedHelper {
                 command: "auth-helper".to_string(),
                 args_prefix,
             },
@@ -835,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_command_preflight_passes_with_matching_rule() {
+    fn mediated_helper_preflight_passes_with_matching_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -859,12 +851,12 @@ mod tests {
             env: Default::default(),
         };
 
-        let res = run_helper_command_preflight(&route, &mediation);
+        let res = run_mediated_helper_preflight(&route, &mediation);
         assert!(res.is_ok(), "preflight should pass: {:?}", res.err());
     }
 
     #[test]
-    fn helper_command_preflight_fails_without_mediation_rule() {
+    fn mediated_helper_preflight_fails_without_mediation_rule() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -885,7 +877,7 @@ mod tests {
         ]);
         let empty = MediationConfig::default();
 
-        let err = run_helper_command_preflight(&route, &empty)
+        let err = run_mediated_helper_preflight(&route, &empty)
             .expect_err("should fail without covering mediation rule");
         assert!(
             err.to_string().contains("no `mediation.commands` rule"),
@@ -894,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_command_preflight_fails_on_argv_mismatch() {
+    fn mediated_helper_preflight_fails_on_argv_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg_dir = tmp.path().to_path_buf();
         std::fs::write(
@@ -918,7 +910,7 @@ mod tests {
             env: Default::default(),
         };
 
-        let err = run_helper_command_preflight(&route, &mediation)
+        let err = run_mediated_helper_preflight(&route, &mediation)
             .expect_err("should fail on argv mismatch");
         assert!(
             err.to_string().contains("does NOT match"),

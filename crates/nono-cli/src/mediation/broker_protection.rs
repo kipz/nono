@@ -13,8 +13,9 @@
 //!
 //! This module closes the realistic version of that threat (subprocess access
 //! via `/usr/bin/security`) by injecting a mediation rule into the
-//! [`super::MediationConfig`] whenever a profile sets `oauth_capture: true`.
-//! The mediation shim intercepts matching `security` invocations in the
+//! [`super::MediationConfig`] whenever a profile declares a credential
+//! route with `OauthIntercept` capture. The mediation shim intercepts
+//! matching `security` invocations in the
 //! unsandboxed parent process and returns `errSecItemNotFound` (exit 44, empty
 //! stdout) without ever invoking the real binary. From the agent's
 //! perspective, the entry simply does not exist — no dialog, no Allow button,

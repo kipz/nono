@@ -182,9 +182,7 @@ impl ProvisionedStore {
                 source.label()
             );
             let credential = source.provision().await.map_err(|e| {
-                ProxyError::Config(format!(
-                    "route '{name}': initial provisioning failed: {e}"
-                ))
+                ProxyError::Config(format!("route '{name}': initial provisioning failed: {e}"))
             })?;
             slots.insert(
                 name,
@@ -255,9 +253,7 @@ impl ProvisionedStore {
         let fresh = match slot.source.provision().await {
             Ok(v) => v,
             Err(e) => {
-                warn!(
-                    "route '{route_name}' refresh failed: {e}; keeping stale credential"
-                );
+                warn!("route '{route_name}' refresh failed: {e}; keeping stale credential");
                 return Err(e);
             }
         };
@@ -293,10 +289,7 @@ mod tests {
     #[tokio::test]
     async fn provision_all_captures_trimmed_stdout() {
         let mut routes = HashMap::new();
-        routes.insert(
-            "echo_route".to_string(),
-            cmd("/bin/echo", &["hello-world"]),
-        );
+        routes.insert("echo_route".to_string(), cmd("/bin/echo", &["hello-world"]));
         let store = ProvisionedStore::provision_all(routes).await.unwrap();
         let cred = store.get("echo_route").await.unwrap();
         assert_eq!(cred.as_str(), "hello-world");
@@ -327,11 +320,8 @@ mod tests {
     #[tokio::test]
     async fn provision_all_fails_on_empty_stdout() {
         // `/usr/bin/true` exits 0 but produces no output
-        let routes: HashMap<_, _> = std::iter::once((
-            "empty_route".to_string(),
-            cmd("/usr/bin/true", &[]),
-        ))
-        .collect();
+        let routes: HashMap<_, _> =
+            std::iter::once(("empty_route".to_string(), cmd("/usr/bin/true", &[]))).collect();
         let err = ProvisionedStore::provision_all(routes)
             .await
             .expect_err("empty stdout must fail provisioning");
@@ -347,11 +337,8 @@ mod tests {
         // writing to /tmp and reading a counter. To avoid filesystem
         // dependencies, we use `date +%N` which returns nanoseconds
         // (different each call).
-        let routes: HashMap<_, _> = std::iter::once((
-            "ns_route".to_string(),
-            cmd("/bin/date", &["+%N"]),
-        ))
-        .collect();
+        let routes: HashMap<_, _> =
+            std::iter::once(("ns_route".to_string(), cmd("/bin/date", &["+%N"]))).collect();
         let store = ProvisionedStore::provision_all(routes).await.unwrap();
         let first = store.get("ns_route").await.unwrap();
         // Sleep briefly to ensure date(1)'s output actually changes.
@@ -383,11 +370,8 @@ mod tests {
         // not all spawn their own helper. We can't directly observe
         // that, but we can observe that all callers complete and
         // none error out (no panics on contention).
-        let routes: HashMap<_, _> = std::iter::once((
-            "echo_route".to_string(),
-            cmd("/bin/echo", &["x"]),
-        ))
-        .collect();
+        let routes: HashMap<_, _> =
+            std::iter::once(("echo_route".to_string(), cmd("/bin/echo", &["x"]))).collect();
         let store = Arc::new(ProvisionedStore::provision_all(routes).await.unwrap());
 
         let mut handles = vec![];

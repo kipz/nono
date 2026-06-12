@@ -1667,50 +1667,11 @@ pub struct Profile {
     #[serde(default)]
     pub mediation: crate::mediation::MediationConfig,
     /// Capture and isolate Anthropic OAuth tokens during `claude /login`.
-    ///
-    /// When `true`, the proxy intercepts the OAuth token endpoint, hands
-    /// real `access_token` / `refresh_token` values to an in-memory
-    /// broker, and substitutes opaque `nono_<hex>` nonces in the response
-    /// body before it reaches the sandboxed client. The captured pair is
-    /// also persisted under a nono-controlled keychain entry so a later
-    /// nono session can rehydrate without forcing a re-login.
-    ///
-    /// Default `false` to preserve existing behaviour. When `false`, the
-    /// proxy startup path is identical to the pre-OAuth-capture build:
-    /// no intercept routes installed, no broker wired, real tokens flow
-    /// to the keychain unchanged.
-    #[serde(default)]
-    pub oauth_capture: bool,
-    /// Reverse-proxy a Claude Code `apiKeyHelper` token through the
-    /// in-process `TokenBroker`.
-    ///
-    /// When set, nono:
-    /// - synthesises a broker-backed reverse-proxy route pointed at
-    ///   [`ApiKeyGatewayConfig::url`];
-    /// - overrides `ANTHROPIC_BASE_URL` in the child env to that route;
-    /// - wires the in-process `TokenBroker` (same primitive
-    ///   `oauth_capture` uses) so a `nono_<hex>` value in the
-    ///   `Authorization` header is resolved to the real bearer on egress;
-    /// - at preflight, refuses to start if the host's Claude Code
-    ///   `apiKeyHelper` is declared but no `mediation.commands` rule
-    ///   covers [`ApiKeyGatewayConfig::helper_argv_prefix`].
-    ///
-    /// Pair with a `mediation.commands` entry on the helper binary
-    /// (e.g. `auth-helper`) so the mediation shim captures the helper's
-    /// stdout into the broker before claude ever sees the real bearer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apikey_gateway: Option<ApiKeyGatewayConfig>,
-    /// Managed credential routes — the generic mechanism that
-    /// `oauth_capture` and `apikey_gateway` are specialized instances
-    /// of. Each entry declares one upstream, one capture mechanism, one
-    /// delivery mechanism, one bearer carriage shape, and zero or more
-    /// preflight checks. See [`ManagedCredentialRoute`] for details and
-    /// the four orthogonal axes.
-    ///
-    /// The legacy fields above are translated into entries in this list
-    /// at profile-resolve time, so consumers (proxy startup, preflight)
-    /// only need to handle this representation. Existing profile JSONs
-    /// keep working unchanged.
+    /// Managed credential routes. Each entry declares one upstream,
+    /// one capture mechanism, one delivery mechanism, one bearer
+    /// carriage shape, and zero or more preflight checks. See
+    /// [`ManagedCredentialRoute`] for details and the four orthogonal
+    /// axes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_routes: Vec<ManagedCredentialRoute>,
 }
@@ -1718,8 +1679,6 @@ pub struct Profile {
 /// A managed credential route: one upstream, one capture path, one
 /// delivery mechanism, one bearer shape, zero or more preflight checks.
 ///
-/// This is the unified primitive that replaces ad-hoc per-provider
-/// flags like [`Profile::oauth_capture`] and [`Profile::apikey_gateway`].
 /// New provider integrations declare one of these (or several, for
 /// multi-provider gateways) rather than adding a new top-level Profile
 /// field. The four axes the user customises:
@@ -1791,12 +1750,18 @@ pub enum CredentialRouteCapture {
         /// `grant_type`s).
         refresh_url_match: String,
     },
-    /// Token is captured from the stdout of a mediation-shim'd helper
-    /// command that runs in the unsandboxed parent. The agent invokes
-    /// the command (e.g. via Claude Code's `apiKeyHelper` setting),
-    /// the shim intercepts, runs the real binary in the parent, mints
-    /// a nonce on stdout, returns it to the sandbox.
-    HelperCommand {
+    /// Token is captured from the stdout of a helper command invoked by
+    /// the sandboxed agent (e.g. via Claude Code's `apiKeyHelper`
+    /// setting) and intercepted by the mediation shim. The shim runs
+    /// the real binary in the unsandboxed parent, mints a nonce on
+    /// stdout, and returns the nonce to the sandbox. The proxy resolves
+    /// the nonce to the real bearer on egress.
+    ///
+    /// Distinct from [`Self::ProxyProvisionedCredential`]: there the
+    /// proxy parent runs the command eagerly at startup and the
+    /// sandbox never invokes the helper. Here the *agent* drives
+    /// timing, and capture happens through the mediation seam.
+    MediatedHelper {
         /// Helper binary name (matches `mediation.commands[].name`).
         command: String,
         /// Expected positional args prefix. Preflight verifies the
@@ -1918,35 +1883,9 @@ pub enum CredentialRoutePreflight {
     NoStaticApiKeySurfaces,
     /// Verify the host's Claude Code `apiKeyHelper` setting matches
     /// the helper command + argv expected by an associated
-    /// `helper_command` capture. Reads `~/.claude/settings.json`
+    /// `mediated_helper` capture. Reads `~/.claude/settings.json`
     /// (or `$CLAUDE_CONFIG_DIR/settings.json`).
     ClaudeCodeApiKeyHelperConfigured,
-}
-
-/// Configuration for [`Profile::apikey_gateway`].
-///
-/// See the field docstring for the full design. In summary: nono mints
-/// a broker-backed reverse-proxy route at `url`, sets
-/// `ANTHROPIC_BASE_URL` in the child env to point at it, and verifies a
-/// matching mediation rule covers the host's `apiKeyHelper` argv.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ApiKeyGatewayConfig {
-    /// Upstream URL the broker-issued bearer is forwarded to.
-    ///
-    /// Example: `"https://gateway.example.com"`.
-    pub url: String,
-    /// argv prefix of the host's Claude Code `apiKeyHelper`, checked
-    /// at preflight so the mediation rule's coverage is verified before
-    /// the sandboxed child is exec'd.
-    ///
-    /// Example: `["auth", "token", "example-scope"]` for
-    /// `auth-helper auth token example-scope --datacenter <region>`.
-    /// The leading binary name (`auth-helper`) is **not** part of this
-    /// prefix — preflight resolves it from the host's settings.json
-    /// `apiKeyHelper` field directly.
-    #[serde(default)]
-    pub helper_argv_prefix: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -2013,10 +1952,6 @@ struct ProfileDeserialize {
     #[serde(default)]
     mediation: crate::mediation::MediationConfig,
     #[serde(default)]
-    oauth_capture: bool,
-    #[serde(default)]
-    apikey_gateway: Option<ApiKeyGatewayConfig>,
-    #[serde(default)]
     credential_routes: Vec<ManagedCredentialRoute>,
 }
 
@@ -2054,8 +1989,6 @@ impl From<ProfileDeserialize> for Profile {
             command_args: raw.command_args,
             unsafe_macos_seatbelt_rules: raw.unsafe_macos_seatbelt_rules,
             mediation: raw.mediation,
-            oauth_capture: raw.oauth_capture,
-            apikey_gateway: raw.apikey_gateway,
             credential_routes: raw.credential_routes,
         };
 
@@ -3041,119 +2974,12 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &child.unsafe_macos_seatbelt_rules,
         ),
         mediation: crate::mediation::merge::merge_mediation(base.mediation, child.mediation),
-        // OAuth capture: child's value wins when set true; otherwise inherit
-        // the base. There is no "explicitly off" form — `false` means
-        // "no opinion, use base" so a derived profile cannot silently
-        // disable a base profile's enabled capture.
-        oauth_capture: child.oauth_capture || base.oauth_capture,
-        // apikey_gateway: child wins when present (Option<T> with `.or()`
-        // semantics). A child profile cannot silently disable a base
-        // profile's gateway because there is no "explicitly off" form
-        // expressible without dropping the field entirely.
-        apikey_gateway: child.apikey_gateway.or(base.apikey_gateway),
         // credential_routes: append child entries after base entries.
         // No de-duplication — by-name collisions are caught later by
         // the synthesis loader's uniqueness check. This matches the
         // append-and-validate-later pattern used by mediation rules.
         credential_routes: dedup_append(&base.credential_routes, &child.credential_routes),
     }
-}
-
-/// Translate the legacy `oauth_capture` and `apikey_gateway` profile
-/// fields into entries appended to [`Profile::credential_routes`],
-/// returning the unified list ready for downstream consumers.
-///
-/// Existing profile JSONs that predate `credential_routes` keep working
-/// — `oauth_capture: true` becomes a synthesised
-/// [`CredentialRouteCapture::OauthIntercept`] entry for Anthropic, and
-/// `apikey_gateway: {...}` becomes a synthesised
-/// [`CredentialRouteCapture::HelperCommand`] entry pointed at the
-/// configured gateway URL. New consumers (Codex, custom gateways) author
-/// `credential_routes` directly and bypass the legacy fields entirely.
-///
-/// The legacy fields' implicit behaviour (`oauth_capture` only ever
-/// targets Anthropic on the `authorization` header; `apikey_gateway`
-/// only ever overrides `ANTHROPIC_BASE_URL` on `x-api-key`) is encoded
-/// here. Adjusting that behaviour for new providers requires authoring
-/// a `credential_routes` entry explicitly.
-///
-/// **Mutual-exclusion guard:** if both legacy fields are set AND both
-/// target the same env-var (`ANTHROPIC_BASE_URL`), the configuration is
-/// ambiguous (claude can only honour one base URL). Caller is expected
-/// to surface this; this function does not error out — it returns the
-/// union and lets downstream validation (proxy startup, preflight)
-/// reject the combination. Keeping shim and validation separate makes
-/// the legacy translation deterministic.
-pub fn resolve_credential_routes(profile: &Profile) -> Vec<ManagedCredentialRoute> {
-    let mut routes: Vec<ManagedCredentialRoute> =
-        Vec::with_capacity(profile.credential_routes.len() + 2);
-
-    if profile.oauth_capture {
-        // PR40/PR50's oauth_capture: TLS-intercept Anthropic OAuth
-        // endpoints, capture access+refresh, agent talks to
-        // api.anthropic.com directly with Bearer tokens.
-        routes.push(ManagedCredentialRoute {
-            name: "anthropic_oauth".to_string(),
-            upstream: "https://api.anthropic.com".to_string(),
-            capture: CredentialRouteCapture::OauthIntercept {
-                token_url_match: "/v1/oauth/token".to_string(),
-                refresh_url_match: "/v1/oauth/token".to_string(),
-            },
-            delivery: CredentialRouteDelivery::Direct,
-            bearer: CredentialRouteBearer {
-                header: "authorization".to_string(),
-                format: "Bearer {}".to_string(),
-            },
-            preflight: vec![CredentialRoutePreflight::NoStaticApiKeySurfaces],
-            egress_headers: Default::default(),
-        });
-    }
-
-    if let Some(g) = profile.apikey_gateway.as_ref() {
-        // apikey_gateway: agent calls `apiKeyHelper` (which the
-        // mediation shim intercepts), gets a nonce, sends it as
-        // `x-api-key` to a localhost reverse-proxy route that swaps
-        // for the real bearer and forwards to the gateway. claude
-        // reaches us via overridden `ANTHROPIC_BASE_URL`.
-        //
-        // The implicit defaults here match the original
-        // `apikey_gateway_route()` synthesis: helper command name is
-        // derived at preflight time from settings.json (not declared
-        // in the legacy field), and we leave the `command` field
-        // empty here as a sentinel meaning "ask preflight". Direct
-        // `credential_routes` authors supply the command explicitly.
-        routes.push(ManagedCredentialRoute {
-            name: "apikey_gateway".to_string(),
-            upstream: g.url.clone(),
-            capture: CredentialRouteCapture::HelperCommand {
-                command: String::new(),
-                args_prefix: g.helper_argv_prefix.clone(),
-            },
-            delivery: CredentialRouteDelivery::Redirected {
-                env_overrides: vec![CredentialEnvOverride {
-                    name: "ANTHROPIC_BASE_URL".to_string(),
-                    value: "$ROUTE_BASE_URL".to_string(),
-                }],
-            },
-            bearer: CredentialRouteBearer {
-                // Claude Code's apiKeyHelper output is sent as
-                // x-api-key (NOT Authorization: Bearer) per binary
-                // analysis. The proxy's reverse.rs already accepts
-                // either, but declaring x-api-key here matches the
-                // ground truth.
-                header: "x-api-key".to_string(),
-                format: "{}".to_string(),
-            },
-            egress_headers: Default::default(),
-            preflight: vec![
-                CredentialRoutePreflight::NoStaticApiKeySurfaces,
-                CredentialRoutePreflight::ClaudeCodeApiKeyHelperConfigured,
-            ],
-        });
-    }
-
-    routes.extend(profile.credential_routes.iter().cloned());
-    routes
 }
 
 /// Hardcoded sentinel value the auto-injected `respond` mediation
@@ -3169,8 +2995,7 @@ pub fn resolve_credential_routes(profile: &Profile) -> Vec<ManagedCredentialRout
 ///    value and doesn't fall through to other auth sources).
 /// 3. Distinct from any real bearer format (`sk-ant-…`, `dd-tok-…`,
 ///    etc.) so a debugger can immediately tell it's our placeholder.
-pub const PROXY_PROVISIONED_SENTINEL: &str =
-    "nono_provisioned_DO_NOT_USE_proxy_handles_egress";
+pub const PROXY_PROVISIONED_SENTINEL: &str = "nono_provisioned_DO_NOT_USE_proxy_handles_egress";
 
 /// Auto-inject a `respond` mediation rule for each
 /// `proxy_provisioned_credential` route on the source command name,
@@ -3196,9 +3021,7 @@ pub fn inject_proxy_provisioned_respond_rules(
     routes: &[ManagedCredentialRoute],
     mediation: &mut crate::mediation::MediationConfig,
 ) -> nono::Result<()> {
-    use crate::mediation::{
-        CommandEntry, InterceptAction, InterceptRule,
-    };
+    use crate::mediation::{CommandEntry, InterceptAction, InterceptRule};
 
     for route in routes {
         let CredentialRouteCapture::ProxyProvisionedCredential { source } = &route.capture else {
@@ -3247,7 +3070,7 @@ pub fn inject_proxy_provisioned_respond_rules(
                  would run the helper in the sandbox: the manual rule (capturing into a nonce) \
                  and the proxy parent (provisioning the cache). Either remove the manual \
                  capture rule from `mediation.commands`, or change the credential route's \
-                 capture type to `helper_command` if you want the agent-driven nonce flow.",
+                 capture type to `mediated_helper` if you want the agent-driven nonce flow.",
                 route.name, command,
             )));
         }
@@ -5523,8 +5346,6 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
-            oauth_capture: false,
-            apikey_gateway: None,
             credential_routes: Vec::new(),
         }
     }
@@ -5608,8 +5429,6 @@ mod tests {
             command_args: vec![],
             unsafe_macos_seatbelt_rules: vec![],
             mediation: crate::mediation::MediationConfig::default(),
-            oauth_capture: false,
-            apikey_gateway: None,
             credential_routes: Vec::new(),
         }
     }
@@ -7870,155 +7689,9 @@ mod tests {
         );
     }
 
-    // --- Legacy shim: resolve_credential_routes ---------------------
-
-    fn empty_profile() -> Profile {
-        Profile {
-            extends: None,
-            meta: ProfileMeta::default(),
-            security: SecurityConfig::default(),
-            groups: GroupsConfig::default(),
-            commands: CommandsConfig::default(),
-            filesystem: FilesystemConfig::default(),
-            network: NetworkConfig {
-                block: false,
-                network_profile: InheritableValue::Inherit,
-                allow_domain: Vec::new(),
-                open_port: Vec::new(),
-                listen_port: Vec::new(),
-                connect_port: Vec::new(),
-                credentials: None,
-                custom_credentials: HashMap::new(),
-                upstream_proxy: None,
-                upstream_bypass: Vec::new(),
-            },
-            diagnostics: DiagnosticsConfig::default(),
-            linux: LinuxConfig::default(),
-            env_credentials: SecretsConfig::default(),
-            environment: None,
-            workdir: WorkdirConfig::default(),
-            hooks: HooksConfig::default(),
-            session_hooks: SessionHooks::default(),
-            rollback: RollbackConfig::default(),
-            open_urls: None,
-            allow_launch_services: None,
-            allow_gpu: None,
-            allow_parent_of_protected: None,
-            interactive: false,
-            skipdirs: Vec::new(),
-            packs: Vec::new(),
-            binary: None,
-            command_args: Vec::new(),
-            unsafe_macos_seatbelt_rules: Vec::new(),
-            mediation: crate::mediation::MediationConfig::default(),
-            oauth_capture: false,
-            apikey_gateway: None,
-            credential_routes: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn resolve_credential_routes_translates_oauth_capture() {
-        let mut p = empty_profile();
-        p.oauth_capture = true;
-        let routes = resolve_credential_routes(&p);
-        assert_eq!(routes.len(), 1, "oauth_capture: true \u{2192} 1 route");
-        assert_eq!(routes[0].name, "anthropic_oauth");
-        assert_eq!(routes[0].upstream, "https://api.anthropic.com");
-        match &routes[0].capture {
-            CredentialRouteCapture::OauthIntercept {
-                token_url_match,
-                refresh_url_match,
-            } => {
-                assert_eq!(token_url_match, "/v1/oauth/token");
-                assert_eq!(refresh_url_match, "/v1/oauth/token");
-            }
-            _ => panic!("expected OauthIntercept capture"),
-        }
-        assert_eq!(routes[0].bearer.header, "authorization");
-        assert_eq!(routes[0].bearer.format, "Bearer {}");
-        assert!(matches!(
-            routes[0].delivery,
-            CredentialRouteDelivery::Direct
-        ));
-    }
-
-    #[test]
-    fn resolve_credential_routes_translates_apikey_gateway() {
-        let mut p = empty_profile();
-        p.apikey_gateway = Some(ApiKeyGatewayConfig {
-            url: "https://gateway.example.com".to_string(),
-            helper_argv_prefix: vec!["auth".to_string(), "token".to_string()],
-        });
-        let routes = resolve_credential_routes(&p);
-        assert_eq!(routes.len(), 1, "apikey_gateway: {{...}} \u{2192} 1 route");
-        assert_eq!(routes[0].name, "apikey_gateway");
-        assert_eq!(routes[0].upstream, "https://gateway.example.com");
-        match &routes[0].capture {
-            CredentialRouteCapture::HelperCommand {
-                command,
-                args_prefix,
-            } => {
-                // Legacy shim leaves command empty as a sentinel for
-                // "ask preflight" — the helper binary name is derived
-                // from settings.json at preflight time.
-                assert_eq!(command, "");
-                assert_eq!(args_prefix, &["auth".to_string(), "token".to_string()]);
-            }
-            _ => panic!("expected HelperCommand capture"),
-        }
-        assert_eq!(routes[0].bearer.header, "x-api-key");
-        match &routes[0].delivery {
-            CredentialRouteDelivery::Redirected { env_overrides } => {
-                assert_eq!(env_overrides.len(), 1);
-                assert_eq!(env_overrides[0].name, "ANTHROPIC_BASE_URL");
-                assert_eq!(env_overrides[0].value, "$ROUTE_BASE_URL");
-            }
-            _ => panic!("expected Redirected delivery"),
-        }
-    }
-
-    #[test]
-    fn resolve_credential_routes_appends_explicit_routes() {
-        // Legacy fields + explicit credential_routes → union, with
-        // explicit entries appended after legacy translations.
-        let mut p = empty_profile();
-        p.oauth_capture = true;
-        p.credential_routes.push(ManagedCredentialRoute {
-            name: "codex_oauth".to_string(),
-            upstream: "https://api.openai.com".to_string(),
-            capture: CredentialRouteCapture::OauthIntercept {
-                token_url_match: "/auth/token".to_string(),
-                refresh_url_match: "/auth/token".to_string(),
-            },
-            delivery: CredentialRouteDelivery::Direct,
-            bearer: CredentialRouteBearer {
-                header: "authorization".to_string(),
-                format: "Bearer {}".to_string(),
-            },
-            preflight: Vec::new(),
-            egress_headers: Default::default(),
-        });
-        let routes = resolve_credential_routes(&p);
-        assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0].name, "anthropic_oauth");
-        assert_eq!(routes[1].name, "codex_oauth");
-    }
-
-    #[test]
-    fn resolve_credential_routes_empty_when_no_fields_set() {
-        let p = empty_profile();
-        let routes = resolve_credential_routes(&p);
-        assert!(routes.is_empty());
-    }
-
     // ---------- proxy_provisioned_credential tests ----------
 
-    fn provisioned_route(
-        name: &str,
-        command: &str,
-        args: &[&str],
-    ) -> ManagedCredentialRoute {
+    fn provisioned_route(name: &str, command: &str, args: &[&str]) -> ManagedCredentialRoute {
         ManagedCredentialRoute {
             name: name.to_string(),
             upstream: "https://gateway.example.com".to_string(),
@@ -8064,9 +7737,7 @@ mod tests {
 
     #[test]
     fn auto_inject_skips_when_existing_respond_rule_covers_command() {
-        use crate::mediation::{
-            CommandEntry, InterceptAction, InterceptRule, MediationConfig,
-        };
+        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule, MediationConfig};
         let routes = vec![provisioned_route(
             "gw",
             "auth-helper",
@@ -8105,9 +7776,7 @@ mod tests {
 
     #[test]
     fn auto_inject_errors_on_conflicting_capture_rule() {
-        use crate::mediation::{
-            CommandEntry, InterceptAction, InterceptRule, MediationConfig,
-        };
+        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule, MediationConfig};
         let routes = vec![provisioned_route(
             "gw",
             "auth-helper",
@@ -8141,26 +7810,47 @@ mod tests {
     }
 
     #[test]
-    fn auto_inject_does_nothing_for_oauth_or_helper_command_routes() {
-        // OAuth intercept route — should not produce any mediation rule
-        let mut p = empty_profile();
-        p.oauth_capture = true;
-        let routes = resolve_credential_routes(&p);
+    fn auto_inject_does_nothing_for_oauth_or_mediated_helper_routes() {
+        // OauthIntercept capture — should not produce any mediation rule
+        let routes = vec![ManagedCredentialRoute {
+            name: "anthropic_oauth".to_string(),
+            upstream: "https://api.anthropic.com".to_string(),
+            capture: CredentialRouteCapture::OauthIntercept {
+                token_url_match: "/v1/oauth/token".to_string(),
+                refresh_url_match: "/v1/oauth/token".to_string(),
+            },
+            delivery: CredentialRouteDelivery::Direct,
+            bearer: CredentialRouteBearer {
+                header: "authorization".to_string(),
+                format: "Bearer {}".to_string(),
+            },
+            egress_headers: Default::default(),
+            preflight: Vec::new(),
+        }];
         let mut mediation = crate::mediation::MediationConfig::default();
         inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
             .expect("oauth_intercept — should be a no-op");
         assert!(mediation.commands.is_empty());
 
-        // Legacy helper_command route (via apikey_gateway) — also no-op
-        let mut p = empty_profile();
-        p.apikey_gateway = Some(ApiKeyGatewayConfig {
-            url: "https://gateway.example.com".to_string(),
-            helper_argv_prefix: vec!["auth".to_string()],
-        });
-        let routes = resolve_credential_routes(&p);
+        // MediatedHelper capture — also no-op
+        let routes = vec![ManagedCredentialRoute {
+            name: "apikey_gateway".to_string(),
+            upstream: "https://gateway.example.com".to_string(),
+            capture: CredentialRouteCapture::MediatedHelper {
+                command: "auth-helper".to_string(),
+                args_prefix: vec!["auth".to_string()],
+            },
+            delivery: CredentialRouteDelivery::Direct,
+            bearer: CredentialRouteBearer {
+                header: "x-api-key".to_string(),
+                format: "{}".to_string(),
+            },
+            egress_headers: Default::default(),
+            preflight: Vec::new(),
+        }];
         let mut mediation = crate::mediation::MediationConfig::default();
         inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
-            .expect("helper_command — should be a no-op");
+            .expect("mediated_helper — should be a no-op");
         assert!(mediation.commands.is_empty());
     }
 }

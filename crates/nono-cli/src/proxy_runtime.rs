@@ -42,7 +42,7 @@ const OAUTH_ANTHROPIC_HOSTS: [&str; 3] = [
     "https://platform.claude.com",
 ];
 
-/// Sentinel URL-match strings used for `HelperCommand`-capture routes
+/// Sentinel URL-match strings used for `MediatedHelper`-capture routes
 /// (no response-body capture happens here — the credential enters the
 /// broker via the mediation shim, not via TLS-intercept rewriting).
 /// Containing a non-URL character (space) further guarantees no
@@ -62,7 +62,7 @@ const HELPER_CAPTURE_SENTINEL: &str = "__nono_helper_capture sentinel — no res
 /// for a single [`crate::profile::ManagedCredentialRoute`].
 ///
 /// `OauthIntercept` capture expands to three intercept routes (one
-/// per Anthropic OAuth hostname); `HelperCommand` capture expands to
+/// per Anthropic OAuth hostname); `MediatedHelper` capture expands to
 /// a single broker-backed reverse-proxy route at the route's
 /// `upstream`. Per-route prefix uses the route's `name` field —
 /// callers ensure uniqueness across routes.
@@ -81,10 +81,7 @@ fn synthesize_proxy_routes(
         CredentialRouteCapture::ProxyProvisionedCredential { .. } => Some(route.name.clone()),
         _ => None,
     };
-    let make = |prefix: String,
-                upstream: String,
-                inject_mode: InjectMode|
-     -> RouteConfig {
+    let make = |prefix: String, upstream: String, inject_mode: InjectMode| -> RouteConfig {
         RouteConfig {
             prefix,
             upstream,
@@ -114,9 +111,7 @@ fn synthesize_proxy_routes(
         } => OAUTH_ANTHROPIC_HOSTS
             .iter()
             .map(|host| {
-                let host_slug = host
-                    .trim_start_matches("https://")
-                    .replace('.', "_");
+                let host_slug = host.trim_start_matches("https://").replace('.', "_");
                 make(
                     format!("{}oauth_{}_{}", RESERVED_PREFIX, host_slug, route.name),
                     (*host).to_string(),
@@ -127,9 +122,9 @@ fn synthesize_proxy_routes(
                 )
             })
             .collect(),
-        CredentialRouteCapture::HelperCommand { .. }
+        CredentialRouteCapture::MediatedHelper { .. }
         | CredentialRouteCapture::ProxyProvisionedCredential { .. } => {
-            // Both helper-command and proxy-provisioned routes are
+            // Both mediated-helper and proxy-provisioned routes are
             // single reverse-proxy entries at the route's `upstream`.
             // The difference is HOW the credential gets there
             // (agent-driven nonce resolution vs proxy-driven
@@ -168,7 +163,7 @@ fn build_route_env_overrides(
         CredentialRouteDelivery::Direct => Vec::new(),
         CredentialRouteDelivery::Redirected { env_overrides } => {
             let proxy_routes = synthesize_proxy_routes(route);
-            // For `HelperCommand` we synthesise exactly one route; for
+            // For `MediatedHelper` we synthesise exactly one route; for
             // `OauthIntercept` we synthesise three but `Redirected`
             // doesn't make sense there (the agent dials the real
             // hostname). Pick the first prefix — the only one a
@@ -180,7 +175,12 @@ fn build_route_env_overrides(
             let base_url = format!("http://127.0.0.1:{}/{}", proxy_port, prefix);
             env_overrides
                 .iter()
-                .map(|o| (o.name.clone(), o.value.replace("$ROUTE_BASE_URL", &base_url)))
+                .map(|o| {
+                    (
+                        o.name.clone(),
+                        o.value.replace("$ROUTE_BASE_URL", &base_url),
+                    )
+                })
                 .collect()
         }
     }
@@ -217,15 +217,13 @@ fn extract_provisioned_sources(
             continue;
         };
         let proxy_source = match source {
-            CliSrc::Command {
-                command,
-                args,
-                env,
-            } => nono_proxy::provisioned::ProvisionSource::Command {
-                command: command.clone(),
-                args: args.clone(),
-                env: env.clone(),
-            },
+            CliSrc::Command { command, args, env } => {
+                nono_proxy::provisioned::ProvisionSource::Command {
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: env.clone(),
+                }
+            }
         };
         out.insert(route.name.clone(), proxy_source);
     }
@@ -489,14 +487,10 @@ pub(crate) fn start_proxy_runtime(
         proxy_config.intercept_parent_ca_pems = read_parent_ssl_cert_file();
     }
 
-    // Unified credential-route wiring. The legacy per-feature paths
-    // (`oauth_capture: true`, `apikey_gateway: {...}`) have already
-    // been folded into `proxy.credential_routes` by
-    // `crate::profile::resolve_credential_routes`. From here on we
-    // iterate the unified representation: each entry expands to one
-    // or more proxy routes (via `synthesize_proxy_routes`) and zero or
-    // more env-var overrides applied to the child (via
-    // `build_route_env_overrides`).
+    // Credential-route wiring. Each entry in `proxy.credential_routes`
+    // expands to one or more proxy routes (via
+    // `synthesize_proxy_routes`) and zero or more env-var overrides
+    // applied to the child (via `build_route_env_overrides`).
     //
     // CA materialisation and `NODE_EXTRA_CA_CERTS` env injection are
     // handled by upstream's `intercept_ca_dir` +
@@ -544,7 +538,7 @@ pub(crate) fn start_proxy_runtime(
         // the proxy queries on egress, and resolution silently fails.
         // (Found the hard way: 401s on every gateway request even when
         // mediation appeared to mint nonces successfully — see the
-        // 2026-06-11 apikey_gateway debug session.)
+        // 2026-06-11 MediatedHelper debug session.)
         let shared_broker: Arc<TokenBroker> = Arc::clone(&broker);
         let resolver: Arc<dyn nono_proxy::TokenResolver> = broker;
         info!(
@@ -648,7 +642,7 @@ pub(crate) fn start_proxy_runtime(
     // and the operator hasn't already granted one. On macOS, Seatbelt's
     // `(allow network-bind)` is blanket — it can't filter by port — so
     // any non-empty bind_ports list suffices to enable bind() at all.
-    // `HelperCommand` capture has no `/login` flow and doesn't need this.
+    // `MediatedHelper` capture has no `/login` flow and doesn't need this.
     let bind_ports = if has_oauth_intercept_route && proxy.allow_bind_ports.is_empty() {
         vec![0]
     } else {
@@ -709,7 +703,7 @@ pub(crate) fn start_proxy_runtime(
     }
 
     // Per-credential-route env-var overrides (e.g.
-    // `ANTHROPIC_BASE_URL` for the legacy `apikey_gateway` path,
+    // `ANTHROPIC_BASE_URL` for a Claude gateway route,
     // `OPENAI_BASE_URL` for an OpenAI gateway, etc.). Pushed AFTER
     // `credential_env_vars` so any auto-emitted `<PREFIX>_BASE_URL`
     // from the route iteration is shadowed by the credential-route's

@@ -21,9 +21,10 @@
 //!
 //! ### Primary: mediation refusal at the subprocess layer
 //!
-//! When a profile sets `oauth_capture: true`, nono auto-injects a mediation
-//! rule that refuses subprocess `security find-generic-password` reads of
-//! this entry (`mediation::broker_protection`). The shim returns
+//! When a profile declares a credential route with `OauthIntercept`
+//! capture, nono auto-injects a mediation rule that refuses subprocess
+//! `security find-generic-password` reads of this entry
+//! (`mediation::broker_protection`). The shim returns
 //! `errSecItemNotFound` in the unsandboxed parent process before any call
 //! reaches macOS securityd. No dialog. No Allow button. No social-engineering
 //! surface. This is the protection the realistic threat model relies on.

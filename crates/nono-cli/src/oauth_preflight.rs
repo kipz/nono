@@ -99,7 +99,22 @@ pub(crate) fn run_credential_routes_preflight(
                         continue;
                     }
                     ran_no_static = true;
-                    if let Some(reason) = detect_blocking_api_key_surface(denied_env_vars)? {
+                    // Effective deny list = `environment.deny_vars`
+                    // (passed in as `denied_env_vars`) UNION
+                    // `mediation.env.block`. Both strip vars before the
+                    // child sees them, so either-or coverage of an
+                    // API-key env var means it's safe to launch.
+                    let mut effective_deny: Vec<String> =
+                        denied_env_vars.map(|v| v.to_vec()).unwrap_or_default();
+                    effective_deny.extend(mediation.env.block.iter().cloned());
+                    let effective_deny_slice = if effective_deny.is_empty() {
+                        None
+                    } else {
+                        Some(effective_deny.as_slice())
+                    };
+                    if let Some(reason) =
+                        detect_blocking_api_key_surface(effective_deny_slice)?
+                    {
                         return Err(NonoError::SandboxInit(format!(
                             "credential_routes preflight: an API-key credential is already configured on the host: {reason}. \
                              Broker-backed routes translate `Authorization: Bearer` / `x-api-key` headers carrying \
@@ -143,11 +158,16 @@ fn run_helper_command_preflight(
             command,
             args_prefix,
         } => (command.clone(), args_prefix.clone()),
-        CredentialRouteCapture::OauthIntercept { .. } => {
-            // ClaudeCodeApiKeyHelperConfigured doesn't apply to OAuth
-            // intercept routes; skip silently. (Legacy shim never
-            // attaches this preflight to an OAuth route, but a hand-
-            // authored credential_routes entry might.)
+        CredentialRouteCapture::OauthIntercept { .. }
+        | CredentialRouteCapture::ProxyProvisionedCredential { .. } => {
+            // ClaudeCodeApiKeyHelperConfigured doesn't apply to either
+            // OAuth-intercept or proxy-provisioned routes. For OAuth,
+            // there's no helper command involved. For
+            // proxy-provisioned, the proxy itself runs the source
+            // command — claude's apiKeyHelper, if any, is shadowed by
+            // an auto-injected `respond` mediation rule, so even when
+            // settings.json declares a helper it's not actually doing
+            // the credential fetch. Skip silently.
             return Ok(());
         }
     };
@@ -598,6 +618,7 @@ mod tests {
                 header: "authorization".to_string(),
                 format: "Bearer {}".to_string(),
             },
+            egress_headers: Default::default(),
             preflight: vec![CredentialRoutePreflight::NoStaticApiKeySurfaces],
         }];
         run_credential_routes_preflight(
@@ -808,6 +829,7 @@ mod tests {
                 header: "x-api-key".to_string(),
                 format: "{}".to_string(),
             },
+            egress_headers: Default::default(),
             preflight: vec![CredentialRoutePreflight::ClaudeCodeApiKeyHelperConfigured],
         }
     }

@@ -1370,6 +1370,23 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     if profile_oauth_capture {
         crate::mediation::broker_protection::inject_into(&mut profile_mediation);
     }
+    // Auto-inject a `respond` mediation rule for each
+    // `proxy_provisioned_credential` route on the same command name
+    // its `source` declares. When the sandboxed agent's
+    // `apiKeyHelper` (or equivalent) invokes that command, the
+    // mediation shim returns a hardcoded sentinel value instead of
+    // running the real binary inside the sandbox. The real binary
+    // runs only in the proxy parent (see `ProvisionedStore`); claude
+    // never sees the real credential.
+    //
+    // Refuses to launch with a clear error if the profile already
+    // declares a manual `capture` rule on the same command + args
+    // prefix — that combination would defeat the design (claude
+    // would actually run the helper in the sandbox).
+    crate::profile::inject_proxy_provisioned_respond_rules(
+        &profile_credential_routes,
+        &mut profile_mediation,
+    )?;
     let profile_secrets = loaded_profile
         .map(|profile| profile.env_credentials.mappings)
         .unwrap_or_default();

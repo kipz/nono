@@ -28,6 +28,7 @@ pub mod filter;
 pub mod forward;
 pub mod oauth2;
 pub(crate) mod oauth_rewrite;
+pub mod provisioned;
 pub mod reverse;
 pub mod route;
 pub mod server;

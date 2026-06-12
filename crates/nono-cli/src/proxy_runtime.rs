@@ -74,6 +74,13 @@ fn synthesize_proxy_routes(
 
     let bearer_header = &route.bearer.header;
     let bearer_format = &route.bearer.format;
+    // For `proxy_provisioned_credential` captures, this is the route
+    // name that egress will look up in the `ProvisionedStore`. For
+    // other captures, `None` (nonce resolution path).
+    let provisioned_key = match &route.capture {
+        CredentialRouteCapture::ProxyProvisionedCredential { .. } => Some(route.name.clone()),
+        _ => None,
+    };
     let make = |prefix: String,
                 upstream: String,
                 inject_mode: InjectMode|
@@ -95,6 +102,8 @@ fn synthesize_proxy_routes(
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: provisioned_key.clone(),
+            egress_headers: route.egress_headers.clone(),
         }
     };
 
@@ -118,7 +127,14 @@ fn synthesize_proxy_routes(
                 )
             })
             .collect(),
-        CredentialRouteCapture::HelperCommand { .. } => {
+        CredentialRouteCapture::HelperCommand { .. }
+        | CredentialRouteCapture::ProxyProvisionedCredential { .. } => {
+            // Both helper-command and proxy-provisioned routes are
+            // single reverse-proxy entries at the route's `upstream`.
+            // The difference is HOW the credential gets there
+            // (agent-driven nonce resolution vs proxy-driven
+            // provisioning); the route shape itself is identical.
+            //
             // For `Direct` delivery, the agent hits `upstream`
             // directly and the proxy CONNECT-intercepts. For
             // `Redirected` delivery, the env-override is applied
@@ -178,6 +194,42 @@ fn any_oauth_intercept(routes: &[crate::profile::ManagedCredentialRoute]) -> boo
     routes
         .iter()
         .any(|r| matches!(r.capture, CredentialRouteCapture::OauthIntercept { .. }))
+}
+
+/// Walk `credential_routes` and collect (route_name → proxy ProvisionSource)
+/// for every entry whose capture is `ProxyProvisionedCredential`. The
+/// returned map is consumed by `ProvisionedStore::provision_all` at
+/// proxy startup; routes with other capture types are absent from the
+/// map and unaffected.
+///
+/// Translates from the CLI's `crate::profile::ProvisionSource` enum to
+/// the proxy crate's `nono_proxy::provisioned::ProvisionSource` enum.
+/// Keeping the type definitions separate (vs sharing a crate) avoids
+/// a cross-crate dependency that would couple the JSON schema crate
+/// to the proxy implementation.
+fn extract_provisioned_sources(
+    routes: &[crate::profile::ManagedCredentialRoute],
+) -> std::collections::HashMap<String, nono_proxy::provisioned::ProvisionSource> {
+    use crate::profile::{CredentialRouteCapture, ProvisionSource as CliSrc};
+    let mut out = std::collections::HashMap::new();
+    for route in routes {
+        let CredentialRouteCapture::ProxyProvisionedCredential { source } = &route.capture else {
+            continue;
+        };
+        let proxy_source = match source {
+            CliSrc::Command {
+                command,
+                args,
+                env,
+            } => nono_proxy::provisioned::ProvisionSource::Command {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+            },
+        };
+        out.insert(route.name.clone(), proxy_source);
+    }
+    out
 }
 
 pub(crate) struct ActiveProxyRuntime {
@@ -454,7 +506,7 @@ pub(crate) fn start_proxy_runtime(
     // handed to the proxy as `Arc<dyn TokenResolver>`.
     let broker_required = !proxy.credential_routes.is_empty();
     let has_oauth_intercept_route = any_oauth_intercept(&proxy.credential_routes);
-    let (proxy_runtime, shared_broker_for_mediation): (
+    let (mut proxy_runtime, shared_broker_for_mediation): (
         nono_proxy::ProxyRuntime,
         Option<Arc<TokenBroker>>,
     ) = if broker_required {
@@ -502,6 +554,7 @@ pub(crate) fn start_proxy_runtime(
         (
             nono_proxy::ProxyRuntime {
                 token_resolver: Some(resolver),
+                provisioned_store: None, // populated below inside the tokio runtime
             },
             Some(shared_broker),
         )
@@ -527,6 +580,31 @@ pub(crate) fn start_proxy_runtime(
         .enable_all()
         .build()
         .map_err(|e| NonoError::SandboxInit(format!("Failed to start proxy runtime: {}", e)))?;
+
+    // Provision per-route credentials in the proxy parent BEFORE the
+    // proxy starts accepting traffic. If a `proxy_provisioned_credential`
+    // route is configured but the source command fails, we fail proxy
+    // startup with a clear error rather than letting the first agent
+    // request 401 with no explanation.
+    let provision_sources = extract_provisioned_sources(&proxy.credential_routes);
+    if !provision_sources.is_empty() {
+        info!(
+            "Provisioning credentials for {} proxy-provisioned route(s) before proxy startup",
+            provision_sources.len()
+        );
+        let store = rt
+            .block_on(async {
+                nono_proxy::provisioned::ProvisionedStore::provision_all(provision_sources).await
+            })
+            .map_err(|e| {
+                NonoError::SandboxInit(format!(
+                    "Failed to provision credential(s) before proxy startup: {}",
+                    e
+                ))
+            })?;
+        proxy_runtime.provisioned_store = Some(Arc::new(store));
+    }
+
     let handle = rt
         .block_on(async {
             nono_proxy::server::start_with_runtime(proxy_config.clone(), proxy_runtime).await
@@ -820,6 +898,7 @@ mod tests {
                 format: "Bearer {}".to_string(),
             },
             preflight: vec![],
+            egress_headers: Default::default(),
         }
     }
 

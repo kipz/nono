@@ -314,6 +314,11 @@ pub struct ProxyRuntime {
     /// enabled (Layer 1 of `2026-04-27-capture-anthropic-auth.md`).
     /// `None` means OAuth-capture features are inert.
     pub token_resolver: Option<Arc<dyn TokenResolver>>,
+    /// Optional provisioned-credential store, populated by the CLI for
+    /// routes whose credential is fetched in the proxy parent and
+    /// substituted on egress (`proxy_provisioned_credential` capture).
+    /// `None` if no such routes are configured.
+    pub provisioned_store: Option<Arc<crate::provisioned::ProvisionedStore>>,
 }
 
 /// Shared state for the proxy server.
@@ -345,6 +350,12 @@ struct ProxyState {
     /// reverse-proxy capture path (Layer 1) both check this before
     /// activating the capture path.
     token_resolver: Option<Arc<dyn TokenResolver>>,
+    /// Shared provisioned-credential store. `None` when no route uses
+    /// `proxy_provisioned_credential` capture. The egress paths in
+    /// `reverse.rs` and `tls_intercept/handle.rs` consult this store
+    /// to look up the per-route credential to substitute into the
+    /// outbound request.
+    provisioned_store: Option<Arc<crate::provisioned::ProvisionedStore>>,
 }
 
 /// Start the proxy server with default runtime inputs (no token
@@ -579,6 +590,7 @@ pub async fn start_with_runtime(config: ProxyConfig, runtime: ProxyRuntime) -> R
         bypass_matcher,
         cert_cache,
         token_resolver: runtime.token_resolver,
+        provisioned_store: runtime.provisioned_store,
     });
 
     // Spawn accept loop as a task within the current runtime.
@@ -785,6 +797,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
                             filter: &state.filter,
                             audit_log: Some(&state.audit_log),
                             token_resolver: state.token_resolver.as_ref(),
+                            provisioned_store: state.provisioned_store.as_ref(),
                         };
                         return tls_intercept::handle_intercept_connect(&mut stream, ctx).await;
                     }
@@ -892,6 +905,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, state: &ProxyState
             tls_connector: &state.tls_connector,
             audit_log: Some(&state.audit_log),
             token_resolver: state.token_resolver.as_ref(),
+            provisioned_store: state.provisioned_store.as_ref(),
         };
         reverse::handle_reverse_proxy(first_line, &mut stream, &header_bytes, &ctx, &buffered).await
     } else {
@@ -952,6 +966,8 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    provisioned_credential_route: None,
+                    egress_headers: Default::default(),
                 }],
                 intercept_ca_dir: Some(dir.path().to_path_buf()),
                 ..Default::default()
@@ -1016,6 +1032,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
@@ -1062,6 +1080,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             intercept_ca_dir: Some(missing_dir),
             ..Default::default()
@@ -1108,6 +1128,8 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    provisioned_credential_route: None,
+                    egress_headers: Default::default(),
                 },
                 crate::config::RouteConfig {
                     prefix: "alias".to_string(),
@@ -1126,6 +1148,8 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    provisioned_credential_route: None,
+                    egress_headers: Default::default(),
                 },
             ],
             intercept_ca_dir: Some(dir.path().to_path_buf()),
@@ -1199,6 +1223,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1245,6 +1271,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1300,6 +1328,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1361,6 +1391,8 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    provisioned_credential_route: None,
+                    egress_headers: Default::default(),
                 },
                 crate::config::RouteConfig {
                     prefix: "github".to_string(),
@@ -1379,6 +1411,8 @@ mod tests {
                     tls_client_cert: None,
                     tls_client_key: None,
                     oauth2: None,
+                    provisioned_credential_route: None,
+                    egress_headers: Default::default(),
                 },
             ],
             ..Default::default()
@@ -1442,6 +1476,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1476,6 +1512,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1528,6 +1566,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };
@@ -1569,6 +1609,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }],
             ..Default::default()
         };

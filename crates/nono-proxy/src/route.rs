@@ -91,6 +91,30 @@ pub struct LoadedRoute {
     /// every request to decide whether to invoke the OAuth body
     /// rewriter.
     pub oauth_capture_match: Option<OauthCaptureMatch>,
+
+    /// When `Some(name)`, the egress path looks up `name` in the
+    /// [`crate::provisioned::ProvisionedStore`] and substitutes the
+    /// inbound credential header with the provisioned value (formatted
+    /// per the route's `credential_format`). See
+    /// [`RouteConfig::provisioned_credential_route`].
+    pub provisioned_credential_route: Option<String>,
+
+    /// Header name to inject the provisioned credential under, copied
+    /// from [`RouteConfig::inject_header`]. Only meaningful when
+    /// `provisioned_credential_route` is `Some`. Carried here (rather
+    /// than left on `RouteConfig`) so the egress hot path doesn't have
+    /// to re-resolve the source `RouteConfig` per request.
+    pub provisioned_inject_header: String,
+
+    /// Template for the provisioned-credential header value, copied
+    /// from [`RouteConfig::credential_format`]. `{}` is replaced with
+    /// the cached credential. Defaults to `"{}"` if absent.
+    pub provisioned_inject_format: String,
+
+    /// Additional headers to inject on every outbound request for
+    /// this route, regardless of what the agent sent. Populated from
+    /// the profile's `egress_headers` map at route-synthesis time.
+    pub egress_headers: std::collections::BTreeMap<String, String>,
 }
 
 /// URL-match patterns extracted from an `InjectMode::OauthCapture`
@@ -268,6 +292,13 @@ impl RouteStore {
                     managed_auth_mechanism,
                     managed_injection_mode,
                     oauth_capture_match,
+                    provisioned_credential_route: route.provisioned_credential_route.clone(),
+                    provisioned_inject_header: route.inject_header.clone(),
+                    provisioned_inject_format: route
+                        .credential_format
+                        .clone()
+                        .unwrap_or_else(|| "{}".to_string()),
+                    egress_headers: route.egress_headers.clone(),
                 },
             );
         }
@@ -662,6 +693,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -701,6 +734,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -727,6 +762,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -754,6 +791,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -772,6 +811,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             },
         ];
 
@@ -826,6 +867,10 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             oauth_capture_match: None,
+            provisioned_credential_route: None,
+            provisioned_inject_header: "authorization".to_string(),
+            provisioned_inject_format: "{}".to_string(),
+            egress_headers: Default::default(),
         };
         let debug_output = format!("{:?}", route);
         assert!(debug_output.contains("api.openai.com"));
@@ -855,6 +900,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -897,6 +944,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("claude.ai:443").unwrap();
@@ -933,6 +982,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -963,6 +1014,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store
@@ -993,6 +1046,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -1011,6 +1066,10 @@ mod tests {
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
             oauth_capture_match: None,
+            provisioned_credential_route: None,
+            provisioned_inject_header: "authorization".to_string(),
+            provisioned_inject_format: "{}".to_string(),
+            egress_headers: Default::default(),
         };
         assert!(managed.missing_managed_credential(false, false));
         assert!(!managed.missing_managed_credential(true, false));
@@ -1026,6 +1085,10 @@ mod tests {
             managed_auth_mechanism: None,
             managed_injection_mode: None,
             oauth_capture_match: None,
+            provisioned_credential_route: None,
+            provisioned_inject_header: "authorization".to_string(),
+            provisioned_inject_format: "{}".to_string(),
+            egress_headers: Default::default(),
         };
         assert!(!l7_only.missing_managed_credential(false, false));
     }
@@ -1049,6 +1112,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -1081,6 +1146,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -1102,6 +1169,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             },
         ];
         let store = RouteStore::load(&routes).unwrap();
@@ -1155,6 +1224,8 @@ mod tests {
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                provisioned_credential_route: None,
+                egress_headers: Default::default(),
             }
         }
 
@@ -1522,6 +1593,8 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
 
         let store = RouteStore::load(&routes).expect("should load mTLS route");

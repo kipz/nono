@@ -1758,6 +1758,13 @@ pub struct ManagedCredentialRoute {
     /// HTTP header carrying the nonce (inbound) and the real token
     /// (outbound to upstream).
     pub bearer: CredentialRouteBearer,
+    /// Additional HTTP headers the proxy injects on every outbound
+    /// request for this route, regardless of what the agent sent.
+    /// Useful for gateway-specific metadata that the agent may not
+    /// always forward (e.g. `org-id`, `provider`, `source`).
+    /// Values are injected after credential substitution.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub egress_headers: std::collections::BTreeMap<String, String>,
     /// Preconditions checked at startup. Failures refuse to launch.
     #[serde(default)]
     pub preflight: Vec<CredentialRoutePreflight>,
@@ -1797,6 +1804,62 @@ pub enum CredentialRouteCapture {
         /// mediation rule is in scope.
         #[serde(default)]
         args_prefix: Vec<String>,
+    },
+    /// Credential is provisioned by the proxy itself, running a command
+    /// in the unsandboxed parent process at startup. The credential
+    /// lives only in the proxy parent's in-memory store; the sandboxed
+    /// agent never sees the real value — only an auto-injected sentinel
+    /// flowing through the agent's `apiKeyHelper`-style auth path.
+    ///
+    /// On egress to [`ManagedCredentialRoute::upstream`], the proxy
+    /// strips whatever the agent sent in the bearer header and
+    /// substitutes the provisioned credential. On HTTP 401/403 from
+    /// the upstream, the proxy re-runs the source command, caches the
+    /// fresh credential, and retries the request once.
+    ///
+    /// Auto-injection: profile resolution appends a `respond` mediation
+    /// rule on the same command name with a hardcoded sentinel value,
+    /// so when the sandboxed agent runs its `apiKeyHelper`, the real
+    /// command does NOT execute inside the sandbox — only in the proxy
+    /// parent. If the profile already has a manual `capture` rule on
+    /// the same command name + args, startup fails with a conflict
+    /// error (the manual rule would let the real credential leak into
+    /// the sandbox, defeating the design).
+    ProxyProvisionedCredential {
+        /// Where the credential comes from. Discriminated union to
+        /// allow future sources (file, http endpoint, keychain entry)
+        /// without renaming the capture variant.
+        source: ProvisionSource,
+    },
+}
+
+/// Source of a [`CredentialRouteCapture::ProxyProvisionedCredential`].
+///
+/// Currently only `command` is implemented. Future variants documented
+/// in the design doc (provision-from-file, provision-from-http,
+/// provision-from-keychain) share the same caching / refresh-on-401 /
+/// auto-shadow plumbing; only the `provision()` step differs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProvisionSource {
+    /// Run a command in the proxy's parent process; capture trimmed
+    /// stdout as the credential. Non-zero exit or empty stdout at
+    /// startup fails proxy startup with a clear message.
+    Command {
+        /// Binary name or absolute path. Resolved via `PATH` if not
+        /// absolute. Runs unsandboxed in the proxy parent.
+        command: String,
+        /// Arguments to pass to `command`. Exact (no glob expansion,
+        /// no shell parsing).
+        args: Vec<String>,
+        /// Optional env vars to set when running `command`. Empty (the
+        /// default) means inherit the parent env. Useful for commands
+        /// that need specific config (`AWS_PROFILE`, `DD_CONFIG_DIR`,
+        /// etc.) without polluting the parent env. `BTreeMap` rather
+        /// than `HashMap` so the schema participates in `Hash` (which
+        /// `ManagedCredentialRoute` requires for dedup).
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
     },
 }
 
@@ -3042,6 +3105,7 @@ pub fn resolve_credential_routes(profile: &Profile) -> Vec<ManagedCredentialRout
                 format: "Bearer {}".to_string(),
             },
             preflight: vec![CredentialRoutePreflight::NoStaticApiKeySurfaces],
+            egress_headers: Default::default(),
         });
     }
 
@@ -3080,6 +3144,7 @@ pub fn resolve_credential_routes(profile: &Profile) -> Vec<ManagedCredentialRout
                 header: "x-api-key".to_string(),
                 format: "{}".to_string(),
             },
+            egress_headers: Default::default(),
             preflight: vec![
                 CredentialRoutePreflight::NoStaticApiKeySurfaces,
                 CredentialRoutePreflight::ClaudeCodeApiKeyHelperConfigured,
@@ -3089,6 +3154,154 @@ pub fn resolve_credential_routes(profile: &Profile) -> Vec<ManagedCredentialRout
 
     routes.extend(profile.credential_routes.iter().cloned());
     routes
+}
+
+/// Hardcoded sentinel value the auto-injected `respond` mediation
+/// rule returns to the sandboxed agent when it invokes a command
+/// covered by a `proxy_provisioned_credential` route. The proxy
+/// recognises this value on egress (and ignores it, substituting the
+/// provisioned credential instead) — but really, any non-empty string
+/// works, because the proxy substitutes unconditionally when the
+/// route is provisioned. The string is chosen to be:
+///
+/// 1. Obviously synthetic if it ever leaks into a log or error message.
+/// 2. Non-empty (so claude treats `apiKeyHelper` as having returned a
+///    value and doesn't fall through to other auth sources).
+/// 3. Distinct from any real bearer format (`sk-ant-…`, `dd-tok-…`,
+///    etc.) so a debugger can immediately tell it's our placeholder.
+pub const PROXY_PROVISIONED_SENTINEL: &str =
+    "nono_provisioned_DO_NOT_USE_proxy_handles_egress";
+
+/// Auto-inject a `respond` mediation rule for each
+/// `proxy_provisioned_credential` route on the source command name,
+/// so when the sandboxed agent invokes that command (via
+/// `apiKeyHelper` or similar), the mediation shim returns
+/// [`PROXY_PROVISIONED_SENTINEL`] without ever running the real
+/// binary in the sandbox.
+///
+/// Conflict handling:
+///
+/// - If the profile already declares a `respond` rule on the same
+///   command + matching args, leave it alone (it serves the same
+///   purpose; user's explicit declaration wins).
+/// - If the profile declares a `capture` rule on the same command +
+///   matching args, return an error. That combination would let claude
+///   actually run the helper inside the sandbox (via mediation
+///   capture), defeating the proxy-provisioned design. The user must
+///   remove the manual capture rule.
+///
+/// Does nothing for routes whose capture is not
+/// `ProxyProvisionedCredential`.
+pub fn inject_proxy_provisioned_respond_rules(
+    routes: &[ManagedCredentialRoute],
+    mediation: &mut crate::mediation::MediationConfig,
+) -> nono::Result<()> {
+    use crate::mediation::{
+        CommandEntry, InterceptAction, InterceptRule,
+    };
+
+    for route in routes {
+        let CredentialRouteCapture::ProxyProvisionedCredential { source } = &route.capture else {
+            continue;
+        };
+        let ProvisionSource::Command {
+            command,
+            args,
+            env: _,
+        } = source;
+
+        // Skip if the user has declared a `respond` rule covering this
+        // command with overlapping args; their rule serves the same
+        // shadowing purpose.
+        let already_responds = mediation.commands.iter().any(|cmd| {
+            cmd.name == *command
+                && cmd.intercept.iter().any(|rule| {
+                    matches!(rule.action, InterceptAction::Respond { .. })
+                        && args_overlap(&rule.args_prefix, args)
+                })
+        });
+        if already_responds {
+            tracing::debug!(
+                "proxy_provisioned_credential route '{}': manual `respond` rule on '{}' \
+                 covers this; skipping auto-injection",
+                route.name,
+                command,
+            );
+            continue;
+        }
+
+        // Refuse if the user has a `capture` rule on the same shape.
+        // That would let claude actually run the helper in the
+        // sandbox, defeating the design.
+        let conflicting_capture = mediation.commands.iter().any(|cmd| {
+            cmd.name == *command
+                && cmd.intercept.iter().any(|rule| {
+                    matches!(rule.action, InterceptAction::Capture { .. })
+                        && args_overlap(&rule.args_prefix, args)
+                })
+        });
+        if conflicting_capture {
+            return Err(nono::NonoError::SandboxInit(format!(
+                "credential route '{}' uses `proxy_provisioned_credential` for command '{}', \
+                 but a manual `capture` mediation rule already targets that command. Two paths \
+                 would run the helper in the sandbox: the manual rule (capturing into a nonce) \
+                 and the proxy parent (provisioning the cache). Either remove the manual \
+                 capture rule from `mediation.commands`, or change the credential route's \
+                 capture type to `helper_command` if you want the agent-driven nonce flow.",
+                route.name, command,
+            )));
+        }
+
+        // Inject the rule. Insert at the front of `commands` so it
+        // runs ahead of any user-declared passthrough rules on the
+        // same command (e.g. a `respond` for OTHER args_prefixes).
+        // Per-command rules within an entry are evaluated in order;
+        // we want OUR rule first.
+        let respond_rule = InterceptRule {
+            args_prefix: args.clone(),
+            admin: false,
+            action: InterceptAction::Respond {
+                stdout: format!("{}\n", PROXY_PROVISIONED_SENTINEL),
+                exit_code: 0,
+            },
+        };
+
+        // If there's already an entry for this command name, prepend
+        // our rule to its intercepts. Otherwise add a new entry.
+        if let Some(entry) = mediation.commands.iter_mut().find(|c| c.name == *command) {
+            entry.intercept.insert(0, respond_rule);
+        } else {
+            mediation.commands.push(CommandEntry {
+                name: command.clone(),
+                binary_path: None,
+                intercept: vec![respond_rule],
+                sandbox: None,
+                caller_policy: Default::default(),
+            });
+        }
+        tracing::info!(
+            "proxy_provisioned_credential route '{}': auto-injected `respond` mediation rule \
+             on '{}' (args prefix {:?}); real binary will only run in the proxy parent",
+            route.name,
+            command,
+            args,
+        );
+    }
+    Ok(())
+}
+
+/// Two args lists "overlap" for the purpose of conflict detection if
+/// one is a prefix of the other. Mediation matching is prefix-based,
+/// so a manual rule with `args_prefix = ["auth"]` covers a more
+/// specific provisioned route with `args = ["auth", "token", "x"]`,
+/// and vice versa.
+fn args_overlap(a: &[String], b: &[String]) -> bool {
+    let shorter_len = a.len().min(b.len());
+    if shorter_len == 0 {
+        // Empty args_prefix matches everything; treat as overlap.
+        return true;
+    }
+    a.iter().take(shorter_len).eq(b.iter().take(shorter_len))
 }
 
 /// Append child items after base items, deduplicating while preserving order.
@@ -7784,6 +7997,7 @@ mod tests {
                 format: "Bearer {}".to_string(),
             },
             preflight: Vec::new(),
+            egress_headers: Default::default(),
         });
         let routes = resolve_credential_routes(&p);
         assert_eq!(routes.len(), 2);
@@ -7796,5 +8010,157 @@ mod tests {
         let p = empty_profile();
         let routes = resolve_credential_routes(&p);
         assert!(routes.is_empty());
+    }
+
+    // ---------- proxy_provisioned_credential tests ----------
+
+    fn provisioned_route(
+        name: &str,
+        command: &str,
+        args: &[&str],
+    ) -> ManagedCredentialRoute {
+        ManagedCredentialRoute {
+            name: name.to_string(),
+            upstream: "https://gateway.example.com".to_string(),
+            capture: CredentialRouteCapture::ProxyProvisionedCredential {
+                source: ProvisionSource::Command {
+                    command: command.to_string(),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    env: std::collections::BTreeMap::new(),
+                },
+            },
+            delivery: CredentialRouteDelivery::Direct,
+            bearer: CredentialRouteBearer {
+                header: "x-api-key".to_string(),
+                format: "{}".to_string(),
+            },
+            preflight: Vec::new(),
+            egress_headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn auto_inject_adds_respond_rule_when_no_existing_rule() {
+        let routes = vec![provisioned_route(
+            "gw",
+            "auth-helper",
+            &["auth", "token", "example"],
+        )];
+        let mut mediation = crate::mediation::MediationConfig::default();
+        inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect("no conflict — should succeed");
+        assert_eq!(mediation.commands.len(), 1);
+        let cmd = &mediation.commands[0];
+        assert_eq!(cmd.name, "auth-helper");
+        assert_eq!(cmd.intercept.len(), 1);
+        match &cmd.intercept[0].action {
+            crate::mediation::InterceptAction::Respond { stdout, exit_code } => {
+                assert!(stdout.contains(PROXY_PROVISIONED_SENTINEL));
+                assert_eq!(*exit_code, 0);
+            }
+            other => panic!("expected Respond action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_inject_skips_when_existing_respond_rule_covers_command() {
+        use crate::mediation::{
+            CommandEntry, InterceptAction, InterceptRule, MediationConfig,
+        };
+        let routes = vec![provisioned_route(
+            "gw",
+            "auth-helper",
+            &["auth", "token", "example"],
+        )];
+        let mut mediation = MediationConfig {
+            commands: vec![CommandEntry {
+                name: "auth-helper".to_string(),
+                binary_path: None,
+                intercept: vec![InterceptRule {
+                    args_prefix: vec!["auth".to_string()],
+                    admin: false,
+                    action: InterceptAction::Respond {
+                        stdout: "user-custom-value".to_string(),
+                        exit_code: 0,
+                    },
+                }],
+                sandbox: None,
+                caller_policy: Default::default(),
+            }],
+            env: Default::default(),
+        };
+        inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect("manual respond rule — should succeed without injection");
+        // Manual rule untouched; no second rule injected
+        assert_eq!(mediation.commands.len(), 1);
+        let cmd = &mediation.commands[0];
+        assert_eq!(cmd.intercept.len(), 1);
+        match &cmd.intercept[0].action {
+            crate::mediation::InterceptAction::Respond { stdout, .. } => {
+                assert_eq!(stdout, "user-custom-value");
+            }
+            other => panic!("expected user's Respond action, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auto_inject_errors_on_conflicting_capture_rule() {
+        use crate::mediation::{
+            CommandEntry, InterceptAction, InterceptRule, MediationConfig,
+        };
+        let routes = vec![provisioned_route(
+            "gw",
+            "auth-helper",
+            &["auth", "token", "example"],
+        )];
+        let mut mediation = MediationConfig {
+            commands: vec![CommandEntry {
+                name: "auth-helper".to_string(),
+                binary_path: None,
+                intercept: vec![InterceptRule {
+                    args_prefix: vec!["auth".to_string(), "token".to_string()],
+                    admin: false,
+                    action: InterceptAction::Capture {
+                        script: None,
+                        format: None,
+                        secret_paths: Vec::new(),
+                    },
+                }],
+                sandbox: None,
+                caller_policy: Default::default(),
+            }],
+            env: Default::default(),
+        };
+        let err = inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect_err("manual capture rule on same command must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("manual `capture` mediation rule"),
+            "error must explain the conflict: {msg}"
+        );
+    }
+
+    #[test]
+    fn auto_inject_does_nothing_for_oauth_or_helper_command_routes() {
+        // OAuth intercept route — should not produce any mediation rule
+        let mut p = empty_profile();
+        p.oauth_capture = true;
+        let routes = resolve_credential_routes(&p);
+        let mut mediation = crate::mediation::MediationConfig::default();
+        inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect("oauth_intercept — should be a no-op");
+        assert!(mediation.commands.is_empty());
+
+        // Legacy helper_command route (via apikey_gateway) — also no-op
+        let mut p = empty_profile();
+        p.apikey_gateway = Some(ApiKeyGatewayConfig {
+            url: "https://gateway.example.com".to_string(),
+            helper_argv_prefix: vec!["auth".to_string()],
+        });
+        let routes = resolve_credential_routes(&p);
+        let mut mediation = crate::mediation::MediationConfig::default();
+        inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect("helper_command — should be a no-op");
+        assert!(mediation.commands.is_empty());
     }
 }

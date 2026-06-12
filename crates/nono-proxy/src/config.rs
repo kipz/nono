@@ -302,6 +302,34 @@ pub struct RouteConfig {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub oauth2: Option<OAuth2Config>,
+
+    /// Provisioned-credential route name.
+    ///
+    /// When `Some(name)`, the proxy looks up `name` in the
+    /// [`crate::provisioned::ProvisionedStore`] on egress and uses
+    /// that credential as the outbound bearer, ignoring whatever the
+    /// inbound request carried in [`Self::inject_header`]. The
+    /// outbound header is formatted via [`Self::credential_format`]
+    /// (default `"{}"` if absent → bare credential).
+    ///
+    /// On HTTP 401/403 from upstream, the egress path triggers a
+    /// refresh of this entry in `ProvisionedStore` and retries the
+    /// request once with the fresh credential.
+    ///
+    /// Authored by the CLI when synthesising routes from a profile's
+    /// `credential_routes` entry whose `capture` is
+    /// `proxy_provisioned_credential`. Not author-facing in
+    /// network-policy JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioned_credential_route: Option<String>,
+
+    /// Additional headers to inject on every outbound request for
+    /// this route, after credential substitution. Useful for
+    /// gateway-specific metadata the agent may not always forward
+    /// (e.g. `org-id`, `provider`). Keys are lowercased header names.
+    /// Populated from the profile's `egress_headers` map.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub egress_headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Optional proxy-side overrides for credential injection shape.

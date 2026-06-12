@@ -559,6 +559,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = CredentialStore::load(&routes, &tls);
         assert!(store.is_ok());
@@ -649,6 +651,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("litellm").expect("route should be loaded");
@@ -678,6 +682,8 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
         let store = CredentialStore::load(&routes, &tls).expect("credential load");
         let cred = store.get("api").expect("route should be loaded");
@@ -718,6 +724,8 @@ mod tests {
                 client_secret: "env://TEST_OAUTH2_CLIENT_SECRET".to_string(),
                 scope: String::new(),
             }),
+            provisioned_credential_route: None,
+            egress_headers: Default::default(),
         }];
 
         let store = CredentialStore::load(&routes, &tls);

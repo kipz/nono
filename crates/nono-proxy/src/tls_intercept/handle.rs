@@ -48,6 +48,12 @@ pub struct InterceptCtx<'a> {
     /// routes. `None` when OAuth capture is not configured for this
     /// proxy session; the capture path is then inert.
     pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
+    /// Optional proxy-provisioned credential store. `None` when no
+    /// route uses `proxy_provisioned_credential` capture; the
+    /// substitution path is then inert. When `Some`, routes carrying
+    /// `LoadedRoute::provisioned_credential_route = Some(name)` look
+    /// up `name` here on egress and replace the inbound bearer.
+    pub provisioned_store: Option<&'a Arc<crate::provisioned::ProvisionedStore>>,
 }
 
 /// Handle a CONNECT request that matched a route requiring L7 visibility.
@@ -412,6 +418,91 @@ where
     ) {
         rewrite_bearer_header(&mut filtered_headers, resolver.as_ref());
     }
+
+    // Proxy-provisioned credential substitution. When the route is
+    // configured with `provisioned_credential_route: Some(name)`, the
+    // egress credential is sourced from the `ProvisionedStore` (not
+    // from any header the agent sent) and replaces the inbound bearer
+    // header entirely. Mutually exclusive with nonce resolution above
+    // — proxy-provisioned routes don't have nonces because the agent
+    // never sees the real credential and the auto-injected `respond`
+    // mediation rule returns a hardcoded sentinel that we discard
+    // here.
+    //
+    // If the route requires a provisioned credential but the inbound
+    // request has no value in the configured bearer header, return a
+    // 401 to the sandbox. This catches mis-configured agents that
+    // haven't been told to send anything (e.g. no apiKeyHelper set)
+    // — without it, we'd silently inject a credential the agent did
+    // not authenticate to use.
+    if let Some(route) = route
+        && let Some(route_name) = route.provisioned_credential_route.as_deref()
+    {
+        let bearer_header_name = route.provisioned_inject_header.as_str();
+        let format_template = route.provisioned_inject_format.as_str();
+        let inbound_present = filtered_headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case(bearer_header_name) && !v.is_empty());
+        if !inbound_present {
+            warn!(
+                "proxy-provisioned route '{}' requires inbound '{}' header from agent \
+                 so the proxy has an auth shape to substitute; agent sent nothing. \
+                 Returning 401 to sandbox.",
+                route_name, bearer_header_name
+            );
+            reverse::send_error_generic(
+                tls_stream,
+                401,
+                "nono proxy: agent did not send a credential header for this route",
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(store) = ctx.provisioned_store {
+            if let Some(real) = store.get(route_name).await {
+                let outbound_value = format_template.replace("{}", real.as_str());
+                // Replace existing header(s) with the same name
+                filtered_headers.retain(|(n, _)| !n.eq_ignore_ascii_case(bearer_header_name));
+                filtered_headers.push((bearer_header_name.to_string(), outbound_value));
+                debug!(
+                    "tls_intercept: substituted inbound '{}' with proxy-provisioned credential for route '{}'",
+                    bearer_header_name, route_name
+                );
+            } else {
+                warn!(
+                    "tls_intercept: route '{}' provisioned-credential lookup missed (store entry absent); forwarding inbound header as-is",
+                    route_name
+                );
+            }
+        } else {
+            warn!(
+                "tls_intercept: route '{}' is provisioned but ProvisionedStore is None; forwarding inbound header as-is",
+                route_name
+            );
+        }
+
+        // Inject egress_headers declared on the route (e.g. org-id,
+        // provider). These are injected after the provisioned-credential
+        // substitution so the profile can supply gateway-specific
+        // metadata the agent may not forward in CONNECT mode.
+        for (hdr_name, hdr_value) in &route.egress_headers {
+            filtered_headers.retain(|(n, _)| !n.eq_ignore_ascii_case(hdr_name));
+            filtered_headers.push((hdr_name.clone(), hdr_value.clone()));
+        }
+    }
+
+    // Also inject egress_headers for non-provisioned routes (e.g.
+    // OAuth-intercept routes may also need gateway metadata injected).
+    if let Some(route) = route
+        && route.provisioned_credential_route.is_none()
+        && !route.egress_headers.is_empty()
+    {
+        for (hdr_name, hdr_value) in &route.egress_headers {
+            filtered_headers.retain(|(n, _)| !n.eq_ignore_ascii_case(hdr_name));
+            filtered_headers.push((hdr_name.clone(), hdr_value.clone()));
+        }
+    }
+
     let content_length = reverse::extract_content_length(&header_bytes);
     let body = match reverse::read_request_body(tls_stream, content_length, &buffered).await? {
         Some(b) => b,
@@ -540,7 +631,14 @@ where
         None
     };
 
-    if let Err(e) = forward::forward_request(
+    // Capture the response status so we can trigger a fire-and-forget
+    // refresh of the proxy-provisioned credential if upstream rejected
+    // with 401/403. The current request still completes with the
+    // upstream's failure status (no in-place retry in v1 — see design
+    // doc), but the next request on this route will see the fresh
+    // credential. With ddtool's ~2h TTL, this means the user sees one
+    // failed request per token expiry; subsequent prompts succeed.
+    let forward_result = forward::forward_request(
         tls_stream,
         request.as_bytes(),
         &body,
@@ -548,8 +646,30 @@ where
         audit_ctx,
         response_hook,
     )
-    .await
+    .await;
+    if let Ok(status) = forward_result
+        && (status == 401 || status == 403)
+        && let Some(route) = route
+        && let Some(route_name) = route.provisioned_credential_route.as_deref()
+        && let Some(store) = ctx.provisioned_store
     {
+        let store = Arc::clone(store);
+        let route_name = route_name.to_string();
+        debug!(
+            "tls_intercept: upstream returned {} for proxy-provisioned route '{}'; \
+             triggering fire-and-forget credential refresh (next request will see fresh value)",
+            status, route_name
+        );
+        tokio::spawn(async move {
+            if let Err(e) = store.refresh(&route_name).await {
+                warn!(
+                    "tls_intercept: post-{} refresh of provisioned credential for route '{}' failed: {}",
+                    status, route_name, e
+                );
+            }
+        });
+    }
+    if let Err(e) = forward_result {
         warn!("tls_intercept: upstream forwarding failed: {}", e);
         audit::log_denied(
             ctx.audit_log,

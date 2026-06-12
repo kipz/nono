@@ -106,6 +106,12 @@ pub struct ReverseProxyCtx<'a> {
     /// routes. `None` when OAuth capture is not configured for this
     /// proxy session; the capture path is then inert.
     pub token_resolver: Option<&'a Arc<dyn crate::broker::TokenResolver>>,
+    /// Optional proxy-provisioned credential store. `None` when no
+    /// route uses `proxy_provisioned_credential` capture. When a
+    /// route's `provisioned_credential_route` is `Some(name)`, the
+    /// egress path substitutes the inbound bearer header with the
+    /// `store.get(name)` value.
+    pub provisioned_store: Option<&'a Arc<crate::provisioned::ProvisionedStore>>,
 }
 
 /// Handle a non-CONNECT HTTP request (reverse proxy mode).
@@ -430,26 +436,59 @@ pub async fn handle_reverse_proxy(
         method, upstream_path_full, version, upstream_authority
     ));
 
-    // Inject the upstream credential. In OAuth pass-through mode, forward
-    // the broker-resolved bearer (re-adding `Bearer ` for Authorization);
-    // otherwise inject the static credential the route configured.
-    let suppress_inbound_header: Option<String> =
-        if let Some((ref header_name, ref cred_value)) = oauth_passthrough_cred {
-            if header_name.eq_ignore_ascii_case("authorization") {
-                request.push_str(&format!(
-                    "Authorization: Bearer {}\r\n",
-                    cred_value.as_str()
-                ));
-            } else {
-                request.push_str(&format!("{}: {}\r\n", header_name, cred_value.as_str()));
-            }
-            Some(header_name.to_lowercase())
+    // Proxy-provisioned credential substitution. Mutually exclusive
+    // with the oauth_passthrough_cred path: when the route is
+    // configured as `proxy_provisioned_credential` (i.e. its
+    // `LoadedRoute::provisioned_credential_route` is `Some(name)`),
+    // the proxy looks up the cached credential and substitutes the
+    // inbound bearer header entirely. The agent's inbound value
+    // (whatever it was) is discarded — proxy is authoritative.
+    let provisioned_cred: Option<(String, Zeroizing<String>, String)> = async {
+        let route_name = route.provisioned_credential_route.as_deref()?;
+        let store = ctx.provisioned_store?;
+        let real = store.get(route_name).await?;
+        Some((
+            route.provisioned_inject_header.clone(),
+            real,
+            route.provisioned_inject_format.clone(),
+        ))
+    }
+    .await;
+
+    // Inject the upstream credential. Priority:
+    //   1. Proxy-provisioned (overrides everything if configured).
+    //   2. OAuth pass-through (broker-resolved bearer from agent).
+    //   3. Static credential from CredentialStore.
+    let suppress_inbound_header: Option<String> = if let Some((
+        ref header_name,
+        ref cred_value,
+        ref format_template,
+    )) = provisioned_cred
+    {
+        let outbound_value = format_template.replace("{}", cred_value.as_str());
+        request.push_str(&format!("{}: {}\r\n", header_name, outbound_value));
+        debug!(
+            "reverse: substituted inbound '{}' with proxy-provisioned credential for route '{}'",
+            header_name,
+            route.provisioned_credential_route.as_deref().unwrap_or("?")
+        );
+        Some(header_name.to_lowercase())
+    } else if let Some((ref header_name, ref cred_value)) = oauth_passthrough_cred {
+        if header_name.eq_ignore_ascii_case("authorization") {
+            request.push_str(&format!(
+                "Authorization: Bearer {}\r\n",
+                cred_value.as_str()
+            ));
         } else {
-            if let Some(cred) = cred {
-                inject_credential_for_mode(cred, &mut request);
-            }
-            None
-        };
+            request.push_str(&format!("{}: {}\r\n", header_name, cred_value.as_str()));
+        }
+        Some(header_name.to_lowercase())
+    } else {
+        if let Some(cred) = cred {
+            inject_credential_for_mode(cred, &mut request);
+        }
+        None
+    };
 
     let auth_header_lower = cred.map(|c| c.header_name.to_lowercase());
     for (name, value) in &filtered_headers {

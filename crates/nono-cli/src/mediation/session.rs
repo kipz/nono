@@ -183,10 +183,10 @@ pub fn setup(
         // Also push the canonicalized target so that exec via the real binary
         // path is blocked even when the agent bypasses the symlink.
         blocked_binaries.push(resolved.real_path.clone());
-        if let Ok(canonical) = resolved.real_path.canonicalize() {
-            if canonical != resolved.real_path {
-                blocked_binaries.push(canonical);
-            }
+        if let Ok(canonical) = resolved.real_path.canonicalize()
+            && canonical != resolved.real_path
+        {
+            blocked_binaries.push(canonical);
         }
         resolved_commands.push(resolved);
     }

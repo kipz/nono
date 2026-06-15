@@ -2958,7 +2958,8 @@ mod tests {
             strict_filter: true,
             ..ProxyLaunchOptions::default()
         };
-        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
+            .expect("build_proxy_config_from_flags");
         assert!(
             config.strict_filter,
             "strict_filter: true must propagate to ProxyConfig"
@@ -2966,9 +2967,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_proxy_config_strict_filter_off_by_default() {
-        let proxy = ProxyLaunchOptions::default();
-        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+    fn test_build_proxy_config_strict_filter_off_when_no_block() {
+        let proxy = ProxyLaunchOptions {
+            active: true,
+            network_block: false,
+            ..ProxyLaunchOptions::default()
+        };
+        let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
+            .expect("build_proxy_config_from_flags");
         assert!(
             !config.strict_filter,
             "strict_filter must default off when not set"

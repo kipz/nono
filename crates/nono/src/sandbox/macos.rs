@@ -2034,9 +2034,14 @@ mod tests {
         let deny_gh = "(deny process-exec (literal \"/opt/homebrew/bin/gh\"))";
         let deny_sec = "(deny process-exec (literal \"/usr/bin/security\"))";
         let deny_gh_pos = profile.find(deny_gh).expect("deny for gh must be present");
-        let deny_sec_pos = profile.find(deny_sec).expect("deny for security must be present");
+        let deny_sec_pos = profile
+            .find(deny_sec)
+            .expect("deny for security must be present");
         assert!(deny_gh_pos > allow_pos, "gh deny must come after allow-all");
-        assert!(deny_sec_pos > allow_pos, "security deny must come after allow-all");
+        assert!(
+            deny_sec_pos > allow_pos,
+            "security deny must come after allow-all"
+        );
     }
 
     #[test]

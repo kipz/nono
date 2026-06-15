@@ -1,0 +1,313 @@
+---
+title: Command Mediation
+description: Per-command interception with predicate-tree matchers, explicit defaults, capture grants, and promotion scoping
+---
+
+Command mediation intercepts agent invocations at the shim layer before they reach the real binary. The sandbox's `PATH` resolves every mediated command to a shim; the shim forwards the invocation over a Unix socket to an unsandboxed supervisor, which evaluates the profile's intercept rules and either responds, captures, or runs.
+
+---
+
+## How it works
+
+1. Agent invokes `gh auth token`
+2. The `gh` shim forwards the request to the mediation server
+3. The server walks the command's `intercept` list, evaluating each rule's `match` predicate against argv
+4. First match wins. If no intercept fires, the command's `default` action runs
+5. The action is one of `respond` (static reply), `capture` (run + wrap stdout in a nonce), or `run` (execute, stream stdio)
+
+The mediation server runs unsandboxed in the supervisor parent. This lets `capture` rules reach the Keychain, OAuth flows, and other credential sources that the sandbox would block.
+
+---
+
+## Argv matchers
+
+The `match` field is a recursive predicate tree. Combinators compose leaves:
+
+| Form | Meaning |
+|------|---------|
+| `{ "all": [ ... ] }` | Conjunction. Empty = vacuously true. |
+| `{ "any": [ ... ] }` | Disjunction. Empty = vacuously false. |
+| `{ "not": <matcher> }` | Logical NOT. |
+| `{ "any_arg_matches": "<re>" }` | At least one argv element matches |
+| `{ "all_args_match": "<re>" }` | Every argv element matches |
+| `{ "nth_arg_matches": N, "regex": "<re>" }` | argv[N] (0-based) matches |
+
+Regexes use the `regex` crate (linear time, no catastrophic backtracking). Inline flags such as `(?i)` are supported.
+
+```jsonc
+// Match "gh auth token"
+{
+  "match": {
+    "all": [
+      { "nth_arg_matches": 0, "regex": "^auth$"  },
+      { "nth_arg_matches": 1, "regex": "^token$" }
+    ]
+  }
+}
+
+// Match any curl call to a specific host, rejecting -k (insecure TLS)
+{
+  "match": {
+    "all": [
+      { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" },
+      { "not": { "any_arg_matches": "^-k$" } }
+    ]
+  }
+}
+```
+
+---
+
+## Three action types
+
+Every intercept rule and the command's `default` entry carries an `action`:
+
+```jsonc
+// respond — return a static reply, real binary never called
+{ "type": "respond", "stdout": "", "stderr": "blocked by sandbox", "exit_code": 1 }
+
+// run — execute the real binary (or a script), stream stdio
+{ "type": "run" }
+{ "type": "run", "script": "exec git \"$@\"" }
+
+// capture — run unsandboxed in broker, wrap stdout in a nonce
+{ "type": "capture", "grant_to": ["gh.default"] }
+```
+
+---
+
+## `default` — required explicit fallback
+
+Every command must declare a `default` block. It dispatches when no intercept fires, and is the primary redemption target for capture grants. Profile load fails if it is absent.
+
+```jsonc
+{
+  "name": "gh",
+  "default": {
+    "action": { "type": "run" },
+    "sandbox": {
+      "network": { "allowed_hosts": ["github.com", "*.github.com"] }
+    }
+  },
+  "intercept": [ ... ]
+}
+```
+
+---
+
+## Capture grants (`grant_to`)
+
+A `capture` action mints a `nono_<hex>` nonce and returns it to the caller instead of the real credential. The `grant_to` field explicitly lists which `<command>.<intercept-id>` consumers are authorised to redeem that nonce when they exec.
+
+```jsonc
+// Only gh's default run may substitute this nonce
+{ "type": "capture", "grant_to": ["gh.default"] }
+
+// Grant to multiple consumers
+{ "type": "capture", "grant_to": ["gh.default", "git.default"] }
+
+// Defensive capture — mint a nonce but make it non-redeemable.
+// The credential is intercepted and discarded; nothing can use it.
+{ "type": "capture", "grant_to": [] }
+```
+
+`grant_to` is required. Missing it causes profile load to fail. There is no implicit "anyone" grant.
+
+Intercept IDs are declared with `"id"` on the rule. The built-in id `"default"` refers to the command's `default` entry and is reserved.
+
+```jsonc
+{
+  "id": "auth-token",          // referenced as "gh.auth-token"
+  "match": { ... },
+  "action": { "type": "capture", "grant_to": ["gh.default"] }
+}
+```
+
+---
+
+## Sandbox inheritance (tri-state)
+
+The `sandbox` field on an intercept rule is tri-state:
+
+| JSON | Effect |
+|------|--------|
+| field absent | Inherit from `cmd.default.sandbox`, then legacy `cmd.sandbox` |
+| `"sandbox": null` | Explicitly unsandboxed — opts out of inheritance entirely |
+| `"sandbox": { ... }` | Use this exact `CommandSandbox` for the matched call |
+
+Only `run` rules honour this field. `capture` always runs unsandboxed in the broker. `respond` never execs.
+
+```jsonc
+{
+  "id": "gitlab-curl",
+  "match": { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" },
+  "action": { "type": "run" },
+  "sandbox": {
+    "network": { "allowed_hosts": ["gitlab.ddbuild.io"] }
+  }
+  // intercepts with no "sandbox" field inherit the command's default.sandbox
+}
+```
+
+---
+
+## Promotion scoping (`promote_in`)
+
+When a `run` or `default` action execs, the broker can substitute `nono_<hex>` substrings with real credentials in argv slots and env vars. `promote_in` declares exactly where that substitution is allowed.
+
+**Defaults are secure:** omitting `promote_in` suppresses argv promotion entirely. Env promotion uses a built-in safe-shape allowlist: `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, `*_AUTH`.
+
+```jsonc
+"promote_in": {
+  "args": { /* ArgPredicate  */ },
+  "env":  { /* EnvPredicate  */ }
+}
+```
+
+### ArgPredicate — which argv slot may receive a nonce
+
+| Form | Allows promotion when |
+|------|-----------------------|
+| `{ "preceded_by_arg": "<re>" }` | The previous slot matches (e.g. `-H` before a header value) |
+| `{ "self_matches": "<re>" }` | The slot itself matches (e.g. `--header=nono_…`) |
+| `{ "at_index": N }` | Exact 0-based positional index |
+| `{ "all_of": [ ... ] }` | Conjunction. Empty = always promote (vacuous). |
+| `{ "any_of": [ ... ] }` | Disjunction. Empty = never promote (lock). |
+| `{ "not": <predicate> }` | Logical NOT. |
+
+### EnvPredicate — which env var may carry a nonce
+
+| Form | Allows promotion when |
+|------|-----------------------|
+| `{ "name_matches": "<re>" }` | The variable's name matches |
+| `{ "value_matches": "<re>" }` | The variable's value matches |
+| Same combinators as ArgPredicate | |
+
+When `env` is set explicitly it **replaces** the built-in allowlist. To extend rather than replace, union the default regex into a custom `any_of`:
+
+```jsonc
+"promote_in": {
+  "env": {
+    "any_of": [
+      { "name_matches": "(?i)^(authorization|[A-Za-z0-9_]+_(token|header|key|secret|password|credentials|auth))$" },
+      { "name_matches": "^MY_CUSTOM_VAR$" }
+    ]
+  }
+}
+```
+
+Intercepts do **not** inherit `promote_in` from the command's `default`. Each rule's filter is independent.
+
+### Example — `curl` to a GitLab host
+
+Nonces are only carried in `-H "PRIVATE-TOKEN: …"` headers. The filter admits exactly those argv slots; anything else (body, upload path, multipart, cookie) stays literal even if a matcher misses a new curl flag variant:
+
+```jsonc
+{
+  "id": "gitlab",
+  "match": { "all": [
+    { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" }
+  ]},
+  "action": { "type": "run" },
+  "sandbox": { "network": { "allowed_hosts": ["gitlab.ddbuild.io"] } },
+  "promote_in": {
+    "args": {
+      "any_of": [
+        { "preceded_by_arg": "^(-H|--header)$" },   // -H <value>
+        { "self_matches":    "^(-H|--header=)"  }    // --header=<value>
+      ]
+    }
+    // env: omitted → built-in safe-shape allowlist
+  }
+}
+```
+
+---
+
+## Full example — `gh`
+
+```jsonc
+{
+  "name": "gh",
+
+  // Required. Dispatches when no intercept fires.
+  "default": {
+    "action": { "type": "run" },
+    "sandbox": {
+      "network": { "allowed_hosts": ["github.com", "*.github.com", "api.github.com"] }
+    }
+    // promote_in omitted → no argv promotion; safe-shape env allowlist applies
+  },
+
+  "intercept": [
+    {
+      // Capture the real token; only gh.default may redeem it.
+      "id": "auth-token",
+      "match": {
+        "all": [
+          { "nth_arg_matches": 0, "regex": "^auth$"  },
+          { "nth_arg_matches": 1, "regex": "^token$" }
+        ]
+      },
+      "action": {
+        "type": "capture",
+        "grant_to": ["gh.default"]
+      }
+      // capture always runs unsandboxed — "sandbox" field is ignored
+    },
+    {
+      // Narrow gh api to api.github.com; allow nonces only in header slots.
+      "id": "api",
+      "match": { "nth_arg_matches": 0, "regex": "^api$" },
+      "action": { "type": "run" },
+      "sandbox": {
+        "network": { "allowed_hosts": ["api.github.com"] }
+      },
+      "promote_in": {
+        "args": {
+          "any_of": [
+            { "preceded_by_arg": "^(-H|--header)$" },
+            { "self_matches":    "^(-H|--header=)"  }
+          ]
+        }
+      }
+    },
+    {
+      // Reject attempts to write a raw token into the gh config.
+      "id": "config-set-token",
+      "match": {
+        "all": [
+          { "nth_arg_matches": 0, "regex": "^config$"      },
+          { "nth_arg_matches": 1, "regex": "^set$"         },
+          { "nth_arg_matches": 2, "regex": "^oauth_token$" }
+        ]
+      },
+      "action": {
+        "type": "respond",
+        "stdout": "",
+        "stderr": "blocked by sandbox",
+        "exit_code": 1
+      }
+    }
+  ]
+}
+```
+
+---
+
+## `env.block`
+
+Raw credential env vars can be stripped from the sandboxed child before any mediation logic runs:
+
+```jsonc
+{
+  "mediation": {
+    "env": {
+      "block": ["GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN"]
+    },
+    "commands": [ ... ]
+  }
+}
+```
+
+This prevents an agent from bypassing mediation by reading the credential directly from its own environment.

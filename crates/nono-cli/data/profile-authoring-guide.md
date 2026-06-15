@@ -255,6 +255,281 @@ Map of application name to hook configuration:
 | `matcher` | string | Regex for tool name matching. |
 | `script`  | string | Script filename from embedded hooks. |
 
+### mediation
+
+Per-command interception of agent invocations. The mediation server runs in the unsandboxed supervisor parent; the sandbox's `PATH` resolves to a shim that forwards the invocation over a Unix socket. Each invocation is dispatched against the matching `CommandEntry`'s intercept list (first-match) and falls back to its required `default` action when no intercept fires.
+
+```json
+{
+  "mediation": {
+    "commands": [
+      {
+        "name": "gh",
+        "default": {
+          "action": { "type": "allow" },
+          "sandbox": { "network": { "allowed_hosts": ["github.com", "*.github.com"] } }
+        },
+        "intercept": [
+          {
+            "id": "auth-token",
+            "match": { "all": [
+              { "nth_arg_matches": 0, "regex": "^auth$" },
+              { "nth_arg_matches": 1, "regex": "^token$" }
+            ]},
+            "action": {
+              "type": "capture",
+              "grant_to": ["gh.default"]
+            }
+          }
+        ]
+      }
+    ],
+    "env": {
+      "block": ["GH_TOKEN", "GITHUB_TOKEN"]
+    }
+  }
+}
+```
+
+**Top-level `mediation` fields:**
+
+| Field             | Type            | Required | Description |
+|-------------------|-----------------|----------|-------------|
+| `commands`        | array           | no       | Per-command mediation entries. |
+| `env`             | EnvPolicy       | no       | Session-level env variable policy (e.g. block credential env vars). |
+| `session_can_use` | array of string | no       | Commands the primary agent sandbox may invoke directly. A command absent from this list is denied (exit 126) when the agent tries to invoke it. Each name must match a defined `commands[].name`. |
+
+#### commands[]
+
+| Field           | Type            | Required | Description |
+|-----------------|-----------------|----------|-------------|
+| `name`          | string          | yes      | Command name as the agent invokes it (resolved via `which` at session start). |
+| `binary_path`   | string          | no       | Absolute path to the real binary, bypassing `which`. Use when `which` resolves to a wrapper. |
+| `default`       | DefaultEntry    | yes      | Dispatched when no intercept rule matches. Profile load fails if absent. |
+| `intercept`     | array           | no       | Intercept rules. Checked in order; first match wins. |
+| `sandbox`       | CommandSandbox  | no       | Legacy command-level sandbox. Falls back here when both the matched rule and `default` omit a sandbox. Prefer `default.sandbox`. |
+| `can_use`       | array of string | no       | Commands this command is authorised to invoke. Any entry in `sandbox.allow_commands` must also appear here. |
+
+#### default (required)
+
+Every command needs a `default` block. It dispatches when no intercept matches and is referenced by capture grants as `<command>.default`.
+
+| Field        | Type            | Required | Description |
+|--------------|-----------------|----------|-------------|
+| `action`     | InterceptAction | yes      | One of `deny`, `allow`, or `capture`. |
+| `sandbox`    | CommandSandbox  | no       | Fallback sandbox. Intercept rules with no own `sandbox` inherit this. |
+| `promote_in` | PromoteFilter   | no       | Per-default scoping of nonce promotion. See "Promotion scoping" below. |
+
+Minimal default — let the call through unchanged:
+
+```json
+{ "default": { "action": { "type": "allow" } } }
+```
+
+Default with a sandbox that scopes every fall-through run:
+
+```json
+{
+  "default": {
+    "action": { "type": "allow" },
+    "sandbox": {
+      "network": { "allowed_hosts": ["github.com", "*.github.com"] },
+      "keychain_access": true
+    }
+  }
+}
+```
+
+#### intercept[]
+
+```json
+{
+  "id": "gitlab-curl",
+  "match": {
+    "all": [
+      { "any_arg_matches": "^https://gitlab\\.ddbuild\\.io" },
+      { "not": { "any_arg_matches": "^-k$" } }
+    ]
+  },
+  "admin": false,
+  "action": { "type": "allow" },
+  "sandbox": { "network": { "allowed_hosts": ["gitlab.ddbuild.io"] } }
+}
+```
+
+| Field        | Type            | Required | Description |
+|--------------|-----------------|----------|-------------|
+| `id`         | string          | conditional | Identifier within the command's intercept list. Required when any `Capture.grant_to` references this rule as `<command>.<id>`. The id `"default"` is reserved for the default entry. |
+| `match`      | ArgsMatcher     | yes      | Predicate tree against argv. See "Argv matchers" below. |
+| `admin`      | boolean         | no       | Require user authentication before the action runs. Default: false. |
+| `action`     | InterceptAction | yes      | One of `deny`, `allow`, or `capture`. |
+| `sandbox`    | tri-state       | no       | Per-invocation sandbox binding. See "Sandbox inheritance" below. |
+| `promote_in` | PromoteFilter   | no       | Per-rule scoping of nonce promotion. See "Promotion scoping" below. |
+
+#### Argv matchers
+
+`match` is a recursive predicate tree. Combinators compose leaves:
+
+| Form                                 | Meaning |
+|--------------------------------------|---------|
+| `{ "all": [ ... ] }`                  | Conjunction. Empty list = vacuously true. |
+| `{ "any": [ ... ] }`                  | Disjunction. Empty list = vacuously false. |
+| `{ "not": <matcher> }`                | Logical NOT. |
+| `{ "any_arg_matches": "<regex>" }`    | At least one argv element matches the regex. |
+| `{ "all_args_match": "<regex>" }`     | Every argv element matches (or argv is empty). |
+| `{ "nth_arg_matches": <n>, "regex": "<re>" }` | argv element at index `n` (0-based, counts flags) matches the regex. |
+
+Regexes use the `regex` crate (linear time, no catastrophic backtracking). Inline flags such as `(?i)` and `(?m)` are supported. The matcher sees only argv — not env, cwd, or stdin.
+
+#### action types
+
+Tagged via `"type"`. Three variants:
+
+| Type      | What it does |
+|-----------|--------------|
+| `deny`    | Return a static response without calling the real binary. Fields: `stdout`, `stderr`, `exit_code` (all optional with defaults). |
+| `allow`   | Run the real binary, streaming stdio. Optional `script` field runs `sh -c "<script>"` instead. Sandboxed per the resolved binding. |
+| `capture` | Run the real binary (or `script`) in the unsandboxed broker parent, capture trimmed stdout, mint a nonce, and return the nonce to the caller. Use for credential-fetching commands so raw tokens never reach the agent. |
+
+```json
+{ "action": { "type": "deny", "stdout": "", "stderr": "blocked", "exit_code": 1 } }
+{ "action": { "type": "allow" } }
+{ "action": { "type": "allow", "script": "exec git \"$@\"" } }
+{ "action": { "type": "capture", "grant_to": ["gh.default", "git.default"] } }
+{ "action": { "type": "capture", "script": "ddtool auth gitlab token", "grant_to": ["glab.default"] } }
+```
+
+#### capture grants
+
+Every `capture` action must include `grant_to: [...]`. Each entry is the identifier of a consumer authorised to redeem the nonce, in the form `<command>.<intercept-id>`. Use `<command>.default` to reference the command's `default` block.
+
+- `"grant_to": ["gh.default"]` — only `gh`'s default run may substitute the nonce for the real value.
+- `"grant_to": []` — explicitly never redeemable. The nonce is minted but no consumer can decode it; use for defensive captures whose only purpose is to intercept and discard a credential.
+- Field missing → profile load fails. There is no implicit "anywhere" grant.
+
+Capture rules always run unsandboxed in the broker parent so credential helpers can reach the Keychain, OAuth flows, etc. The `sandbox` field on a `Capture` intercept is ignored.
+
+#### sandbox inheritance
+
+The `sandbox` field on an intercept rule is tri-state, distinguished by JSON presence:
+
+| JSON                       | Meaning |
+|----------------------------|---------|
+| field absent               | Inherit. At exec time, falls back to `cmd.default.sandbox`, then the legacy `cmd.sandbox`, then no sandbox. |
+| `"sandbox": null`           | Explicitly unsandboxed. Opts out of inheritance entirely; the rule runs with no per-command sandbox. |
+| `"sandbox": { ... }`        | Explicit sandbox. Use this exact `CommandSandbox` for the matched call. |
+
+Only `allow` rules honour this field. `capture` ignores it (always unsandboxed in the broker). `deny` ignores it (no exec happens).
+
+#### CommandSandbox fields
+
+| Field             | Type            | Description |
+|-------------------|-----------------|-------------|
+| `network`         | NetworkConfig   | `{ "block": bool, "allowed_hosts": [string] }`. If `allowed_hosts` is non-empty, a per-command proxy restricts outbound to those hosts. `block` and `allowed_hosts` are mutually exclusive. |
+| `fs_read`         | array of string | Directories the command may read. |
+| `fs_read_file`    | array of string | Individual files the command may read. |
+| `fs_write`        | array of string | Directories the command may write. |
+| `fs_write_file`   | array of string | Individual files the command may write. |
+| `allow_commands`  | array of string | Commands the sandboxed binary may exec directly (real binary, not shim). |
+| `keychain_access` | boolean         | macOS only. Grant read access to login/metadata keychain databases and skip default mach-lookup denies for security daemons. |
+
+#### can_use
+
+An explicit list of commands this command is authorised to invoke. The authorization graph gate checks this list before any intercept or sandbox logic:
+
+- A command not listed in a parent's `can_use` is denied (exit 126) when that parent tries to invoke it.
+- Any entry in `sandbox.allow_commands` or `default.sandbox.allow_commands` must also appear in `can_use` — profile load fails if the subset constraint is violated.
+
+Session-level gating is controlled by `mediation.session_can_use` (the list of commands the primary agent sandbox may invoke directly). See the top-level `mediation` table.
+
+#### Promotion scoping (`promote_in`)
+
+When a mediated command exec'd via an `allow` intercept (or via the command's `default` action) receives nonces in its argv or env, the broker substitutes those `nono_<hex>` substrings with real credentials at exec time. `promote_in` declares which slots are admissible — defence-in-depth alongside the matcher's `not`-clauses and capture-side `grant_to`.
+
+```jsonc
+"promote_in": {
+  "args": { /* ArgPredicate */ },
+  "env":  { /* EnvPredicate  */ }
+}
+```
+
+Both sub-fields are independently optional. **Defaults are secure**:
+
+- `args` absent ⇒ **no argv slot promotes**. The redemption site must declare which positional slots may receive a credential. Closes the "credential lands in an unexpected argv slot" attack surface as a default posture.
+- `env` absent ⇒ promotion uses the built-in safe-shape allowlist (case-insensitive): `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`, `*_KEY`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, `*_AUTH`. Env names outside this set stay literal.
+
+##### ArgPredicate (positional)
+
+Evaluated per argv slot — each leaf answers "may this slot receive promotion?".
+
+| Form                                  | Meaning |
+|---------------------------------------|---------|
+| `{ "self_matches": "<re>" }`           | argv[i] matches. Use for attached forms like `-Hnono_<hex>` or `--header=...`. |
+| `{ "preceded_by_arg": "<re>" }`        | argv[i-1] matches. Use for separate-arg forms like `["-H", "Authorization: ..."]`. argv[0] always misses (no left neighbour). |
+| `{ "at_index": <n> }`                  | Exact 0-based positional pin. |
+| `{ "all_of": [ ... ] }`                | Conjunction. Empty list = always promote (vacuous). |
+| `{ "any_of": [ ... ] }`                | Disjunction. Empty list = never promote (defensive lock). |
+| `{ "not": <predicate> }`               | Logical NOT. |
+
+##### EnvPredicate (name + value)
+
+Env vars are stored as a name→value map; predicates key off var name and (rarely) value.
+
+| Form                                  | Meaning |
+|---------------------------------------|---------|
+| `{ "name_matches": "<re>" }`           | The env var's name matches. |
+| `{ "value_matches": "<re>" }`          | The env var's value matches. |
+| `{ "all_of": [ ... ] }` / `{ "any_of": [ ... ] }` / `{ "not": <predicate> }` | Combinators with the same semantics as `ArgPredicate`. |
+
+When an explicit `env` predicate is set, it **replaces** the built-in default. To keep the safe-shape allowlist and admit one extra name, union the default regex into a custom `any_of`:
+
+```jsonc
+"promote_in": {
+  "env": {
+    "any_of": [
+      { "name_matches": "(?i-u)^(authorization|[A-Za-z0-9_]+_(token|header|key|secret|password|credentials|auth))$" },
+      { "name_matches": "^MY_CUSTOM_NONCE_VAR$" }
+    ]
+  }
+}
+```
+
+##### Worked example — `curl.gitlab`
+
+A redemption-site intercept that handles `curl` to `gitlab.ddbuild.io`. Captured GitLab nonces are carried only in `-H "PRIVATE-TOKEN: nono_<hex>"` headers, so the filter admits exactly those slots:
+
+```jsonc
+{
+  "id": "gitlab",
+  "match": { "all": [
+    { "any_arg_matches": "^https?://(gitlab\\.ddbuild\\.io)(:[0-9]+)?(/|$)" }
+    /* plus any file-shape `not`-clauses */
+  ]},
+  "action": { "type": "allow" },
+  "sandbox": { "network": { "allowed_hosts": ["gitlab.ddbuild.io"] } },
+  "promote_in": {
+    "args": {
+      "any_of": [
+        { "preceded_by_arg": "^(-H|--header)$" },
+        { "self_matches":    "^(-H|--header=)" }
+      ]
+    }
+  }
+}
+```
+
+Effect: a `nono_<hex>` substring anywhere outside the header slots — body (`--data*`/`-d`), upload-file target (`-T`), multipart (`-F`, `=@`), config file (`-K`), cookie (`-b`) — stays literal even if the matcher's `not`-clauses ever miss a new variant. The upstream sees an unauthenticated request rather than a leaked credential.
+
+##### Inheritance
+
+Intercepts do **not** inherit `promote_in` from the command's `default`. Each rule's filter is independent, matching the per-rule scoping of `grant_to` and avoiding action-at-a-distance.
+
+#### env
+
+| Field   | Type            | Description |
+|---------|-----------------|-------------|
+| `block` | array of string | Environment variable names stripped from the sandboxed child. Use for raw credentials (e.g. `GH_TOKEN`, `GITLAB_TOKEN`) so they cannot bypass mediation. |
+
 ### rollback (alias: undo)
 
 | Field              | Type            | Description |

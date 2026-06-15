@@ -266,11 +266,30 @@ where
     fs.write_file = expand_path_list_with(&fs.write_file, &mut resolver)?;
 
     for cmd in &mut profile.mediation.commands {
+        // Expand tokens in the top-level command sandbox (legacy field).
         if let Some(sandbox) = cmd.sandbox.as_mut() {
             sandbox.fs_read = expand_path_list_with(&sandbox.fs_read, &mut resolver)?;
             sandbox.fs_read_file = expand_path_list_with(&sandbox.fs_read_file, &mut resolver)?;
             sandbox.fs_write = expand_path_list_with(&sandbox.fs_write, &mut resolver)?;
             sandbox.fs_write_file = expand_path_list_with(&sandbox.fs_write_file, &mut resolver)?;
+        }
+        // Expand tokens in the default entry sandbox (new DSL path).
+        if let Some(sandbox) = cmd.default.sandbox.as_mut() {
+            sandbox.fs_read = expand_path_list_with(&sandbox.fs_read, &mut resolver)?;
+            sandbox.fs_read_file = expand_path_list_with(&sandbox.fs_read_file, &mut resolver)?;
+            sandbox.fs_write = expand_path_list_with(&sandbox.fs_write, &mut resolver)?;
+            sandbox.fs_write_file = expand_path_list_with(&sandbox.fs_write_file, &mut resolver)?;
+        }
+        // Expand tokens in per-intercept sandboxes.
+        for rule in &mut cmd.intercept {
+            if let crate::mediation::SandboxBinding::Explicit(sandbox) = &mut rule.sandbox {
+                sandbox.fs_read = expand_path_list_with(&sandbox.fs_read, &mut resolver)?;
+                sandbox.fs_read_file =
+                    expand_path_list_with(&sandbox.fs_read_file, &mut resolver)?;
+                sandbox.fs_write = expand_path_list_with(&sandbox.fs_write, &mut resolver)?;
+                sandbox.fs_write_file =
+                    expand_path_list_with(&sandbox.fs_write_file, &mut resolver)?;
+            }
         }
     }
     Ok(())
@@ -630,12 +649,19 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .push(crate::mediation::CommandEntry {
                 name: "git".to_string(),
                 binary_path: None,
+                default: crate::mediation::DefaultEntry {
+                    id: "default".to_string(),
+                    action: crate::mediation::InterceptAction::Allow { script: None },
+                    sandbox: None,
+                    promote_in: None,
+                },
                 intercept: vec![],
                 sandbox: Some(crate::mediation::CommandSandbox {
                     fs_read_file: vec!["@git:config-paths".to_string()],
                     ..Default::default()
                 }),
-                caller_policy: Default::default(),
+                can_use: Vec::new(),
+                from: Default::default(),
             });
         expand_profile_tokens_with(&mut profile, |_, _| Ok(vec!["/x".to_string()]))
             .expect("per-command expansion");
@@ -644,6 +670,40 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .as_ref()
             .expect("sandbox preserved after expansion");
         assert_eq!(sandbox.fs_read_file, vec!["/x"]);
+    }
+
+    #[test]
+    fn expand_profile_tokens_walks_default_sandbox_fs_read_file() {
+        // Tokens in cmd.default.sandbox (new DSL path) must be expanded.
+        let mut profile = Profile::default();
+        profile
+            .mediation
+            .commands
+            .push(crate::mediation::CommandEntry {
+                name: "git".to_string(),
+                binary_path: None,
+                default: crate::mediation::DefaultEntry {
+                    id: "default".to_string(),
+                    action: crate::mediation::InterceptAction::Allow { script: None },
+                    sandbox: Some(crate::mediation::CommandSandbox {
+                        fs_read_file: vec!["@git:config-files".to_string()],
+                        ..Default::default()
+                    }),
+                    promote_in: None,
+                },
+                intercept: vec![],
+                sandbox: None,
+                can_use: Vec::new(),
+                from: Default::default(),
+            });
+        expand_profile_tokens_with(&mut profile, |_, _| Ok(vec!["/expanded".to_string()]))
+            .expect("default.sandbox expansion");
+        let sandbox = profile.mediation.commands[0]
+            .default
+            .sandbox
+            .as_ref()
+            .expect("default sandbox preserved");
+        assert_eq!(sandbox.fs_read_file, vec!["/expanded"]);
     }
 
     #[test]

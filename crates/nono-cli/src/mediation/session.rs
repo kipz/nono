@@ -9,34 +9,199 @@
 
 use super::admin::AdminState;
 use super::approval::NativeApprovalGate;
-use super::broker::TokenBroker;
-use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo,
-};
+use super::broker::{GrantDescriptor, GrantSet, TokenBroker};
+use super::{CommandEntry, CommandSandbox, InterceptAction, MediationConfig, SessionAuditInfo};
 use nix::libc;
 use nono::{NonoError, Result};
+use sha2::Digest;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
+/// Identity snapshot of a resolved binary, captured at session start.
+#[derive(Clone, Debug)]
+pub struct PinnedBinary {
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_nanos: i128,
+    pub sha256: String,
+}
+
+#[cfg(test)]
+impl PinnedBinary {
+    pub fn dummy() -> Self {
+        PinnedBinary {
+            dev: 0,
+            ino: 0,
+            size: 0,
+            mtime_nanos: 0,
+            sha256: String::new(),
+        }
+    }
+}
+
+/// Open `path` with O_NOFOLLOW|O_RDONLY, fstat it, and hash its contents.
+pub(super) fn pin_binary(path: &std::path::Path) -> Result<PinnedBinary> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| NonoError::SandboxInit("mediation: binary path contains NUL".into()))?;
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "mediation: cannot open binary for pinning {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(AsRawFd::as_raw_fd(&fd), &mut st) } != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "mediation: fstat failed pinning {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mtime_nanos = (st.st_mtime as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(st.st_mtime_nsec as i128);
+    let mut file = std::fs::File::from(fd);
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| NonoError::SandboxInit(format!("mediation: binary read for hash: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let sha256 = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok(PinnedBinary {
+        dev: st.st_dev as u64,
+        ino: st.st_ino as u64,
+        size: st.st_size as u64,
+        mtime_nanos,
+        sha256,
+    })
+}
+
+/// Re-open the binary O_NOFOLLOW and confirm its stat tuple matches the pin.
+/// Cheap (no hashing) per the caching decision; a mismatch fails closed.
+pub(super) fn verify_pin(path: &std::path::Path, pin: &PinnedBinary) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| NonoError::SandboxInit("mediation: binary path contains NUL".into()))?;
+    let raw = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "mediation: binary vanished or is a symlink at exec: {}",
+            path.display()
+        )));
+    }
+    let fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(NonoError::SandboxInit(format!(
+            "mediation: fstat failed at exec: {}",
+            path.display()
+        )));
+    }
+    let mtime_nanos = (st.st_mtime as i128)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(st.st_mtime_nsec as i128);
+    if st.st_dev as u64 != pin.dev
+        || st.st_ino as u64 != pin.ino
+        || st.st_size as u64 != pin.size
+        || mtime_nanos != pin.mtime_nanos
+    {
+        return Err(NonoError::SandboxInit(format!(
+            "mediation: binary identity changed since session start: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// The action stored in a resolved intercept rule.
 #[derive(Clone, Debug)]
 pub enum ResolvedAction {
-    Respond { stdout: String },
-    Capture { script: Option<String> },
-    Approve { script: Option<String> },
+    Deny {
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
+    Capture {
+        script: Option<String>,
+        grants: GrantSet,
+    },
+    Allow {
+        script: Option<String>,
+    },
 }
 
 /// A resolved intercept rule ready for the mediation server.
 #[derive(Clone, Debug)]
 pub struct ResolvedIntercept {
-    pub args_prefix: Vec<String>,
+    /// Optional identifier carried over from the profile rule. When set,
+    /// this is the redemption-site identifier other rules can reference
+    /// via `Capture.grant_to = ["<command>.<id>"]`.
+    pub id: Option<String>,
+    /// Compiled predicate against the invocation's argv.
+    pub matcher: crate::mediation::matcher::ResolvedArgsMatcher,
     pub action: ResolvedAction,
-    pub exit_code: i32,
     /// If true, requires user authentication before the action executes.
     pub admin: bool,
+    /// Tri-state binding resolved from the profile's `SandboxBinding`. At
+    /// exec time, `policy::apply` collapses this to `Option<CommandSandbox>`:
+    /// `Explicit` → use the rule's sandbox; `ExplicitlyUnsandboxed` → None;
+    /// `InheritFromDefault` → `cmd.default.sandbox` if set, else legacy
+    /// `cmd.sandbox`.
+    pub sandbox: ResolvedSandboxBinding,
+    /// Compiled per-rule nonce-promotion filter. `None` means the profile
+    /// did not declare `promote_in` for this rule — argv promotion is
+    /// suppressed and env promotion falls back to the built-in safe-shape
+    /// allowlist.
+    pub promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
+}
+
+/// Resolved counterpart of `mediation::SandboxBinding`. The tri-state is
+/// preserved through profile load so `policy::apply` can decide what to
+/// inherit from at exec time.
+#[derive(Clone, Debug)]
+pub enum ResolvedSandboxBinding {
+    InheritFromDefault,
+    ExplicitlyUnsandboxed,
+    Explicit(crate::mediation::CommandSandbox),
+}
+
+/// Resolved counterpart of `mediation::CallerBinding`.
+#[derive(Clone, Debug)]
+pub enum ResolvedCallerBinding {
+    Deny,
+    Bound {
+        action: crate::mediation::CallerAction,
+        sandbox: Option<crate::mediation::CommandSandbox>,
+    },
 }
 
 /// A fully resolved command entry ready for the mediation server.
@@ -45,11 +210,32 @@ pub struct ResolvedCommand {
     pub name: String,
     /// Absolute path to the real binary (to exec on passthrough).
     pub real_path: PathBuf,
+    /// Identity snapshot of the binary at session start. Verified before each
+    /// spawn to detect binary swaps (TOCTOU mitigation).
+    pub pin: PinnedBinary,
     pub intercepts: Vec<ResolvedIntercept>,
     /// Optional sandbox profile to apply when exec-ing the real binary.
     pub sandbox: Option<CommandSandbox>,
-    /// Gate that decides whether a given caller may invoke this command.
-    pub caller_policy: CallerPolicy,
+    /// Default entry dispatched when no intercept matches.
+    pub default: ResolvedDefault,
+    /// Commands this command may invoke (authorization graph). Carried from
+    /// `CommandEntry::can_use`.
+    pub can_use: Vec<String>,
+    /// Per-caller behaviour map, resolved from `CommandEntry::from`.
+    pub from: std::collections::BTreeMap<String, ResolvedCallerBinding>,
+}
+
+/// A resolved default entry. When present on `ResolvedCommand`, dispatched
+/// after the intercept loop completes without a match — replaces the legacy
+/// implicit fall-through.
+#[derive(Clone, Debug)]
+pub struct ResolvedDefault {
+    pub action: ResolvedAction,
+    pub sandbox: Option<crate::mediation::CommandSandbox>,
+    /// Compiled per-default nonce-promotion filter. Same secure defaults
+    /// as `ResolvedIntercept::promote_filter`. Intercepts do NOT inherit
+    /// this — each rule's filter is independent.
+    pub promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
 }
 
 /// Handle returned by `setup()`. Dropping this shuts down the runtime.
@@ -153,29 +339,7 @@ pub fn setup(
     let mut resolved_commands: Vec<ResolvedCommand> = Vec::new();
     let mut blocked_binaries: Vec<PathBuf> = Vec::new();
 
-    let command_names: Vec<&str> = config.commands.iter().map(|c| c.name.as_str()).collect();
-
     for entry in &config.commands {
-        // Validate allow_commands references
-        if let Some(ref sb) = entry.sandbox {
-            for allowed in &sb.allow_commands {
-                if allowed == &entry.name {
-                    return Err(NonoError::SandboxInit(format!(
-                        "mediation: command '{}' lists itself in allow_commands",
-                        entry.name
-                    )));
-                }
-                if !command_names.contains(&allowed.as_str()) {
-                    tracing::warn!(
-                        "mediation: command '{}' lists '{}' in allow_commands but '{}' is not a mediated command",
-                        entry.name,
-                        allowed,
-                        allowed
-                    );
-                }
-            }
-        }
-
         let Some(resolved) = resolve_command(entry, &shim_dir, &shim_binary, &workdir)? else {
             continue;
         };
@@ -190,6 +354,19 @@ pub fn setup(
         }
         resolved_commands.push(resolved);
     }
+
+    // -------------------------------------------------------------------------
+    // Profile-load validation of can_use graph.
+    // -------------------------------------------------------------------------
+    validate_can_use_graph(config)?;
+
+    // -------------------------------------------------------------------------
+    // Profile-load validation of Capture grant_to references and default
+    // actions. Every grant_to entry must resolve to a known
+    // `<command>.default` or `<command>.<intercept-id>`. A command's default
+    // action cannot be `capture` (no intercept id to anchor grants at).
+    // -------------------------------------------------------------------------
+    validate_grant_to_references(&resolved_commands)?;
 
     // -------------------------------------------------------------------------
     // Generate session authentication token and control token
@@ -287,6 +464,7 @@ pub fn setup(
     let gate_clone = Arc::clone(&approval_gate);
     let audit_log_dir = crate::session::ensure_sessions_dir()?;
     let audit_info_for_server = Arc::clone(&audit_info_arc);
+    let session_can_use = config.session_can_use.clone();
     runtime.spawn(async move {
         if let Err(e) = super::server::run(
             sock,
@@ -299,6 +477,7 @@ pub fn setup(
             audit_log_dir,
             workdir,
             audit_info_for_server,
+            session_can_use,
         )
         .await
         {
@@ -383,6 +562,11 @@ fn resolve_command(
         real_path.display()
     );
 
+    // Canonicalize so O_NOFOLLOW in pin_binary succeeds even when which/binary_path
+    // returns a symlink (e.g. Homebrew shims under /opt/homebrew/bin).
+    let pin_path = real_path.canonicalize().unwrap_or_else(|_| real_path.clone());
+    let pin = pin_binary(&pin_path)?;
+
     // Create shim symlink (remove stale link if present)
     let shim_path = shim_dir.join(&entry.name);
     if shim_path.exists() || shim_path.symlink_metadata().is_ok() {
@@ -402,56 +586,252 @@ fn resolve_command(
         ))
     })?;
 
-    // Convert intercept rules, expanding env-var tokens in `args_prefix`
-    // entries at profile-load time so matchers like
-    // `["find-generic-password", "$USER", "Claude Code-credentials"]`
-    // resolve to the current console user instead of requiring profile
-    // authors to pre-substitute placeholders at install time.
+    // Convert intercept rules. Every rule carries a required `match` field
+    // (a predicate tree). Profile load fails if the field is missing.
     let intercepts: Vec<ResolvedIntercept> = entry
         .intercept
         .iter()
-        .map(|rule| {
-            let args_prefix = rule
-                .args_prefix
-                .iter()
-                .map(|arg| crate::profile::expand_str(arg, workdir))
-                .collect::<Result<Vec<String>>>()?;
-            let (action, exit_code) = match &rule.action {
-                InterceptAction::Respond { stdout, exit_code } => (
-                    ResolvedAction::Respond {
-                        stdout: stdout.clone(),
-                    },
-                    *exit_code,
-                ),
-                InterceptAction::Capture { script } => (
-                    ResolvedAction::Capture {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
-                InterceptAction::Approve { script } => (
-                    ResolvedAction::Approve {
-                        script: script.clone(),
-                    },
-                    0,
-                ),
+        .map(|rule| -> Result<ResolvedIntercept> {
+            if matches!(rule.id.as_deref(), Some("default")) {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: command '{}': intercept id 'default' is reserved (it refers to the command's default entry)",
+                    entry.name
+                )));
+            }
+            let matcher =
+                crate::mediation::matcher::compile_args_matcher(&rule.matcher, &entry.name)?;
+            let action = resolve_intercept_action(&rule.action)?;
+            let sandbox = match &rule.sandbox {
+                crate::mediation::SandboxBinding::InheritFromDefault => {
+                    ResolvedSandboxBinding::InheritFromDefault
+                }
+                crate::mediation::SandboxBinding::ExplicitlyUnsandboxed => {
+                    ResolvedSandboxBinding::ExplicitlyUnsandboxed
+                }
+                crate::mediation::SandboxBinding::Explicit(sb) => {
+                    ResolvedSandboxBinding::Explicit(sb.clone())
+                }
+            };
+            let promote_filter = match &rule.promote_in {
+                Some(p) => Some(crate::mediation::promote::compile_promote_filter(
+                    p,
+                    &entry.name,
+                )?),
+                None => None,
             };
             Ok(ResolvedIntercept {
-                args_prefix,
+                id: rule.id.clone(),
+                matcher,
                 action,
-                exit_code,
                 admin: rule.admin,
+                sandbox,
+                promote_filter,
             })
         })
         .collect::<Result<Vec<_>>>()?;
 
+    let default_action = resolve_intercept_action(&entry.default.action)?;
+    let default_promote_filter = match &entry.default.promote_in {
+        Some(p) => Some(crate::mediation::promote::compile_promote_filter(
+            p,
+            &entry.name,
+        )?),
+        None => None,
+    };
+    let default = ResolvedDefault {
+        action: default_action,
+        sandbox: entry.default.sandbox.clone(),
+        promote_filter: default_promote_filter,
+    };
+
+    let from = entry
+        .from
+        .iter()
+        .map(|(k, v)| {
+            let resolved = match v {
+                crate::mediation::CallerBinding::Deny(_) => ResolvedCallerBinding::Deny,
+                crate::mediation::CallerBinding::Bound(b) => ResolvedCallerBinding::Bound {
+                    action: b.action,
+                    sandbox: b.sandbox.clone(),
+                },
+            };
+            (k.clone(), resolved)
+        })
+        .collect();
+
     Ok(Some(ResolvedCommand {
         name: entry.name.clone(),
         real_path,
+        pin,
         intercepts,
         sandbox: entry.sandbox.clone(),
-        caller_policy: entry.caller_policy.clone(),
+        default,
+        can_use: entry.can_use.clone(),
+        from,
     }))
+}
+
+/// Validate every `Capture` rule's `grant_to` references and the default
+/// action of every command. Called once after all commands are resolved.
+///
+/// Rejects:
+/// - a `grant_to` entry that does not resolve to a known
+///   `<command>.default` or `<command>.<intercept-id>` in the profile;
+/// - a command whose `default.action` is `Capture` (there is no intercept
+///   id to anchor grants at).
+pub(super) fn validate_grant_to_references(commands: &[ResolvedCommand]) -> Result<()> {
+    use std::collections::HashSet;
+
+    let valid_descriptors: HashSet<GrantDescriptor> = commands
+        .iter()
+        .flat_map(|c| {
+            let mut entries = vec![GrantDescriptor {
+                command: c.name.clone(),
+                intercept_id: "default".to_string(),
+            }];
+            for i in &c.intercepts {
+                if let Some(id) = &i.id {
+                    entries.push(GrantDescriptor {
+                        command: c.name.clone(),
+                        intercept_id: id.clone(),
+                    });
+                }
+            }
+            entries
+        })
+        .collect();
+
+    for cmd in commands {
+        for rule in &cmd.intercepts {
+            if let ResolvedAction::Capture {
+                grants: GrantSet::Allow(list),
+                ..
+            } = &rule.action
+            {
+                for d in list {
+                    if !valid_descriptors.contains(d) {
+                        return Err(NonoError::SandboxInit(format!(
+                            "mediation: command '{}' capture rule: grant_to entry '{}.{}' does not resolve to any known intercept or default",
+                            cmd.name, d.command, d.intercept_id
+                        )));
+                    }
+                }
+            }
+        }
+        if matches!(cmd.default.action, ResolvedAction::Capture { .. }) {
+            return Err(NonoError::SandboxInit(format!(
+                "mediation: command '{}': default.action cannot be 'capture'",
+                cmd.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `can_use` graph at profile load.
+///
+/// Checks:
+/// - Every entry in `session_can_use` names a command that exists in `commands`.
+/// - For every command, every entry in `can_use` names a command that exists in `commands`.
+/// - For every command `C` and every `(caller_name, binding)` in `C.from`:
+///   - `caller_name` must be a defined command (dangling caller).
+///   - If `binding != Deny`: `caller_name.can_use` must contain `C.name` (mutual consent).
+///   - If `binding == Deny`: `caller_name.can_use` must NOT contain `C.name` (contradiction).
+pub(super) fn validate_can_use_graph(config: &MediationConfig) -> Result<()> {
+    use std::collections::HashSet;
+    let defined: HashSet<&str> = config.commands.iter().map(|c| c.name.as_str()).collect();
+
+    for c in &config.session_can_use {
+        if !defined.contains(c.as_str()) {
+            return Err(NonoError::SandboxInit(format!(
+                "mediation: session_can_use references unknown command '{c}'"
+            )));
+        }
+    }
+    for cmd in &config.commands {
+        for child in &cmd.can_use {
+            if !defined.contains(child.as_str()) {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: command '{}' can_use references unknown command '{}'",
+                    cmd.name, child
+                )));
+            }
+        }
+        for (caller, binding) in &cmd.from {
+            if !defined.contains(caller.as_str()) {
+                return Err(NonoError::SandboxInit(format!(
+                    "mediation: '{}'.from references unknown caller '{caller}'",
+                    cmd.name
+                )));
+            }
+            let parent_authorizes = config
+                .commands
+                .iter()
+                .find(|c| c.name == *caller)
+                .is_some_and(|p| p.can_use.iter().any(|x| x == &cmd.name));
+            match binding {
+                crate::mediation::CallerBinding::Deny(_) if parent_authorizes => {
+                    return Err(NonoError::SandboxInit(format!(
+                        "mediation: '{caller}'.can_use lists '{}' but '{}'.from['{caller}'] = deny (contradiction)",
+                        cmd.name, cmd.name
+                    )));
+                }
+                crate::mediation::CallerBinding::Bound(_) if !parent_authorizes => {
+                    return Err(NonoError::SandboxInit(format!(
+                        "mediation: '{}'.from['{caller}'] set but '{caller}'.can_use does not list '{}' (mutual consent required)",
+                        cmd.name, cmd.name
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a profile `InterceptAction` to a `ResolvedAction`. The `Deny`
+/// variant carries its own `exit_code`, so resolution preserves it directly
+/// on the variant rather than threading a separate rule-level field through
+/// the policy dispatcher. Shared between intercept-rule resolution and
+/// default-entry resolution.
+fn resolve_intercept_action(action: &InterceptAction) -> Result<ResolvedAction> {
+    match action {
+        InterceptAction::Deny {
+            stdout,
+            stderr,
+            exit_code,
+        } => Ok(ResolvedAction::Deny {
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            exit_code: *exit_code,
+        }),
+        InterceptAction::Capture { script, grant_to } => {
+            let grants = if grant_to.is_empty() {
+                GrantSet::None
+            } else {
+                let mut descriptors = Vec::with_capacity(grant_to.len());
+                for s in grant_to {
+                    match GrantDescriptor::parse(s) {
+                        Some(d) => descriptors.push(d),
+                        None => {
+                            return Err(NonoError::SandboxInit(format!(
+                                "mediation: capture rule's grant_to entry '{}' is not in '<command>.<intercept-id>' form",
+                                s
+                            )));
+                        }
+                    }
+                }
+                GrantSet::Allow(descriptors)
+            };
+            Ok(ResolvedAction::Capture {
+                script: script.clone(),
+                grants,
+            })
+        }
+        InterceptAction::Allow { script } => Ok(ResolvedAction::Allow {
+            script: script.clone(),
+        }),
+    }
 }
 
 /// Find the nono-shim binary.
@@ -640,67 +1020,334 @@ mod tests {
         assert!(matches!(*rx.borrow(), AdminModeStatus::Disabled));
     }
 
+    /// A.5: the intercept `id` field cannot be `"default"` — that name is
+    /// reserved for the command's default entry. `resolve_command` returns
+    /// `SandboxInit` for any rule that claims it.
     #[test]
-    fn test_resolve_command_expands_env_vars_in_args_prefix_and_binary_path() {
-        use crate::mediation::{CommandEntry, InterceptAction, InterceptRule};
+    fn intercept_id_default_is_rejected_at_profile_load() {
+        use crate::mediation::{
+            ArgsMatcher, CommandEntry, DefaultEntry, InterceptAction, InterceptRule,
+        };
 
         let tmp = tempfile::tempdir().expect("tmpdir");
-
-        // Create a real binary file so `is_file()` succeeds after expansion.
         let fake_binary = tmp.path().join("fake-cmd");
         std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
-        let binary_env_var = "NONO_TEST_RESOLVE_CMD_BINARY";
-
-        // Create shim dir and a fake shim target next to it so symlink creation
-        // succeeds without needing to spin up the real nono-shim binary.
         let shim_dir = tmp.path().join("shims");
         std::fs::create_dir_all(&shim_dir).expect("shim dir");
         let fake_shim_binary = tmp.path().join("fake-shim");
         std::fs::write(&fake_shim_binary, b"").expect("write shim");
 
-        let _guard = match crate::test_env::ENV_LOCK.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Allow { script: None },
+                sandbox: None,
+                promote_in: None,
+            },
+            intercept: vec![InterceptRule {
+                id: Some("default".to_string()),
+                matcher: ArgsMatcher::All { all: vec![] },
+                admin: false,
+                action: InterceptAction::Deny {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+                sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+                promote_in: None,
+            }],
+            sandbox: None,
+            can_use: Vec::new(),
+            from: Default::default(),
         };
-        let _env = crate::test_env::EnvVarGuard::set_all(&[
-            (binary_env_var, fake_binary.to_str().expect("utf8")),
-            ("NONO_TEST_RESOLVE_CMD_USER", "test-user"),
-        ]);
+
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("id='default' must be rejected at profile load"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("intercept id 'default' is reserved"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// A bad `promote_in` regex on an intercept rule surfaces at profile
+    /// load with a `SandboxInit` error keyed by command name. Validates the
+    /// resolve-time compile path.
+    #[test]
+    fn intercept_promote_in_regex_error_surfaces_at_profile_load() {
+        use crate::mediation::{
+            ArgPredicate, ArgsMatcher, CommandEntry, DefaultEntry, InterceptAction, InterceptRule,
+            PromoteFilter,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
 
         let entry = CommandEntry {
             name: "fake-cmd".to_string(),
-            binary_path: Some(format!("${}", binary_env_var)),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Allow { script: None },
+                sandbox: None,
+                promote_in: None,
+            },
             intercept: vec![InterceptRule {
-                args_prefix: vec![
-                    "find-generic-password".to_string(),
-                    "$NONO_TEST_RESOLVE_CMD_USER".to_string(),
-                    "Claude Code-credentials".to_string(),
-                ],
+                id: Some("bad-rule".to_string()),
+                matcher: ArgsMatcher::All { all: vec![] },
                 admin: false,
-                action: InterceptAction::Respond {
-                    stdout: String::new(),
-                    exit_code: 0,
-                },
+                action: InterceptAction::Allow { script: None },
+                sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+                promote_in: Some(PromoteFilter {
+                    args: Some(ArgPredicate::SelfMatches {
+                        self_matches: "(unclosed".to_string(),
+                    }),
+                    env: None,
+                }),
             }],
             sandbox: None,
-            caller_policy: CallerPolicy::default(),
+            can_use: Vec::new(),
+            from: Default::default(),
         };
 
-        let workdir = tmp.path();
-        let resolved = resolve_command(&entry, &shim_dir, &fake_shim_binary, workdir)
-            .expect("resolve")
-            .expect("command resolved");
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("bad regex must fail profile load"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("fake-cmd"), "msg should name command: {msg}");
+        assert!(
+            msg.contains("promote_in"),
+            "msg should mention promote_in: {msg}"
+        );
+        assert!(
+            msg.contains("(unclosed"),
+            "msg should include the bad pattern: {msg}"
+        );
+    }
 
-        assert_eq!(resolved.real_path, fake_binary);
-        let args = &resolved.intercepts[0].args_prefix;
-        assert_eq!(
-            args,
-            &vec![
-                "find-generic-password".to_string(),
-                "test-user".to_string(),
-                "Claude Code-credentials".to_string(),
-            ],
-            "env-var tokens in args_prefix must be expanded at profile-load time"
+    /// Same regex-error surfacing applies to the default entry's
+    /// `promote_in` field.
+    #[test]
+    fn default_promote_in_regex_error_surfaces_at_profile_load() {
+        use crate::mediation::{
+            CommandEntry, DefaultEntry, EnvPredicate, InterceptAction, PromoteFilter,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let fake_binary = tmp.path().join("fake-cmd");
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write binary");
+        let shim_dir = tmp.path().join("shims");
+        std::fs::create_dir_all(&shim_dir).expect("shim dir");
+        let fake_shim_binary = tmp.path().join("fake-shim");
+        std::fs::write(&fake_shim_binary, b"").expect("write shim");
+
+        let entry = CommandEntry {
+            name: "fake-cmd".to_string(),
+            binary_path: Some(fake_binary.to_string_lossy().into_owned()),
+            default: DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Allow { script: None },
+                sandbox: None,
+                promote_in: Some(PromoteFilter {
+                    args: None,
+                    env: Some(EnvPredicate::NameMatches {
+                        name_matches: "(*)".to_string(),
+                    }),
+                }),
+            },
+            intercept: vec![],
+            sandbox: None,
+            can_use: Vec::new(),
+            from: Default::default(),
+        };
+
+        let err = match resolve_command(&entry, &shim_dir, &fake_shim_binary, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("bad regex on default must fail profile load"),
+        };
+        assert!(err.to_string().contains("fake-cmd"));
+    }
+
+    /// Build a minimal `ResolvedCommand` for the validation unit tests.
+    /// `validate_grant_to_references` only inspects names, intercept ids,
+    /// and actions — it does not touch the filesystem or sandbox fields.
+    fn validation_command(
+        name: &str,
+        intercept_ids: &[&str],
+        capture_rules: Vec<(Option<&str>, GrantSet)>,
+        default_action: ResolvedAction,
+    ) -> ResolvedCommand {
+        use crate::mediation::matcher::ResolvedArgsMatcher;
+        let mut intercepts: Vec<ResolvedIntercept> = intercept_ids
+            .iter()
+            .map(|id| ResolvedIntercept {
+                id: Some((*id).to_string()),
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
+            })
+            .collect();
+        for (id, grants) in capture_rules {
+            intercepts.push(ResolvedIntercept {
+                id: id.map(str::to_string),
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Capture {
+                    script: None,
+                    grants,
+                },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
+            });
+        }
+        ResolvedCommand {
+            name: name.to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+            pin: PinnedBinary::dummy(),
+            intercepts,
+            sandbox: None,
+            default: ResolvedDefault {
+                action: default_action,
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        }
+    }
+
+    /// A capture rule's `grant_to` may reference a known intercept's id.
+    #[test]
+    fn validate_grant_to_accepts_known_intercept_id() {
+        let curl = validation_command(
+            "curl",
+            &["gitlab"],
+            vec![],
+            ResolvedAction::Allow { script: None },
+        );
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("gitlab-token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "gitlab".to_string(),
+                }]),
+            )],
+            ResolvedAction::Allow { script: None },
+        );
+        validate_grant_to_references(&[curl, ddtool]).expect("known intercept must validate");
+    }
+
+    /// A capture rule's `grant_to` may reference `<command>.default`.
+    #[test]
+    fn validate_grant_to_accepts_command_default() {
+        let curl = validation_command("curl", &[], vec![], ResolvedAction::Allow { script: None });
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("any-token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "default".to_string(),
+                }]),
+            )],
+            ResolvedAction::Allow { script: None },
+        );
+        validate_grant_to_references(&[curl, ddtool]).expect("<command>.default must validate");
+    }
+
+    /// `grant_to` referring to a non-existent command is rejected with
+    /// a profile-friendly error naming both the capture command and the
+    /// unresolved descriptor.
+    #[test]
+    fn validate_grant_to_rejects_unknown_command() {
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "nosuchcmd".to_string(),
+                    intercept_id: "default".to_string(),
+                }]),
+            )],
+            ResolvedAction::Allow { script: None },
+        );
+        let err =
+            validate_grant_to_references(&[ddtool]).expect_err("unknown command must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ddtool"), "msg: {msg}");
+        assert!(
+            msg.contains("nosuchcmd.default"),
+            "msg should name the unresolved descriptor: {msg}"
+        );
+    }
+
+    /// `grant_to` referring to a known command but unknown intercept id is
+    /// rejected.
+    #[test]
+    fn validate_grant_to_rejects_unknown_intercept_id() {
+        let curl = validation_command(
+            "curl",
+            &["gitlab"],
+            vec![],
+            ResolvedAction::Allow { script: None },
+        );
+        let ddtool = validation_command(
+            "ddtool",
+            &[],
+            vec![(
+                Some("token"),
+                GrantSet::Allow(vec![GrantDescriptor {
+                    command: "curl".to_string(),
+                    intercept_id: "no-such-id".to_string(),
+                }]),
+            )],
+            ResolvedAction::Allow { script: None },
+        );
+        let err = validate_grant_to_references(&[curl, ddtool])
+            .expect_err("unknown intercept id must be rejected");
+        assert!(
+            err.to_string().contains("curl.no-such-id"),
+            "msg should name the unresolved descriptor: {err}"
+        );
+    }
+
+    /// `Capture` is not allowed as a command's default action — there is
+    /// no intercept id to anchor grants at.
+    #[test]
+    fn validate_rejects_capture_as_default_action() {
+        let bad = validation_command(
+            "ddtool",
+            &[],
+            vec![],
+            ResolvedAction::Capture {
+                script: None,
+                grants: GrantSet::None,
+            },
+        );
+        let err =
+            validate_grant_to_references(&[bad]).expect_err("Capture as default must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ddtool"), "msg: {msg}");
+        assert!(
+            msg.contains("default.action cannot be 'capture'"),
+            "msg: {msg}"
         );
     }
 
@@ -712,5 +1359,252 @@ mod tests {
         // Re-derive using the same logic as setup()
         let derived = session_dir_path().join("control.sock");
         assert_eq!(expected, derived);
+    }
+
+    // ---------------------------------------------------------------------------
+    // validate_can_use_graph tests
+    // ---------------------------------------------------------------------------
+
+    fn minimal_command_entry(name: &str) -> CommandEntry {
+        use crate::mediation::InterceptAction;
+        CommandEntry {
+            name: name.to_string(),
+            binary_path: None,
+            default: crate::mediation::DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Allow { script: None },
+                sandbox: None,
+                promote_in: None,
+            },
+            intercept: vec![],
+            sandbox: None,
+            can_use: vec![],
+            from: Default::default(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_dangling_session_can_use() {
+        let cfg = MediationConfig {
+            session_can_use: vec!["nope".into()],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("dangling session_can_use must be rejected");
+        assert!(
+            err.to_string().contains("nope"),
+            "error should name the unknown command: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_dangling_cmd_can_use() {
+        let mut git = minimal_command_entry("git");
+        git.can_use = vec!["nope".into()];
+        let cfg = MediationConfig {
+            commands: vec![git],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("dangling cmd.can_use must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("git"),
+            "error should name the command with dangling can_use: {msg}"
+        );
+        assert!(
+            msg.contains("nope"),
+            "error should name the unknown can_use target: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_consistent_graph() {
+        // git.can_use=["ssh"], "ssh" defined
+        let mut git = minimal_command_entry("git");
+        git.can_use = vec!["ssh".into()];
+        let ssh = minimal_command_entry("ssh");
+        let cfg = MediationConfig {
+            commands: vec![git, ssh],
+            session_can_use: vec!["git".into()],
+            ..Default::default()
+        };
+        validate_can_use_graph(&cfg).expect("consistent graph must validate");
+    }
+
+    // --- Mutual-consent validation tests ---
+
+    #[test]
+    fn validate_rejects_from_without_can_use() {
+        use crate::mediation::{CallerBinding, CallerBindingEntry, CallerAction};
+        // "ddtool" has from["claude"] = passthrough, but "claude".can_use does not list "ddtool"
+        let mut ddtool = minimal_command_entry("ddtool");
+        ddtool.from.insert(
+            "claude".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Passthrough,
+                sandbox: None,
+            }),
+        );
+        let claude = minimal_command_entry("claude");
+        let cfg = MediationConfig {
+            commands: vec![ddtool, claude],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("from without can_use must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("ddtool"), "msg should name the callee: {msg}");
+        assert!(msg.contains("claude"), "msg should name the caller: {msg}");
+        assert!(msg.contains("mutual consent"), "msg should mention mutual consent: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_deny_with_can_use_contradiction() {
+        use crate::mediation::{CallerBinding, DenyKeyword};
+        // "ddtool" has from["claude"] = deny, but "claude".can_use lists "ddtool" — contradiction
+        let mut ddtool = minimal_command_entry("ddtool");
+        ddtool.from.insert(
+            "claude".to_string(),
+            CallerBinding::Deny(DenyKeyword),
+        );
+        let mut claude = minimal_command_entry("claude");
+        claude.can_use = vec!["ddtool".into()];
+        let cfg = MediationConfig {
+            commands: vec![ddtool, claude],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("deny contradicting can_use must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("contradiction"), "msg should mention contradiction: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_from_with_unknown_caller() {
+        use crate::mediation::{CallerBinding, CallerBindingEntry, CallerAction};
+        let mut ddtool = minimal_command_entry("ddtool");
+        ddtool.from.insert(
+            "nobody".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Allow,
+                sandbox: None,
+            }),
+        );
+        let cfg = MediationConfig {
+            commands: vec![ddtool],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("dangling caller must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("nobody"), "msg should name the unknown caller: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_from_with_mutual_can_use() {
+        use crate::mediation::{CallerBinding, CallerBindingEntry, CallerAction};
+        // "ddtool" from["claude"] = passthrough; "claude".can_use = ["ddtool"]
+        let mut ddtool = minimal_command_entry("ddtool");
+        ddtool.from.insert(
+            "claude".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Passthrough,
+                sandbox: None,
+            }),
+        );
+        let mut claude = minimal_command_entry("claude");
+        claude.can_use = vec!["ddtool".into()];
+        let cfg = MediationConfig {
+            commands: vec![ddtool, claude],
+            session_can_use: vec!["claude".into()],
+            ..Default::default()
+        };
+        validate_can_use_graph(&cfg).expect("consistent from+can_use must validate");
+    }
+
+    #[test]
+    fn validate_rejects_passthrough_without_can_use() {
+        use crate::mediation::{CallerBinding, CallerBindingEntry, CallerAction};
+        // security.from["gh"] = passthrough, but gh.can_use does not list "security"
+        // Should fail: mutual consent not satisfied
+        let mut security = minimal_command_entry("security");
+        security.from.insert(
+            "gh".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Passthrough,
+                sandbox: None,
+            }),
+        );
+        let gh = minimal_command_entry("gh"); // can_use is empty — does not list "security"
+        let cfg = MediationConfig {
+            commands: vec![security, gh],
+            ..Default::default()
+        };
+        let err = validate_can_use_graph(&cfg)
+            .expect_err("passthrough from without can_use must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("security"), "msg should name the callee: {msg}");
+        assert!(msg.contains("gh"), "msg should name the caller: {msg}");
+        assert!(msg.contains("mutual consent"), "msg should mention mutual consent: {msg}");
+    }
+
+    #[test]
+    fn validate_accepts_passthrough_with_can_use() {
+        use crate::mediation::{CallerBinding, CallerBindingEntry, CallerAction};
+        // security.from["gh"] = passthrough, AND gh.can_use lists "security"
+        // Should pass: mutual consent satisfied
+        let mut security = minimal_command_entry("security");
+        security.from.insert(
+            "gh".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Passthrough,
+                sandbox: None,
+            }),
+        );
+        let mut gh = minimal_command_entry("gh");
+        gh.can_use = vec!["security".into()];
+        let cfg = MediationConfig {
+            commands: vec![security, gh],
+            session_can_use: vec!["gh".into()],
+            ..Default::default()
+        };
+        validate_can_use_graph(&cfg).expect("passthrough with mutual can_use must validate");
+    }
+
+    // ---------------------------------------------------------------------------
+    // pin_binary / verify_pin tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn pin_binary_captures_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tool");
+        std::fs::write(&p, b"#!/bin/sh\necho hi\n").unwrap();
+        let pin = pin_binary(&p).expect("pins");
+        assert_eq!(pin.size, 18);
+        assert_eq!(pin.sha256.len(), 64);
+    }
+
+    #[test]
+    fn verify_pin_fails_on_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tool");
+        std::fs::write(&p, b"original").unwrap();
+        let pin = pin_binary(&p).unwrap();
+        std::fs::write(&p, b"swapped-larger-content").unwrap();
+        assert!(
+            verify_pin(&p, &pin).is_err(),
+            "swapped binary must fail verification"
+        );
+    }
+
+    #[test]
+    fn verify_pin_passes_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("tool");
+        std::fs::write(&p, b"original").unwrap();
+        let pin = pin_binary(&p).unwrap();
+        verify_pin(&p, &pin).expect("unchanged binary must verify");
     }
 }

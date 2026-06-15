@@ -5,33 +5,25 @@
 //! that meant a child profile that added a single mediated command would
 //! silently drop every command the base profile mediated. The new behaviour
 //! merges per field, with restrictive-wins on security gates so a child
-//! cannot weaken a base's caller policy or per-command sandbox network deny.
+//! cannot weaken a base's per-command sandbox network deny.
 //!
 //! Merge rules:
 //!
 //! - `commands` is keyed by `name`. Same-name collisions get per-field merge
 //!   (child binary_path wins, intercept rules dedup with child first, sandbox
-//!   recursive-merges, caller_policy applies restrictive-wins). Names that
+//!   recursive-merges). Names that
 //!   appear in only one side are appended in order: base first, then any
 //!   names new to the child.
 //! - `env.block` is dedup-appended.
 //!
 //! Within a `CommandSandbox`:
 //! - `network.block` is OR (sticky-restrictive — a base deny stays).
-//! - `network.allowed_hosts` and the `fs_*` / `allow_commands` lists union via
+//! - `network.allowed_hosts` and the `fs_*` lists union via
 //!   `dedup_append` (base first, child appended).
 //! - `keychain_access` is OR.
-//!
-//! Within a `CallerPolicy` (security exceptions):
-//! - `agent_allowed` is AND. Default is `true`; OR would silently re-enable a
-//!   managed `false`. AND preserves managed denies.
-//! - `allowed_parents` follows: `(None, None)→None`, `(Some, None)→Some`,
-//!   `(None, Some)→Some`, `(Some, Some)→intersection`. `None` is "any";
-//!   `Some(...)` is a restriction; intersection preserves the strictest.
 
 use super::{
-    CallerPolicy, CommandEntry, CommandSandbox, EnvPolicy, InterceptRule, MediationConfig,
-    NetworkConfig,
+    CommandEntry, CommandSandbox, EnvPolicy, InterceptRule, MediationConfig, NetworkConfig,
 };
 use crate::profile::dedup_append;
 
@@ -40,6 +32,7 @@ pub fn merge_mediation(base: MediationConfig, child: MediationConfig) -> Mediati
     MediationConfig {
         commands: merge_command_entries(base.commands, child.commands),
         env: merge_env_policy(base.env, child.env),
+        session_can_use: dedup_append(&base.session_can_use, &child.session_can_use),
     }
 }
 
@@ -86,6 +79,11 @@ fn merge_command_entry(base: CommandEntry, child: CommandEntry) -> CommandEntry 
     CommandEntry {
         name: child.name,
         binary_path: child.binary_path.or(base.binary_path),
+        // Child's default wins outright. Default actions are scalar policy
+        // choices (respond/run/capture); a "merge" between two scalars has
+        // no obvious meaning. If child wants the base's default they can
+        // copy it explicitly; otherwise the child override stands.
+        default: child.default,
         intercept: merge_intercept_rules(base.intercept, child.intercept),
         sandbox: match (base.sandbox, child.sandbox) {
             (Some(b), Some(c)) => Some(merge_command_sandbox(b, c)),
@@ -93,36 +91,38 @@ fn merge_command_entry(base: CommandEntry, child: CommandEntry) -> CommandEntry 
             (None, Some(c)) => Some(c),
             (None, None) => None,
         },
-        caller_policy: merge_caller_policy(base.caller_policy, child.caller_policy),
+        can_use: dedup_append(&base.can_use, &child.can_use),
+        from: {
+            let mut m = base.from;
+            for (k, v) in child.from {
+                m.insert(k, v);
+            }
+            m
+        },
     }
 }
 
 /// Merge two intercept lists. Child rules are placed first so they shadow
-/// base rules under nono's first-match-wins matching. Base rules with an
-/// `args_prefix` already covered by a child rule are dropped (a child intercept
-/// for the same args prefix is an explicit override).
+/// base rules under nono's first-match-wins matching. No deduplication is
+/// applied: rules use the predicate-tree `match` form which is too rich for
+/// structural equality to be meaningful — authors needing to override a base
+/// rule should use a child rule whose matcher catches the same calls (child
+/// wins by ordering).
 fn merge_intercept_rules(
     base: Vec<InterceptRule>,
     child: Vec<InterceptRule>,
 ) -> Vec<InterceptRule> {
-    let child_prefixes: std::collections::HashSet<Vec<String>> =
-        child.iter().map(|r| r.args_prefix.clone()).collect();
-
-    let mut merged = Vec::with_capacity(base.len() + child.len());
+    let mut merged: Vec<InterceptRule> = Vec::with_capacity(base.len() + child.len());
     merged.extend(child);
-    for base_rule in base {
-        if !child_prefixes.contains(&base_rule.args_prefix) {
-            merged.push(base_rule);
-        }
-    }
+    merged.extend(base);
     merged
 }
 
 /// Recursive merge of a [`CommandSandbox`]. Restrictive-wins on security gates
 /// (`network.block`, `keychain_access`, `allow_process_exec`); list fields union.
 ///
-/// `allow_process_exec` merges with AND: granting broad spawn is a permission,
-/// so an extending profile that opts in cannot un-deny what the base denies.
+/// `allow_process_exec` merges with AND: granting broad spawn is a permission;
+/// an extending profile cannot un-deny what the base denies.
 /// A base that already grants `allow_process_exec: true` can be tightened by
 /// the extending profile setting it back to `false`.
 fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> CommandSandbox {
@@ -135,32 +135,8 @@ fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> Command
         fs_read_file: dedup_append(&base.fs_read_file, &child.fs_read_file),
         fs_write: dedup_append(&base.fs_write, &child.fs_write),
         fs_write_file: dedup_append(&base.fs_write_file, &child.fs_write_file),
-        allow_commands: dedup_append(&base.allow_commands, &child.allow_commands),
         keychain_access: base.keychain_access || child.keychain_access,
         allow_process_exec: base.allow_process_exec && child.allow_process_exec,
-    }
-}
-
-/// Merge two [`CallerPolicy`]s with restrictive-wins.
-///
-/// `agent_allowed` is AND so a managed `false` cannot be silently re-enabled.
-/// `allowed_parents` follows the truth table in the module docs: `None` is
-/// "any allowed", `Some` is a restriction, intersection preserves the
-/// strictest restriction when both sides are `Some`.
-fn merge_caller_policy(base: CallerPolicy, child: CallerPolicy) -> CallerPolicy {
-    let allowed_parents = match (base.allowed_parents, child.allowed_parents) {
-        (None, None) => None,
-        (Some(b), None) => Some(b),
-        (None, Some(c)) => Some(c),
-        (Some(b), Some(c)) => {
-            // Intersection, preserving base order so output is deterministic.
-            let child_set: std::collections::HashSet<&String> = c.iter().collect();
-            Some(b.into_iter().filter(|p| child_set.contains(p)).collect())
-        }
-    };
-    CallerPolicy {
-        agent_allowed: base.agent_allowed && child.agent_allowed,
-        allowed_parents,
     }
 }
 
@@ -181,20 +157,47 @@ mod tests {
         CommandEntry {
             name: name.to_string(),
             binary_path: None,
+            default: crate::mediation::DefaultEntry {
+                id: "default".to_string(),
+                action: InterceptAction::Allow { script: None },
+                sandbox: None,
+                promote_in: None,
+            },
             intercept: Vec::new(),
             sandbox: None,
-            caller_policy: CallerPolicy::default(),
+            can_use: Vec::new(),
+            from: Default::default(),
         }
     }
 
+    /// Build a rule whose matcher is an `All([AnyArgMatches("^p$")])` for each
+    /// entry in `prefix`. Equivalent to the legacy positional-prefix matcher
+    /// for the simple cases the merge tests exercise.
     fn rule(prefix: &[&str], stdout: &str) -> InterceptRule {
+        use crate::mediation::ArgsMatcher;
+        let matcher = if prefix.is_empty() {
+            ArgsMatcher::All { all: vec![] }
+        } else {
+            ArgsMatcher::All {
+                all: prefix
+                    .iter()
+                    .map(|p| ArgsMatcher::AnyArgMatches {
+                        any_arg_matches: format!("^{}$", regex::escape(p)),
+                    })
+                    .collect(),
+            }
+        };
         InterceptRule {
-            args_prefix: prefix.iter().map(|s| s.to_string()).collect(),
+            id: Some(prefix.join("-")),
+            matcher,
             admin: false,
-            action: InterceptAction::Respond {
+            action: InterceptAction::Deny {
                 stdout: stdout.to_string(),
+                stderr: String::new(),
                 exit_code: 0,
             },
+            sandbox: crate::mediation::SandboxBinding::InheritFromDefault,
+            promote_in: None,
         }
     }
 
@@ -239,12 +242,16 @@ mod tests {
         assert_eq!(gh.binary_path.as_deref(), Some("/child/gh"));
         // Both intercept rules survive — child first, then base.
         assert_eq!(gh.intercept.len(), 2);
-        assert_eq!(gh.intercept[0].args_prefix, vec!["pr", "view"]);
-        assert_eq!(gh.intercept[1].args_prefix, vec!["auth", "token"]);
+        assert_eq!(gh.intercept[0].id.as_deref(), Some("pr-view"));
+        assert_eq!(gh.intercept[1].id.as_deref(), Some("auth-token"));
     }
 
+    /// Child rules are placed before base rules; both survive because
+    /// predicate-tree matchers are no longer structurally dedup'd. Authors
+    /// override a base rule by ordering: the child rule's matcher fires first
+    /// under nono's first-match-wins semantics.
     #[test]
-    fn test_merge_mediation_intercept_dedup_by_args_prefix_child_first() {
+    fn test_merge_mediation_intercept_child_rules_come_first() {
         let mut base_gh = cmd("gh");
         base_gh.intercept = vec![
             rule(&["auth", "token"], "base-token"),
@@ -265,111 +272,19 @@ mod tests {
             },
         );
         let gh = &merged.commands[0];
-        assert_eq!(gh.intercept.len(), 2);
-        // Child override comes first (first-match-wins).
-        assert_eq!(gh.intercept[0].args_prefix, vec!["auth", "token"]);
+        // Three rules now (no dedup) — child first, then base in original order.
+        assert_eq!(gh.intercept.len(), 3);
+        assert_eq!(gh.intercept[0].id.as_deref(), Some("auth-token"));
         match &gh.intercept[0].action {
-            InterceptAction::Respond { stdout, .. } => assert_eq!(stdout, "child-token"),
+            InterceptAction::Deny { stdout, .. } => assert_eq!(stdout, "child-token"),
             _ => panic!("unexpected action"),
         }
-        // Non-overlapping base rule preserved.
-        assert_eq!(gh.intercept[1].args_prefix, vec!["pr", "list"]);
-    }
-
-    #[test]
-    fn test_merge_mediation_caller_policy_agent_allowed_is_and() {
-        let mut base_gh = cmd("gh");
-        base_gh.caller_policy.agent_allowed = false;
-        let mut child_gh = cmd("gh");
-        child_gh.caller_policy.agent_allowed = true;
-
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![base_gh],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![child_gh],
-                ..Default::default()
-            },
-        );
-        // Managed deny survives a permissive child.
-        assert!(!merged.commands[0].caller_policy.agent_allowed);
-    }
-
-    #[test]
-    fn test_merge_mediation_caller_policy_allowed_parents_intersect() {
-        let mut base_gh = cmd("gh");
-        base_gh.caller_policy.allowed_parents = Some(vec!["git".to_string(), "make".to_string()]);
-        let mut child_gh = cmd("gh");
-        child_gh.caller_policy.allowed_parents = Some(vec!["git".to_string(), "bash".to_string()]);
-
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![base_gh],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![child_gh],
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            merged.commands[0].caller_policy.allowed_parents.as_deref(),
-            Some(&["git".to_string()][..])
-        );
-    }
-
-    #[test]
-    fn test_merge_mediation_caller_policy_allowed_parents_none_inherits() {
-        // base is None ("any"), child restricts.
-        let mut child_gh = cmd("gh");
-        child_gh.caller_policy.allowed_parents = Some(vec!["git".to_string()]);
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![cmd("gh")],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![child_gh],
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            merged.commands[0].caller_policy.allowed_parents.as_deref(),
-            Some(&["git".to_string()][..])
-        );
-
-        // base restricts, child is None — the restriction stays.
-        let mut base_gh = cmd("gh");
-        base_gh.caller_policy.allowed_parents = Some(vec!["bash".to_string()]);
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![base_gh],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![cmd("gh")],
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            merged.commands[0].caller_policy.allowed_parents.as_deref(),
-            Some(&["bash".to_string()][..])
-        );
-
-        // Both None — stays None.
-        let merged = merge_mediation(
-            MediationConfig {
-                commands: vec![cmd("gh")],
-                ..Default::default()
-            },
-            MediationConfig {
-                commands: vec![cmd("gh")],
-                ..Default::default()
-            },
-        );
-        assert!(merged.commands[0].caller_policy.allowed_parents.is_none());
+        assert_eq!(gh.intercept[1].id.as_deref(), Some("auth-token"));
+        match &gh.intercept[1].action {
+            InterceptAction::Deny { stdout, .. } => assert_eq!(stdout, "base-token"),
+            _ => panic!("unexpected action"),
+        }
+        assert_eq!(gh.intercept[2].id.as_deref(), Some("pr-list"));
     }
 
     #[test]
@@ -443,14 +358,12 @@ mod tests {
             fs_read_file: vec!["~/.netrc".to_string()],
             fs_write: vec!["~/.cache/gh".to_string()],
             fs_write_file: vec!["/tmp/gh.log".to_string()],
-            allow_commands: vec!["xdg-open".to_string()],
             ..Default::default()
         });
         let mut child_gh = cmd("gh");
         child_gh.sandbox = Some(CommandSandbox {
             fs_read: vec!["~/.config/gh".to_string()],
             fs_read_file: vec!["~/.netrc".to_string()],
-            allow_commands: vec!["pbcopy".to_string()],
             ..Default::default()
         });
 
@@ -473,10 +386,6 @@ mod tests {
         assert_eq!(sb.fs_read_file, vec!["~/.netrc".to_string()]);
         assert_eq!(sb.fs_write, vec!["~/.cache/gh".to_string()]);
         assert_eq!(sb.fs_write_file, vec!["/tmp/gh.log".to_string()]);
-        assert_eq!(
-            sb.allow_commands,
-            vec!["xdg-open".to_string(), "pbcopy".to_string()]
-        );
     }
 
     #[test]
@@ -532,18 +441,17 @@ mod tests {
     fn test_merge_mediation_empty_child_inherits_base() {
         let mut base_gh = cmd("gh");
         base_gh.intercept = vec![rule(&["auth", "token"], "base")];
-        base_gh.caller_policy.agent_allowed = false;
 
         let base = MediationConfig {
             commands: vec![base_gh],
             env: EnvPolicy {
                 block: vec!["GH_TOKEN".to_string()],
             },
+            ..Default::default()
         };
         let merged = merge_mediation(base, MediationConfig::default());
         assert_eq!(merged.commands.len(), 1);
         assert_eq!(merged.commands[0].intercept.len(), 1);
-        assert!(!merged.commands[0].caller_policy.agent_allowed);
         assert_eq!(merged.env.block, vec!["GH_TOKEN".to_string()]);
     }
 
@@ -556,11 +464,94 @@ mod tests {
             env: EnvPolicy {
                 block: vec!["GH_TOKEN".to_string()],
             },
+            ..Default::default()
         };
         let merged = merge_mediation(MediationConfig::default(), child);
         assert_eq!(merged.commands.len(), 1);
         assert_eq!(merged.commands[0].intercept.len(), 1);
         assert_eq!(merged.env.block, vec!["GH_TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn merge_unions_can_use_and_session_can_use() {
+        let base = MediationConfig {
+            commands: vec![],
+            env: EnvPolicy::default(),
+            session_can_use: vec!["git".into(), "gh".into()],
+            ..Default::default()
+        };
+        let child = MediationConfig {
+            commands: vec![],
+            env: EnvPolicy::default(),
+            session_can_use: vec!["gh".into(), "kubectl".into()],
+            ..Default::default()
+        };
+        let merged = merge_mediation(base, child);
+        assert_eq!(merged.session_can_use, vec!["git", "gh", "kubectl"]);
+    }
+
+    #[test]
+    fn merge_unions_command_can_use() {
+        let mut base_cmd = cmd("git");
+        base_cmd.can_use = vec!["ssh".into(), "gh".into()];
+        let mut child_cmd = cmd("git");
+        child_cmd.can_use = vec!["gh".into(), "kubectl".into()];
+        let merged = merge_command_entry(base_cmd, child_cmd);
+        assert_eq!(merged.can_use, vec!["ssh", "gh", "kubectl"]);
+    }
+
+    #[test]
+    fn merge_unions_from_bindings_with_child_wins() {
+        use crate::mediation::{CallerAction, CallerBinding, CallerBindingEntry, DenyKeyword};
+
+        // base: glab=deny, kubectl=allow
+        let mut base_cmd = cmd("ddtool");
+        base_cmd.from.insert(
+            "glab".to_string(),
+            CallerBinding::Deny(DenyKeyword),
+        );
+        base_cmd.from.insert(
+            "kubectl".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Allow,
+                sandbox: None,
+            }),
+        );
+
+        // child: kubectl=passthrough (override), gh=allow (new)
+        let mut child_cmd = cmd("ddtool");
+        child_cmd.from.insert(
+            "kubectl".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Passthrough,
+                sandbox: None,
+            }),
+        );
+        child_cmd.from.insert(
+            "gh".to_string(),
+            CallerBinding::Bound(CallerBindingEntry {
+                action: CallerAction::Allow,
+                sandbox: None,
+            }),
+        );
+
+        let merged = merge_command_entry(base_cmd, child_cmd);
+
+        // 1. Key only in base is preserved.
+        assert!(
+            matches!(merged.from["glab"], CallerBinding::Deny(_)),
+            "glab from base should be preserved"
+        );
+        // 2. Key only in child is added.
+        assert!(
+            matches!(&merged.from["gh"], CallerBinding::Bound(b) if b.action == CallerAction::Allow),
+            "gh from child should be added"
+        );
+        // 3. Key in both: child value wins.
+        assert!(
+            matches!(&merged.from["kubectl"], CallerBinding::Bound(b) if b.action == CallerAction::Passthrough),
+            "kubectl child value should win over base"
+        );
     }
 
     #[test]

@@ -495,12 +495,13 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
         profile.push_str("(debug deny)\n");
     }
 
-    // Process operations: by default permit all exec and fork. When the
-    // capability set restricts process-exec, deny exec by default and emit
-    // explicit allow rules only for the paths in `allowed_exec_paths`.
-    // `process-fork` remains allowed so threading and fork-without-exec
-    // continue to work; the kernel's deny on exec is what closes the
-    // child-process exfiltration escape.
+    // Process operations:
+    // - process_exec_restricted: deny exec* by default, emit explicit allows for declared paths.
+    //   fork remains allowed so threading and fork-without-exec keep working. The path
+    //   allowlist (the command's own binary and the shim) is what
+    //   closes child-process exfil escapes like ssh's ProxyCommand: a sandbox that grants
+    //   ~/.ssh read but only allowlists ssh's own binary cannot exec /bin/sh.
+    // - default: allow both exec* and fork.
     if caps.process_exec_restricted() {
         profile.push_str("(allow process-fork)\n");
         for (path, is_subpath) in caps.allowed_exec_paths() {

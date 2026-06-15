@@ -2,22 +2,24 @@
 //!
 //! For each incoming `ShimRequest`, this module:
 //! 1. Finds the matching `ResolvedCommand` entry.
-//! 2. Checks `intercept` rules in order (positional subcommand match).
-//! 3. If matched with `Respond`: returns the configured `ShimResponse` without calling the binary.
+//! 2. Checks `intercept` rules in order via each rule's compiled `ResolvedArgsMatcher`
+//!    (predicate trees over regex leaves: combinators `all`/`any`/`not` over
+//!    `any_arg_matches`, `all_args_match`, `nth_arg_matches`).
+//! 3. If matched with `Deny`: returns the configured `ShimResponse` without calling the binary.
 //! 4. If matched with `Capture`: runs the real binary (or a script), stores output in the broker,
 //!    returns a `nono_<hex>` nonce to the sandbox.
 //! 5. If not matched: execs the real binary. `nono_<64-hex>` substrings inside both argv and
 //!    env-var values are replaced with the broker's real value before exec.
 
 use super::approval::ApprovalGate;
-use super::broker::TokenBroker;
-use super::session::{ResolvedAction, ResolvedCommand};
+use super::broker::{ConsumerContext, GrantSet, TokenBroker};
+use super::session::{ResolvedAction, ResolvedCommand, ResolvedSandboxBinding};
+use crate::mediation::CommandSandbox;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -73,6 +75,10 @@ pub struct SessionCtx<'a> {
     /// sandbox paths resolves consistently across the main and per-command
     /// sandboxes.
     pub workdir: &'a std::path::Path,
+    /// Commands the agent (primary sandbox) may invoke directly. Populated
+    /// from `MediationConfig::session_can_use`. Used by the authorization
+    /// graph gate in `apply`.
+    pub session_can_use: Vec<String>,
 }
 
 /// Env var names that must never receive a nonce-promoted value, even if a
@@ -90,14 +96,14 @@ static DANGEROUS_ENV_VAR_NAMES: &[&str] = &[
 /// Apply policy to a shim request and produce a response.
 ///
 /// - If the command is unknown: returns an error response (not found).
-/// - If an intercept rule matches with `Respond`: returns the pre-resolved output.
+/// - If an intercept rule matches with `Deny`: returns the pre-resolved output.
 /// - If an intercept rule matches with `Capture`: runs the binary/script, issues a nonce.
 /// - Otherwise: execs the real binary with strict env filtering.
 ///
 /// `stdin_fd`/`stdout_fd`/`stderr_fd` are the shim's stdio fds, received via
 /// SCM_RIGHTS. The streaming passthrough path moves them into the spawned
 /// child via `Stdio::from(...)` so binary streams (ssh/git) are not buffered
-/// or corrupted. The `Capture`/`Respond`/`Approve` paths drop them and keep
+/// or corrupted. The `Capture`/`Deny`/`Approve` paths drop them and keep
 /// the existing `Stdio::piped()` + `wait_with_output` behaviour.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply(
@@ -126,105 +132,120 @@ pub async fn apply(
         );
     };
 
-    // Caller-policy gate. Decides whether this caller is permitted to invoke
-    // the command at all, before any intercept / sandbox logic runs.
-    //
-    // - No NONO_SANDBOX_CONTEXT → caller is the agent (primary sandbox).
-    //   Reject unless `agent_allowed` is true.
-    // - NONO_SANDBOX_CONTEXT present → caller is a mediated parent.
-    //   If `allowed_parents` is `Some(list)`, the parent name (resolved via
-    //   the broker nonce) must be in `list`. `Some(empty list)` denies all
-    //   mediated parents. `None` allows any.
+    // Authorization graph gate (replaces caller_policy).
+    // - No NONO_SANDBOX_CONTEXT → caller is the agent; allowed iff command is in session_can_use.
+    // - NONO_SANDBOX_CONTEXT present → caller is mediated parent P; allowed iff command is in P.can_use.
+    let sandbox_consumer = ConsumerContext {
+        command: &request.command,
+        intercept_id: "default",
+    };
     let caller_parent = request
         .env
         .get("NONO_SANDBOX_CONTEXT")
-        .and_then(|nonce| broker.resolve(nonce));
-    match &caller_parent {
-        None => {
-            if !cmd.caller_policy.agent_allowed {
-                warn!(
-                    "mediation: rejecting '{}' from primary sandbox (agent_allowed=false)",
-                    request.command
-                );
-                return (
-                    ShimResponse {
-                        stdout: String::new(),
-                        stderr: format!(
-                            "nono-mediation: '{}' cannot be invoked from the primary sandbox\n",
-                            request.command
-                        ),
-                        exit_code: 126,
-                    },
-                    "denied",
-                );
-            }
-        }
+        .and_then(|nonce| broker.resolve(nonce, &sandbox_consumer));
+    let authorized = match &caller_parent {
+        None => ctx.session_can_use.iter().any(|c| c == &request.command),
         Some(parent) => {
-            if let Some(allowed) = &cmd.caller_policy.allowed_parents {
-                let parent_name: &str = parent;
-                if !allowed.iter().any(|p| p == parent_name) {
+            let parent_name: &str = parent;
+            match commands.iter().find(|c| c.name == parent_name) {
+                None => {
                     warn!(
-                        "mediation: rejecting '{}' invoked from '{}' (not in allowed_parents)",
+                        "mediation: rejecting '{}': parent '{}' is not a registered command",
                         request.command, parent_name
                     );
-                    return (
-                        ShimResponse {
-                            stdout: String::new(),
-                            stderr: format!(
-                                "nono-mediation: '{}' cannot be invoked from '{}'\n",
-                                request.command, parent_name
-                            ),
-                            exit_code: 126,
-                        },
-                        "denied",
-                    );
+                    false
                 }
+                Some(p) => p.can_use.iter().any(|c| c == &request.command),
             }
         }
+    };
+    if !authorized {
+        let who = caller_parent.as_deref().map_or("the agent", |p| p);
+        warn!(
+            "mediation: rejecting '{}' from {} (not authorized by can_use/session_can_use)",
+            request.command, who
+        );
+        return (
+            ShimResponse {
+                stdout: String::new(),
+                stderr: format!(
+                    "nono-mediation: '{}' is not authorized for this caller\n",
+                    request.command
+                ),
+                exit_code: 126,
+            },
+            "denied",
+        );
     }
 
-    // If the request comes from within a per-command sandbox (via allow_commands),
-    // skip intercepts — credentials flow between trusted sub-processes, not to the
-    // agent. The sandbox context nonce is unforgeable (only the server can issue
-    // valid nonces).
+    // Per-caller behaviour from the `from` map (callee-side). `can_use` already
+    // authorised the call. Agent callers (caller_parent == None) always go through
+    // normal mediation — never passthrough.
     //
-    // The child's own per-command sandbox is still applied. Skipping it here would
-    // let a parent with `allow_commands: ["ssh"]` invoke ssh entirely unsandboxed,
-    // re-opening the ProxyCommand exfil class that the process-exec default-deny
-    // is designed to close (issue #249). The child's sandbox already grants the
-    // filesystem access the child needs (~/.ssh for ssh, ~/.vault-token for
-    // ddtool, etc.), so applying it here doesn't break the credential flow.
-    if let Some(ctx_nonce) = request.env.get("NONO_SANDBOX_CONTEXT")
-        && let Some(parent_name) = broker.resolve(ctx_nonce)
-        && let Some(parent_cmd) = commands.iter().find(|c| c.name == **parent_name)
-        && let Some(ref sb) = parent_cmd.sandbox
-        && sb.allow_commands.contains(&request.command)
-    {
-        debug!(
-            "mediation: skipping intercepts for '{}' (called from '{}' via allow_commands)",
-            request.command, &**parent_name
-        );
-        let result = exec_passthrough(
-            cmd,
-            &request.args,
-            &request.env,
-            &broker,
-            cmd.sandbox.clone(),
-            ctx,
-            commands,
-            Some((stdin_fd, stdout_fd, stderr_fd)),
-            request.cwd.as_deref(),
-        )
-        .await;
-        return (result, "passthrough");
+    // `Passthrough`: skip intercepts so credentials flow between trusted
+    // sub-processes, not to the agent. The child's own per-command sandbox is
+    // still applied (see issue #249).
+    let from_binding = match caller_parent.as_deref() {
+        Some(parent) => cmd.from.get(parent),
+        None => None,
+    };
+    match from_binding {
+        Some(super::session::ResolvedCallerBinding::Deny) => {
+            warn!(
+                "mediation: rejecting '{}': from[{}] = deny",
+                request.command,
+                caller_parent.as_deref().map_or("agent", |p| p)
+            );
+            return (
+                ShimResponse {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "nono-mediation: '{}' is denied for this caller\n",
+                        request.command
+                    ),
+                    exit_code: 126,
+                },
+                "denied",
+            );
+        }
+        Some(super::session::ResolvedCallerBinding::Bound {
+            action: crate::mediation::CallerAction::Passthrough,
+            sandbox,
+        }) => {
+            // Skip intercepts — return real output to the trusted parent process.
+            // Apply the binding's sandbox if present, otherwise fall back to the
+            // command-level default.
+            let sb = sandbox.clone().or_else(|| cmd.default.sandbox.clone()).or_else(|| cmd.sandbox.clone());
+            debug!(
+                "mediation: skipping intercepts for '{}' (called from '{}' via from[passthrough])",
+                request.command,
+                caller_parent.as_deref().map_or("agent", |p| p)
+            );
+            let result = exec_passthrough(
+                cmd,
+                &request.args,
+                &request.env,
+                &broker,
+                sb,
+                ctx,
+                commands,
+                Some((stdin_fd, stdout_fd, stderr_fd)),
+                request.cwd.as_deref(),
+                "default",
+                cmd.default.promote_filter.as_ref(),
+            )
+            .await;
+            return (result, "passthrough");
+        }
+        _ => {} // Allow or absent: fall through to normal intercept / default dispatch.
     }
 
     // Check intercept rules in order
     for rule in &cmd.intercepts {
-        if subcommand_matches(&rule.args_prefix, &request.args) {
+        if rule.matcher.matches(&request.args) {
             debug!(
-                "mediation: intercepting '{}' with prefix {:?}",
-                request.command, rule.args_prefix
+                "mediation: intercepting '{}' with matcher {:?}",
+                request.command, rule.matcher
             );
 
             // Admin gate: require user authentication before executing this rule.
@@ -243,9 +264,9 @@ pub async fn apply(
                         format!("{} {}", request.command, request.args.join(" "))
                     };
                     let action_type = match &rule.action {
-                        ResolvedAction::Respond { .. } => "respond",
+                        ResolvedAction::Deny { .. } => "deny",
                         ResolvedAction::Capture { .. } => "capture",
-                        ResolvedAction::Approve { .. } => "approve",
+                        ResolvedAction::Allow { .. } => "allow",
                     };
                     return (
                         ShimResponse {
@@ -258,25 +279,48 @@ pub async fn apply(
                 }
             }
 
-            // Buffered intercept paths: the passed stdio fds are not used —
-            // the duplicated fds drop here, leaving the originals open in the
-            // shim so it can write the buffered response to them.
-            drop(stdin_fd);
-            drop(stdout_fd);
-            drop(stderr_fd);
-
+            // For buffered intercept paths (`respond`/`capture`/`approve`) the
+            // passed stdio fds are not used — the duplicated fds drop in each
+            // branch, leaving the originals open in the shim so it can write
+            // the buffered response to them. The `passthrough` arm keeps the
+            // fds and hands them to `exec_passthrough` for streaming.
             return match &rule.action {
-                ResolvedAction::Respond { stdout } => (
-                    ShimResponse {
-                        stdout: stdout.clone(),
-                        stderr: String::new(),
-                        exit_code: rule.exit_code,
-                    },
-                    "respond",
-                ),
-                ResolvedAction::Capture { script } => {
+                ResolvedAction::Deny {
+                    stdout,
+                    stderr,
+                    exit_code,
+                } => {
+                    drop(stdin_fd);
+                    drop(stdout_fd);
+                    drop(stderr_fd);
+                    (
+                        ShimResponse {
+                            stdout: stdout.clone(),
+                            stderr: stderr.clone(),
+                            exit_code: *exit_code,
+                        },
+                        "deny",
+                    )
+                }
+                ResolvedAction::Capture { script, grants } => {
+                    drop(stdin_fd);
+                    drop(stdout_fd);
+                    drop(stderr_fd);
+                    let capture_consumer = ConsumerContext {
+                        command: &cmd.name,
+                        intercept_id: rule.id.as_deref().unwrap_or(""),
+                    };
                     let result = match script {
-                        Some(sh) => exec_script(sh, &request.env, &broker).await,
+                        Some(sh) => {
+                            exec_script(
+                                sh,
+                                &request.env,
+                                &broker,
+                                &capture_consumer,
+                                rule.promote_filter.as_ref(),
+                            )
+                            .await
+                        }
                         None => {
                             // No per-command sandbox during capture — the real binary needs
                             // full access to system resources (e.g. Keychain) to fetch the credential.
@@ -290,6 +334,8 @@ pub async fn apply(
                                 commands,
                                 None,
                                 request.cwd.as_deref(),
+                                rule.id.as_deref().unwrap_or(""),
+                                rule.promote_filter.as_ref(),
                             )
                             .await
                         }
@@ -297,7 +343,10 @@ pub async fn apply(
                     if result.exit_code != 0 {
                         return (result, "capture");
                     }
-                    let nonce = broker.issue(Zeroizing::new(result.stdout.trim().to_string()));
+                    let nonce = broker.issue(
+                        Zeroizing::new(result.stdout.trim().to_string()),
+                        grants.clone(),
+                    );
                     (
                         ShimResponse {
                             stdout: format!("{}\n", nonce),
@@ -307,58 +356,155 @@ pub async fn apply(
                         "capture",
                     )
                 }
-                ResolvedAction::Approve { script } => {
-                    // Run the real binary (or script) and return the actual output.
-                    // Typically used with admin: true to gate behind approval.
-                    //
-                    // No per-command sandbox is applied (None). The real binary
-                    // needs unrestricted access to system resources (e.g. macOS
-                    // Keychain via mach-lookup to securityd) that a Seatbelt
-                    // sandbox would block. Protection comes from the profile
-                    // author's deliberate choice of which commands get `approve`.
-                    let resp = match script {
-                        Some(sh) => exec_script(sh, &request.env, &broker).await,
-                        None => {
-                            exec_passthrough(
-                                cmd,
-                                &request.args,
-                                &request.env,
-                                &broker,
-                                None,
-                                ctx,
-                                commands,
-                                None,
-                                request.cwd.as_deref(),
-                            )
-                            .await
+                ResolvedAction::Allow { script } => {
+                    // Allow streams the real binary's stdio directly, with the
+                    // matched rule's tri-state sandbox binding: `Explicit`
+                    // overrides; `ExplicitlyUnsandboxed` opts out;
+                    // `InheritFromDefault` falls back to
+                    // `cmd.default.sandbox` then the legacy
+                    // command-level `cmd.sandbox`. Optionally substitutes the
+                    // command with a shell script (same semantics as
+                    // `Capture.script`).
+                    let effective_sandbox: Option<CommandSandbox> = match &rule.sandbox {
+                        ResolvedSandboxBinding::Explicit(sb) => Some(sb.clone()),
+                        ResolvedSandboxBinding::ExplicitlyUnsandboxed => None,
+                        ResolvedSandboxBinding::InheritFromDefault => {
+                            cmd.default.sandbox.clone().or_else(|| cmd.sandbox.clone())
                         }
                     };
-                    (resp, "approve")
+                    let run_consumer = ConsumerContext {
+                        command: &cmd.name,
+                        intercept_id: rule.id.as_deref().unwrap_or(""),
+                    };
+                    if let Some(script_str) = script {
+                        drop(stdin_fd);
+                        drop(stdout_fd);
+                        drop(stderr_fd);
+                        return (
+                            exec_script(
+                                script_str,
+                                &request.env,
+                                &broker,
+                                &run_consumer,
+                                rule.promote_filter.as_ref(),
+                            )
+                            .await,
+                            "allow",
+                        );
+                    }
+                    let result = exec_passthrough(
+                        cmd,
+                        &request.args,
+                        &request.env,
+                        &broker,
+                        effective_sandbox,
+                        ctx,
+                        commands,
+                        Some((stdin_fd, stdout_fd, stderr_fd)),
+                        request.cwd.as_deref(),
+                        rule.id.as_deref().unwrap_or(""),
+                        rule.promote_filter.as_ref(),
+                    )
+                    .await;
+                    (result, "allow")
                 }
             };
         }
     }
 
-    // No intercept matched — pass through to the real binary, streaming stdio.
-    debug!(
-        "mediation: passthrough '{}' {:?} -> {}",
-        request.command,
-        request.args,
-        cmd.real_path.display()
-    );
-    let resp = exec_passthrough(
-        cmd,
-        &request.args,
-        &request.env,
-        &broker,
-        cmd.sandbox.clone(),
-        ctx,
-        commands,
-        Some((stdin_fd, stdout_fd, stderr_fd)),
-        request.cwd.as_deref(),
-    )
-    .await;
-    (resp, "passthrough")
+    // No intercept matched — dispatch the command's default action.
+    debug!("mediation: dispatching default for '{}'", request.command);
+    let default_entry = &cmd.default;
+    match &default_entry.action {
+        ResolvedAction::Deny {
+            stdout,
+            stderr,
+            exit_code,
+        } => {
+            drop(stdin_fd);
+            drop(stdout_fd);
+            drop(stderr_fd);
+            (
+                ShimResponse {
+                    stdout: stdout.clone(),
+                    stderr: stderr.clone(),
+                    exit_code: *exit_code,
+                },
+                "deny",
+            )
+        }
+        ResolvedAction::Allow { script } => {
+            // The default's sandbox wins; fall back to the legacy
+            // command-level `cmd.sandbox` when the default omits one.
+            // If a `from[P]` binding with an explicit sandbox is present,
+            // it takes highest precedence (overrides the command-default).
+            let from_sandbox = match caller_parent.as_deref() {
+                Some(p) => match cmd.from.get(p) {
+                    Some(super::session::ResolvedCallerBinding::Bound { sandbox, .. }) => {
+                        sandbox.clone()
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
+            let effective_sandbox = from_sandbox
+                .or_else(|| default_entry.sandbox.clone())
+                .or_else(|| cmd.sandbox.clone());
+            let default_consumer = ConsumerContext {
+                command: &cmd.name,
+                intercept_id: "default",
+            };
+            if let Some(script_str) = script {
+                drop(stdin_fd);
+                drop(stdout_fd);
+                drop(stderr_fd);
+                return (
+                    exec_script(
+                        script_str,
+                        &request.env,
+                        &broker,
+                        &default_consumer,
+                        default_entry.promote_filter.as_ref(),
+                    )
+                    .await,
+                    "allow",
+                );
+            }
+            let result = exec_passthrough(
+                cmd,
+                &request.args,
+                &request.env,
+                &broker,
+                effective_sandbox,
+                ctx,
+                commands,
+                Some((stdin_fd, stdout_fd, stderr_fd)),
+                request.cwd.as_deref(),
+                "default",
+                default_entry.promote_filter.as_ref(),
+            )
+            .await;
+            (result, "allow")
+        }
+        ResolvedAction::Capture { .. } => {
+            // Rejected at profile load (see session::setup validation), but
+            // surface a clear error if it ever reaches here.
+            drop(stdin_fd);
+            drop(stdout_fd);
+            drop(stderr_fd);
+            (
+                ShimResponse {
+                    stdout: String::new(),
+                    stderr: format!(
+                        "nono-mediation: command '{}': default.action cannot be 'capture'\n",
+                        request.command
+                    ),
+                    exit_code: 1,
+                },
+                "error",
+            )
+        }
+    }
 }
 
 /// Execute the real binary without any mediation — no intercept rules, no env
@@ -456,22 +602,6 @@ pub async fn admin_passthrough(
     (resp, "admin_passthrough")
 }
 
-/// Check if the invocation's positional args start with the given prefix.
-///
-/// Flags (args starting with `-`) are ignored, allowing matches regardless of
-/// flag placement. E.g. `["auth", "github", "token"]` matches both
-/// `ddtool auth github token` and `ddtool --debug auth github token`.
-pub fn subcommand_matches(prefix: &[String], args: &[String]) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    if prefix.len() > positional.len() {
-        return false;
-    }
-    prefix.iter().zip(positional.iter()).all(|(p, a)| p == *a)
-}
-
 /// Execute a shell script and collect its output.
 ///
 /// Uses the same strict env-building as `exec_passthrough`: starts from the
@@ -480,8 +610,10 @@ async fn exec_script(
     script: &str,
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    consumer: &ConsumerContext<'_>,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> ShimResponse {
-    let env = build_exec_env(sandbox_env, broker);
+    let env = build_exec_env(sandbox_env, broker, consumer, promote_filter);
     let script = script.to_string();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ShimResponse> {
@@ -523,9 +655,6 @@ async fn exec_script(
     }
 }
 
-/// Atomic counter for generating unique filtered shim directory names.
-static FILTERED_SHIM_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Execute the real binary and collect its output.
 ///
 /// Env building:
@@ -539,10 +668,6 @@ static FILTERED_SHIM_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// - Arg nonces: any `nono_<64-hex>` substring inside an arg is replaced with
 ///   the real value, so embedded uses like `-H "Authorization: Bearer nono_..."`
 ///   work without the caller having to put the nonce at the start of the arg.
-///
-/// When `allow_commands` is non-empty on the sandbox, a filtered shim directory is
-/// created containing symlinks only for commands NOT in the allow list. Allowed
-/// commands run directly (real binary) inside the per-command sandbox.
 ///
 /// `stdio_fds`:
 /// - `Some((stdin, stdout, stderr))`: streaming mode — the real binary inherits
@@ -564,73 +689,27 @@ async fn exec_passthrough(
     all_commands: &[ResolvedCommand],
     stdio_fds: Option<(OwnedFd, OwnedFd, OwnedFd)>,
     request_cwd: Option<&str>,
+    consumer_intercept_id: &str,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> ShimResponse {
-    let mut env = build_exec_env(sandbox_env, broker);
-
-    // Build the effective shim directory and PATH.
-    // When allow_commands is set, create a filtered shim dir that excludes allowed
-    // commands so they resolve to their real binaries instead of routing through mediation.
-    let allow_commands = sandbox
-        .as_ref()
-        .map(|sb| &sb.allow_commands)
-        .filter(|ac| !ac.is_empty());
-
-    let (effective_shim_dir, _filtered_dir_guard) = if let Some(allow_cmds) = allow_commands {
-        match build_filtered_shim_dir(ctx.shim_dir, allow_cmds, all_commands) {
-            Ok((dir, guard)) => (dir, Some(guard)),
-            Err(e) => {
-                return ShimResponse {
-                    stdout: String::new(),
-                    stderr: format!(
-                        "nono-mediation: failed to create filtered shim dir: {}\n",
-                        e
-                    ),
-                    exit_code: 1,
-                };
-            }
-        }
-    } else {
-        (ctx.shim_dir.to_path_buf(), None)
+    let consumer = ConsumerContext {
+        command: &cmd.name,
+        intercept_id: consumer_intercept_id,
     };
+    let mut env = build_exec_env(sandbox_env, broker, &consumer, promote_filter);
 
-    let shim_dir_str = effective_shim_dir.to_string_lossy().to_string();
+    // Build PATH: prepend the shim directory so subprocess invocations of
+    // mediated commands route through the mediation server.
+    let shim_dir_str = ctx.shim_dir.to_string_lossy().to_string();
     let parent_path = env
         .get("PATH")
         .cloned()
         .unwrap_or_else(|| "/usr/bin:/bin".to_string());
-
-    // For allowed commands, prepend their real binary directories after the shim dir
-    // so they resolve to the real binary (which won't have a shim in the filtered dir).
-    let mut path_parts = vec![shim_dir_str.clone()];
-    if let Some(allow_cmds) = allow_commands {
-        let mut seen_dirs: HashSet<String> = HashSet::new();
-        for allowed_name in allow_cmds {
-            if let Some(allowed_cmd) = all_commands.iter().find(|c| c.name == *allowed_name) {
-                // Only add real binary dirs for commands without their own mediation.
-                // Commands with intercepts or sandbox keep their shim and route through
-                // the mediation server, so they don't need the real binary on PATH.
-                let has_mediation =
-                    !allowed_cmd.intercepts.is_empty() || allowed_cmd.sandbox.is_some();
-                if has_mediation {
-                    continue;
-                }
-                if let Some(parent) = allowed_cmd.real_path.parent() {
-                    let dir_str = parent.to_string_lossy().to_string();
-                    if seen_dirs.insert(dir_str.clone()) {
-                        path_parts.push(dir_str);
-                    }
-                }
-            }
-        }
-    }
-    path_parts.push(parent_path);
+    let path_parts = vec![shim_dir_str.clone(), parent_path];
     env.insert("PATH".to_string(), path_parts.join(":"));
 
-    // Update NONO_SHIM_DIR to point to the effective shim dir (which may be a
-    // filtered shim dir when allow_commands is set). The nono-shim binary uses
-    // this to skip its own directory when resolving the real binary. Without
-    // this, shims in the filtered dir would skip the wrong directory and find
-    // themselves again, causing infinite exec recursion (EAGAIN).
+    // Update NONO_SHIM_DIR so nono-shim can skip its own directory when
+    // resolving the real binary, preventing infinite exec recursion (EAGAIN).
     env.insert("NONO_SHIM_DIR".to_string(), shim_dir_str.clone());
 
     // Inject mediation socket path and session token so the shim binaries
@@ -648,69 +727,53 @@ async fn exec_passthrough(
 
     // Inject a sandbox context nonce so the mediation server can identify
     // shim requests originating from within this per-command sandbox.
-    // This allows the server to skip intercepts for allow_commands calls
-    // (credentials flow between trusted sub-processes, not to the agent).
+    // Credentials flow between trusted sub-processes, not to the agent.
     // The nonce is unforgeable — only the server can issue valid nonces.
-    let sandbox_context_nonce = broker.issue(Zeroizing::new(cmd.name.clone()));
+    //
+    // Grant set: every mediated command's `default` descriptor — the
+    // caller-policy gate uses `intercept_id="default"` and the called
+    // command's own name, so any mediated command may resolve this nonce
+    // when looking up its own caller.
+    let sandbox_context_grants = GrantSet::Allow(
+        all_commands
+            .iter()
+            .map(|c| crate::mediation::broker::GrantDescriptor {
+                command: c.name.clone(),
+                intercept_id: "default".to_string(),
+            })
+            .collect(),
+    );
+    let sandbox_context_nonce =
+        broker.issue(Zeroizing::new(cmd.name.clone()), sandbox_context_grants);
     env.insert("NONO_SANDBOX_CONTEXT".to_string(), sandbox_context_nonce);
 
     // Promote nonce values in args. Any `nono_<64-hex>` substring is replaced
     // with the broker's resolved value, so headers like
     // `Authorization: Bearer nono_...` expand to the real token before the
     // exec'd command sees them.
+    //
+    // Per-slot scoping: `allows_arg` returns false when `promote_filter` is
+    // None or has no `args` sub-predicate. This is the secure-default switch
+    // — a rule that says nothing about argv promotion gets no argv promotion.
     let args: Vec<String> = args
         .iter()
-        .map(|a| promote_nonces_in_str(a, broker))
+        .enumerate()
+        .map(|(i, a)| {
+            let allow = super::promote::ResolvedPromoteFilter::allows_arg(promote_filter, args, i);
+            promote_nonces_in_str(a, broker, &consumer, allow)
+        })
         .collect();
 
     let real_path = cmd.real_path.clone();
+    let pin = cmd.pin.clone();
     let cmd_name = cmd.name.clone();
     // Owned shim paths for use in spawn_blocking (which requires 'static captures).
-    let shim_dir_buf = effective_shim_dir.clone();
+    let shim_dir_buf = ctx.shim_dir.to_path_buf();
     let real_shim_binary = std::fs::canonicalize(ctx.shim_dir.join(&cmd.name)).ok();
     // Own the session workdir for use inside spawn_blocking (profile::expand_vars
     // borrows it).
     let workdir_buf = ctx.workdir.to_path_buf();
 
-    // Collect allowed command binary directories for sandbox read capabilities.
-    let allowed_binary_dirs: Vec<std::path::PathBuf> = sandbox
-        .as_ref()
-        .map(|sb| &sb.allow_commands)
-        .filter(|ac| !ac.is_empty())
-        .map(|allow_cmds| {
-            allow_cmds
-                .iter()
-                .filter_map(|name| {
-                    all_commands
-                        .iter()
-                        .find(|c| c.name == *name)
-                        .and_then(|c| c.real_path.parent())
-                        .filter(|p| p.exists())
-                        .map(|p| p.to_path_buf())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Collect full real binary paths for allow_commands targets so they can be
-    // exec'd directly (bypassing the shim) inside this command's sandbox when
-    // process-exec is restricted by default.
-    let allowed_binary_real_paths: Vec<std::path::PathBuf> = sandbox
-        .as_ref()
-        .map(|sb| &sb.allow_commands)
-        .filter(|ac| !ac.is_empty())
-        .map(|allow_cmds| {
-            allow_cmds
-                .iter()
-                .filter_map(|name| {
-                    all_commands
-                        .iter()
-                        .find(|c| c.name == *name)
-                        .map(|c| c.real_path.clone())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
 
     // Start a per-command proxy if allowed_hosts is configured (and block is not set).
     let mut proxy_handle: Option<nono_proxy::ProxyHandle> = None;
@@ -829,12 +892,6 @@ async fn exec_passthrough(
                 caps = caps.allow_file(real_shim, nono::AccessMode::Read)?;
             }
 
-            // Allow read access to directories of allowed commands so they can exec
-            // their real binaries directly (bypassing the shim).
-            for dir in &allowed_binary_dirs {
-                caps = caps.allow_path(dir, nono::AccessMode::Read)?;
-            }
-
             // Process-spawn gating.
             //
             // By default a per-command sandbox cannot spawn child processes via
@@ -844,18 +901,11 @@ async fn exec_passthrough(
             // that legitimately shell out to helpers (git, gh, aws, kubectl, etc.)
             // must opt in with `allow_process_exec: true` in their CommandSandbox.
             // See docs/cli/features/profile-authoring.mdx § "Per-command Sandboxes".
-            //
-            // Even when restricted, the command must be able to launch itself and
-            // any binaries it declares via `allow_commands` — those run directly
-            // inside this command's sandbox, bypassing the shim.
             if !sb.allow_process_exec {
                 caps = caps.restrict_process_exec();
                 caps = caps.allow_exec_path(&real_path);
                 if let Some(ref real_shim) = real_shim_binary {
                     caps = caps.allow_exec_path(real_shim);
-                }
-                for bin in &allowed_binary_real_paths {
-                    caps = caps.allow_exec_path(bin);
                 }
             }
 
@@ -925,6 +975,16 @@ async fn exec_passthrough(
             }
         }
 
+        let verify_path = real_path.canonicalize().unwrap_or_else(|_| real_path.clone());
+        if let Err(e) = crate::mediation::session::verify_pin(&verify_path, &pin) {
+            warn!("mediation: pin verification failed for '{}': {}", cmd_name, e);
+            return Ok(ShimResponse {
+                stdout: String::new(),
+                stderr: format!("nono-mediation: '{}' failed integrity check\n", cmd_name),
+                exit_code: 126,
+            });
+        }
+
         let mut child = cmd_builder.spawn().map_err(NonoError::CommandExecution)?;
 
         if streaming {
@@ -965,113 +1025,6 @@ async fn exec_passthrough(
             stderr: format!("nono-mediation: internal error: {}\n", e),
             exit_code: 1,
         },
-    }
-}
-
-/// Build a filtered shim directory containing symlinks only for commands NOT
-/// in the `allow_commands` list. Returns the path and a guard that cleans up
-/// on drop. The directory is created under the session dir (derived from the
-/// shim_dir's parent) so `SessionHandle::drop` also cleans it up.
-fn build_filtered_shim_dir(
-    shim_dir: &std::path::Path,
-    allow_commands: &[String],
-    all_commands: &[ResolvedCommand],
-) -> Result<(std::path::PathBuf, FilteredShimDirGuard)> {
-    let allow_set: HashSet<&str> = allow_commands.iter().map(|s| s.as_str()).collect();
-
-    // Derive directory under the session dir for automatic cleanup.
-    let session_dir = shim_dir
-        .parent()
-        .ok_or_else(|| NonoError::SandboxInit("mediation: shim_dir has no parent".to_string()))?;
-    let counter = FILTERED_SHIM_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let filtered_dir = session_dir.join(format!("filtered-shims-{}", counter));
-
-    std::fs::create_dir_all(&filtered_dir).map_err(|e| {
-        NonoError::SandboxInit(format!(
-            "mediation: failed to create filtered shim dir {}: {}",
-            filtered_dir.display(),
-            e
-        ))
-    })?;
-
-    // For each shim in the original shim_dir, symlink it into the filtered dir
-    // unless the command is in the allow list.
-    let entries = std::fs::read_dir(shim_dir).map_err(|e| {
-        NonoError::SandboxInit(format!(
-            "mediation: failed to read shim dir {}: {}",
-            shim_dir.display(),
-            e
-        ))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            NonoError::SandboxInit(format!("mediation: failed to read shim dir entry: {}", e))
-        })?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if allow_set.contains::<str>(name_str.as_ref()) {
-            // If the allowed command has its own mediation rules (intercepts or sandbox),
-            // keep the shim so it routes through the mediation server. Only exclude
-            // commands that have no mediation and should resolve to real binaries directly.
-            let has_mediation = all_commands
-                .iter()
-                .any(|c| c.name == name_str && (!c.intercepts.is_empty() || c.sandbox.is_some()));
-            if has_mediation {
-                debug!(
-                    "mediation: keeping shim for '{}' in filtered dir (has own mediation rules)",
-                    name_str
-                );
-            } else {
-                debug!(
-                    "mediation: allowing direct exec for '{}' (excluded from filtered shim dir)",
-                    name_str
-                );
-                continue;
-            }
-        }
-
-        // Symlink the original shim (which itself points to nono-shim)
-        let src = entry.path();
-        let dst = filtered_dir.join(&name);
-        std::os::unix::fs::symlink(&src, &dst).map_err(|e| {
-            NonoError::SandboxInit(format!(
-                "mediation: failed to symlink {} -> {}: {}",
-                dst.display(),
-                src.display(),
-                e
-            ))
-        })?;
-    }
-
-    // Log the allowed commands and their real paths for auditability.
-    for allowed_name in allow_commands {
-        if let Some(cmd) = all_commands.iter().find(|c| c.name == *allowed_name) {
-            debug!(
-                "mediation: allow_commands '{}' -> {} (direct exec in per-command sandbox)",
-                allowed_name,
-                cmd.real_path.display()
-            );
-        }
-    }
-
-    let guard = FilteredShimDirGuard {
-        path: filtered_dir.clone(),
-    };
-    Ok((filtered_dir, guard))
-}
-
-/// RAII guard that removes the filtered shim directory on drop.
-/// The session dir cleanup also handles this, but this ensures prompt cleanup
-/// when the exec_passthrough call completes.
-struct FilteredShimDirGuard {
-    path: std::path::PathBuf,
-}
-
-impl Drop for FilteredShimDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -1150,9 +1103,19 @@ fn add_sandbox_file(
 ///
 /// Starts from the trusted parent env, then promotes nonce-bearing sandbox vars.
 /// Non-nonce sandbox vars and dangerous var names are silently discarded.
+///
+/// `promote_filter` scopes which env vars are admitted for nonce promotion.
+/// When absent (or its `env` sub-predicate is absent), the built-in safe-
+/// shape name allowlist
+/// ([`super::promote::PROMOTE_ENV_DEFAULT_NAMES`]) decides — credential-shaped
+/// names like `AUTHORIZATION`, `*_TOKEN`, `*_HEADER`, etc. flow promotion;
+/// anything else stays literal. Profiles widen this by setting an explicit
+/// `EnvPredicate` that unions the default regex with extra names.
 fn build_exec_env(
     sandbox_env: &HashMap<String, String>,
     broker: &Arc<TokenBroker>,
+    consumer: &ConsumerContext,
+    promote_filter: Option<&super::promote::ResolvedPromoteFilter>,
 ) -> HashMap<String, String> {
     // Start from parent (trusted) env
     let mut env: HashMap<String, String> = std::env::vars().collect();
@@ -1170,7 +1133,20 @@ fn build_exec_env(
             warn!("mediation: blocked dangerous var {} from sandbox env", key);
             continue;
         }
-        env.insert(key.clone(), promote_nonces_in_str(value, broker));
+        // Per-var scoping: allow promotion only for env keys the filter
+        // admits (or that match the built-in safe-shape allowlist when no
+        // explicit env predicate is set). Non-admitted vars still flow
+        // through with their literal value — only the nonce promotion is
+        // suppressed.
+        let allow = super::promote::ResolvedPromoteFilter::allows_env(
+            promote_filter,
+            key,
+            value,
+        );
+        env.insert(
+            key.clone(),
+            promote_nonces_in_str(value, broker, consumer, allow),
+        );
     }
 
     env
@@ -1180,7 +1156,20 @@ fn build_exec_env(
 /// value. Substrings that look like nonces but were never issued are left in
 /// place verbatim, matching the existing argv behaviour and avoiding a probe
 /// oracle that would only return shape information the caller already has.
-fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
+///
+/// `allow` is the per-slot decision computed one scope up by
+/// `ResolvedPromoteFilter::allows_arg` / `allows_env`. When `false`, returns
+/// the original string unchanged so the call site does not have to branch.
+fn promote_nonces_in_str(
+    s: &str,
+    broker: &TokenBroker,
+    consumer: &ConsumerContext,
+    allow: bool,
+) -> String {
+    if !allow {
+        return s.to_string();
+    }
+
     const PREFIX: &[u8] = b"nono_";
     const HEX_LEN: usize = 64;
     const NONCE_LEN: usize = PREFIX.len() + HEX_LEN;
@@ -1203,7 +1192,7 @@ fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
             // s[last_end..i] / s[i..i+NONCE_LEN] are valid str slices.
             out.push_str(&s[last_end..i]);
             let nonce = &s[i..i + NONCE_LEN];
-            match broker.resolve(nonce) {
+            match broker.resolve(nonce, consumer) {
                 Some(real) => out.push_str(real.as_str()),
                 None => out.push_str(nonce),
             }
@@ -1220,13 +1209,44 @@ fn promote_nonces_in_str(s: &str, broker: &TokenBroker) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mediation::CallerPolicy;
     use crate::mediation::approval::{AlwaysAllow, AlwaysDeny};
-    use crate::mediation::session::{ResolvedCommand, ResolvedIntercept};
+    use crate::mediation::broker::GrantDescriptor;
+    use crate::mediation::matcher::ResolvedArgsMatcher;
+    use crate::mediation::session::{PinnedBinary, ResolvedCommand, ResolvedDefault, ResolvedIntercept};
     use std::path::PathBuf;
 
     fn make_broker() -> Arc<TokenBroker> {
         Arc::new(TokenBroker::new())
+    }
+
+    /// Default consumer context for tests that just need to redeem
+    /// nonces issued with a permissive `GrantSet::Allow` covering this
+    /// `(command, intercept_id)`.
+    fn test_consumer() -> ConsumerContext<'static> {
+        ConsumerContext {
+            command: "testcmd",
+            intercept_id: "default",
+        }
+    }
+
+    /// Permissive grant set used by tests that need a nonce redeemable by
+    /// any of the consumer contexts the policy code constructs:
+    /// `(testcmd, default)` for build_exec_env/promote_nonces helpers, and
+    /// the `(*, default)` shapes used by the caller-policy gate when
+    /// resolving a sandbox-context nonce. Replaces the former
+    /// `test_grants()` in tests; no equivalent variant exists in the
+    /// production code path now.
+    fn test_grants() -> GrantSet {
+        GrantSet::Allow(vec![
+            GrantDescriptor {
+                command: "testcmd".to_string(),
+                intercept_id: "default".to_string(),
+            },
+            GrantDescriptor {
+                command: "anything".to_string(),
+                intercept_id: "default".to_string(),
+            },
+        ])
     }
 
     fn always_allow() -> Arc<dyn ApprovalGate + Send + Sync> {
@@ -1237,13 +1257,28 @@ mod tests {
         Arc::new(AlwaysDeny)
     }
 
+    /// Compute a real `PinnedBinary` for `path` so `verify_pin` passes in tests
+    /// that exec the binary through `exec_passthrough`.
+    fn real_pin(path: &std::path::Path) -> PinnedBinary {
+        crate::mediation::session::pin_binary(path).expect("pin_binary failed in test")
+    }
+
     fn make_cmd(intercepts: Vec<ResolvedIntercept>) -> ResolvedCommand {
+        let path = PathBuf::from("/usr/bin/true");
+        let pin = real_pin(&path);
         ResolvedCommand {
             name: "testcmd".to_string(),
-            real_path: PathBuf::from("/usr/bin/true"),
+            real_path: path,
+            pin,
             intercepts,
             sandbox: None,
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         }
     }
 
@@ -1290,7 +1325,7 @@ mod tests {
     /// streamed into the returned `ShimResponse` so existing tests can
     /// continue to assert on `resp.stdout`/`resp.stderr` regardless of
     /// whether the path was streaming (passthrough) or buffered (Capture/
-    /// Respond/Approve).
+    /// Deny/Approve).
     async fn apply_capture(
         req: ShimRequest,
         cmds: &[ResolvedCommand],
@@ -1353,6 +1388,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1360,7 +1396,7 @@ mod tests {
         assert_eq!(resp.exit_code, 127);
     }
 
-    // --- caller_policy gate ---
+    // --- authorization graph gate (can_use / session_can_use) ---
 
     fn ctx() -> SessionCtx<'static> {
         SessionCtx {
@@ -1368,25 +1404,29 @@ mod tests {
             socket_path: std::path::Path::new("/tmp/test.sock"),
             session_token: "test_token",
             workdir: std::path::Path::new("/tmp"),
+            session_can_use: vec![
+                "testcmd".to_string(),
+                "echo".to_string(),
+                "vault".to_string(),
+            ],
         }
     }
 
-    /// Default `CallerPolicy` (agent_allowed=true, allowed_parents=None) lets
-    /// the agent invoke a command. Regression for backward compatibility:
-    /// existing profiles that omit `caller_policy` keep the old behaviour.
+    /// Agent may invoke a command that is in `session_can_use`.
     #[tokio::test]
     async fn test_caller_policy_agent_allowed_by_default() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec![],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
                 stdout: "ok\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
-        // Default caller_policy from make_cmd.
-        assert!(cmd.caller_policy.agent_allowed);
-        assert!(cmd.caller_policy.allowed_parents.is_none());
 
         let req = ShimRequest {
             command: "testcmd".to_string(),
@@ -1397,20 +1437,16 @@ mod tests {
         };
         let (resp, action) =
             apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
-        assert_eq!(action, "respond");
+        assert_eq!(action, "deny");
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "ok\n");
     }
 
-    /// `agent_allowed: false` rejects a call from the primary sandbox
-    /// (no NONO_SANDBOX_CONTEXT) with exit 126.
+    /// Agent is denied when the command is not in `session_can_use`, regardless
+    /// of the legacy `agent_allowed` field.
     #[tokio::test]
     async fn test_caller_policy_rejects_agent_when_agent_allowed_false() {
-        let mut cmd = make_cmd(vec![]);
-        cmd.caller_policy = CallerPolicy {
-            agent_allowed: false,
-            allowed_parents: Some(vec!["git".to_string()]),
-        };
+        let cmd = make_cmd(vec![]);
 
         let req = ShimRequest {
             command: "testcmd".to_string(),
@@ -1418,37 +1454,60 @@ mod tests {
             session_token: String::new(),
             ..Default::default()
         };
+        // ctx with empty session_can_use → agent cannot invoke testcmd.
+        let ctx_empty = SessionCtx {
+            shim_dir: std::path::Path::new("/tmp"),
+            socket_path: std::path::Path::new("/tmp/test.sock"),
+            session_token: "test_token",
+            workdir: std::path::Path::new("/tmp"),
+            session_can_use: vec![],
+        };
         let (resp, action) =
-            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+            apply_capture(req, &[cmd], make_broker(), &ctx_empty, always_allow()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("primary sandbox"),
-            "stderr should mention primary sandbox: {}",
+            resp.stderr.contains("testcmd"),
+            "stderr should name the denied command: {}",
             resp.stderr
         );
     }
 
-    /// `allowed_parents: Some(["git"])` permits ssh-from-git: the broker
-    /// resolves the request's NONO_SANDBOX_CONTEXT nonce to "git" and the
-    /// gate falls through to the existing policy logic.
+    /// A parent with `can_use` containing the child command is permitted.
     #[tokio::test]
     async fn test_caller_policy_allows_listed_parent() {
-        let mut cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec![],
-            action: ResolvedAction::Respond {
+        let child_cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
                 stdout: "from_git\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
-        cmd.caller_policy = CallerPolicy {
-            agent_allowed: false,
-            allowed_parents: Some(vec!["git".to_string()]),
+
+        // "git" parent has testcmd in its can_use.
+        let parent_cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec!["testcmd".to_string()],
+            from: Default::default(),
         };
 
         let broker = make_broker();
-        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let nonce = broker.issue(Zeroizing::new("git".to_string()), test_grants());
         let mut env = HashMap::new();
         env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
 
@@ -1460,24 +1519,37 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
-        assert_eq!(action, "respond", "stderr: {}", resp.stderr);
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, parent_cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "deny", "stderr: {}", resp.stderr);
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "from_git\n");
     }
 
-    /// A parent not in `allowed_parents` is rejected with exit 126.
+    /// A parent whose `can_use` does not include the child command is denied.
     #[tokio::test]
     async fn test_caller_policy_rejects_unlisted_parent() {
-        let mut cmd = make_cmd(vec![]);
-        cmd.caller_policy = CallerPolicy {
-            agent_allowed: true,
-            allowed_parents: Some(vec!["git".to_string()]),
+        let child_cmd = make_cmd(vec![]);
+
+        // "kubectl" parent does not have testcmd in its can_use.
+        let parent_cmd = ResolvedCommand {
+            name: "kubectl".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let broker = make_broker();
-        // Caller is "kubectl", not in the allowed list.
-        let nonce = broker.issue(Zeroizing::new("kubectl".to_string()));
+        let nonce = broker.issue(Zeroizing::new("kubectl".to_string()), test_grants());
         let mut env = HashMap::new();
         env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
 
@@ -1489,29 +1561,41 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, parent_cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
         assert!(
-            resp.stderr.contains("kubectl"),
-            "stderr should name the rejected parent: {}",
+            resp.stderr.contains("testcmd"),
+            "stderr should name the denied command: {}",
             resp.stderr
         );
     }
 
-    /// `allowed_parents: Some(vec![])` (explicit empty list) blocks every
-    /// mediated parent. With `agent_allowed: true` the command is still
-    /// reachable from the agent — useful for "agent-only" tools.
+    /// A parent with empty `can_use` cannot invoke any child command.
     #[tokio::test]
     async fn test_caller_policy_empty_allowed_parents_blocks_all_parents() {
-        let mut cmd = make_cmd(vec![]);
-        cmd.caller_policy = CallerPolicy {
-            agent_allowed: true,
-            allowed_parents: Some(vec![]),
+        let child_cmd = make_cmd(vec![]);
+
+        // "git" parent has empty can_use → cannot invoke testcmd.
+        let parent_cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let broker = make_broker();
-        let nonce = broker.issue(Zeroizing::new("git".to_string()));
+        let nonce = broker.issue(Zeroizing::new("git".to_string()), test_grants());
         let mut env = HashMap::new();
         env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
 
@@ -1523,28 +1607,48 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, parent_cmd], broker, &ctx(), always_allow()).await;
         assert_eq!(action, "denied");
         assert_eq!(resp.exit_code, 126);
     }
 
-    /// `allowed_parents: None` (the default) accepts any mediated parent —
-    /// preserves backward compatibility with profiles that don't set the field.
+    /// A parent with `can_use` containing the child is permitted to invoke it.
+    /// Replaces the old `allowed_parents: None` open-by-default behaviour.
     #[tokio::test]
     async fn test_caller_policy_none_allowed_parents_accepts_any() {
-        let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec![],
-            action: ResolvedAction::Respond {
+        let child_cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
                 stdout: "any_parent_ok\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
-        // Confirm default state.
-        assert!(cmd.caller_policy.allowed_parents.is_none());
+
+        // "anything" parent explicitly lists testcmd in can_use.
+        let parent_cmd = ResolvedCommand {
+            name: "anything".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec!["testcmd".to_string()],
+            from: Default::default(),
+        };
 
         let broker = make_broker();
-        let nonce = broker.issue(Zeroizing::new("anything".to_string()));
+        let nonce = broker.issue(Zeroizing::new("anything".to_string()), test_grants());
         let mut env = HashMap::new();
         env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
 
@@ -1556,25 +1660,236 @@ mod tests {
             pid: 0,
             cwd: None,
         };
-        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
-        assert_eq!(action, "respond");
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, parent_cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "deny");
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout, "any_parent_ok\n");
     }
 
+    // --- can_use / session_can_use gate tests ---
+
+    /// Agent is denied when it calls a command that is not in `session_can_use`.
+    /// No NONO_SANDBOX_CONTEXT → caller is the agent → the command must appear
+    /// in ctx.session_can_use, otherwise the request is rejected with exit 126.
     #[tokio::test]
-    async fn test_intercept_respond_exact_prefix_match() {
+    async fn test_session_can_use_agent_denied_when_command_not_listed() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec![
-                "auth".to_string(),
-                "github".to_string(),
-                "token".to_string(),
-            ],
-            action: ResolvedAction::Respond {
-                stdout: "static_output\n".to_string(),
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
+                stdout: "should_not_reach\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            // No NONO_SANDBOX_CONTEXT → caller is the agent.
+            ..Default::default()
+        };
+        // session_can_use does NOT include "testcmd" → must be denied.
+        let ctx_no_testcmd = SessionCtx {
+            shim_dir: std::path::Path::new("/tmp"),
+            socket_path: std::path::Path::new("/tmp/test.sock"),
+            session_token: "test_token",
+            workdir: std::path::Path::new("/tmp"),
+            session_can_use: vec![],
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx_no_testcmd, always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("testcmd"),
+            "stderr should name the denied command: {}",
+            resp.stderr
+        );
+    }
+
+    /// Agent is allowed when the command is in `session_can_use`.
+    #[tokio::test]
+    async fn test_session_can_use_agent_allowed_when_command_listed() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
+                stdout: "reached\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
+        }]);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        // session_can_use includes "testcmd" → must pass through to intercept.
+        let ctx_with_testcmd = SessionCtx {
+            shim_dir: std::path::Path::new("/tmp"),
+            socket_path: std::path::Path::new("/tmp/test.sock"),
+            session_token: "test_token",
+            workdir: std::path::Path::new("/tmp"),
+            session_can_use: vec!["testcmd".to_string()],
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx_with_testcmd, always_allow()).await;
+        assert_eq!(action, "deny");
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout, "reached\n");
+    }
+
+    /// A mediated parent is denied when it tries to invoke a command not in
+    /// its own `can_use` list. The parent is identified via the broker nonce
+    /// in NONO_SANDBOX_CONTEXT.
+    #[tokio::test]
+    async fn test_can_use_parent_denied_when_child_not_in_can_use() {
+        // "testcmd" is the child being invoked.
+        let child_cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
+                stdout: "should_not_reach\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
+        }]);
+
+        // "git" is the parent. Its can_use does NOT include "testcmd".
+        let parent_cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![], // "testcmd" not listed
+            from: Default::default(),
+        };
+
+        let broker = make_broker();
+        let nonce = broker.issue(Zeroizing::new("git".to_string()), test_grants());
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            cwd: None,
+        };
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, parent_cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("testcmd"),
+            "stderr should name the denied command: {}",
+            resp.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_can_use_parent_unknown_command_denied() {
+        // Parent nonce resolves to a name not registered in commands → denied.
+        // (Ensures the gate is fail-closed for unregistered parents.)
+        let child_cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]),
+            action: ResolvedAction::Deny {
+                stdout: "should_not_reach\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
+        }]);
+
+        // "git" is registered in commands; the nonce will resolve to "unknown-parent"
+        // which is NOT registered in commands.
+        let git_cmd = ResolvedCommand {
+            name: "git".to_string(),
+            real_path: std::path::PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&std::path::PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec!["testcmd".to_string()],
+            from: Default::default(),
+        };
+
+        let broker = make_broker();
+        // Issue a nonce for a name that is NOT in the commands list.
+        let nonce = broker.issue(
+            Zeroizing::new("unknown-parent".to_string()),
+            test_grants(),
+        );
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            cwd: None,
+        };
+        let (resp, action) =
+            apply_capture(req, &[child_cmd, git_cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("testcmd"),
+            "stderr should name the denied command: {}",
+            resp.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_intercept_deny_exact_prefix_match() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^auth$").unwrap()),
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^github$").unwrap()),
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^token$").unwrap()),
+            ]),
+            action: ResolvedAction::Deny {
+                stdout: "static_output\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+            admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1596,6 +1911,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1607,12 +1923,18 @@ mod tests {
     #[tokio::test]
     async fn test_intercept_prefix_matches_longer_args() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![ResolvedArgsMatcher::AnyArgMatches(
+                ::regex::Regex::new("^auth$").unwrap(),
+            )]),
+            action: ResolvedAction::Deny {
                 stdout: "matched\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1630,6 +1952,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1641,12 +1964,19 @@ mod tests {
     #[tokio::test]
     async fn test_no_intercept_match_falls_through() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string(), "github".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^auth$").unwrap()),
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^github$").unwrap()),
+            ]),
+            action: ResolvedAction::Deny {
                 stdout: "secret\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1665,6 +1995,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1675,12 +2006,19 @@ mod tests {
     #[tokio::test]
     async fn test_admin_rule_allow_proceeds() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["repo".to_string(), "delete".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^repo$").unwrap()),
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^delete$").unwrap()),
+            ]),
+            action: ResolvedAction::Deny {
                 stdout: "deleted\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: true,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1698,6 +2036,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1709,12 +2048,19 @@ mod tests {
     #[tokio::test]
     async fn test_admin_rule_deny_blocks() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["repo".to_string(), "delete".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^repo$").unwrap()),
+                ResolvedArgsMatcher::AnyArgMatches(::regex::Regex::new("^delete$").unwrap()),
+            ]),
+            action: ResolvedAction::Deny {
                 stdout: "deleted\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: true,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1732,6 +2078,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_deny(),
         )
@@ -1744,12 +2091,18 @@ mod tests {
     async fn test_non_admin_rule_skips_gate() {
         // admin=false rule with AlwaysDeny gate — gate must NOT be called, action executes.
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["status".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![ResolvedArgsMatcher::AnyArgMatches(
+                ::regex::Regex::new("^status$").unwrap(),
+            )]),
+            action: ResolvedAction::Deny {
                 stdout: "ok\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1767,6 +2120,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_deny(),
         )
@@ -1776,95 +2130,29 @@ mod tests {
         assert_eq!(resp.stdout, "ok\n");
     }
 
-    // --- subcommand_matches tests ---
-
-    #[test]
-    fn test_subcommand_matches_basic() {
-        assert!(subcommand_matches(
-            &["a".to_string(), "b".to_string()],
-            &["a".to_string(), "b".to_string(), "c".to_string()]
-        ));
-        assert!(subcommand_matches(&[], &["a".to_string()]));
-        assert!(!subcommand_matches(
-            &["a".to_string(), "b".to_string()],
-            &["a".to_string()]
-        ));
-        assert!(!subcommand_matches(&["a".to_string()], &["b".to_string()]));
-    }
-
-    #[test]
-    fn test_subcommand_matches_ignores_leading_flags() {
-        // --debug before positional args should not break matching
-        assert!(subcommand_matches(
-            &[
-                "auth".to_string(),
-                "github".to_string(),
-                "token".to_string()
-            ],
-            &[
-                "--debug".to_string(),
-                "auth".to_string(),
-                "github".to_string(),
-                "token".to_string(),
-            ]
-        ));
-    }
-
-    #[test]
-    fn test_subcommand_matches_ignores_interleaved_flags() {
-        // flags between subcommands should be ignored
-        assert!(subcommand_matches(
-            &["auth".to_string(), "github".to_string()],
-            &[
-                "auth".to_string(),
-                "--verbose".to_string(),
-                "github".to_string(),
-            ]
-        ));
-    }
-
-    #[test]
-    fn test_subcommand_matches_empty_prefix_matches_anything() {
-        assert!(subcommand_matches(&[], &[]));
-        assert!(subcommand_matches(&[], &["anything".to_string()]));
-    }
-
-    #[test]
-    fn test_subcommand_matches_flag_value_injection_does_not_defeat_prefix() {
-        // Inserting a flag+value pair inserts an extra positional ("kipz"),
-        // which shifts real positionals and defeats a prefix that relied on
-        // their positions. This test documents the known limitation:
-        // profiles must not rely on a value arg appearing at a specific
-        // positional index — use a catch-all prefix for the subcommand instead.
-        assert!(!subcommand_matches(
-            &[
-                "find-generic-password".to_string(),
-                "gh:github.com".to_string(),
-            ],
-            &[
-                "find-generic-password".to_string(),
-                "-a".to_string(),
-                "kipz".to_string(), // injected positional shifts "gh:github.com"
-                "-s".to_string(),
-                "gh:github.com".to_string(),
-                "-w".to_string(),
-            ]
-        ));
-    }
-
     // --- Capture tests ---
 
     #[tokio::test]
     async fn test_capture_runs_real_binary_and_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string()],
-            action: ResolvedAction::Capture { script: None },
-            exit_code: 0,
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![ResolvedArgsMatcher::AnyArgMatches(
+                ::regex::Regex::new("^auth$").unwrap(),
+            )]),
+            action: ResolvedAction::Capture {
+                script: None,
+                grants: test_grants(),
+            },
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
         // Use a command that outputs something: `echo hello` → "hello"
         let cmd = ResolvedCommand {
             real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            can_use: vec![],
             ..cmd
         };
 
@@ -1885,6 +2173,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1897,19 +2186,26 @@ mod tests {
         );
         // The nonce resolves to the trimmed stdout of `echo auth hello`
         let nonce = resp.stdout.trim();
-        let resolved = broker.resolve(nonce).expect("nonce should be in broker");
+        let resolved = broker
+            .resolve(nonce, &test_consumer())
+            .expect("nonce should be in broker");
         assert_eq!(resolved.as_str(), "auth hello");
     }
 
     #[tokio::test]
     async fn test_capture_script_returns_nonce() {
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string()],
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![ResolvedArgsMatcher::AnyArgMatches(
+                ::regex::Regex::new("^auth$").unwrap(),
+            )]),
             action: ResolvedAction::Capture {
                 script: Some("echo my_secret_token".to_string()),
+                grants: test_grants(),
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let req = ShimRequest {
@@ -1928,6 +2224,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -1935,7 +2232,9 @@ mod tests {
         assert_eq!(resp.exit_code, 0);
         let nonce = resp.stdout.trim();
         assert!(nonce.starts_with("nono_"), "expected nonce, got: {}", nonce);
-        let resolved = broker.resolve(nonce).expect("nonce should be in broker");
+        let resolved = broker
+            .resolve(nonce, &test_consumer())
+            .expect("nonce should be in broker");
         assert_eq!(resolved.as_str(), "my_secret_token");
     }
 
@@ -1955,7 +2254,7 @@ mod tests {
             "context_value".to_string(),
         );
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
 
         // Dangerous vars must not be injected from sandbox.
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil"));
@@ -1970,12 +2269,12 @@ mod tests {
     #[test]
     fn test_build_exec_env_promotes_valid_nonce() {
         let broker = make_broker();
-        let nonce = broker.issue(Zeroizing::new("real_credential".to_string()));
+        let nonce = broker.issue(Zeroizing::new("real_credential".to_string()), test_grants());
 
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("GH_TOKEN".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert_eq!(
             env.get("GH_TOKEN").map(|s| s.as_str()),
             Some("real_credential")
@@ -1985,13 +2284,13 @@ mod tests {
     #[test]
     fn test_build_exec_env_blocks_dangerous_var_even_with_valid_nonce() {
         let broker = make_broker();
-        let nonce = broker.issue(Zeroizing::new("/evil/path".to_string()));
+        let nonce = broker.issue(Zeroizing::new("/evil/path".to_string()), test_grants());
 
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("PATH".to_string(), nonce.clone());
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         // PATH from sandbox must not be the injected value (parent PATH is used instead)
         assert_ne!(env.get("PATH").map(|s| s.as_str()), Some("/evil/path"));
         // LD_PRELOAD should not have been injected
@@ -2010,198 +2309,13 @@ mod tests {
             "nono_0000000000000000000000000000000000000000000000000000000000000000".to_string();
         sandbox_env.insert("MY_TOKEN".to_string(), unknown.clone());
 
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         // Substring promotion: unknown nonces are passed through verbatim
         // rather than discarded. The sandbox can probe shape but cannot recover
         // any issued nonce this way.
         assert_eq!(
             env.get("MY_TOKEN").map(|s| s.as_str()),
             Some(unknown.as_str())
-        );
-    }
-
-    // --- Filtered shim dir tests ---
-
-    #[test]
-    fn test_filtered_shim_dir_excludes_allowed_commands() {
-        // Create a temporary shim directory with some shim files
-        let session_dir = tempfile::tempdir().expect("create temp dir");
-        let shim_dir = session_dir.path().join("shims");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-
-        // Create fake shim files
-        for name in &["gh", "ddtool", "kubectl"] {
-            std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
-        }
-
-        let commands = vec![
-            ResolvedCommand {
-                name: "gh".to_string(),
-                real_path: PathBuf::from("/usr/bin/gh"),
-                intercepts: vec![],
-                sandbox: None,
-                caller_policy: CallerPolicy::default(),
-            },
-            ResolvedCommand {
-                name: "ddtool".to_string(),
-                real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
-                intercepts: vec![],
-                sandbox: None,
-                caller_policy: CallerPolicy::default(),
-            },
-            ResolvedCommand {
-                name: "kubectl".to_string(),
-                real_path: PathBuf::from("/usr/local/bin/kubectl"),
-                intercepts: vec![],
-                sandbox: None,
-                caller_policy: CallerPolicy::default(),
-            },
-        ];
-
-        let allow_commands = vec!["ddtool".to_string()];
-
-        let (filtered_dir, _guard) = build_filtered_shim_dir(&shim_dir, &allow_commands, &commands)
-            .expect("build filtered shim dir");
-
-        // ddtool should NOT be in the filtered dir (it's allowed)
-        assert!(
-            !filtered_dir.join("ddtool").exists(),
-            "ddtool should be excluded from filtered shim dir"
-        );
-        // gh and kubectl should be symlinked
-        assert!(
-            filtered_dir.join("gh").exists(),
-            "gh should be in filtered shim dir"
-        );
-        assert!(
-            filtered_dir.join("kubectl").exists(),
-            "kubectl should be in filtered shim dir"
-        );
-    }
-
-    #[test]
-    fn test_filtered_shim_dir_empty_allow_commands_copies_all() {
-        let session_dir = tempfile::tempdir().expect("create temp dir");
-        let shim_dir = session_dir.path().join("shims");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-
-        for name in &["gh", "ddtool"] {
-            std::fs::write(shim_dir.join(name), "fake-shim").expect("write shim");
-        }
-
-        let commands = vec![];
-        // This function should not normally be called with empty allow_commands,
-        // but if it is, all shims should be present.
-        let allow_commands: Vec<String> = vec![];
-        let (filtered_dir, _guard) = build_filtered_shim_dir(&shim_dir, &allow_commands, &commands)
-            .expect("build filtered shim dir");
-
-        assert!(filtered_dir.join("gh").exists());
-        assert!(filtered_dir.join("ddtool").exists());
-    }
-
-    /// When `allow_commands` is set, `exec_passthrough` creates a filtered shim dir
-    /// and sets NONO_SHIM_DIR to that dir. This ensures nono-shim's
-    /// `resolve_real_binary` skips the correct directory and doesn't exec itself
-    /// recursively (which would cause EAGAIN).
-    #[tokio::test]
-    async fn test_allow_commands_sets_nono_shim_dir_to_filtered_dir() {
-        use crate::mediation::CommandSandbox;
-        use crate::mediation::NetworkConfig;
-        use std::os::unix::fs::PermissionsExt;
-
-        let session_dir = tempfile::tempdir().expect("create temp dir");
-        let shim_dir = session_dir.path().join("shims");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-
-        // Create fake shim files (need to exist for build_filtered_shim_dir)
-        for name in &["gh", "ddtool"] {
-            let p = shim_dir.join(name);
-            std::fs::write(&p, "fake-shim").expect("write shim");
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod shim");
-        }
-
-        let cmd = ResolvedCommand {
-            name: "gh".to_string(),
-            // Use /usr/bin/env so the child process prints its own environment.
-            real_path: PathBuf::from("/usr/bin/env"),
-            intercepts: vec![],
-            sandbox: Some(CommandSandbox {
-                network: NetworkConfig::default(),
-                fs_read: vec![],
-                fs_read_file: vec![],
-                fs_write: vec![],
-                fs_write_file: vec![],
-                allow_commands: vec!["ddtool".to_string()],
-                keychain_access: false,
-                allow_process_exec: false,
-            }),
-            caller_policy: CallerPolicy::default(),
-        };
-
-        // Provide a ddtool entry so build_filtered_shim_dir can find its real path.
-        let ddtool_cmd = ResolvedCommand {
-            name: "ddtool".to_string(),
-            real_path: PathBuf::from("/opt/homebrew/bin/ddtool"),
-            intercepts: vec![],
-            sandbox: None,
-            caller_policy: CallerPolicy::default(),
-        };
-
-        let req = ShimRequest {
-            command: "gh".to_string(),
-            args: vec![],
-            session_token: String::new(),
-            ..Default::default()
-        };
-
-        let broker = make_broker();
-        let (resp, _action_type) = apply_capture(
-            req,
-            &[cmd, ddtool_cmd],
-            Arc::clone(&broker),
-            &SessionCtx {
-                shim_dir: &shim_dir,
-                socket_path: std::path::Path::new("/tmp/test.sock"),
-                session_token: "test_token",
-                workdir: std::path::Path::new("/tmp"),
-            },
-            always_allow(),
-        )
-        .await;
-
-        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
-
-        // Extract the value of NONO_SHIM_DIR from the child's printed environment.
-        let shim_dir_line = resp
-            .stdout
-            .lines()
-            .find(|l| l.starts_with("NONO_SHIM_DIR="))
-            .expect("NONO_SHIM_DIR not found in env output");
-        let child_shim_dir = shim_dir_line.trim_start_matches("NONO_SHIM_DIR=");
-
-        // NONO_SHIM_DIR must NOT be the original shims/ directory — it should
-        // be the filtered shim dir created by exec_passthrough.
-        assert_ne!(
-            child_shim_dir,
-            shim_dir.to_string_lossy().as_ref() as &str,
-            "NONO_SHIM_DIR should be the filtered dir, not the original shim dir"
-        );
-
-        // NONO_SHIM_DIR must also be at the front of PATH so resolve_real_binary
-        // in the shim finds it first when skipping its own directory.
-        let path_line = resp
-            .stdout
-            .lines()
-            .find(|l| l.starts_with("PATH="))
-            .expect("PATH not found in env output");
-        let child_path = path_line.trim_start_matches("PATH=");
-        assert!(
-            child_path.starts_with(child_shim_dir),
-            "PATH should start with NONO_SHIM_DIR ({}), got: {}",
-            child_shim_dir,
-            child_path
         );
     }
 
@@ -2217,6 +2331,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2227,11 +2343,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2252,6 +2373,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -2282,6 +2404,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2292,11 +2416,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2316,6 +2445,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -2329,26 +2459,31 @@ mod tests {
         );
     }
 
-    /// Approve action does NOT apply the per-command sandbox. The real binary
-    /// needs unrestricted access to system resources (e.g. macOS Keychain via
-    /// mach-lookup to securityd). Protection comes from the profile author's
-    /// deliberate choice of which commands get `approve`.
+    /// A `Allow` rule with `sandbox: ExplicitlyUnsandboxed` runs the real
+    /// binary without applying the command-level sandbox. This is the
+    /// replacement for the legacy `Approve` action: profile authors who want
+    /// "real binary, no sandbox" use `Allow` with `"sandbox": null`.
     ///
     /// We verify by checking that HTTPS_PROXY is NOT injected even when the
-    /// command has `allowed_hosts` configured, proving the sandbox was skipped.
+    /// command-level sandbox has `allowed_hosts` configured, proving the
+    /// command-level sandbox was skipped in favour of the rule's binding.
     #[tokio::test]
-    async fn test_approve_does_not_apply_per_command_sandbox() {
+    async fn test_allow_explicitly_unsandboxed_skips_command_sandbox() {
         use crate::mediation::CommandSandbox;
         use crate::mediation::NetworkConfig;
 
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![ResolvedIntercept {
-                args_prefix: vec![],
-                action: ResolvedAction::Approve { script: None },
-                exit_code: 0,
+                id: None,
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
                 admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
             }],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2359,11 +2494,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2385,17 +2525,19 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
         .await;
 
-        assert_eq!(action_type, "approve");
+        assert_eq!(action_type, "allow");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
-        // HTTPS_PROXY must NOT be present — approve runs without per-command sandbox.
+        // HTTPS_PROXY must NOT be present — Allow with ExplicitlyUnsandboxed
+        // skips the command-level sandbox.
         assert!(
             !resp.stdout.contains("HTTPS_PROXY=http://nono:"),
-            "Approve action should NOT apply per-command sandbox, but HTTPS_PROXY found: {}",
+            "Allow with ExplicitlyUnsandboxed should NOT apply per-command sandbox, but HTTPS_PROXY found: {}",
             resp.stdout
         );
     }
@@ -2413,6 +2555,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2423,11 +2567,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: true,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2449,12 +2598,13 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
         assert!(
             resp.stdout.contains("HTTPS_PROXY=http://nono:"),
@@ -2473,6 +2623,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2483,11 +2635,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2509,12 +2666,13 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
         assert!(
             resp.stdout.contains("HTTPS_PROXY=http://nono:"),
@@ -2534,6 +2692,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2544,11 +2704,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: true,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2570,6 +2735,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -2597,6 +2763,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2607,11 +2775,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2633,12 +2806,13 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         // /bin/sh runs (its path is allowed via real_path) but cannot launch
         // /usr/bin/true; sh reports non-zero exit.
         assert_ne!(
@@ -2660,6 +2834,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2670,11 +2846,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: true,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2696,97 +2877,16 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         assert_eq!(
             resp.exit_code, 0,
             "expected sh -c /usr/bin/true to succeed with allow_process_exec=true; stderr={}",
-            resp.stderr
-        );
-    }
-
-    /// `allow_commands` targets are exec-allowed inside the caller's sandbox
-    /// even when `allow_process_exec: false`. Verifies the bypass-the-shim
-    /// design: the listed binary is run directly with no re-mediation.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn test_allow_commands_binary_is_exec_allowed_when_restricted() {
-        use crate::mediation::CommandSandbox;
-        use crate::mediation::NetworkConfig;
-        use std::os::unix::fs::PermissionsExt;
-
-        // build_filtered_shim_dir requires fake shim files in shim_dir, and
-        // creates the filtered dir as a sibling — so shim_dir's parent must
-        // be writable. Use a tempdir.
-        let session_dir = tempfile::tempdir().expect("create temp dir");
-        let shim_dir = session_dir.path().join("shims");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-        for name in &["testcmd", "myhelper"] {
-            let p = shim_dir.join(name);
-            std::fs::write(&p, "fake-shim").expect("write shim");
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod shim");
-        }
-
-        let other = ResolvedCommand {
-            name: "myhelper".to_string(),
-            real_path: PathBuf::from("/usr/bin/true"),
-            intercepts: vec![],
-            sandbox: None,
-            caller_policy: CallerPolicy::default(),
-        };
-        let cmd = ResolvedCommand {
-            name: "testcmd".to_string(),
-            real_path: PathBuf::from("/usr/bin/env"),
-            intercepts: vec![],
-            sandbox: Some(CommandSandbox {
-                network: NetworkConfig {
-                    block: true,
-                    allowed_hosts: vec![],
-                },
-                fs_read: vec![],
-                fs_read_file: vec![],
-                fs_write: vec![],
-                fs_write_file: vec![],
-                allow_commands: vec!["myhelper".to_string()],
-                keychain_access: false,
-                allow_process_exec: false,
-            }),
-            caller_policy: CallerPolicy::default(),
-        };
-
-        let req = ShimRequest {
-            command: "testcmd".to_string(),
-            args: vec!["/usr/bin/true".to_string()],
-            session_token: String::new(),
-            env: HashMap::new(),
-            pid: 0,
-            cwd: None,
-        };
-
-        let broker = make_broker();
-        let (resp, action_type) = apply_capture(
-            req,
-            &[cmd, other],
-            Arc::clone(&broker),
-            &SessionCtx {
-                shim_dir: &shim_dir,
-                socket_path: std::path::Path::new("/tmp/test.sock"),
-                session_token: "test_token",
-                workdir: std::path::Path::new("/tmp"),
-            },
-            always_allow(),
-        )
-        .await;
-
-        assert_eq!(action_type, "passthrough");
-        assert_eq!(
-            resp.exit_code, 0,
-            "expected allow_commands target to be exec-allowed even under restrict; stderr={}",
             resp.stderr
         );
     }
@@ -2841,6 +2941,8 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
             intercepts: vec![],
             sandbox: Some(CommandSandbox {
                 network: NetworkConfig {
@@ -2851,11 +2953,16 @@ mod tests {
                 fs_read_file: vec![],
                 fs_write: vec![],
                 fs_write_file: vec![],
-                allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: true,
             }),
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let req = ShimRequest {
@@ -2881,6 +2988,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
         )
@@ -2910,9 +3018,17 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/bin/cat"),
+
+            pin: real_pin(&PathBuf::from("/bin/cat")),
             intercepts: vec![],
             sandbox: None,
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         let (child_in, mut test_in) = UnixStream::pair().expect("pair stdin");
@@ -2952,6 +3068,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
             OwnedFd::from(child_in),
@@ -2960,7 +3077,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
         // Streaming path: the response carries no buffered output.
         assert!(
@@ -2984,7 +3101,7 @@ mod tests {
         );
     }
 
-    /// Capture/Respond/Approve paths drop the passed fds and produce buffered
+    /// Capture/Deny/Approve paths drop the passed fds and produce buffered
     /// output via the response. Verifies the dropped fds let the test side
     /// see EOF (no hang) and that the buffered stdout flows through normally.
     #[tokio::test]
@@ -2993,12 +3110,18 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let cmd = make_cmd(vec![ResolvedIntercept {
-            args_prefix: vec!["auth".to_string()],
-            action: ResolvedAction::Respond {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![ResolvedArgsMatcher::AnyArgMatches(
+                ::regex::Regex::new("^auth$").unwrap(),
+            )]),
+            action: ResolvedAction::Deny {
                 stdout: "buffered_response\n".to_string(),
+                stderr: String::new(),
+                exit_code: 0,
             },
-            exit_code: 0,
             admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
         }]);
 
         let (child_in, _test_in) = UnixStream::pair().expect("pair stdin");
@@ -3021,6 +3144,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
             OwnedFd::from(child_in),
@@ -3029,17 +3153,17 @@ mod tests {
         )
         .await;
 
-        assert_eq!(action_type, "respond");
+        assert_eq!(action_type, "deny");
         assert_eq!(resp.stdout, "buffered_response\n");
 
-        // The Respond path dropped the child_out fd, so the test side
+        // The Deny path dropped the child_out fd, so the test side
         // immediately sees EOF — read_to_end returns 0 bytes without
         // hanging because there are no other writers on the socketpair.
         let mut buf = Vec::new();
         let _ = test_out.read_to_end(&mut buf);
         assert!(
             buf.is_empty(),
-            "Respond path should not write anything to passed stdout fd, got {:?}",
+            "Deny path should not write anything to passed stdout fd, got {:?}",
             buf
         );
     }
@@ -3059,9 +3183,17 @@ mod tests {
         let cmd = ResolvedCommand {
             name: "testcmd".to_string(),
             real_path: PathBuf::from("/bin/pwd"),
+
+            pin: real_pin(&PathBuf::from("/bin/pwd")),
             intercepts: vec![],
             sandbox: None,
-            caller_policy: CallerPolicy::default(),
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
         };
 
         // Use a tempdir as the caller cwd so it differs from whatever cwd the
@@ -3094,6 +3226,7 @@ mod tests {
                 socket_path: std::path::Path::new("/tmp/test.sock"),
                 session_token: "test_token",
                 workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["testcmd".to_string()],
             },
             always_allow(),
             OwnedFd::from(child_in),
@@ -3102,7 +3235,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(action_type, "passthrough");
+        assert_eq!(action_type, "allow");
         assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
 
         let mut buf = Vec::new();
@@ -3120,25 +3253,34 @@ mod tests {
     #[test]
     fn promote_nonces_substitutes_pure_nonce_arg() {
         let broker = TokenBroker::new();
-        let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
-        assert_eq!(promote_nonces_in_str(&nonce, &broker), "real-token");
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
+        assert_eq!(
+            promote_nonces_in_str(&nonce, &broker, &test_consumer(), true),
+            "real-token"
+        );
     }
 
     #[test]
     fn promote_nonces_substitutes_embedded_nonce() {
         let broker = TokenBroker::new();
-        let nonce = broker.issue(Zeroizing::new("real-token".to_string()));
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
         let arg = format!("X-Token: {}", nonce);
-        assert_eq!(promote_nonces_in_str(&arg, &broker), "X-Token: real-token");
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
+            "X-Token: real-token"
+        );
     }
 
     #[test]
     fn promote_nonces_substitutes_multiple_nonces_in_one_arg() {
         let broker = TokenBroker::new();
-        let a = broker.issue(Zeroizing::new("AAA".to_string()));
-        let b = broker.issue(Zeroizing::new("BBB".to_string()));
+        let a = broker.issue(Zeroizing::new("AAA".to_string()), test_grants());
+        let b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
         let arg = format!("first={} second={}", a, b);
-        assert_eq!(promote_nonces_in_str(&arg, &broker), "first=AAA second=BBB");
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
+            "first=AAA second=BBB"
+        );
     }
 
     #[test]
@@ -3146,13 +3288,19 @@ mod tests {
         let broker = TokenBroker::new();
         // Too few hex chars after the prefix — not a valid nonce shape.
         let arg = "nono_abc123";
-        assert_eq!(promote_nonces_in_str(arg, &broker), arg);
+        assert_eq!(promote_nonces_in_str(arg, &broker, &test_consumer(), true), arg);
         // Prefix followed by non-hex characters in the 64-char window.
         let arg2 = format!("nono_{}", "z".repeat(64));
-        assert_eq!(promote_nonces_in_str(&arg2, &broker), arg2);
+        assert_eq!(
+            promote_nonces_in_str(&arg2, &broker, &test_consumer(), true),
+            arg2
+        );
         // Uppercase hex must not match — broker only emits lowercase.
         let arg3 = format!("nono_{}", "A".repeat(64));
-        assert_eq!(promote_nonces_in_str(&arg3, &broker), arg3);
+        assert_eq!(
+            promote_nonces_in_str(&arg3, &broker, &test_consumer(), true),
+            arg3
+        );
     }
 
     #[test]
@@ -3160,37 +3308,60 @@ mod tests {
         let broker = TokenBroker::new();
         // Shape is valid but the nonce was never issued.
         let arg = format!("nono_{}", "a".repeat(64));
-        assert_eq!(promote_nonces_in_str(&arg, &broker), arg);
+        assert_eq!(promote_nonces_in_str(&arg, &broker, &test_consumer(), true), arg);
     }
 
     #[test]
     fn promote_nonces_preserves_surrounding_text() {
         let broker = TokenBroker::new();
-        let nonce = broker.issue(Zeroizing::new("XYZ".to_string()));
+        let nonce = broker.issue(Zeroizing::new("XYZ".to_string()), test_grants());
         let arg = format!("prefix-{}-suffix", nonce);
-        assert_eq!(promote_nonces_in_str(&arg, &broker), "prefix-XYZ-suffix");
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
+            "prefix-XYZ-suffix"
+        );
     }
 
     #[test]
     fn promote_nonces_no_match_returns_original() {
         let broker = TokenBroker::new();
         assert_eq!(
-            promote_nonces_in_str("plain string", &broker),
+            promote_nonces_in_str("plain string", &broker, &test_consumer(), true),
             "plain string"
         );
-        assert_eq!(promote_nonces_in_str("", &broker), "");
+        assert_eq!(promote_nonces_in_str("", &broker, &test_consumer(), true), "");
+    }
+
+    /// `allow=false` short-circuits before any nonce scanning. Used by the
+    /// per-arg / per-env-key filter wiring so the per-slot decision happens
+    /// one scope up.
+    #[test]
+    fn promote_nonces_allow_false_returns_input_verbatim() {
+        let broker = TokenBroker::new();
+        let nonce = broker.issue(Zeroizing::new("real-token".to_string()), test_grants());
+        let arg = format!("Authorization: Bearer {}", nonce);
+        // allow=true promotes
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), true),
+            "Authorization: Bearer real-token"
+        );
+        // allow=false leaves verbatim — same string, including the nonce
+        assert_eq!(
+            promote_nonces_in_str(&arg, &broker, &test_consumer(), false),
+            arg
+        );
     }
 
     #[test]
     fn build_exec_env_promotes_substring_in_value() {
         let broker = Arc::new(TokenBroker::new());
-        let nonce = broker.issue(Zeroizing::new("jwt-body".to_string()));
+        let nonce = broker.issue(Zeroizing::new("jwt-body".to_string()), test_grants());
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert(
             "AUTH_HEADER".to_string(),
             format!("Authorization: Bearer {}", nonce),
         );
-        let env = build_exec_env(&sandbox_env, &broker);
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert_eq!(
             env.get("AUTH_HEADER").map(String::as_str),
             Some("Authorization: Bearer jwt-body"),
@@ -3200,12 +3371,1307 @@ mod tests {
     #[test]
     fn build_exec_env_still_blocks_dangerous_names() {
         let broker = Arc::new(TokenBroker::new());
-        let nonce = broker.issue(Zeroizing::new("evil".to_string()));
+        let nonce = broker.issue(Zeroizing::new("evil".to_string()), test_grants());
         let mut sandbox_env = HashMap::new();
         sandbox_env.insert("LD_PRELOAD".to_string(), nonce.clone());
-        sandbox_env.insert("SAFE".to_string(), nonce);
-        let env = build_exec_env(&sandbox_env, &broker);
+        // SAFE matches no safe-shape pattern in the built-in default, so
+        // it stays literal — the nonce flows through verbatim, the var
+        // still flows through (only the promotion is suppressed).
+        sandbox_env.insert("SAFE".to_string(), nonce.clone());
+        let env = build_exec_env(&sandbox_env, &broker, &test_consumer(), None);
         assert!(!env.contains_key("LD_PRELOAD"));
-        assert_eq!(env.get("SAFE").map(String::as_str), Some("evil"));
+        // SAFE flows through but the nonce stays literal.
+        assert_eq!(env.get("SAFE").map(String::as_str), Some(nonce.as_str()));
+    }
+
+    /// Built-in env default: any *_HEADER name flows promotion when no
+    /// filter is set. AUTH_HEADER matches the `.+_header` pattern.
+    #[test]
+    fn build_exec_env_default_admits_safe_shape_names() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("jwt".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce),
+        );
+        env_in.insert("X_TOKEN".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer jwt"));
+        assert_eq!(env.get("X_TOKEN").map(String::as_str), Some("jwt"));
+    }
+
+    /// Built-in env default: random names like MY_VAR are NOT admitted —
+    /// nonce stays literal.
+    #[test]
+    fn build_exec_env_default_rejects_random_names() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert("MY_VAR".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some(nonce.as_str()));
+    }
+
+    /// Built-in env default is case-insensitive — lowercase
+    /// `authorization` admits.
+    #[test]
+    fn build_exec_env_default_is_case_insensitive() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let mut env_in = HashMap::new();
+        env_in.insert("authorization".to_string(), format!("Bearer {}", nonce));
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), None);
+        assert_eq!(
+            env.get("authorization").map(String::as_str),
+            Some("Bearer real")
+        );
+    }
+
+    /// Explicit env predicate REPLACES the built-in default — when set,
+    /// only the predicate decides. AUTH_HEADER is no longer in play.
+    #[test]
+    fn build_exec_env_explicit_predicate_replaces_default() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), test_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": { "name_matches": "^MY_VAR$" }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce_a),
+        );
+        env_in.insert("MY_VAR".to_string(), nonce_b.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // AUTH_HEADER no longer auto-promotes — the explicit predicate replaced
+        // the default and only admits MY_VAR.
+        assert_eq!(
+            env.get("AUTH_HEADER").map(String::as_str),
+            Some(format!("Bearer {}", nonce_a).as_str()),
+        );
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some("BBB"));
+    }
+
+    /// Documented widening pattern: union the default regex with a custom
+    /// name to keep the safe-shape allowlist AND admit a bespoke env var.
+    #[test]
+    fn build_exec_env_explicit_predicate_can_union_default() {
+        use crate::mediation::{PromoteFilter, promote::PROMOTE_ENV_DEFAULT_NAMES};
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), test_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": {
+                "any_of": [
+                    { "name_matches": PROMOTE_ENV_DEFAULT_NAMES },
+                    { "name_matches": "^MY_CUSTOM_NONCE_VAR$" }
+                ]
+            }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce_a),
+        );
+        env_in.insert("MY_CUSTOM_NONCE_VAR".to_string(), nonce_b);
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer AAA"));
+        assert_eq!(
+            env.get("MY_CUSTOM_NONCE_VAR").map(String::as_str),
+            Some("BBB")
+        );
+    }
+
+    /// `not` env predicate inverts: promotes everywhere except the named
+    /// one.
+    #[test]
+    fn build_exec_env_not_env_predicate_inverts() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "env": { "not": { "name_matches": "^DD_API_KEY$" } }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert("DD_API_KEY".to_string(), nonce.clone());
+        env_in.insert("ANY".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // DD_API_KEY: not(name=DD_API_KEY) → false → no promotion.
+        assert_eq!(
+            env.get("DD_API_KEY").map(String::as_str),
+            Some(nonce.as_str()),
+        );
+        // ANY: not(name=DD_API_KEY) → true → promote.
+        assert_eq!(env.get("ANY").map(String::as_str), Some("real"));
+    }
+
+    /// args-only filter still uses the built-in env default — the env
+    /// scope is independent of the args scope.
+    #[test]
+    fn build_exec_env_args_only_filter_still_uses_default() {
+        use crate::mediation::PromoteFilter;
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real".to_string()), test_grants());
+        let p: PromoteFilter = serde_json::from_value(serde_json::json!({
+            "args": { "self_matches": "^-H" }
+        }))
+        .unwrap();
+        let filter =
+            crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile");
+
+        let mut env_in = HashMap::new();
+        env_in.insert(
+            "AUTH_HEADER".to_string(),
+            format!("Bearer {}", nonce),
+        );
+        env_in.insert("MY_VAR".to_string(), nonce.clone());
+        let env = build_exec_env(&env_in, &broker, &test_consumer(), Some(&filter));
+        // AUTH_HEADER still promotes via the built-in default.
+        assert_eq!(env.get("AUTH_HEADER").map(String::as_str), Some("Bearer real"));
+        // MY_VAR doesn't.
+        assert_eq!(env.get("MY_VAR").map(String::as_str), Some(nonce.as_str()));
+    }
+
+    /// A `Allow` intercept runs the real binary the same way the
+    /// no-intercept-matched fall-through does. We point `real_path` at
+    /// `/bin/echo` and check that its stdout reaches the streamed response.
+    #[tokio::test]
+    async fn test_allow_intercept_streams_real_binary() {
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                id: None,
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(
+            resp.stdout.contains("hello"),
+            "expected echo output, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Per-arg promotion filter (promote_in.args)
+    //
+    // These tests use /bin/echo as the real binary so the streamed stdout
+    // shows exactly which argv slots the filter promoted (real token) vs
+    // left literal (`nono_<hex>`).
+    // ------------------------------------------------------------------
+
+    /// Builds an echo-backed ResolvedCommand whose single matching rule
+    /// carries the given `promote_filter`. The grant is permissive across
+    /// the consumer contexts we exercise so the grant gate is not the
+    /// bottleneck — only the filter.
+    fn echo_cmd_with_filter(
+        promote_filter: Option<crate::mediation::promote::ResolvedPromoteFilter>,
+    ) -> ResolvedCommand {
+        ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                id: Some("filtered".to_string()),
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        }
+    }
+
+    fn echo_grants() -> GrantSet {
+        GrantSet::Allow(vec![GrantDescriptor {
+            command: "echo".to_string(),
+            intercept_id: "filtered".to_string(),
+        }])
+    }
+
+    fn compile(filter_json: serde_json::Value) -> crate::mediation::promote::ResolvedPromoteFilter {
+        let p: crate::mediation::PromoteFilter =
+            serde_json::from_value(filter_json).expect("parse");
+        crate::mediation::promote::compile_promote_filter(&p, "echo").expect("compile")
+    }
+
+    /// Test 1: separate-arg `["-H", "Authorization: Bearer nono_X"]` with
+    /// `preceded_by_arg: ^-H$` promotes the value slot.
+    #[tokio::test]
+    async fn promote_args_separate_form_promotes_value_slot() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "-H".to_string(),
+                format!("Authorization: Bearer {}", nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            resp.stdout.contains("real-tok"),
+            "value slot must contain promoted token, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            !resp.stdout.contains("nono_"),
+            "no nonce should remain literal, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 2: attached form `["-Hnono_X"]` with `self_matches: ^-H`
+    /// promotes the single slot.
+    #[tokio::test]
+    async fn promote_args_attached_form_promotes_self_slot() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("attached-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": "^-H" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("-H{}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            resp.stdout.contains("attached-tok"),
+            "attached -H slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 3: long-equals form `["--header=Authorization: Bearer nono_X"]`
+    /// with `self_matches: ^--header=` promotes.
+    #[tokio::test]
+    async fn promote_args_long_equals_form_promotes() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("eq-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": "^--header=" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("--header=Authorization: Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            resp.stdout.contains("eq-tok"),
+            "long-equals slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 4: a `--data-binary` body slot must NOT promote when the filter
+    /// only admits `-H` predecessors.
+    #[tokio::test]
+    async fn promote_args_body_slot_stays_literal() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("body-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "--data-binary".to_string(),
+                format!("X: {}", nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        // The body slot predecessor is "--data-binary", not "-H" → filter
+        // rejects. Nonce stays literal in the streamed output.
+        assert!(
+            !resp.stdout.contains("body-tok"),
+            "body slot must NOT promote, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must remain, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 5: upload-file `["-T", "/tmp/nono_X.bin"]` keeps the path
+    /// literal under a header-only filter.
+    #[tokio::test]
+    async fn promote_args_upload_path_stays_literal() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("upload-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "preceded_by_arg": "^-H$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-T".to_string(), format!("/tmp/{}.bin", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            !resp.stdout.contains("upload-tok"),
+            "upload-file path must NOT promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 6: `any_of` combinator admits both attached and separate forms.
+    #[tokio::test]
+    async fn promote_args_any_of_covers_both_header_forms() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce_a = broker.issue(Zeroizing::new("AAA".to_string()), echo_grants());
+        let nonce_b = broker.issue(Zeroizing::new("BBB".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": {
+                "any_of": [
+                    { "preceded_by_arg": "^(-H|--header)$" },
+                    { "self_matches":    "^(-H|--header=)" }
+                ]
+            }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "-H".to_string(),
+                format!("Bearer {}", nonce_a),
+                format!("--header=X-Other: {}", nonce_b),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(resp.stdout.contains("AAA"));
+        assert!(resp.stdout.contains("BBB"));
+    }
+
+    /// Test 7: `not` combinator that inverts a body-slot rule promotes
+    /// everywhere except after body flags.
+    #[tokio::test]
+    async fn promote_args_not_body_inverts_correctly() {
+        let broker = Arc::new(TokenBroker::new());
+        let body_nonce = broker.issue(Zeroizing::new("REAL-BODY-X".to_string()), echo_grants());
+        let header_nonce = broker.issue(Zeroizing::new("REAL-HDR-Y".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": {
+                "not": {
+                    "preceded_by_arg": "^(-d|--data-binary)$"
+                }
+            }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![
+                "--data-binary".to_string(),
+                body_nonce,
+                "-H".to_string(),
+                format!("Bearer {}", header_nonce),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        // Body slot promoted? No — `not(preceded_by_arg=^(-d|--data-binary)$)`
+        // evaluates false there, so the nonce stays literal.
+        assert!(
+            !resp.stdout.contains("REAL-BODY-X"),
+            "body slot must stay literal, got: {:?}",
+            resp.stdout
+        );
+        // Header slot promotes — predecessor is `-H`, not a body flag.
+        assert!(
+            resp.stdout.contains("REAL-HDR-Y"),
+            "header slot must promote, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 8: secure default — a rule with no `promote_in` field gets no
+    /// argv promotion at all, even when a valid nonce is present.
+    /// Documents the breaking change.
+    #[tokio::test]
+    async fn promote_args_secure_default_no_filter_no_promotion() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("would-be-real".to_string()), echo_grants());
+        // No filter on the rule.
+        let cmd = echo_cmd_with_filter(None);
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            !resp.stdout.contains("would-be-real"),
+            "no promotion expected with secure default, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must survive, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 9: an `env`-only filter (no `args` sub-field) still gets the
+    /// secure-default argv behaviour — no argv slot promotes.
+    #[tokio::test]
+    async fn promote_args_env_only_filter_no_argv_promotion() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("real-tok".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "env": { "name_matches": "^AUTH_HEADER$" }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(
+            !resp.stdout.contains("real-tok"),
+            "env-only filter must NOT enable argv promotion, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Test 10: empty `any_of: []` never promotes — defensive lock test.
+    #[tokio::test]
+    async fn promote_args_empty_any_of_never_promotes() {
+        let broker = Arc::new(TokenBroker::new());
+        let nonce = broker.issue(Zeroizing::new("lock".to_string()), echo_grants());
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "any_of": [] }
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["-H".to_string(), format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(!resp.stdout.contains("lock"));
+    }
+
+    /// Test 11: filter × grant interaction — if the grant rejects the
+    /// consumer, the filter is irrelevant. Grant gate stays primary.
+    #[tokio::test]
+    async fn promote_args_grant_rejection_overrides_admitting_filter() {
+        let broker = Arc::new(TokenBroker::new());
+        // Issue a nonce whose grant excludes the echo.filtered consumer.
+        let other_grants = GrantSet::Allow(vec![GrantDescriptor {
+            command: "other".to_string(),
+            intercept_id: "default".to_string(),
+        }]);
+        let nonce = broker.issue(Zeroizing::new("never-leak".to_string()), other_grants);
+        let cmd = echo_cmd_with_filter(Some(compile(serde_json::json!({
+            "args": { "self_matches": ".*" } // admit every slot
+        }))));
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec![format!("Bearer {}", nonce)],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) = apply_capture(req, &[cmd], broker, &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        // Filter admits, but grant denies → nonce stays literal.
+        assert!(
+            !resp.stdout.contains("never-leak"),
+            "grant must reject regardless of filter, got: {:?}",
+            resp.stdout
+        );
+        assert!(
+            resp.stdout.contains("nono_"),
+            "literal nonce must survive, got: {:?}",
+            resp.stdout
+        );
+    }
+
+    /// Per-intercept `sandbox` overrides the command-level `sandbox` for a
+    /// single `Allow` invocation. The matching intercept here carries a
+    /// tight sandbox (`network.block = true`); the command-level sandbox is
+    /// permissive (default). The exec target `/bin/echo` does not touch the
+    /// network, so the test cannot directly observe which sandbox was
+    /// applied — but it verifies that the wiring compiles and runs without
+    /// error. An end-to-end test that observes the per-intercept proxy
+    /// starting (`test_per_intercept_sandbox_starts_proxy`) is the follow-up.
+    #[tokio::test]
+    async fn test_allow_uses_per_intercept_sandbox() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let tight = CommandSandbox {
+            network: NetworkConfig {
+                block: true,
+                allowed_hosts: vec![],
+            },
+            ..CommandSandbox::default()
+        };
+
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                id: None,
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::Explicit(tight.clone()),
+                promote_filter: None,
+            }],
+            sandbox: Some(CommandSandbox::default()), // permissive
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["ok".to_string()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(resp.stdout.contains("ok"));
+    }
+
+    /// Extracts the HTTPS_PROXY value from a printenv/env stdout dump.
+    fn extract_https_proxy(stdout: &str) -> Option<String> {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("HTTPS_PROXY=").map(str::to_string))
+    }
+
+    /// End-to-end mirror of `test_allowed_hosts_injects_https_proxy`, except
+    /// the `allowed_hosts` policy lives on the matched intercept's `sandbox`,
+    /// not on the command-level `sandbox`. This exercises the per-intercept
+    /// override path: `cmd.sandbox` is `None`, so it is the intercept's
+    /// sandbox that causes the proxy to start.
+    #[tokio::test]
+    async fn test_per_intercept_sandbox_starts_proxy() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let intercept_sandbox = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["example.com".to_string()],
+            },
+            ..CommandSandbox::default()
+        };
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
+            intercepts: vec![ResolvedIntercept {
+                id: None,
+                matcher: ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::Explicit(intercept_sandbox),
+                promote_filter: None,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            // `env` with no args prints its environment; we grep for HTTPS_PROXY.
+            args: vec![],
+            session_token: String::new(),
+            ..Default::default()
+        };
+
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        let proxy = extract_https_proxy(&resp.stdout).unwrap_or_else(|| {
+            panic!(
+                "expected HTTPS_PROXY to be injected by per-intercept sandbox, got: {}",
+                resp.stdout
+            )
+        });
+        assert!(
+            proxy.starts_with("http://nono:") || proxy.starts_with("http://127.0.0.1:"),
+            "HTTPS_PROXY should point at the per-intercept proxy, got: {}",
+            proxy
+        );
+        assert!(
+            resp.stdout.contains("127.0.0.1"),
+            "proxy addr not 127.0.0.1: {}",
+            resp.stdout
+        );
+    }
+
+    /// Two intercept rules on the same command, each with its own `sandbox`
+    /// that enables a different `allowed_hosts` proxy. Driving an invocation
+    /// matching rule A produces one `HTTPS_PROXY` URL; driving one matching
+    /// rule B produces a different URL. This proves the broker spun up two
+    /// distinct per-intercept proxies for the same command.
+    #[tokio::test]
+    async fn test_two_intercepts_select_different_sandboxes() {
+        use crate::mediation::matcher::compile_args_matcher;
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+
+        let sandbox_a = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["a.example".to_string()],
+            },
+            ..CommandSandbox::default()
+        };
+        let sandbox_b = CommandSandbox {
+            network: NetworkConfig {
+                block: false,
+                allowed_hosts: vec!["b.example".to_string()],
+            },
+            ..CommandSandbox::default()
+        };
+
+        // Matcher A: argv[1] == "MARKER_A". Matcher B: argv[1] == "MARKER_B".
+        // We invoke `/usr/bin/env -u MARKER_<x> /usr/bin/printenv` so the
+        // marker arrives as argv[1] (after `-u`) and is consumed by env
+        // (a no-op unset of a never-defined name); printenv then dumps the
+        // environment so the test can grep for HTTPS_PROXY.
+        let matcher_a = compile_args_matcher(
+            &serde_json::from_value(serde_json::json!({
+                "nth_arg_matches": 1,
+                "regex": "^MARKER_A$"
+            }))
+            .unwrap(),
+            "test",
+        )
+        .unwrap();
+        let matcher_b = compile_args_matcher(
+            &serde_json::from_value(serde_json::json!({
+                "nth_arg_matches": 1,
+                "regex": "^MARKER_B$"
+            }))
+            .unwrap(),
+            "test",
+        )
+        .unwrap();
+
+        let cmd = ResolvedCommand {
+            name: "testcmd".to_string(),
+            real_path: PathBuf::from("/usr/bin/env"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/env")),
+            intercepts: vec![
+                ResolvedIntercept {
+                    id: None,
+                    matcher: matcher_a,
+                    action: ResolvedAction::Allow { script: None },
+                    admin: false,
+                    sandbox: ResolvedSandboxBinding::Explicit(sandbox_a),
+                    promote_filter: None,
+                },
+                ResolvedIntercept {
+                    id: None,
+                    matcher: matcher_b,
+                    action: ResolvedAction::Allow { script: None },
+                    admin: false,
+                    sandbox: ResolvedSandboxBinding::Explicit(sandbox_b),
+                    promote_filter: None,
+                },
+            ],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+
+        // Drive intercept A.
+        let req_a = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "-u".to_string(),
+                "MARKER_A".to_string(),
+                "/usr/bin/printenv".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp_a, action_a) = apply_capture(
+            req_a,
+            std::slice::from_ref(&cmd),
+            make_broker(),
+            &ctx(),
+            always_allow(),
+        )
+        .await;
+        assert_eq!(action_a, "allow");
+        assert_eq!(resp_a.exit_code, 0, "stderr A: {}", resp_a.stderr);
+        let proxy_a = extract_https_proxy(&resp_a.stdout).unwrap_or_else(|| {
+            panic!(
+                "intercept A: expected HTTPS_PROXY in env, got: {}",
+                resp_a.stdout
+            )
+        });
+
+        // Drive intercept B.
+        let req_b = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec![
+                "-u".to_string(),
+                "MARKER_B".to_string(),
+                "/usr/bin/printenv".to_string(),
+            ],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp_b, action_b) =
+            apply_capture(req_b, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action_b, "allow");
+        assert_eq!(resp_b.exit_code, 0, "stderr B: {}", resp_b.stderr);
+        let proxy_b = extract_https_proxy(&resp_b.stdout).unwrap_or_else(|| {
+            panic!(
+                "intercept B: expected HTTPS_PROXY in env, got: {}",
+                resp_b.stdout
+            )
+        });
+
+        assert_ne!(
+            proxy_a, proxy_b,
+            "the two intercepts must have produced different proxy URLs (A={}, B={})",
+            proxy_a, proxy_b
+        );
+    }
+
+    /// `Allow` matched-intercept action streams the real binary the same way
+    /// `Passthrough` does. The action_type label is `"allow"`.
+    #[tokio::test]
+    async fn test_allow_action_streams_real_binary() {
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                id: None,
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["hello".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert!(resp.stdout.contains("hello"));
+    }
+
+    /// When `cmd.default` is set and no intercept matches, the default's
+    /// action is dispatched instead of the legacy implicit fall-through.
+    #[tokio::test]
+    async fn test_default_action_allow_dispatched_when_no_intercept_matches() {
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["default-dispatch".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "allow");
+        assert!(resp.stdout.contains("default-dispatch"));
+    }
+
+    /// `Deny` carries stdout, stderr, AND a configurable `exit_code`.
+    /// Profiles express "deny with a message" via
+    /// `Deny { exit_code: 126, stderr: "..." }` instead of inventing a
+    /// separate action variant. Regression for both the variant's `stderr`
+    /// (Phase B Commit 1) and `exit_code` (which the default-dispatch arm
+    /// previously hardcoded to 0).
+    #[tokio::test]
+    async fn test_default_deny_returns_stderr_and_exit_code() {
+        let cmd = ResolvedCommand {
+            name: "vault".to_string(),
+            real_path: PathBuf::from("/usr/bin/false"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/false")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Deny {
+                    stdout: String::new(),
+                    stderr: "vault not invokable\n".to_string(),
+                    exit_code: 126,
+                },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+        let req = ShimRequest {
+            command: "vault".to_string(),
+            args: vec!["read".into(), "secret/foo".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "deny");
+        assert!(
+            resp.stderr.contains("vault not invokable"),
+            "stderr should round-trip from Deny.stderr: {}",
+            resp.stderr
+        );
+        assert_eq!(
+            resp.exit_code, 126,
+            "default-dispatch Deny must return the variant's configured exit_code, not 0"
+        );
+    }
+
+    /// Companion regression for the matched-intercept Deny path: the
+    /// variant's `exit_code` must reach the shim response (not be dropped
+    /// or hardcoded). Pairs with `test_default_deny_returns_stderr_and_exit_code`
+    /// which covers the default-dispatch path.
+    #[tokio::test]
+    async fn test_matched_intercept_deny_returns_configured_exit_code() {
+        let cmd = make_cmd(vec![ResolvedIntercept {
+            id: None,
+            matcher: ResolvedArgsMatcher::All(vec![]), // match anything
+            action: ResolvedAction::Deny {
+                stdout: String::new(),
+                stderr: "blocked\n".to_string(),
+                exit_code: 42,
+            },
+            admin: false,
+            sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+            promote_filter: None,
+        }]);
+        let req = ShimRequest {
+            command: "testcmd".to_string(),
+            args: vec!["read".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, action) =
+            apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(action, "deny");
+        assert_eq!(
+            resp.exit_code, 42,
+            "matched-intercept Deny must return the variant's exit_code, got {}",
+            resp.exit_code
+        );
+        assert!(resp.stderr.contains("blocked"));
+    }
+
+    /// A.5: when an intercept rule binds an `Explicit` sandbox, that sandbox
+    /// is the one applied at exec time — the command-level `cmd.sandbox` does
+    /// NOT override the rule's binding. We can't easily assert the effective
+    /// sandbox from inside the test (it's collapsed deep inside
+    /// `exec_passthrough`), but exercising the matched-Allow path with
+    /// `Explicit` confirms the binding resolves cleanly and the child still
+    /// executes the real binary.
+    #[tokio::test]
+    async fn test_sandbox_binding_explicit_overrides_default() {
+        use crate::mediation::{CommandSandbox, NetworkConfig};
+        let tight = CommandSandbox {
+            network: NetworkConfig {
+                block: true,
+                allowed_hosts: vec![],
+            },
+            ..CommandSandbox::default()
+        };
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                id: Some("test".to_string()),
+                sandbox: ResolvedSandboxBinding::Explicit(tight.clone()),
+                promote_filter: None,
+            }],
+            sandbox: Some(CommandSandbox::default()), // permissive command-level
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["ok".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, _) = apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(resp.exit_code, 0);
+        assert!(resp.stdout.contains("ok"));
+    }
+
+    /// A.5: when an intercept rule's sandbox binding is
+    /// `InheritFromDefault`, the effective sandbox comes from
+    /// `cmd.default.sandbox` (preferred over the legacy `cmd.sandbox`).
+    /// Same caveat as above re: directly observing the effective sandbox.
+    #[tokio::test]
+    async fn test_sandbox_binding_inherits_from_default_sandbox() {
+        use crate::mediation::CommandSandbox;
+        let default_sb = CommandSandbox::default();
+        let cmd = ResolvedCommand {
+            name: "echo".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Allow { script: None },
+                admin: false,
+                id: Some("test".to_string()),
+                sandbox: ResolvedSandboxBinding::InheritFromDefault,
+                promote_filter: None,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: Some(default_sb.clone()),
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: Default::default(),
+        };
+        let req = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["inherited".into()],
+            session_token: String::new(),
+            ..Default::default()
+        };
+        let (resp, _) = apply_capture(req, &[cmd], make_broker(), &ctx(), always_allow()).await;
+        assert_eq!(resp.exit_code, 0);
+        assert!(resp.stdout.contains("inherited"));
+    }
+
+    // ------------------------------------------------------------------
+    // from-map dispatch tests
+    // ------------------------------------------------------------------
+
+    /// `from[kubectl] = passthrough` — a kubectl-invoked ddtool should skip
+    /// capture intercepts and return real output (not a nonce string).
+    #[tokio::test]
+    async fn from_passthrough_skips_intercepts() {
+        use crate::mediation::session::ResolvedCallerBinding;
+        use crate::mediation::CallerAction;
+
+        // ddtool with a Capture intercept that would return a nonce if fired.
+        let ddtool_cmd = ResolvedCommand {
+            name: "ddtool".to_string(),
+            real_path: PathBuf::from("/bin/echo"),
+
+            pin: real_pin(&PathBuf::from("/bin/echo")),
+            intercepts: vec![ResolvedIntercept {
+                id: None,
+                matcher: crate::mediation::matcher::ResolvedArgsMatcher::All(vec![]),
+                action: ResolvedAction::Capture {
+                    script: None,
+                    grants: test_grants(),
+                },
+                admin: false,
+                sandbox: ResolvedSandboxBinding::ExplicitlyUnsandboxed,
+                promote_filter: None,
+            }],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "kubectl".to_string(),
+                    ResolvedCallerBinding::Bound {
+                        action: CallerAction::Passthrough,
+                        sandbox: None,
+                    },
+                );
+                m
+            },
+        };
+
+        // kubectl parent that has ddtool in its can_use.
+        let kubectl_cmd = ResolvedCommand {
+            name: "kubectl".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec!["ddtool".to_string()],
+            from: Default::default(),
+        };
+
+        let broker = make_broker();
+        // Grant must match ConsumerContext { command: "ddtool", intercept_id: "default" }
+        // which is how `apply` resolves the NONO_SANDBOX_CONTEXT nonce.
+        let nonce = broker.issue(
+            Zeroizing::new("kubectl".to_string()),
+            GrantSet::Allow(vec![GrantDescriptor {
+                command: "ddtool".to_string(),
+                intercept_id: "default".to_string(),
+            }]),
+        );
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "ddtool".to_string(),
+            args: vec!["auth".to_string(), "github".to_string(), "token".to_string()],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            cwd: None,
+        };
+
+        let (resp, action) = apply_capture(
+            req,
+            &[ddtool_cmd, kubectl_cmd],
+            broker,
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["ddtool".to_string()],
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(resp.exit_code, 0, "stderr: {}", resp.stderr);
+        assert_eq!(action, "passthrough");
+        // Real output from /bin/echo — must NOT be a nonce.
+        assert!(
+            !resp.stdout.trim().starts_with("nono_"),
+            "expected real output, got nonce: {}",
+            resp.stdout
+        );
+    }
+
+    /// `from[cron] = deny` — a cron-invoked ssh returns exit 126.
+    #[tokio::test]
+    async fn from_deny_blocks_invocation() {
+        use crate::mediation::session::ResolvedCallerBinding;
+
+        let ssh_cmd = ResolvedCommand {
+            name: "ssh".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec![],
+            from: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("cron".to_string(), ResolvedCallerBinding::Deny);
+                m
+            },
+        };
+
+        // cron parent that has ssh in its can_use.
+        let cron_cmd = ResolvedCommand {
+            name: "cron".to_string(),
+            real_path: PathBuf::from("/usr/bin/true"),
+
+            pin: real_pin(&PathBuf::from("/usr/bin/true")),
+            intercepts: vec![],
+            sandbox: None,
+            default: ResolvedDefault {
+                action: ResolvedAction::Allow { script: None },
+                sandbox: None,
+                promote_filter: None,
+            },
+            can_use: vec!["ssh".to_string()],
+            from: Default::default(),
+        };
+
+        let broker = make_broker();
+        // Grant must match ConsumerContext { command: "ssh", intercept_id: "default" }.
+        let nonce = broker.issue(
+            Zeroizing::new("cron".to_string()),
+            GrantSet::Allow(vec![GrantDescriptor {
+                command: "ssh".to_string(),
+                intercept_id: "default".to_string(),
+            }]),
+        );
+        let mut env = HashMap::new();
+        env.insert("NONO_SANDBOX_CONTEXT".to_string(), nonce);
+
+        let req = ShimRequest {
+            command: "ssh".to_string(),
+            args: vec![],
+            session_token: String::new(),
+            env,
+            pid: 0,
+            cwd: None,
+        };
+
+        let (resp, action) = apply_capture(
+            req,
+            &[ssh_cmd, cron_cmd],
+            broker,
+            &SessionCtx {
+                shim_dir: std::path::Path::new("/tmp"),
+                socket_path: std::path::Path::new("/tmp/test.sock"),
+                session_token: "test_token",
+                workdir: std::path::Path::new("/tmp"),
+                session_can_use: vec!["ssh".to_string()],
+            },
+            always_allow(),
+        )
+        .await;
+
+        assert_eq!(action, "denied");
+        assert_eq!(resp.exit_code, 126);
+        assert!(
+            resp.stderr.contains("ssh"),
+            "stderr should name the denied command: {}",
+            resp.stderr
+        );
     }
 }

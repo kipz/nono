@@ -44,6 +44,7 @@ pub async fn run(
     audit_log_dir: PathBuf,
     workdir: PathBuf,
     audit_info: Arc<SessionAuditInfo>,
+    session_can_use: Vec<String>,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -56,6 +57,7 @@ pub async fn run(
     let shim_dir = Arc::new(shim_dir);
     let socket_path = Arc::new(socket_path);
     let workdir = Arc::new(workdir);
+    let session_can_use = Arc::new(session_can_use);
 
     loop {
         match listener.accept().await {
@@ -70,6 +72,7 @@ pub async fn run(
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
                 let stamp = Arc::clone(&audit_info);
+                let scu = Arc::clone(&session_can_use);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         stream,
@@ -83,6 +86,7 @@ pub async fn run(
                         &sess_dir,
                         &wd,
                         &stamp,
+                        &scu,
                     )
                     .await
                     {
@@ -112,6 +116,7 @@ async fn handle_connection(
     audit_log_dir: &Path,
     workdir: &std::path::Path,
     audit_info: &SessionAuditInfo,
+    session_can_use: &[String],
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -201,6 +206,7 @@ async fn handle_connection(
         socket_path,
         session_token: &session_token,
         workdir,
+        session_can_use: session_can_use.to_vec(),
     };
     let (response, action_type) = apply(
         request, commands, broker, &ctx, approval, stdin_fd, stdout_fd, stderr_fd,

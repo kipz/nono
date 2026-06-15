@@ -1,0 +1,9 @@
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld@21/bin/ld64.lld"]
+
+[build]
+rustdocflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld@21/bin/ld64.lld"]
+
+[env]
+LDFLAGS = "-fuse-ld=/opt/homebrew/opt/lld@21/bin/ld64.lld"

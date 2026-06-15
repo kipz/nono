@@ -545,7 +545,8 @@ mod tests {
             network_block: true,
             ..ProxyLaunchOptions::default()
         };
-        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
+            .expect("build_proxy_config_from_flags");
         assert!(
             config.strict_filter,
             "network_block: true must set strict_filter on ProxyConfig"
@@ -559,7 +560,8 @@ mod tests {
             network_block: false,
             ..ProxyLaunchOptions::default()
         };
-        let config = build_proxy_config_from_flags(&proxy).expect("build_proxy_config_from_flags");
+        let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
+            .expect("build_proxy_config_from_flags");
         assert!(
             !config.strict_filter,
             "strict_filter must default off when network_block is false"

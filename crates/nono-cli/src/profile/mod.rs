@@ -3053,28 +3053,6 @@ pub fn inject_proxy_provisioned_respond_rules(
             continue;
         }
 
-        // Refuse if the user has a `capture` rule on the same shape.
-        // That would let claude actually run the helper in the
-        // sandbox, defeating the design.
-        let conflicting_capture = mediation.commands.iter().any(|cmd| {
-            cmd.name == *command
-                && cmd.intercept.iter().any(|rule| {
-                    matches!(rule.action, InterceptAction::Capture { .. })
-                        && args_overlap(&rule.args_prefix, args)
-                })
-        });
-        if conflicting_capture {
-            return Err(nono::NonoError::SandboxInit(format!(
-                "credential route '{}' uses `proxy_provisioned_credential` for command '{}', \
-                 but a manual `capture` mediation rule already targets that command. Two paths \
-                 would run the helper in the sandbox: the manual rule (capturing into a nonce) \
-                 and the proxy parent (provisioning the cache). Either remove the manual \
-                 capture rule from `mediation.commands`, or change the credential route's \
-                 capture type to `mediated_helper` if you want the agent-driven nonce flow.",
-                route.name, command,
-            )));
-        }
-
         // Inject the rule. Insert at the front of `commands` so it
         // runs ahead of any user-declared passthrough rules on the
         // same command (e.g. a `respond` for OTHER args_prefixes).
@@ -7775,7 +7753,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_inject_errors_on_conflicting_capture_rule() {
+    fn auto_inject_coexists_with_manual_capture_rule() {
         use crate::mediation::{CommandEntry, InterceptAction, InterceptRule, MediationConfig};
         let routes = vec![provisioned_route(
             "gw",
@@ -7800,13 +7778,18 @@ mod tests {
             }],
             env: Default::default(),
         };
-        let err = inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
-            .expect_err("manual capture rule on same command must error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("manual `capture` mediation rule"),
-            "error must explain the conflict: {msg}"
-        );
+        inject_proxy_provisioned_respond_rules(&routes, &mut mediation)
+            .expect("manual capture rule should coexist with proxy-provisioned route");
+        let cmd = &mediation.commands[0];
+        assert_eq!(cmd.intercept.len(), 2);
+        assert!(matches!(
+            cmd.intercept[0].action,
+            InterceptAction::Respond { .. }
+        ));
+        assert!(matches!(
+            cmd.intercept[1].action,
+            InterceptAction::Capture { .. }
+        ));
     }
 
     #[test]

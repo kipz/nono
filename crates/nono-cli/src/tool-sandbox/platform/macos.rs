@@ -186,6 +186,11 @@ impl ResolvedToolSandboxPlan {
         let path_env = std::env::var_os("PATH");
         let resolved =
             crate::command_policy::resolve_policy_command_binaries(config, path_env.clone())?;
+        for w in &resolved.warnings {
+            if w.code == "command_not_found" {
+                eprintln!("  [nono] Warning: {}", w.message);
+            }
+        }
         let search_dirs = command_search_dirs(config, path_env, outer_caps)?;
         validate_trusted_executable_dirs(&search_dirs, outer_caps)?;
         // BMETE command policies are scoped to command_policies.commands.
@@ -3635,9 +3640,8 @@ fn resolve_allowed_direct_bypasses(
     let mut paths = Vec::new();
     for (command_name, command) in &config.commands {
         let Some(policy_binary) = resolved.commands.get(command_name) else {
-            return Err(NonoError::SandboxInit(format!(
-                "missing resolved binary for command '{command_name}'"
-            )));
+            // Command was skipped during resolution (not found on PATH); skip here too.
+            continue;
         };
         let policy_id = FileId {
             dev: policy_binary.dev,

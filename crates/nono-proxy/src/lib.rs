@@ -37,3 +37,4 @@ pub mod token;
 pub use config::ProxyConfig;
 pub use error::{ProxyError, Result};
 pub use server::{ProxyHandle, start};
+pub use token::NonceResolver;

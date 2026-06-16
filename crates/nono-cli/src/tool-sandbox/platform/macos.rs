@@ -150,7 +150,7 @@ struct ToolSandboxState {
     active_count: AtomicUsize,
     queued_requests: AtomicUsize,
     emitted_error_response: AtomicBool,
-    token_broker: Mutex<crate::tool_sandbox::token_broker::TokenBroker>,
+    token_broker: crate::tool_sandbox::token_broker::SharedBroker,
     approval_backends: nono_proxy::approval::ApprovalBackendRegistry,
 }
 
@@ -223,6 +223,7 @@ impl PreparedToolSandboxRuntime {
             policy_root,
             proxy_credential_env_vars,
             proxy_trust_bundle_paths,
+            shared_broker,
         } = input;
 
         validate_platform_requirements(config)?;
@@ -294,7 +295,8 @@ impl PreparedToolSandboxRuntime {
                 active_count: AtomicUsize::new(0),
                 queued_requests: AtomicUsize::new(0),
                 emitted_error_response: AtomicBool::new(false),
-                token_broker: Mutex::new(crate::tool_sandbox::token_broker::TokenBroker::new()),
+                token_broker: shared_broker
+                    .unwrap_or_else(crate::tool_sandbox::token_broker::new_shared_broker),
                 approval_backends,
             }),
             listener: Arc::new(listener),
@@ -1247,8 +1249,13 @@ fn handle_shim_stream_inner(
     }
 
     // ── Capture credential ──────────────────────────────────────────────
-    if let InterceptActionConfig::CaptureCredential { credential } = intercept_action {
-        if let Some(nonce) = issue_existing_ambient_credential_nonce(state, credential)? {
+    if let InterceptActionConfig::CaptureCredential { credential, grant_to } = intercept_action {
+        let grants = if grant_to.is_empty() {
+            crate::tool_sandbox::token_broker::GrantSet::All
+        } else {
+            crate::tool_sandbox::token_broker::GrantSet::Specific(grant_to.clone())
+        };
+        if let Some(nonce) = issue_existing_ambient_credential_nonce(state, credential, grants.clone())? {
             record_command_policy_audit(
                 audit_recorder.as_ref(),
                 &request,
@@ -1314,7 +1321,7 @@ fn handle_shim_stream_inner(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured)
+                    broker.store_named(credential.clone(), captured, grants.clone())
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -2433,7 +2440,8 @@ fn filter_child_env(
             let broker = state.token_broker.lock().map_err(|_| {
                 NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
             })?;
-            if let Some(resolved) = broker.resolve_env_entry(entry) {
+            let consumer = format!("cmd.{}", request.command);
+            if let Some(resolved) = broker.resolve_env_entry(entry, &consumer) {
                 result.push(resolved);
             } else {
                 result.push(entry.clone());
@@ -2741,6 +2749,7 @@ fn join_relay_thread(
 fn issue_existing_ambient_credential_nonce(
     state: &ToolSandboxState,
     credential: &str,
+    grants: crate::tool_sandbox::token_broker::GrantSet,
 ) -> Result<Option<String>> {
     {
         let mut broker = state.token_broker.lock().map_err(|_| {
@@ -2757,7 +2766,7 @@ fn issue_existing_ambient_credential_nonce(
     let mut broker = state.token_broker.lock().map_err(|_| {
         NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
     })?;
-    Ok(Some(broker.store_named(credential.to_string(), value)))
+    Ok(Some(broker.store_named(credential.to_string(), value, grants)))
 }
 
 fn load_ambient_credential_source(
@@ -4032,7 +4041,7 @@ mod tests {
             active_count: AtomicUsize::new(0),
             queued_requests: AtomicUsize::new(0),
             emitted_error_response: AtomicBool::new(false),
-            token_broker: Mutex::new(crate::tool_sandbox::token_broker::TokenBroker::new()),
+            token_broker: crate::tool_sandbox::token_broker::new_shared_broker(),
             approval_backends: nono_proxy::approval::ApprovalBackendRegistry::singleton(Arc::new(
                 crate::terminal_approval::TerminalApproval,
             )),

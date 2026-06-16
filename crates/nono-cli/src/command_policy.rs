@@ -387,6 +387,11 @@ pub enum InterceptActionConfig {
     CaptureCredential {
         /// Command credential handle receiving the captured value.
         credential: String,
+        /// Consumer IDs that may redeem the issued nonce via env-var promotion
+        /// (`"cmd.<name>"`) or L7 header injection (`"proxy.<route_id>"`).
+        /// An empty list means any consumer may redeem (equivalent to `GrantSet::All`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        grant_to: Vec<String>,
     },
     /// Block and route through `ApprovalBackend` before forking the child.
     /// On denial the shim receives an error response; no child is forked.
@@ -1228,7 +1233,7 @@ fn validate_intercept_rules(
                 format!("command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"),
             );
         }
-        if let InterceptActionConfig::CaptureCredential { credential } = &rule.action {
+        if let InterceptActionConfig::CaptureCredential { credential, .. } = &rule.action {
             validate_identifier(
                 &format!("commands.{command_name}.intercept[{i}].action.credential"),
                 credential,
@@ -3576,6 +3581,7 @@ mod tests {
     fn capture_credential_action_serde_roundtrip() {
         let action = InterceptActionConfig::CaptureCredential {
             credential: "github".to_string(),
+            grant_to: vec![],
         };
         let json = serde_json::to_string(&action).expect("serialize");
 
@@ -3602,6 +3608,7 @@ mod tests {
             args: vec!["auth".to_string(), "token".to_string()],
             action: InterceptActionConfig::CaptureCredential {
                 credential: "github".to_string(),
+                grant_to: vec![],
             },
         });
 
@@ -3629,6 +3636,7 @@ mod tests {
             args: vec!["auth".to_string(), "token".to_string()],
             action: InterceptActionConfig::CaptureCredential {
                 credential: "agent".to_string(),
+                grant_to: vec![],
             },
         });
 

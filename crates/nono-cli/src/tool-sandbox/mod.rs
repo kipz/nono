@@ -32,6 +32,8 @@ mod audit_context;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod credentials;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dynamic_providers;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod env;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod launch;

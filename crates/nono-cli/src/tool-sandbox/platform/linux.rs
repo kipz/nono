@@ -3197,19 +3197,20 @@ fn add_policy_fs(
     policy: &CommandSandboxConfig,
     policy_root: &Path,
 ) -> Result<()> {
-    for entry in &policy.fs_read {
+    use super::dynamic_providers::expand_dynamic_tokens;
+    for entry in &expand_dynamic_tokens(&policy.fs_read)? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_dir(path, AccessMode::Read)?);
     }
-    for entry in &policy.fs_write {
+    for entry in &expand_dynamic_tokens(&policy.fs_write)? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_dir(path, AccessMode::ReadWrite)?);
     }
-    for entry in &policy.fs_read_file {
+    for entry in &expand_dynamic_tokens(&policy.fs_read_file)? {
         let path = resolve_policy_path(entry, policy_root)?;
         add_optional_read_file(caps, path)?;
     }
-    for entry in &policy.fs_write_file {
+    for entry in &expand_dynamic_tokens(&policy.fs_write_file)? {
         let path = resolve_policy_path(entry, policy_root)?;
         caps.add_fs(FsCapability::new_file(path, AccessMode::ReadWrite)?);
     }

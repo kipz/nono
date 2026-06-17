@@ -123,8 +123,7 @@
         "group": "Development",
         "pages": [
           "cli/development/index",
-          "cli/development/testing",
-          "cli/development/manual-witness-guide"
+          "cli/development/testing"
         ]
       }
     ]

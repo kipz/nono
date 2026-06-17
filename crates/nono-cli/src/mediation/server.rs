@@ -21,11 +21,38 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 /// Maximum request size: 1 MiB. Prevents a rogue same-user process from causing
 /// a large allocation before the session token check can reject it.
 const MAX_REQUEST_SIZE: u32 = 1024 * 1024;
+
+/// fds consumed per in-flight connection: accepted socket + stdin + stdout + stderr.
+const FDS_PER_CONN: usize = 4;
+
+/// fds reserved for the server itself (listener socket, tokio runtime, logs, etc.).
+const FD_HEADROOM: usize = 32;
+
+/// Compute how many connections can run concurrently without exhausting the
+/// process fd table. Reads RLIMIT_NOFILE at startup; falls back to 256.
+fn compute_max_connections() -> usize {
+    let soft_limit: usize = {
+        // SAFETY: rlimit is plain old data; getrlimit is async-signal-safe.
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) };
+        if ret == 0 && rl.rlim_cur != libc::RLIM_INFINITY {
+            rl.rlim_cur as usize
+        } else {
+            256
+        }
+    };
+    let available = soft_limit.saturating_sub(FD_HEADROOM);
+    (available / FDS_PER_CONN).clamp(8, 512)
+}
 
 /// Run the mediation server.
 ///
@@ -57,6 +84,10 @@ pub async fn run(
     let socket_path = Arc::new(socket_path);
     let workdir = Arc::new(workdir);
 
+    let max_conn = compute_max_connections();
+    debug!("mediation: max concurrent connections: {}", max_conn);
+    let semaphore = Arc::new(Semaphore::new(max_conn));
+
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -70,7 +101,12 @@ pub async fn run(
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
                 let stamp = Arc::clone(&audit_info);
+                let sem = Arc::clone(&semaphore);
                 tokio::spawn(async move {
+                    // Acquire a slot before handling the connection so total
+                    // in-flight fds stay within RLIMIT_NOFILE. Excess connections
+                    // queue here rather than failing with EMFILE/EMSGSIZE.
+                    let _permit = sem.acquire_owned().await;
                     if let Err(e) = handle_connection(
                         stream,
                         &cmds,
@@ -88,6 +124,7 @@ pub async fn run(
                     {
                         warn!("mediation: connection error: {}", e);
                     }
+                    // _permit dropped here, releasing slot
                 });
             }
             Err(e) => {

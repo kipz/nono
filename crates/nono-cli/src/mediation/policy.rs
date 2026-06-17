@@ -918,7 +918,7 @@ async fn exec_passthrough(
             }
             unsafe {
                 cmd_builder.pre_exec(move || {
-                    nono::Sandbox::apply(&caps).map_err(|e| {
+                    nono::Sandbox::apply(&caps).map(|_| ()).map_err(|e| {
                         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e.to_string())
                     })
                 });

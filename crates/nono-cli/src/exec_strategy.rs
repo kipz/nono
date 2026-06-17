@@ -2083,7 +2083,10 @@ fn wait_for_child_with_pty(
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {
-                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
+                // Resume the child so the session doesn't hang stopped forever.
+                debug!("Child stopped by signal {}, resuming", sig);
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Continued(_)) => {
@@ -2697,7 +2700,10 @@ fn run_supervisor_loop(
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {
-                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
+                // Resume the child so the session doesn't hang stopped forever.
+                debug!("Child stopped by signal {}, resuming", sig);
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Continued(_)) => {
@@ -3058,7 +3064,10 @@ fn run_supervisor_loop(
                 continue;
             }
             Ok(WaitStatus::Stopped(_, sig)) => {
-                debug!("Child stopped by signal {}, keeping supervisor alive", sig);
+                // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
+                // Resume the child so the session doesn't hang stopped forever.
+                debug!("Child stopped by signal {}, resuming", sig);
+                let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
             }
             Ok(WaitStatus::Continued(_)) => {

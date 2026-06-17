@@ -18,6 +18,12 @@ const DEFAULT_ENV_ALLOW: &[&str] = &[
     "LANG",
     "LC_*",
     "TZ",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
 ];
 
 pub(crate) fn default_env_allow_patterns() -> Vec<String> {

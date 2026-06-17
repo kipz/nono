@@ -902,7 +902,7 @@
         },
         "allow_writable_executables": {
           "type": "boolean",
-          "description": "Explicit profile-wide trust downgrade that disables tool-sandbox writable executable and parent-directory checks for policy, deny-only, and outer executable allow-list paths, including outer sandbox capability-set writability."
+          "description": "Explicit profile-wide trust downgrade that disables tool-sandbox checks for policy, deny-only, and outer executable allow-list paths writable through the sandbox capability set."
         },
         "entrypoint": {
           "$ref": "#/$defs/CommandPolicyIdentifier",
@@ -1150,7 +1150,7 @@
         },
         "allow_writable_executable": {
           "type": "boolean",
-          "description": "Explicit per-command trust downgrade for a pinned executable in a supervisor-user/group/world-writable location. Valid only when executable is set to an absolute file path. On macOS this remains path-racy and is not suitable for high-assurance policies."
+          "description": "Explicit per-command trust downgrade for a pinned executable or parent directory writable through the sandbox capability set. Valid only when executable is set to an absolute file path. On macOS this remains path-racy and is not suitable for high-assurance policies."
         },
         "can_use": {
           "type": "array",

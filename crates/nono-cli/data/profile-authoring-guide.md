@@ -79,7 +79,7 @@ Controls startup-time command gating. These checks run only at launch time and a
 
 ### command_policies
 
-tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable by the supervisor user, group, or world. If that pinned executable lives in a writable location, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos or low-assurance user-writable toolchains, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths, including outer capability-set writability. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so writable pinned executables are not suitable for high-assurance policies.
+tool-sandbox policies live under `command_policies`. Use `commands.<name>.executable` to bind a command name to one exact executable file instead of the first PATH match. By default, tool-sandbox rejects pinned executables and direct parent directories that are writable through the outer sandbox capability set. If a low-assurance profile intentionally grants write access overlapping a pinned executable, `commands.<name>.allow_writable_executable` is available as a per-command trust downgrade. It is valid only with an absolute `executable` path; relative paths and bare command names fail validation. For local demos, `command_policies.allow_writable_executables` disables the writable executable and parent-directory trust check across policy, deny-only, and outer executable allow-list paths. The agent still invokes the command name through the tool-sandbox shim. On macOS, tool-sandbox verifies the file before sandboxing but must still exec by path, so sandbox-writable pinned executables are not suitable for high-assurance policies.
 
 ```json
 {
@@ -88,6 +88,9 @@ tool-sandbox policies live under `command_policies`. Use `commands.<name>.execut
     "commands": {
       "demonator": {
         "executable": "/opt/homebrew/bin/demonator",
+        "sandbox": {
+          "fs_write": ["/opt/homebrew/bin"]
+        },
         "allow_writable_executable": true
       }
     }

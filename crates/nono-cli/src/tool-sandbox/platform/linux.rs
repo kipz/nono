@@ -2432,14 +2432,7 @@ fn validate_controlled_file(
     label: &str,
     allow_writable_path: bool,
 ) -> Result<()> {
-    let metadata = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !allow_writable_path {
-        reject_user_writable_path(path, &metadata, label)?;
-    }
-    if !allow_writable_path && outer_caps_grant_write(outer_caps, path) {
+    if !allow_writable_path && outer_caps_grant_file_write(outer_caps, path) {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox {label} binary is writable by the outer session capability set: {}",
             path.display()
@@ -2451,17 +2444,6 @@ fn validate_controlled_file(
             path.display()
         ))
     })?;
-    let parent_metadata = fs::metadata(parent).map_err(|source| NonoError::ConfigRead {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    if !allow_writable_path {
-        reject_user_writable_path(
-            parent,
-            &parent_metadata,
-            &format!("{label} executable parent directory for {}", path.display()),
-        )?;
-    }
     if !allow_writable_path && outer_caps_grant_write(outer_caps, parent) {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox {label} binary is replaceable through writable parent directory: {}",
@@ -2485,22 +2467,6 @@ fn reject_group_or_world_writable_path(
     Ok(())
 }
 
-fn reject_user_writable_path(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
-    let mode = metadata.permissions().mode();
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    let owner_writable_by_supervisor = metadata.uid() == euid && mode & 0o200 != 0;
-    let group_writable_by_supervisor = metadata.gid() == egid && mode & 0o020 != 0;
-    let group_or_world_writable = mode & 0o022 != 0;
-    if owner_writable_by_supervisor || group_writable_by_supervisor || group_or_world_writable {
-        return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox {label} is writable by the supervisor user or an untrusted class: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
 fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
     caps.fs_capabilities().iter().any(|cap| {
         cap.access.contains(AccessMode::Write)
@@ -2510,6 +2476,12 @@ fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
                 path.starts_with(&cap.resolved)
             }
     })
+}
+
+fn outer_caps_grant_file_write(caps: &CapabilitySet, path: &Path) -> bool {
+    caps.fs_capabilities()
+        .iter()
+        .any(|cap| cap.access.contains(AccessMode::Write) && cap.is_file && cap.resolved == path)
 }
 
 fn resolve_governance_denies(config: &CommandPoliciesConfig) -> Result<HashMap<FileId, PathBuf>> {
@@ -4851,10 +4823,12 @@ fn le_u64(data: &[u8], offset: usize) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::command_policy::{
-        CommandEnvironmentConfig, CommandSandboxConfig, ResolvedCommandBinaries,
-        ResolvedCommandBinary, ResolvedExecutableKind, ResolvedExecutableShape,
+        CommandEnvironmentConfig, CommandPolicyConfig, CommandSandboxConfig,
+        ResolvedCommandBinaries, ResolvedCommandBinary, ResolvedExecutableKind,
+        ResolvedExecutableShape,
     };
     use std::collections::BTreeMap;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     fn make_binary(dev: u64, ino: u64) -> ResolvedCommandBinary {
@@ -4893,6 +4867,47 @@ mod tests {
         fs::create_dir(path).map_err(|source| NonoError::ConfigWrite {
             path: path.to_path_buf(),
             source,
+        })
+    }
+
+    fn create_executable(path: &Path) -> Result<()> {
+        File::create(path).map_err(|source| NonoError::ConfigWrite {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            NonoError::ConfigWrite {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+
+    fn test_binary(name: &str, path: &Path) -> Result<ResolvedCommandBinary> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|source| NonoError::PathCanonicalization {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let metadata = fs::metadata(&canonical).map_err(|source| NonoError::ConfigRead {
+            path: canonical.clone(),
+            source,
+        })?;
+        Ok(ResolvedCommandBinary {
+            name: name.to_string(),
+            canonical_path: canonical,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            size: metadata.size(),
+            mtime_nanos: mtime_nanos(&metadata),
+            sha256: String::new(),
+            duplicate_paths: vec![],
+            shape: ResolvedExecutableShape {
+                kind: ResolvedExecutableKind::Elf,
+                interpreter: None,
+                interpreter_args: vec![],
+            },
         })
     }
 
@@ -4953,6 +4968,92 @@ mod tests {
         let result =
             ensure_outer_exec_gate_fully_enforced(landlock::RulesetStatus::PartiallyEnforced);
         assert!(matches!(result, Err(err) if err.to_string().contains("partially enforced")));
+    }
+
+    #[test]
+    fn writable_policy_command_override_is_explicit_for_sandbox_writable_paths() -> Result<()> {
+        let temp = test_tempdir()?;
+        let bin_dir = temp.path().join("bin");
+        create_dir(&bin_dir)?;
+        let tool = bin_dir.join("tool");
+        create_executable(&tool)?;
+
+        let mut config = CommandPoliciesConfig::default();
+        config.commands.insert(
+            "tool".to_string(),
+            CommandPolicyConfig {
+                executable: Some(tool.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        let mut resolved = ResolvedCommandBinaries {
+            commands: BTreeMap::new(),
+            warnings: Vec::new(),
+        };
+        resolved
+            .commands
+            .insert("tool".to_string(), test_binary("tool", &tool)?);
+
+        let caps = CapabilitySet::new();
+        validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
+
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&tool, AccessMode::ReadWrite)?);
+        let err = validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &file_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable executable rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("writable by the outer session capability set")
+        );
+
+        let mut parent_write_caps = CapabilitySet::new();
+        parent_write_caps.add_fs(FsCapability::new_dir(&bin_dir, AccessMode::ReadWrite)?);
+        let err = validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &parent_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable parent rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("replaceable through writable parent directory")
+        );
+
+        config.allow_writable_executables = true;
+        validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &parent_write_caps,
+        )?;
+        config.allow_writable_executables = false;
+
+        let command = config
+            .commands
+            .get_mut("tool")
+            .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?;
+        command.allow_writable_executable = true;
+
+        validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &file_write_caps,
+        )?;
+
+        Ok(())
     }
 
     // ── check_exec_gate: bypass ordering ──────────────────────────────────

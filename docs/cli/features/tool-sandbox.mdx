@@ -48,7 +48,7 @@ The top-level `command_policies` object accepts these fields:
 | `commands` | object | Policy-controlled commands. A non-empty object activates Tool Sandbox. |
 | `credentials` | object | Named credentials that selected child policies may request. |
 | `executable_dirs` | string array | Extra directories used while resolving command names before shim `PATH` is prepended. |
-| `allow_writable_executables` | boolean | Profile-wide trust downgrade for writable executable paths. |
+| `allow_writable_executables` | boolean | Profile-wide trust downgrade for command targets writable by the sandbox capability set. |
 | `deny_direct_exec_bypass` | absolute path array | Canonical executable paths that must not bypass shim control. |
 | `approval_backends` | object | Named backends for `approve` decisions. |
 | `approval_defaults` | object | Default approval backend and timeout. |
@@ -62,7 +62,7 @@ Each entry under `commands` uses the command name as the key:
 | `from` | object | Caller-specific policies. Use `session` for direct session invocation or another command name for chaining. |
 | `can_use` | command-name array | Commands this command may invoke through Tool Sandbox. |
 | `executable` | absolute path | Pin the command name to one executable file instead of the first `PATH` match. |
-| `allow_writable_executable` | boolean | Per-command trust downgrade for a writable pinned executable. Requires absolute `executable`. |
+| `allow_writable_executable` | boolean | Per-command trust downgrade for a pinned executable writable by the sandbox capability set. Requires absolute `executable`. |
 | `intercept` | array | Ordered argument-prefix mediation rules evaluated after invocation policy. |
 | `allow_direct_exec_bypass` | absolute path array | Compatibility escape hatch for direct canonical-path invocation. |
 | `allow_direct_exec_bypass_with_credentials` | boolean | Required when a credential-using command also allows direct exec bypass. |
@@ -124,13 +124,18 @@ By default, Tool Sandbox resolves a command to the first executable found on the
 
 `executable` is canonicalized at startup and bound by path, inode, and digest. The command name still uses the shim, so `nono run --profile my-profile -- aws ...` reaches the pinned executable.
 
-Tool Sandbox rejects executables and executable parent directories that are writable by the supervisor user, group, or world. For a Homebrew-style or otherwise writable installation root that you intentionally trust for one command, pin the command to a full absolute executable path and set `allow_writable_executable: true`:
+Tool Sandbox rejects executables and executable parent directories that are writable through the outer sandbox capability set. This prevents a profile from both trusting a command target and granting the agent write or replace access to that same target. Homebrew-style or otherwise user-writable host toolchains are allowed when the sandbox does not grant write access to the executable or its parent.
+
+If a low-assurance profile intentionally grants write access overlapping a command target, pin the command to a full absolute executable path and set `allow_writable_executable: true`:
 
 ```json
 {
   "commands": {
     "demonator": {
       "executable": "/opt/homebrew/bin/demonator",
+      "sandbox": {
+        "fs_write": ["/opt/homebrew/bin"]
+      },
       "allow_writable_executable": true
     }
   }
@@ -139,7 +144,7 @@ Tool Sandbox rejects executables and executable parent directories that are writ
 
 This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the Tool Sandbox shim.
 
-For local demos or other low-assurance profiles that intentionally run from user-writable toolchains, a profile can disable the writable-executable trust check across Tool Sandbox:
+For local demos or other low-assurance profiles that intentionally grant write access overlapping tool locations, a profile can disable the writable-executable trust check across Tool Sandbox:
 
 ```json
 {
@@ -147,16 +152,19 @@ For local demos or other low-assurance profiles that intentionally run from user
     "allow_writable_executables": true,
     "commands": {
       "npm": {
-        "executable": "/Users/alice/.nvm/versions/node/v24.13.0/bin/npm"
+        "executable": "/Users/alice/.nvm/versions/node/v24.13.0/bin/npm",
+        "sandbox": {
+          "fs_write": ["/Users/alice/.nvm/versions/node/v24.13.0/bin"]
+        }
       }
     }
   }
 }
 ```
 
-This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by Tool Sandbox, including paths writable through the sandbox's own outer capability set.
+This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by Tool Sandbox.
 
-Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
+Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a sandbox-writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
 Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. Tool Sandbox grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by Tool Sandbox; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.
 

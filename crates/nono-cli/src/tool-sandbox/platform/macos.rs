@@ -661,8 +661,8 @@ fn run_child_launcher() -> Result<()> {
 
     // macOS lacks fexecve/execveat, so verification can open and hash one
     // object but the final exec is still path-based. Default immutability
-    // checks reject writable controlled paths; allow_writable_executable is
-    // therefore a deliberate trust downgrade for this remaining race.
+    // checks reject paths writable by the sandboxed agent; allowing writable
+    // executable targets is therefore a deliberate trust downgrade.
     verify_launch_binary(&spec)?;
     let caps = caps_from_spec(&spec.caps)?;
     Sandbox::apply(&caps)?;
@@ -3495,14 +3495,7 @@ fn validate_controlled_file(
     label: &str,
     allow_writable_path: bool,
 ) -> Result<()> {
-    let metadata = fs::metadata(path).map_err(|source| NonoError::ConfigRead {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !allow_writable_path {
-        reject_user_writable_path(path, &metadata, label)?;
-    }
-    if !allow_writable_path && outer_caps_grant_write(outer_caps, path) {
+    if !allow_writable_path && outer_caps_grant_file_write(outer_caps, path) {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox {label} binary is writable by the outer session capability set: {}",
             path.display()
@@ -3514,17 +3507,6 @@ fn validate_controlled_file(
             path.display()
         ))
     })?;
-    let parent_metadata = fs::metadata(parent).map_err(|source| NonoError::ConfigRead {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    if !allow_writable_path {
-        reject_user_writable_path(
-            parent,
-            &parent_metadata,
-            &format!("{label} executable parent directory for {}", path.display()),
-        )?;
-    }
     if !allow_writable_path && outer_caps_grant_write(outer_caps, parent) {
         return Err(NonoError::SandboxInit(format!(
             "tool-sandbox {label} binary is replaceable through writable parent directory: {}",
@@ -3549,22 +3531,6 @@ fn reject_group_or_world_writable_path(
     Ok(())
 }
 
-fn reject_user_writable_path(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
-    let mode = metadata.permissions().mode();
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    let owner_writable_by_supervisor = metadata.uid() == euid && mode & 0o200 != 0;
-    let group_writable_by_supervisor = metadata.gid() == egid && mode & 0o020 != 0;
-    let group_or_world_writable = mode & 0o022 != 0;
-    if owner_writable_by_supervisor || group_writable_by_supervisor || group_or_world_writable {
-        return Err(NonoError::SandboxInit(format!(
-            "tool-sandbox {label} is writable by the supervisor user or an untrusted class: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
 fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
     caps.fs_capabilities().iter().any(|cap| {
         cap.access.contains(AccessMode::Write)
@@ -3574,6 +3540,12 @@ fn outer_caps_grant_write(caps: &CapabilitySet, path: &Path) -> bool {
                 path.starts_with(&cap.resolved)
             }
     })
+}
+
+fn outer_caps_grant_file_write(caps: &CapabilitySet, path: &Path) -> bool {
+    caps.fs_capabilities()
+        .iter()
+        .any(|cap| cap.access.contains(AccessMode::Write) && cap.is_file && cap.resolved == path)
 }
 
 fn resolve_governance_denies(config: &CommandPoliciesConfig) -> Result<HashMap<FileId, PathBuf>> {
@@ -4293,13 +4265,12 @@ mod tests {
     }
 
     #[test]
-    fn writable_policy_command_override_is_explicit_for_owner_writable_paths() -> Result<()> {
+    fn writable_policy_command_override_is_explicit_for_sandbox_writable_paths() -> Result<()> {
         let temp = test_tempdir()?;
         let bin_dir = temp.path().join("bin");
         create_dir(&bin_dir)?;
         let tool = bin_dir.join("tool");
         create_executable(&tool)?;
-        set_mode(&bin_dir, 0o500)?;
 
         let mut config = CommandPoliciesConfig::default();
         config.commands.insert(
@@ -4318,29 +4289,49 @@ mod tests {
             .insert("tool".to_string(), test_binary("tool", &tool)?);
         let caps = CapabilitySet::new();
 
-        let err =
-            validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)
-                .err()
-                .ok_or_else(|| {
-                    NonoError::SandboxInit("expected writable executable rejection".to_string())
-                })?;
-        assert!(err.to_string().contains("writable by the supervisor user"));
+        validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
 
-        set_mode(&tool, 0o500)?;
-        set_mode(&bin_dir, 0o700)?;
-        let err =
-            validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)
-                .err()
-                .ok_or_else(|| {
-                    NonoError::SandboxInit("expected writable parent rejection".to_string())
-                })?;
+        let mut file_write_caps = CapabilitySet::new();
+        file_write_caps.add_fs(FsCapability::new_file(&tool, AccessMode::ReadWrite)?);
+        let err = validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &file_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable executable rejection".to_string())
+        })?;
         assert!(
             err.to_string()
-                .contains("policy command executable parent directory")
+                .contains("writable by the outer session capability set")
+        );
+
+        let mut parent_write_caps = CapabilitySet::new();
+        parent_write_caps.add_fs(FsCapability::new_dir(&bin_dir, AccessMode::ReadWrite)?);
+        let err = validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &parent_write_caps,
+        )
+        .err()
+        .ok_or_else(|| {
+            NonoError::SandboxInit("expected sandbox-writable parent rejection".to_string())
+        })?;
+        assert!(
+            err.to_string()
+                .contains("replaceable through writable parent directory")
         );
 
         config.allow_writable_executables = true;
-        validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
+        validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &parent_write_caps,
+        )?;
         config.allow_writable_executables = false;
 
         let command = config
@@ -4348,9 +4339,13 @@ mod tests {
             .get_mut("tool")
             .ok_or_else(|| NonoError::SandboxInit("missing test command policy".to_string()))?;
         command.allow_writable_executable = true;
-        set_mode(&tool, 0o700)?;
 
-        validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
+        validate_controlled_binary_immutability(
+            &config,
+            &resolved,
+            &BTreeMap::new(),
+            &file_write_caps,
+        )?;
 
         Ok(())
     }

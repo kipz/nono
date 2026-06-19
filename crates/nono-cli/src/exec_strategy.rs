@@ -1958,9 +1958,13 @@ fn handle_pty_poll_events(
     resize_revents: libc::c_short,
     loop_name: &str,
 ) -> bool {
-    if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
-        && !pty.proxy_master_to_client()
-    {
+    // Only relay data — and stop the loop on EOF — when POLLIN is set.
+    // Bare POLLHUP/POLLERR/POLLNVAL without POLLIN can fire transiently
+    // during interactive TUI startup (e.g. Node.js reinitialising its TTY)
+    // and would otherwise cause read() to return EIO, which proxy_master_to_client
+    // maps to Closed, tearing down the relay while the child is still alive.
+    // Let waitpid signal child exit instead of relying on PTY master HUP.
+    if master_revents & libc::POLLIN != 0 && !pty.proxy_master_to_client() {
         debug!("Stopping {loop_name} after PTY master relay failure");
         return false;
     }

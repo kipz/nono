@@ -11,8 +11,9 @@
 //!
 //! Protocol:
 //!   1. Request:  u32 (big-endian length) || JSON {"command":..., "args":..., ...}
-//!   2. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg.
-//!   3. Response: u32 (big-endian length) || JSON {"stdout":..., "stderr":..., "exit_code":...}
+//!   2. ACK:      1 byte (0x06) from server — confirms JSON was read, buffer is drained.
+//!   3. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg.
+//!   4. Response: u32 (big-endian length) || JSON {"stdout":..., "stderr":..., "exit_code":...}
 //!
 //! For passthrough cases the response's stdout/stderr are empty strings; the
 //! real binary already streamed its output through the passed fds. For
@@ -47,7 +48,7 @@ struct ShimRequest {
     cwd: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct ShimResponse {
     stdout: String,
     stderr: String,
@@ -194,7 +195,7 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
-    let mut stream = match UnixStream::connect(&socket_path) {
+    let stream = match UnixStream::connect(&socket_path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nono-shim: failed to connect to {}: {}", socket_path, e);
@@ -202,10 +203,30 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
         }
     };
 
+    execute_on_stream(stream, request_bytes)
+}
+
+/// Run the shim protocol on an already-connected stream. Extracted for testability.
+///
+/// Sends the length-prefixed request, waits for the ACK, sends stdio fds via
+/// SCM_RIGHTS, then reads and applies the length-prefixed response.
+fn execute_on_stream(mut stream: UnixStream, request_bytes: Vec<u8>) -> i32 {
     // Send length-prefixed request
     let len = request_bytes.len() as u32;
     if stream.write_all(&len.to_be_bytes()).is_err() || stream.write_all(&request_bytes).is_err() {
         eprintln!("nono-shim: failed to send request");
+        return 127;
+    }
+
+    // Wait for the server to acknowledge that it has read the JSON body.
+    // The server sends a single ACK byte (0x06) once the socket receive buffer
+    // is drained. Without this, the subsequent sendmsg with SCM_RIGHTS can fail
+    // with EMSGSIZE on macOS when the JSON body is large enough to fill the
+    // ~8 KB UDS receive buffer — there is then no contiguous space for the
+    // ancillary control message even in a single sendmsg call.
+    let mut ack = [0u8; 1];
+    if stream.read_exact(&mut ack).is_err() || ack[0] != 0x06 {
+        eprintln!("nono-shim: did not receive fd-send ACK from server");
         return 127;
     }
 
@@ -255,4 +276,94 @@ fn run_mediated(command_name: &str, args: &[String]) -> i32 {
     }
 
     response.exit_code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// Verify the ACK handshake: the shim must wait for the server's 0x06 ACK
+    /// before sending stdio fds, and the full protocol must round-trip correctly.
+    ///
+    /// This guards against regressions where the shim sends fds before the server
+    /// has drained the JSON from the socket buffer, causing EMSGSIZE on macOS.
+    #[test]
+    fn ack_handshake_round_trips() {
+        let dir = std::env::temp_dir();
+        let sock_path = dir.join(format!("nono-shim-test-{}.sock", std::process::id()));
+
+        let listener = UnixListener::bind(&sock_path).expect("bind");
+
+        // Minimal JSON request — small enough to fit in the buffer, but exercises
+        // the full protocol including the ACK gate and SCM_RIGHTS transfer.
+        let request = ShimRequest {
+            command: "echo".to_string(),
+            args: vec!["hello".to_string()],
+            session_token: "test-token".to_string(),
+            env: HashMap::new(),
+            pid: std::process::id(),
+            cwd: None,
+        };
+        let request_bytes = serde_json::to_vec(&request).unwrap();
+
+        let mock_response = serde_json::to_vec(&ShimResponse {
+            stdout: "hello\n".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        })
+        .unwrap();
+
+        // Server thread: verify protocol order and return a mock response.
+        let server = std::thread::spawn({
+            let mock_response = mock_response.clone();
+            move || {
+                let (mut conn, _) = listener.accept().unwrap();
+
+                // 1. Read length-prefixed JSON
+                let mut len_buf = [0u8; 4];
+                conn.read_exact(&mut len_buf).unwrap();
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; len];
+                conn.read_exact(&mut body).unwrap();
+
+                // 2. Send ACK — signals the shim it may now sendmsg the fds
+                conn.write_all(&[0x06u8]).unwrap();
+                conn.flush().unwrap();
+
+                // 3. Receive the three stdio fds via SCM_RIGHTS
+                let fd_size = std::mem::size_of::<RawFd>();
+                let n: usize = 3;
+                let payload_len = n * fd_size;
+                let mut data = [0u8; 1];
+                let mut iov = libc::iovec {
+                    iov_base: data.as_mut_ptr().cast::<libc::c_void>(),
+                    iov_len: 1,
+                };
+                let cmsg_space = unsafe { libc::CMSG_SPACE(payload_len as u32) } as usize;
+                let mut cmsg_buf = vec![0u8; cmsg_space];
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_iov = &mut iov as *mut libc::iovec;
+                msg.msg_iovlen = 1;
+                msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
+                msg.msg_controllen = cmsg_space as _;
+                let received = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
+                assert!(received >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
+                assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0, "ancillary data truncated");
+
+                // 4. Send mock response
+                let rlen = mock_response.len() as u32;
+                conn.write_all(&rlen.to_be_bytes()).unwrap();
+                conn.write_all(&mock_response).unwrap();
+            }
+        });
+
+        let client = UnixStream::connect(&sock_path).unwrap();
+        let exit_code = execute_on_stream(client, request_bytes);
+
+        server.join().expect("server thread panicked");
+        let _ = std::fs::remove_file(&sock_path);
+
+        assert_eq!(exit_code, 0);
+    }
 }

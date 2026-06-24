@@ -6,8 +6,9 @@
 //!
 //! Protocol (same as nono-shim):
 //!   1. Request:  u32 big-endian length || JSON payload
-//!   2. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg
-//!   3. Response: u32 big-endian length || JSON payload
+//!   2. ACK:      1 byte (0x06) from server — confirms JSON was read, buffer is drained.
+//!   3. One SCM_RIGHTS message — stdin/stdout/stderr fds together in one sendmsg
+//!   4. Response: u32 big-endian length || JSON payload
 
 use super::admin::AdminModeStatus;
 use super::approval::ApprovalGate;
@@ -163,6 +164,33 @@ async fn handle_connection(
     let mut buf = vec![0u8; len as usize];
     stream.read_exact(&mut buf).await?;
 
+    // ACK the shim: the JSON body has been read and the receive buffer is now
+    // drained. The shim blocks on this byte before calling sendmsg with
+    // SCM_RIGHTS; without the synchronisation, large JSON bodies (e.g. a full
+    // Claude Code environment) fill the ~8 KB UDS receive buffer and leave no
+    // contiguous space for the ancillary control message, causing EMSGSIZE even
+    // with a single bundled sendmsg.
+    stream.write_u8(0x06).await?;
+    stream.flush().await?;
+
+    // Receive the three stdio fds the shim sends immediately after the ACK.
+    // We do this before parsing or validating the request so that the fds are
+    // always consumed — regardless of whether the request is malformed or the
+    // session token is invalid — keeping the protocol state consistent.
+    let (stdin_fd, stdout_fd, stderr_fd) = match recv_three_fds(&stream).await {
+        Ok(fds) => fds,
+        Err(e) => {
+            warn!("mediation: failed to receive stdio fds: {}", e);
+            let err_resp = ShimResponse {
+                stdout: String::new(),
+                stderr: format!("nono-mediation: failed to receive stdio fds: {}\n", e),
+                exit_code: 127,
+            };
+            write_response(&mut stream, &err_resp).await?;
+            return Ok(());
+        }
+    };
+
     let request: ShimRequest = match serde_json::from_slice(&buf) {
         Ok(r) => r,
         Err(e) => {
@@ -189,22 +217,6 @@ async fn handle_connection(
         "mediation: request command='{}' args={:?}",
         request.command, request.args
     );
-
-    // Receive the three stdio fds the shim sent over SCM_RIGHTS after the JSON
-    // request. These are used for streaming passthrough (see policy::apply).
-    let (stdin_fd, stdout_fd, stderr_fd) = match recv_three_fds(&stream).await {
-        Ok(fds) => fds,
-        Err(e) => {
-            warn!("mediation: failed to receive stdio fds: {}", e);
-            let err_resp = ShimResponse {
-                stdout: String::new(),
-                stderr: format!("nono-mediation: failed to receive stdio fds: {}\n", e),
-                exit_code: 127,
-            };
-            write_response(&mut stream, &err_resp).await?;
-            return Ok(());
-        }
-    };
 
     // Check admin mode — bypass all policy if active
     if admin_receiver.borrow().is_active() {
@@ -260,9 +272,8 @@ async fn handle_connection(
 /// Receive stdin, stdout, and stderr from the shim in a single `recvmsg` call.
 ///
 /// The shim sends all three fds as one SCM_RIGHTS control message accompanied
-/// by a one-byte payload.  Receiving them together matches the single
-/// `sendmsg` the shim uses, and avoids the macOS-specific EMSGSIZE failure
-/// that occurred when three separate `sendmsg` calls were used.
+/// by a one-byte payload, immediately after receiving the ACK byte that signals
+/// the JSON body has been read from the socket buffer.
 ///
 /// We temporarily switch the underlying fd to blocking mode so `recvmsg`
 /// waits inside `spawn_blocking` rather than returning EAGAIN.

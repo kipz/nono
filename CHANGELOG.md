@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- *(profile)* Expand `@git:*` dynamic tokens (e.g. `@git:common-dir`) in top-level `filesystem.allow`, `filesystem.read`, and `filesystem.write` paths. Previously these tokens were only expanded in per-command sandboxes; they now also take effect in the top-level process sandbox built from the profile.
+
 ## [0.66.0] - 2026-06-29
 
 ### Bug Fixes
@@ -63,6 +69,8 @@
 ## [Unreleased]
 
 ### Features
+
+- *(tool-sandbox)* Add `@git:worktree`, `@git:toplevel`, and `@git:toplevel-parent` dynamic tokens for per-command sandbox path lists. `@git:worktree` expands to the main repo root when running from a linked worktree (parent of `@git:common-dir`). `@git:toplevel` expands to the current checkout root (`git rev-parse --show-toplevel`). `@git:toplevel-parent` expands to its parent directory, enabling `git worktree add ../sibling` grants ([#1280](https://github.com/nolabs-ai/nono/pull/1280))
 
 - *(tool-sandbox)* Add `@git:common-dir` dynamic token: expands to the git common directory (`.git` in a regular repo; the main repo's `.git` when running inside a worktree). Use in `fs_write` to cover the object store when the agent session starts from a worktree and `--workdir` points to the worktree itself ([#1270](https://github.com/nolabs-ai/nono/issues/1270))
 

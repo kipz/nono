@@ -6,6 +6,8 @@
 use crate::cli::SandboxArgs;
 use crate::policy;
 use crate::profile::{Profile, expand_vars};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::tool_sandbox::dynamic_providers::expand_dynamic_tokens;
 use crate::protected_paths::{self, ProtectedRoots};
 use nono::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result, SocketScope,
@@ -13,6 +15,12 @@ use nono::{
 };
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+// Platform-specific cfg fallbacks (placed here after all use statements)
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn expand_dynamic_tokens(entries: &[String]) -> nono::Result<Vec<String>> {
+    Ok(entries.to_vec())
+}
 
 /// Try to create a directory capability, warning and skipping on PathNotFound.
 /// Propagates all other errors.
@@ -657,7 +665,8 @@ impl CapabilitySetExt for CapabilitySet {
         let fs = &profile.filesystem;
 
         // Directories with read+write access
-        for path_template in &fs.allow {
+        let allow_expanded = expand_dynamic_tokens(&fs.allow)?;
+        for path_template in &allow_expanded {
             let path = expand_vars(path_template, workdir)?;
             validate_requested_dir(
                 &path,
@@ -673,7 +682,8 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Read-only filesystem entries (directory or file)
-        for path_template in &fs.read {
+        let read_expanded = expand_dynamic_tokens(&fs.read)?;
+        for path_template in &read_expanded {
             let path = expand_vars(path_template, workdir)?;
             let label = format!("Profile path '{}' does not exist, skipping", path_template);
 
@@ -706,7 +716,8 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Directories with write-only access
-        for path_template in &fs.write {
+        let write_expanded = expand_dynamic_tokens(&fs.write)?;
+        for path_template in &write_expanded {
             let path = expand_vars(path_template, workdir)?;
             validate_requested_dir(
                 &path,
@@ -722,7 +733,8 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with read+write access
-        for path_template in &fs.allow_file {
+        let allow_file_expanded = expand_dynamic_tokens(&fs.allow_file)?;
+        for path_template in &allow_file_expanded {
             let path = expand_vars(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
@@ -741,7 +753,8 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with read-only access
-        for path_template in &fs.read_file {
+        let read_file_expanded = expand_dynamic_tokens(&fs.read_file)?;
+        for path_template in &read_file_expanded {
             let path = expand_vars(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
@@ -757,7 +770,8 @@ impl CapabilitySetExt for CapabilitySet {
         }
 
         // Single files with write-only access
-        for path_template in &fs.write_file {
+        let write_file_expanded = expand_dynamic_tokens(&fs.write_file)?;
+        for path_template in &write_file_expanded {
             let path = expand_vars(path_template, workdir)?;
             let label = format!("Profile file '{}' does not exist, skipping", path_template);
             if let Some(mut cap) = try_new_profile_exact_path(
@@ -3123,5 +3137,83 @@ mod tests {
         assert_eq!(socks.len(), 1);
         assert_eq!(socks[0].mode, UnixSocketMode::ConnectBind);
         assert_eq!(socks[0].scope, SocketScope::DirSubtree);
+    }
+
+    #[test]
+    fn test_from_profile_filesystem_allow_expands_git_dynamic_token() {
+        // Set up outside the env lock: create repos and profile.
+        let tmp = tempfile::TempDir::new_in(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+        .expect("tmpdir");
+        let main_repo = tmp.path().join("main");
+        std::fs::create_dir_all(&main_repo).expect("create main");
+
+        // git init + initial commit so worktree add works
+        std::process::Command::new("git")
+            .args(["init", main_repo.to_str().unwrap()])
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["-C", main_repo.to_str().unwrap(),
+                   "-c", "user.email=test@test.com",
+                   "-c", "user.name=Test",
+                   "commit", "--allow-empty", "-m", "init"])
+            .output()
+            .expect("git commit");
+
+        // git worktree add
+        let wt = tmp.path().join("linked");
+        std::process::Command::new("git")
+            .args(["-C", main_repo.to_str().unwrap(),
+                   "worktree", "add", wt.to_str().unwrap(), "HEAD"])
+            .output()
+            .expect("git worktree add");
+
+        // Build a profile with @git:common-dir in filesystem.allow.
+        // In a linked worktree, @git:common-dir resolves to the absolute path of the
+        // main repo's .git directory — verifying that dynamic tokens are expanded in
+        // the top-level filesystem grant, not just in per-command sandboxes.
+        let profile_dir = tmp.path().join("profile");
+        std::fs::create_dir_all(&profile_dir).expect("create profile dir");
+        let profile_path = profile_dir.join("test.json");
+        std::fs::write(
+            &profile_path,
+            r#"{"meta":{"name":"test"},"filesystem":{"allow":["@git:common-dir"]}}"#,
+        )
+        .expect("write profile");
+
+        let profile = crate::profile::load_profile_from_path(&profile_path).expect("load profile");
+        let args = sandbox_args();
+
+        // Hold env lock for the cwd change + from_profile call: cwd is process-global.
+        let result = with_env_lock(|| {
+            let orig = std::env::current_dir().expect("cwd");
+            // Change cwd to the linked worktree so @git:common-dir resolves to the
+            // main repo's absolute .git path.
+            std::env::set_current_dir(&wt).expect("chdir to worktree");
+            let r = CapabilitySet::from_profile(&profile, &wt, &args).map(|prepared| {
+                let PreparedCaps { caps, needs_unlink_overrides, .. } = prepared;
+                (caps, needs_unlink_overrides)
+            });
+            std::env::set_current_dir(&orig).expect("restore cwd");
+            r
+        });
+
+        let (caps, _) = result.expect("from_profile should succeed");
+
+        let expected_git_dir = main_repo.join(".git").canonicalize().expect("canonicalize .git");
+        assert!(
+            caps.fs_capabilities().iter().any(|c| {
+                !c.is_file && c.access == nono::AccessMode::ReadWrite && c.resolved == expected_git_dir
+            }),
+            "@git:common-dir in filesystem.allow should grant ReadWrite on the main .git dir {:?}; \
+             caps = {:?}",
+            expected_git_dir,
+            caps.fs_capabilities()
+                .iter()
+                .map(|c| (&c.resolved, c.access))
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -224,7 +224,7 @@ fn dispatch_token(provider: &str, query: &str) -> Result<Vec<String>> {
 
 /// Expand every dynamic-provider token in a path list in place, returning
 /// the expanded list. Literal paths pass through unchanged.
-pub(super) fn expand_dynamic_tokens(entries: &[String]) -> Result<Vec<String>> {
+pub(crate) fn expand_dynamic_tokens(entries: &[String]) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         match parse_token(entry) {

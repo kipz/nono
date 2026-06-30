@@ -487,6 +487,10 @@ For path denials that should stay visible but skip save prompts, use
 `filesystem.suppress_save_prompt` instead. To disable all diagnostic footers,
 use `--no-diagnostics`.
 
+### MCP OAuth Credentials
+
+For agents that talk to MCP servers or the Claude.ai API using short-lived OAuth access tokens, combine `cmd://` capture with a host-side token-cache helper. The helper manages refresh and browser re-login; the proxy injects only the live token into upstream requests while the sandbox is denied access to the token file. See [OAuth Credentials (MCP & Claude.ai)](/cli/features/mcp-oauth) for complete profile examples and a reusable bash helper skeleton.
+
 ### Exclude Inherited Groups
 
 ```json

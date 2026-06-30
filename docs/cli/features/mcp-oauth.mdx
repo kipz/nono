@@ -1,0 +1,426 @@
+---
+title: OAuth Credentials (MCP & Claude.ai)
+description: Keep OAuth access tokens out of the sandbox — manage token refresh and browser login flows on the host, inject only via the proxy
+---
+
+Many services that AI agents talk to — MCP servers, and the Claude.ai API itself — use OAuth2 access tokens rather than static API keys. These tokens are short-lived (typically minutes to hours), backed by refresh tokens, and occasionally require a full browser re-authorisation flow. nono's `cmd://` capture mechanism, combined with `credential_capture` and `interaction.open_urls`, composes into a complete solution without ever letting the token enter the sandbox.
+
+---
+
+## How it works
+
+```
+Agent calls mcp.example.com
+    ↓
+Proxy intercepts (phantom token in Authorization header)
+    ↓
+No valid cached token? → Supervisor runs token-cache helper (cmd://)
+    ↓
+Helper: check cache → still valid? emit access_token
+                     → expired + refresh_token? call /token endpoint, update cache, emit
+                     → no refresh? open browser, complete PKCE flow, write cache, emit
+    ↓
+Proxy injects real Bearer token into upstream request
+    ↓
+Response streamed back to agent
+```
+
+The sandboxed agent never holds the real access token — it only ever sees the phantom session token. The helper and token cache live on the host, outside the sandbox.
+
+---
+
+## Writing a token-cache helper
+
+The helper is a regular host-side script. nono calls it each time the cache is cold (controlled by `cache_ttl_secs`). It must:
+
+1. Print the current access token to **stdout** and exit 0.
+2. Silently refresh with the stored refresh token when the cached token is near expiry.
+3. Fall back to an interactive browser flow if no refresh token is available.
+4. Exit non-zero if it cannot produce a token (nono will surface a 503 to the agent and record an audit event).
+
+### Generic bash skeleton
+
+```bash
+#!/usr/bin/env bash
+# mcp-token-helper <provider-name> <token-endpoint> <client-id>
+set -euo pipefail
+
+PROVIDER="${1:?provider required}"
+TOKEN_ENDPOINT="${2:?token endpoint required}"
+CLIENT_ID="${3:?client-id required}"
+
+CACHE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mcp-tokens"
+CACHE_FILE="$CACHE_DIR/$PROVIDER.json"
+EXPIRY_BUFFER=60   # refresh this many seconds before actual expiry
+
+mkdir -p "$CACHE_DIR"
+chmod 700 "$CACHE_DIR"
+
+# Read cache
+if [[ -f "$CACHE_FILE" ]]; then
+  access_token="$(jq -r '.access_token // empty' "$CACHE_FILE")"
+  refresh_token="$(jq -r '.refresh_token // empty' "$CACHE_FILE")"
+  expires_at="$(jq -r '.expires_at // 0' "$CACHE_FILE")"
+  now="$(date +%s)"
+
+  if [[ -n "$access_token" && "$expires_at" -gt $(( now + EXPIRY_BUFFER )) ]]; then
+    printf '%s' "$access_token"
+    exit 0
+  fi
+
+  # Refresh
+  if [[ -n "$refresh_token" ]]; then
+    response="$(curl -sf -X POST "$TOKEN_ENDPOINT" \
+      -d "grant_type=refresh_token" \
+      -d "client_id=$CLIENT_ID" \
+      -d "refresh_token=$refresh_token")"
+    new_access="$(echo "$response" | jq -r '.access_token // empty')"
+    if [[ -n "$new_access" ]]; then
+      expires_in="$(echo "$response" | jq -r '.expires_in // 3600')"
+      new_expiry=$(( $(date +%s) + expires_in ))
+      new_refresh="$(echo "$response" | jq -r '.refresh_token // empty')"
+      [[ -z "$new_refresh" ]] && new_refresh="$refresh_token"
+      jq -n \
+        --arg at "$new_access" \
+        --arg rt "$new_refresh" \
+        --argjson ea "$new_expiry" \
+        '{"access_token":$at,"refresh_token":$rt,"expires_at":$ea}' \
+        > "$CACHE_FILE"
+      chmod 600 "$CACHE_FILE"
+      printf '%s' "$new_access"
+      exit 0
+    fi
+  fi
+fi
+
+# Headless fallback — skip browser in CI
+if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
+  echo "mcp-token-helper: no cached token and NO_BROWSER_LOGIN=1" >&2
+  exit 1
+fi
+
+# Interactive browser flow (tool-specific; replace with your provider's CLI or PKCE helper)
+echo "mcp-token-helper: launching browser login for $PROVIDER" >&2
+# Example: mcp-remote auth $PROVIDER ...
+# After login, write access_token, refresh_token, expires_at to $CACHE_FILE
+echo "mcp-token-helper: browser login not implemented — store token manually in $CACHE_FILE" >&2
+exit 1
+```
+
+Place the script at a stable path (e.g. `/usr/local/libexec/mcp-token-helper`) and make it executable:
+
+```bash
+chmod 755 /usr/local/libexec/mcp-token-helper
+```
+
+---
+
+## Pattern: MCP server OAuth tokens
+
+Use this pattern for any remote MCP server that issues short-lived access tokens.
+
+### Profile
+
+```jsonc
+{
+  "extends": "default",
+  "meta": { "name": "agent-with-mcp" },
+  "network": {
+    "custom_credentials": {
+      "example_mcp": {
+        "upstream": "https://mcp.example.com",
+        "credential_key": "cmd://example_mcp",
+        "env_var": "EXAMPLE_MCP_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [
+          { "method": "*", "path": "/mcp" },
+          { "method": "*", "path": "/mcp/**" }
+        ]
+      }
+    },
+    "credentials": ["example_mcp"]
+  },
+  "credential_capture": {
+    "example_mcp": {
+      "command": [
+        "/usr/local/libexec/mcp-token-helper",
+        "example",
+        "https://auth.example.com/oauth/token",
+        "my-client-id"
+      ],
+      "timeout_secs": 300,
+      "cache_ttl_secs": 240,
+      "interaction": {
+        "open_urls": {
+          "allow_origins": ["https://example.com", "https://auth.example.com"],
+          "allow_localhost": true
+        },
+        "allow_launch_services": true
+      }
+    }
+  },
+  "filesystem": {
+    "deny": ["$HOME/.local/state/mcp-tokens"]
+  }
+}
+```
+
+**Key points:**
+
+- `cache_ttl_secs: 240` is shorter than a typical 300-second token lifetime — the helper refreshes proactively before the proxy would call it again.
+- `endpoint_rules` restricts injection to `/mcp` and `/mcp/**` — the token is not sent to other paths on the same upstream.
+- `filesystem.deny` prevents the agent from reading the token cache directly.
+- `interaction.open_urls` allows the browser to open only the provider's auth domain and localhost (for PKCE redirect).
+
+### Using multiple MCP servers
+
+Add one `custom_credentials` entry and one `credential_capture` entry per provider. Each is cached independently and uses its own helper invocation:
+
+```jsonc
+{
+  "network": {
+    "custom_credentials": {
+      "calendar_mcp": {
+        "upstream": "https://mcp.calendar.example.com",
+        "credential_key": "cmd://calendar_mcp",
+        "env_var": "CALENDAR_MCP_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [{ "method": "*", "path": "/**" }]
+      },
+      "docs_mcp": {
+        "upstream": "https://mcp.docs.example.com",
+        "credential_key": "cmd://docs_mcp",
+        "env_var": "DOCS_MCP_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [{ "method": "*", "path": "/**" }]
+      }
+    },
+    "credentials": ["calendar_mcp", "docs_mcp"]
+  },
+  "credential_capture": {
+    "calendar_mcp": {
+      "command": ["/usr/local/libexec/mcp-token-helper", "calendar",
+                  "https://auth.calendar.example.com/token", "cal-client-id"],
+      "timeout_secs": 300,
+      "cache_ttl_secs": 240,
+      "interaction": {
+        "open_urls": {
+          "allow_origins": ["https://calendar.example.com"],
+          "allow_localhost": true
+        }
+      }
+    },
+    "docs_mcp": {
+      "command": ["/usr/local/libexec/mcp-token-helper", "docs",
+                  "https://auth.docs.example.com/token", "docs-client-id"],
+      "timeout_secs": 300,
+      "cache_ttl_secs": 240,
+      "interaction": {
+        "open_urls": {
+          "allow_origins": ["https://docs.example.com"],
+          "allow_localhost": true
+        }
+      }
+    }
+  }
+}
+```
+
+---
+
+## Pattern: Claude.ai session tokens
+
+Claude Code stores its session state in `~/.claude/.credentials.json`. When running Claude Code inside a nono sandbox, you can broker the `accessToken` the same way — the proxy injects it into `api.anthropic.com` requests while the file is denied to the agent directly.
+
+### Token cache helper for Claude.ai
+
+```bash
+#!/usr/bin/env bash
+# claude-token-helper
+set -euo pipefail
+
+CREDS_FILE="$HOME/.claude/.credentials.json"
+EXPIRY_BUFFER=60
+
+if [[ ! -f "$CREDS_FILE" ]]; then
+  echo "claude-token-helper: credentials file not found" >&2
+  exit 1
+fi
+
+access_token="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS_FILE")"
+expires_at="$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS_FILE")"
+refresh_token="$(jq -r '.claudeAiOauth.refreshToken // empty' "$CREDS_FILE")"
+now="$(date +%s)"
+
+# expiresAt is in milliseconds
+expires_at_secs=$(( expires_at / 1000 ))
+
+if [[ -n "$access_token" && "$expires_at_secs" -gt $(( now + EXPIRY_BUFFER )) ]]; then
+  printf '%s' "$access_token"
+  exit 0
+fi
+
+if [[ -n "$refresh_token" ]]; then
+  response="$(curl -sf -X POST "https://auth.anthropic.com/oauth/token" \
+    -H "Content-Type: application/json" \
+    -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\"}")"
+  new_access="$(echo "$response" | jq -r '.access_token // empty')"
+  if [[ -n "$new_access" ]]; then
+    expires_in="$(echo "$response" | jq -r '.expires_in // 3600')"
+    new_expiry=$(( ($(date +%s) + expires_in) * 1000 ))
+    new_refresh="$(echo "$response" | jq -r '.refresh_token // empty')"
+    [[ -z "$new_refresh" ]] && new_refresh="$refresh_token"
+    # Update the credentials file in place
+    tmp="$(mktemp)"
+    jq --arg at "$new_access" --arg rt "$new_refresh" --argjson ea "$new_expiry" \
+      '.claudeAiOauth.accessToken=$at | .claudeAiOauth.refreshToken=$rt | .claudeAiOauth.expiresAt=$ea' \
+      "$CREDS_FILE" > "$tmp" && mv "$tmp" "$CREDS_FILE"
+    printf '%s' "$new_access"
+    exit 0
+  fi
+fi
+
+if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
+  echo "claude-token-helper: token expired and NO_BROWSER_LOGIN=1" >&2
+  exit 1
+fi
+
+echo "claude-token-helper: token expired — run 'claude auth login' on the host to refresh" >&2
+exit 1
+```
+
+### Profile
+
+```jsonc
+{
+  "extends": "claude-code",
+  "meta": { "name": "claude-with-oauth" },
+  "network": {
+    "custom_credentials": {
+      "anthropic": {
+        "upstream": "https://api.anthropic.com",
+        "credential_key": "cmd://anthropic",
+        "env_var": "ANTHROPIC_API_KEY",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [
+          { "method": "*", "path": "/*" }
+        ]
+      }
+    },
+    "credentials": ["anthropic"]
+  },
+  "credential_capture": {
+    "anthropic": {
+      "command": ["/usr/local/libexec/claude-token-helper"],
+      "timeout_secs": 30,
+      "cache_ttl_secs": 240,
+      "interaction": {
+        "open_urls": {
+          "allow_origins": ["https://auth.anthropic.com", "https://claude.ai"],
+          "allow_localhost": true
+        },
+        "allow_launch_services": true
+      }
+    }
+  },
+  "filesystem": {
+    "deny": ["$HOME/.claude/.credentials.json"]
+  }
+}
+```
+
+<Note>
+  The built-in `anthropic` credential route reads from the `ANTHROPIC_API_KEY` host environment variable. The custom credential above overrides it to use the Claude.ai OAuth access token instead. Use whichever credential your Claude Code installation is configured with — not both.
+</Note>
+
+---
+
+## Scoping injection with endpoint_rules
+
+Without `endpoint_rules`, a credential is injected on every request to that upstream. When an agent talks to multiple paths on the same host, or when you want to restrict which operations can use a given token, use `endpoint_rules` to narrow the scope.
+
+```jsonc
+{
+  "custom_credentials": {
+    "workspace_mcp": {
+      "upstream": "https://mcp.workspace.example.com",
+      "credential_key": "cmd://workspace_mcp",
+      "env_var": "WORKSPACE_TOKEN",
+      "inject_header": "Authorization",
+      "credential_format": "Bearer {}",
+      "endpoint_rules": [
+        // Narrow to MCP protocol paths only
+        { "method": "*", "path": "/mcp" },
+        { "method": "*", "path": "/mcp/**" }
+      ]
+    }
+  }
+}
+```
+
+The `path` field is a glob pattern. `/**` matches any path below the prefix. `method` is an HTTP verb or `*` for any method.
+
+A credential is only injected when the incoming request's method **and** path both match at least one rule. If no rule matches, nono returns 403 and records an audit event.
+
+Keeping each credential's `endpoint_rules` narrow prevents cross-leaking: even if an agent constructs a request to the wrong path, the proxy will not inject that service's token.
+
+See [Networking — Endpoint Filtering](/cli/features/networking#endpoint-filtering) for the full pattern syntax.
+
+---
+
+## Environment opt-outs
+
+Helpers should respect `NO_BROWSER_LOGIN=1` for headless environments (CI, containers, remote agents). When set, return non-zero rather than blocking on user input:
+
+```bash
+if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
+  echo "token expired and browser login disabled" >&2
+  exit 1
+fi
+```
+
+nono treats a non-zero exit as a capture failure, surfaces a 503 to the agent, and records a `DENY CAPTURE` audit event. The agent can then return a helpful error rather than hanging.
+
+---
+
+## Testing the setup
+
+**Verify phantom tokens are present:**
+
+```bash
+nono run --profile agent-with-mcp -- env | grep _TOKEN
+# EXAMPLE_MCP_TOKEN=nono_sess_a1b2c3...
+```
+
+**Verify injection to the upstream:**
+
+```bash
+nono run --profile agent-with-mcp -- \
+  curl -si http://127.0.0.1:${NONO_PROXY_PORT}/example_mcp/mcp \
+  -H "Authorization: $EXAMPLE_MCP_TOKEN"
+# Upstream should respond normally; Authorization header carries the real token
+```
+
+**Inspect the audit log:**
+
+```bash
+nono run --profile agent-with-mcp --audit-log /tmp/audit.jsonl -- my-agent
+grep REVERSE /tmp/audit.jsonl
+# {"event":"ALLOW","kind":"REVERSE","route":"example_mcp","method":"POST","path":"/mcp"}
+```
+
+Look for `ALLOW REVERSE` lines confirming injection, and `DENY CAPTURE` lines if the helper failed.
+
+---
+
+## Security notes
+
+- **Tokens never enter the sandbox in plaintext.** The agent process only sees the phantom session token; the real access token is held by the proxy on the host side.
+- **Deny the token cache and credentials file.** Add `filesystem.deny` entries for `$HOME/.local/state/mcp-tokens` and `$HOME/.claude/.credentials.json` to prevent the agent from reading them directly.
+- **Set `cache_ttl_secs` shorter than the actual token lifetime.** This ensures the helper is re-invoked before the token expires, rather than after a failed upstream request forces a retry.
+- **Scope `interaction.open_urls` tightly.** List only the exact origins the provider's OAuth flow uses; omit unrelated domains.
+- **Token cache files should be mode 600.** The helper skeleton above sets this; verify your own implementation does the same.

@@ -16,9 +16,9 @@ Proxy intercepts (phantom token in Authorization header)
     ↓
 No valid cached token? → Supervisor runs token-cache helper (cmd://)
     ↓
-Helper: check cache → still valid? emit access_token
-                     → expired + refresh_token? call /token endpoint, update cache, emit
-                     → no refresh? open browser, complete PKCE flow, write cache, emit
+Helper: check keychain → still valid? emit access_token
+                        → expired + refresh_token? call /token endpoint, update keychain, emit
+                        → no refresh? open browser, complete PKCE flow, store to keychain, emit
     ↓
 Proxy injects real Bearer token into upstream request
     ↓
@@ -38,79 +38,118 @@ The helper is a regular host-side script. nono calls it each time the cache is c
 3. Fall back to an interactive browser flow if no refresh token is available.
 4. Exit non-zero if it cannot produce a token (nono will surface a 503 to the agent and record an audit event).
 
-### Generic bash skeleton
+Tokens are stored in the **system keychain** (macOS Keychain, Linux Secret Service) via the [`keyring`](https://pypi.org/project/keyring/) library — not on disk — so they are protected by the OS credential store.
+
+Install the dependency once:
 
 ```bash
-#!/usr/bin/env bash
-# mcp-token-helper <provider-name> <token-endpoint> <client-id>
-set -euo pipefail
-
-PROVIDER="${1:?provider required}"
-TOKEN_ENDPOINT="${2:?token endpoint required}"
-CLIENT_ID="${3:?client-id required}"
-
-CACHE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mcp-tokens"
-CACHE_FILE="$CACHE_DIR/$PROVIDER.json"
-EXPIRY_BUFFER=60   # refresh this many seconds before actual expiry
-
-mkdir -p "$CACHE_DIR"
-chmod 700 "$CACHE_DIR"
-
-# Read cache
-if [[ -f "$CACHE_FILE" ]]; then
-  access_token="$(jq -r '.access_token // empty' "$CACHE_FILE")"
-  refresh_token="$(jq -r '.refresh_token // empty' "$CACHE_FILE")"
-  expires_at="$(jq -r '.expires_at // 0' "$CACHE_FILE")"
-  now="$(date +%s)"
-
-  if [[ -n "$access_token" && "$expires_at" -gt $(( now + EXPIRY_BUFFER )) ]]; then
-    printf '%s' "$access_token"
-    exit 0
-  fi
-
-  # Refresh
-  if [[ -n "$refresh_token" ]]; then
-    response="$(curl -sf -X POST "$TOKEN_ENDPOINT" \
-      -d "grant_type=refresh_token" \
-      -d "client_id=$CLIENT_ID" \
-      -d "refresh_token=$refresh_token")"
-    new_access="$(echo "$response" | jq -r '.access_token // empty')"
-    if [[ -n "$new_access" ]]; then
-      expires_in="$(echo "$response" | jq -r '.expires_in // 3600')"
-      new_expiry=$(( $(date +%s) + expires_in ))
-      new_refresh="$(echo "$response" | jq -r '.refresh_token // empty')"
-      [[ -z "$new_refresh" ]] && new_refresh="$refresh_token"
-      jq -n \
-        --arg at "$new_access" \
-        --arg rt "$new_refresh" \
-        --argjson ea "$new_expiry" \
-        '{"access_token":$at,"refresh_token":$rt,"expires_at":$ea}' \
-        > "$CACHE_FILE"
-      chmod 600 "$CACHE_FILE"
-      printf '%s' "$new_access"
-      exit 0
-    fi
-  fi
-fi
-
-# Headless fallback — skip browser in CI
-if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
-  echo "mcp-token-helper: no cached token and NO_BROWSER_LOGIN=1" >&2
-  exit 1
-fi
-
-# Interactive browser flow (tool-specific; replace with your provider's CLI or PKCE helper)
-echo "mcp-token-helper: launching browser login for $PROVIDER" >&2
-# Example: mcp-remote auth $PROVIDER ...
-# After login, write access_token, refresh_token, expires_at to $CACHE_FILE
-echo "mcp-token-helper: browser login not implemented — store token manually in $CACHE_FILE" >&2
-exit 1
+pip install keyring
 ```
 
-Place the script at a stable path (e.g. `/usr/local/libexec/mcp-token-helper`) and make it executable:
+### Generic Python skeleton
+
+```python
+#!/usr/bin/env python3
+"""
+Generic MCP OAuth token helper for nono.
+Stores tokens in the system keychain via the `keyring` library.
+
+Usage:
+    mcp-token-helper <provider-name> <token-endpoint> <client-id>
+"""
+import json
+import os
+import sys
+import time
+import urllib.request
+import urllib.parse
+
+try:
+    import keyring
+except ImportError:
+    print("mcp-token-helper: pip install keyring", file=sys.stderr)
+    sys.exit(1)
+
+KEYRING_SERVICE = "nono-mcp"
+EXPIRY_BUFFER_MS = 60_000  # refresh 60 s before actual expiry
+
+
+def load(key):
+    raw = keyring.get_password(KEYRING_SERVICE, key)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def store(key, token_data):
+    keyring.set_password(KEYRING_SERVICE, key, json.dumps(token_data))
+
+
+def do_refresh(token_endpoint, client_id, refresh_tok):
+    payload = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": client_id,
+        "refresh_token": refresh_tok,
+    }).encode()
+    req = urllib.request.Request(
+        token_endpoint,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def main():
+    if len(sys.argv) < 4:
+        print(f"usage: {sys.argv[0]} <provider> <token-endpoint> <client-id>", file=sys.stderr)
+        sys.exit(1)
+
+    provider, token_endpoint, client_id = sys.argv[1], sys.argv[2], sys.argv[3]
+    now_ms = int(time.time() * 1_000)
+    token_data = load(provider)
+
+    if token_data and token_data.get("expires_at_ms", 0) > now_ms + EXPIRY_BUFFER_MS:
+        sys.stdout.write(token_data["access_token"])
+        return
+
+    if token_data and token_data.get("refresh_token"):
+        try:
+            body = do_refresh(token_endpoint, client_id, token_data["refresh_token"])
+            if body.get("access_token"):
+                new_data = {
+                    "access_token": body["access_token"],
+                    "refresh_token": body.get("refresh_token") or token_data["refresh_token"],
+                    "expires_at_ms": now_ms + body.get("expires_in", 3600) * 1_000,
+                }
+                store(provider, new_data)
+                sys.stdout.write(new_data["access_token"])
+                return
+        except Exception as exc:
+            print(f"mcp-token-helper: refresh failed: {exc}", file=sys.stderr)
+
+    if os.environ.get("NO_BROWSER_LOGIN") == "1":
+        print(f"mcp-token-helper: no valid token for '{provider}' and NO_BROWSER_LOGIN=1", file=sys.stderr)
+        sys.exit(1)
+
+    # Provider-specific browser flow: complete PKCE auth, then call store().
+    # See the Slack example below for a concrete implementation.
+    print(f"mcp-token-helper: no valid token for '{provider}' — implement browser flow here", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Place at a stable path and make it executable:
 
 ```bash
-chmod 755 /usr/local/libexec/mcp-token-helper
+install -m 755 mcp-token-helper.py /usr/local/libexec/mcp-token-helper
 ```
 
 ---
@@ -145,9 +184,9 @@ Use this pattern for any remote MCP server that issues short-lived access tokens
     "example_mcp": {
       "command": [
         "/usr/local/libexec/mcp-token-helper",
-        "example",
+        "example_mcp",
         "https://auth.example.com/oauth/token",
-        "my-client-id"
+        "<client-id>"
       ],
       "timeout_secs": 300,
       "cache_ttl_secs": 240,
@@ -159,9 +198,6 @@ Use this pattern for any remote MCP server that issues short-lived access tokens
         "allow_launch_services": true
       }
     }
-  },
-  "filesystem": {
-    "deny": ["$HOME/.local/state/mcp-tokens"]
   }
 }
 ```
@@ -170,12 +206,12 @@ Use this pattern for any remote MCP server that issues short-lived access tokens
 
 - `cache_ttl_secs: 240` is shorter than a typical 300-second token lifetime — the helper refreshes proactively before the proxy would call it again.
 - `endpoint_rules` restricts injection to `/mcp` and `/mcp/**` — the token is not sent to other paths on the same upstream.
-- `filesystem.deny` prevents the agent from reading the token cache directly.
 - `interaction.open_urls` allows the browser to open only the provider's auth domain and localhost (for PKCE redirect).
+- Tokens live in the system keychain, not on disk, so no `filesystem.deny` entry is needed for the cache.
 
 ### Using multiple MCP servers
 
-Add one `custom_credentials` entry and one `credential_capture` entry per provider. Each is cached independently and uses its own helper invocation:
+Add one `custom_credentials` entry and one `credential_capture` entry per provider. Each uses a distinct keychain key (the first argument to the helper), so caches are independent:
 
 ```jsonc
 {
@@ -202,8 +238,8 @@ Add one `custom_credentials` entry and one `credential_capture` entry per provid
   },
   "credential_capture": {
     "calendar_mcp": {
-      "command": ["/usr/local/libexec/mcp-token-helper", "calendar",
-                  "https://auth.calendar.example.com/token", "cal-client-id"],
+      "command": ["/usr/local/libexec/mcp-token-helper", "calendar_mcp",
+                  "https://auth.calendar.example.com/token", "<client-id>"],
       "timeout_secs": 300,
       "cache_ttl_secs": 240,
       "interaction": {
@@ -214,8 +250,8 @@ Add one `custom_credentials` entry and one `credential_capture` entry per provid
       }
     },
     "docs_mcp": {
-      "command": ["/usr/local/libexec/mcp-token-helper", "docs",
-                  "https://auth.docs.example.com/token", "docs-client-id"],
+      "command": ["/usr/local/libexec/mcp-token-helper", "docs_mcp",
+                  "https://auth.docs.example.com/token", "<client-id>"],
       "timeout_secs": 300,
       "cache_ttl_secs": 240,
       "interaction": {
@@ -233,82 +269,213 @@ Add one `custom_credentials` entry and one `credential_capture` entry per provid
 
 ## Example: Slack MCP
 
-[Slack's MCP server](https://mcp.slack.com) uses standard OAuth2. Tokens are managed by [`mcp-remote`](https://github.com/modelcontextprotocol/mcp-remote), which stores them in `~/.mcp-auth/<url-hash>/tokens.json`. The helper below reads from that cache, refreshes when necessary, and triggers a browser login for the initial flow.
+[Slack's MCP server](https://mcp.slack.com) implements standard OAuth2 PKCE with the following endpoints (discovered from `https://mcp.slack.com/.well-known/oauth-authorization-server`):
+
+| | |
+|---|---|
+| Authorization | `https://slack.com/oauth/v2_user/authorize` |
+| Token / refresh | `https://slack.com/api/oauth.v2.user.access` |
+
+Initial auth is handled by [`mcp-remote`](https://github.com/modelcontextprotocol/mcp-remote), which drives the PKCE browser flow. The helper migrates the resulting tokens into the system keychain and handles all subsequent refreshes itself without re-invoking mcp-remote.
 
 ### Prerequisites
 
 ```bash
-npm install -g mcp-remote
+pip install keyring
+npm install -g mcp-remote   # or: npx mcp-remote (no install needed)
 ```
 
-`mcp-remote` must be authenticated at least once before the helper can refresh silently:
+### Token helper
 
-```bash
-npx mcp-remote https://mcp.slack.com/mcp
-# Follow the browser prompt to authorise your Slack workspace
-# Then Ctrl-C — the tokens are now cached in ~/.mcp-auth/
-```
+```python
+#!/usr/bin/env python3
+"""
+Slack MCP token helper for nono.
 
-### Token cache helper for Slack
+First run: triggers browser auth via mcp-remote, then migrates tokens to keychain.
+Subsequent runs: refreshes silently from keychain via Slack's token endpoint.
+"""
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.parse
 
-```bash
-#!/usr/bin/env bash
-# slack-mcp-token-helper
-# Emits the current Slack MCP access token to stdout.
-# Stores state in ~/.mcp-auth/ (managed by mcp-remote).
-set -euo pipefail
+try:
+    import keyring
+except ImportError:
+    print("slack-mcp-token-helper: pip install keyring", file=sys.stderr)
+    sys.exit(1)
 
-MCP_URL="https://mcp.slack.com/mcp"
-EXPIRY_BUFFER=60
+MCP_URL = "https://mcp.slack.com/mcp"
+TOKEN_ENDPOINT = "https://slack.com/api/oauth.v2.user.access"
+KEYRING_SERVICE = "nono-mcp"
+KEYRING_KEY = "slack_mcp"
+EXPIRY_BUFFER_MS = 60_000
 
-# mcp-remote hashes the URL to derive the cache directory name
-CACHE_DIR="$HOME/.mcp-auth/$(node -e "
-const crypto = require('crypto');
-console.log(crypto.createHash('sha256').update('$MCP_URL').digest('hex').slice(0,16));
-" 2>/dev/null || true)"
 
-TOKEN_FILE="$CACHE_DIR/tokens.json"
+def load():
+    raw = keyring.get_password(KEYRING_SERVICE, KEYRING_KEY)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    return None
 
-if [[ -f "$TOKEN_FILE" ]]; then
-  access_token="$(jq -r '.access_token // empty' "$TOKEN_FILE")"
-  expires_at="$(jq -r '.expires_at // 0' "$TOKEN_FILE")"
-  now="$(date +%s)"
-  # expires_at is in milliseconds
-  expires_at_secs=$(( expires_at / 1000 ))
 
-  if [[ -n "$access_token" && "$expires_at_secs" -gt $(( now + EXPIRY_BUFFER )) ]]; then
-    printf '%s' "$access_token"
-    exit 0
-  fi
-fi
+def store(token_data):
+    keyring.set_password(KEYRING_SERVICE, KEYRING_KEY, json.dumps(token_data))
 
-# Headless fallback
-if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
-  echo "slack-mcp-token-helper: token expired and NO_BROWSER_LOGIN=1" >&2
-  exit 1
-fi
 
-# Re-auth via mcp-remote — opens browser, writes new tokens to ~/.mcp-auth/
-echo "slack-mcp-token-helper: token expired, launching browser re-auth" >&2
-timeout 300 npx mcp-remote "$MCP_URL" --once 2>/dev/null || true
+def do_refresh(refresh_tok):
+    # Slack's token endpoint accepts refresh_token grant for MCP tokens.
+    # The client_id was registered by mcp-remote's DCR flow and is stored in
+    # the client_info file; for the public Slack MCP app it is fixed.
+    payload = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_tok,
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
 
-# Re-read after auth
-if [[ -f "$TOKEN_FILE" ]]; then
-  access_token="$(jq -r '.access_token // empty' "$TOKEN_FILE")"
-  if [[ -n "$access_token" ]]; then
-    printf '%s' "$access_token"
-    exit 0
-  fi
-fi
 
-echo "slack-mcp-token-helper: could not obtain token" >&2
-exit 1
+def find_mcp_remote_tokens():
+    """
+    mcp-remote stores tokens in ~/.mcp-auth/<version-dir>/<md5(url)>_tokens.json.
+    Walk all version directories and return the first matching tokens file found.
+    """
+    url_hash = hashlib.md5(MCP_URL.encode()).hexdigest()
+    mcp_auth = pathlib.Path.home() / ".mcp-auth"
+    if not mcp_auth.is_dir():
+        return None
+    for version_dir in sorted(mcp_auth.iterdir(), reverse=True):  # newest version first
+        candidate = version_dir / f"{url_hash}_tokens.json"
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text()), candidate
+            except (json.JSONDecodeError, OSError):
+                pass
+    return None, None
+
+
+def migrate_from_disk():
+    """Read tokens from mcp-remote disk cache, store in keychain, delete from disk."""
+    result = find_mcp_remote_tokens()
+    if result[0] is None:
+        return None
+    disk_tokens, token_file = result
+    # mcp-remote files have no expires_at; set to 0 to force an immediate refresh.
+    token_data = {
+        "access_token": disk_tokens["access_token"],
+        "refresh_token": disk_tokens.get("refresh_token", ""),
+        "expires_at_ms": 0,
+    }
+    store(token_data)
+    try:
+        token_file.unlink()  # remove from disk now that it is in keychain
+    except OSError:
+        pass
+    return token_data
+
+
+def browser_auth():
+    if os.environ.get("NO_BROWSER_LOGIN") == "1":
+        print("slack-mcp-token-helper: token expired and NO_BROWSER_LOGIN=1", file=sys.stderr)
+        sys.exit(1)
+    print("slack-mcp-token-helper: launching browser auth via mcp-remote", file=sys.stderr)
+    try:
+        subprocess.run(
+            ["npx", "--yes", "mcp-remote", MCP_URL, "--once"],
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        print("slack-mcp-token-helper: browser auth timed out", file=sys.stderr)
+        sys.exit(1)
+    return migrate_from_disk()
+
+
+def main():
+    now_ms = int(time.time() * 1_000)
+    token_data = load()
+
+    # Valid cached token
+    if token_data and token_data.get("expires_at_ms", 0) > now_ms + EXPIRY_BUFFER_MS:
+        sys.stdout.write(token_data["access_token"])
+        return
+
+    # Refresh
+    if token_data and token_data.get("refresh_token"):
+        try:
+            body = do_refresh(token_data["refresh_token"])
+            if body.get("ok") and body.get("access_token"):
+                new_data = {
+                    "access_token": body["access_token"],
+                    "refresh_token": body.get("refresh_token") or token_data["refresh_token"],
+                    "expires_at_ms": now_ms + body.get("expires_in", 3600) * 1_000,
+                }
+                store(new_data)
+                sys.stdout.write(new_data["access_token"])
+                return
+        except Exception as exc:
+            print(f"slack-mcp-token-helper: refresh failed: {exc}", file=sys.stderr)
+
+    # Check disk cache left by mcp-remote (e.g. first run, or after mcp-remote upgraded)
+    migrated = migrate_from_disk()
+    if migrated and migrated.get("refresh_token"):
+        try:
+            body = do_refresh(migrated["refresh_token"])
+            if body.get("ok") and body.get("access_token"):
+                new_data = {
+                    "access_token": body["access_token"],
+                    "refresh_token": body.get("refresh_token") or migrated["refresh_token"],
+                    "expires_at_ms": now_ms + body.get("expires_in", 3600) * 1_000,
+                }
+                store(new_data)
+                sys.stdout.write(new_data["access_token"])
+                return
+        except Exception as exc:
+            print(f"slack-mcp-token-helper: refresh after migration failed: {exc}", file=sys.stderr)
+
+    # Full browser auth
+    new_token = browser_auth()
+    if new_token and new_token.get("refresh_token"):
+        try:
+            body = do_refresh(new_token["refresh_token"])
+            if body.get("ok") and body.get("access_token"):
+                new_data = {
+                    "access_token": body["access_token"],
+                    "refresh_token": body.get("refresh_token") or new_token["refresh_token"],
+                    "expires_at_ms": now_ms + body.get("expires_in", 3600) * 1_000,
+                }
+                store(new_data)
+                sys.stdout.write(new_data["access_token"])
+                return
+        except Exception:
+            pass
+
+    print("slack-mcp-token-helper: could not obtain a valid token", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 Install the helper:
 
 ```bash
-install -m 755 slack-mcp-token-helper /usr/local/libexec/slack-mcp-token-helper
+install -m 755 slack-mcp-token-helper.py /usr/local/libexec/slack-mcp-token-helper
 ```
 
 ### Profile
@@ -356,69 +523,106 @@ install -m 755 slack-mcp-token-helper /usr/local/libexec/slack-mcp-token-helper
 }
 ```
 
-The `open_urls` origins cover Slack's OAuth authorisation pages. The `filesystem.deny` entry prevents the sandboxed agent from reading the raw token cache directly — it can only obtain tokens through the proxy.
+`filesystem.deny` on `~/.mcp-auth` is still needed — mcp-remote writes the initial tokens there before the helper migrates them to keychain.
 
 ---
 
 ## Pattern: Claude.ai session tokens
 
-Claude Code stores its session state in `~/.claude/.credentials.json`. When running Claude Code inside a nono sandbox, you can broker the `accessToken` the same way — the proxy injects it into `api.anthropic.com` requests while the file is denied to the agent directly.
+Claude Code stores its OAuth state in `~/.claude/.credentials.json`. When running Claude Code inside a nono sandbox, broker the `accessToken` the same way — the proxy injects it into `api.anthropic.com` requests while the file is denied to the agent directly.
 
-### Token cache helper for Claude.ai
+The helper reads from the file (which Claude Code manages as the source of truth) and refreshes via Anthropic's token endpoint, writing new tokens back so Claude Code stays in sync.
+
+### Token helper
+
+```python
+#!/usr/bin/env python3
+"""
+Claude.ai OAuth token helper for nono.
+
+Reads and refreshes tokens from ~/.claude/.credentials.json.
+The file is managed by Claude Code (source of truth); this helper
+reads it on the host and refreshes when needed, keeping it up to date.
+"""
+import json
+import os
+import pathlib
+import sys
+import time
+import urllib.request
+
+CREDS_FILE = pathlib.Path.home() / ".claude" / ".credentials.json"
+TOKEN_ENDPOINT = "https://auth.anthropic.com/oauth/token"
+EXPIRY_BUFFER_MS = 60_000
+
+
+def load():
+    if not CREDS_FILE.exists():
+        print("claude-token-helper: ~/.claude/.credentials.json not found", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(CREDS_FILE.read_text())
+
+
+def save(creds):
+    CREDS_FILE.write_text(json.dumps(creds, indent=2))
+
+
+def do_refresh(refresh_tok):
+    payload = json.dumps({"grant_type": "refresh_token", "refresh_token": refresh_tok}).encode()
+    req = urllib.request.Request(
+        TOKEN_ENDPOINT,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def main():
+    now_ms = int(time.time() * 1_000)
+    creds = load()
+    oauth = creds.get("claudeAiOauth", {})
+
+    access_token = oauth.get("accessToken", "")
+    expires_at_ms = oauth.get("expiresAt", 0)  # already in milliseconds
+    refresh_tok = oauth.get("refreshToken", "")
+
+    if access_token and expires_at_ms > now_ms + EXPIRY_BUFFER_MS:
+        sys.stdout.write(access_token)
+        return
+
+    if refresh_tok:
+        try:
+            body = do_refresh(refresh_tok)
+            new_access = body.get("access_token")
+            if new_access:
+                oauth["accessToken"] = new_access
+                oauth["refreshToken"] = body.get("refresh_token") or refresh_tok
+                oauth["expiresAt"] = now_ms + body.get("expires_in", 3600) * 1_000
+                creds["claudeAiOauth"] = oauth
+                save(creds)
+                sys.stdout.write(new_access)
+                return
+        except Exception as exc:
+            print(f"claude-token-helper: refresh failed: {exc}", file=sys.stderr)
+
+    if os.environ.get("NO_BROWSER_LOGIN") == "1":
+        print("claude-token-helper: token expired and NO_BROWSER_LOGIN=1", file=sys.stderr)
+        sys.exit(1)
+
+    print("claude-token-helper: token expired — run 'claude auth login' on the host", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Install the helper:
 
 ```bash
-#!/usr/bin/env bash
-# claude-token-helper
-set -euo pipefail
-
-CREDS_FILE="$HOME/.claude/.credentials.json"
-EXPIRY_BUFFER=60
-
-if [[ ! -f "$CREDS_FILE" ]]; then
-  echo "claude-token-helper: credentials file not found" >&2
-  exit 1
-fi
-
-access_token="$(jq -r '.claudeAiOauth.accessToken // empty' "$CREDS_FILE")"
-expires_at="$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS_FILE")"
-refresh_token="$(jq -r '.claudeAiOauth.refreshToken // empty' "$CREDS_FILE")"
-now="$(date +%s)"
-
-# expiresAt is in milliseconds
-expires_at_secs=$(( expires_at / 1000 ))
-
-if [[ -n "$access_token" && "$expires_at_secs" -gt $(( now + EXPIRY_BUFFER )) ]]; then
-  printf '%s' "$access_token"
-  exit 0
-fi
-
-if [[ -n "$refresh_token" ]]; then
-  response="$(curl -sf -X POST "https://auth.anthropic.com/oauth/token" \
-    -H "Content-Type: application/json" \
-    -d "{\"grant_type\":\"refresh_token\",\"refresh_token\":\"$refresh_token\"}")"
-  new_access="$(echo "$response" | jq -r '.access_token // empty')"
-  if [[ -n "$new_access" ]]; then
-    expires_in="$(echo "$response" | jq -r '.expires_in // 3600')"
-    new_expiry=$(( ($(date +%s) + expires_in) * 1000 ))
-    new_refresh="$(echo "$response" | jq -r '.refresh_token // empty')"
-    [[ -z "$new_refresh" ]] && new_refresh="$refresh_token"
-    # Update the credentials file in place
-    tmp="$(mktemp)"
-    jq --arg at "$new_access" --arg rt "$new_refresh" --argjson ea "$new_expiry" \
-      '.claudeAiOauth.accessToken=$at | .claudeAiOauth.refreshToken=$rt | .claudeAiOauth.expiresAt=$ea' \
-      "$CREDS_FILE" > "$tmp" && mv "$tmp" "$CREDS_FILE"
-    printf '%s' "$new_access"
-    exit 0
-  fi
-fi
-
-if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
-  echo "claude-token-helper: token expired and NO_BROWSER_LOGIN=1" >&2
-  exit 1
-fi
-
-echo "claude-token-helper: token expired — run 'claude auth login' on the host to refresh" >&2
-exit 1
+install -m 755 claude-token-helper.py /usr/local/libexec/claude-token-helper
 ```
 
 ### Profile
@@ -503,13 +707,12 @@ See [Networking — Endpoint Filtering](/cli/features/networking#endpoint-filter
 
 ## Environment opt-outs
 
-Helpers should respect `NO_BROWSER_LOGIN=1` for headless environments (CI, containers, remote agents). When set, return non-zero rather than blocking on user input:
+Helpers should exit non-zero when `NO_BROWSER_LOGIN=1` so headless environments (CI, containers, remote agents) fail fast rather than blocking on user input:
 
-```bash
-if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
-  echo "token expired and browser login disabled" >&2
-  exit 1
-fi
+```python
+if os.environ.get("NO_BROWSER_LOGIN") == "1":
+    print("token expired and browser login disabled", file=sys.stderr)
+    sys.exit(1)
 ```
 
 nono treats a non-zero exit as a capture failure, surfaces a 503 to the agent, and records a `DENY CAPTURE` audit event. The agent can then return a helpful error rather than hanging.
@@ -549,7 +752,7 @@ Look for `ALLOW REVERSE` lines confirming injection, and `DENY CAPTURE` lines if
 ## Security notes
 
 - **Tokens never enter the sandbox in plaintext.** The agent process only sees the phantom session token; the real access token is held by the proxy on the host side.
-- **Deny the token cache and credentials file.** Add `filesystem.deny` entries for `$HOME/.local/state/mcp-tokens` and `$HOME/.claude/.credentials.json` to prevent the agent from reading them directly.
+- **Prefer keychain over disk.** The helpers above store tokens in the system keychain (macOS Keychain, Linux Secret Service), not in world-readable files.
+- **Deny raw token files.** Where mcp-remote writes to disk before migration (`~/.mcp-auth`) or where Claude Code keeps its state (`~/.claude/.credentials.json`), add a `filesystem.deny` entry so the agent cannot read them.
 - **Set `cache_ttl_secs` shorter than the actual token lifetime.** This ensures the helper is re-invoked before the token expires, rather than after a failed upstream request forces a retry.
 - **Scope `interaction.open_urls` tightly.** List only the exact origins the provider's OAuth flow uses; omit unrelated domains.
-- **Token cache files should be mode 600.** The helper skeleton above sets this; verify your own implementation does the same.

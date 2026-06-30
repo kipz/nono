@@ -231,6 +231,135 @@ Add one `custom_credentials` entry and one `credential_capture` entry per provid
 
 ---
 
+## Example: Slack MCP
+
+[Slack's MCP server](https://mcp.slack.com) uses standard OAuth2. Tokens are managed by [`mcp-remote`](https://github.com/modelcontextprotocol/mcp-remote), which stores them in `~/.mcp-auth/<url-hash>/tokens.json`. The helper below reads from that cache, refreshes when necessary, and triggers a browser login for the initial flow.
+
+### Prerequisites
+
+```bash
+npm install -g mcp-remote
+```
+
+`mcp-remote` must be authenticated at least once before the helper can refresh silently:
+
+```bash
+npx mcp-remote https://mcp.slack.com/mcp
+# Follow the browser prompt to authorise your Slack workspace
+# Then Ctrl-C — the tokens are now cached in ~/.mcp-auth/
+```
+
+### Token cache helper for Slack
+
+```bash
+#!/usr/bin/env bash
+# slack-mcp-token-helper
+# Emits the current Slack MCP access token to stdout.
+# Stores state in ~/.mcp-auth/ (managed by mcp-remote).
+set -euo pipefail
+
+MCP_URL="https://mcp.slack.com/mcp"
+EXPIRY_BUFFER=60
+
+# mcp-remote hashes the URL to derive the cache directory name
+CACHE_DIR="$HOME/.mcp-auth/$(node -e "
+const crypto = require('crypto');
+console.log(crypto.createHash('sha256').update('$MCP_URL').digest('hex').slice(0,16));
+" 2>/dev/null || true)"
+
+TOKEN_FILE="$CACHE_DIR/tokens.json"
+
+if [[ -f "$TOKEN_FILE" ]]; then
+  access_token="$(jq -r '.access_token // empty' "$TOKEN_FILE")"
+  expires_at="$(jq -r '.expires_at // 0' "$TOKEN_FILE")"
+  now="$(date +%s)"
+  # expires_at is in milliseconds
+  expires_at_secs=$(( expires_at / 1000 ))
+
+  if [[ -n "$access_token" && "$expires_at_secs" -gt $(( now + EXPIRY_BUFFER )) ]]; then
+    printf '%s' "$access_token"
+    exit 0
+  fi
+fi
+
+# Headless fallback
+if [[ "${NO_BROWSER_LOGIN:-}" == "1" ]]; then
+  echo "slack-mcp-token-helper: token expired and NO_BROWSER_LOGIN=1" >&2
+  exit 1
+fi
+
+# Re-auth via mcp-remote — opens browser, writes new tokens to ~/.mcp-auth/
+echo "slack-mcp-token-helper: token expired, launching browser re-auth" >&2
+timeout 300 npx mcp-remote "$MCP_URL" --once 2>/dev/null || true
+
+# Re-read after auth
+if [[ -f "$TOKEN_FILE" ]]; then
+  access_token="$(jq -r '.access_token // empty' "$TOKEN_FILE")"
+  if [[ -n "$access_token" ]]; then
+    printf '%s' "$access_token"
+    exit 0
+  fi
+fi
+
+echo "slack-mcp-token-helper: could not obtain token" >&2
+exit 1
+```
+
+Install the helper:
+
+```bash
+install -m 755 slack-mcp-token-helper /usr/local/libexec/slack-mcp-token-helper
+```
+
+### Profile
+
+```jsonc
+{
+  "extends": "default",
+  "meta": { "name": "agent-with-slack" },
+  "network": {
+    "custom_credentials": {
+      "slack_mcp": {
+        "upstream": "https://mcp.slack.com",
+        "credential_key": "cmd://slack_mcp",
+        "env_var": "SLACK_MCP_TOKEN",
+        "inject_header": "Authorization",
+        "credential_format": "Bearer {}",
+        "endpoint_rules": [
+          { "method": "*", "path": "/mcp" },
+          { "method": "*", "path": "/mcp/**" }
+        ]
+      }
+    },
+    "credentials": ["slack_mcp"]
+  },
+  "credential_capture": {
+    "slack_mcp": {
+      "command": ["/usr/local/libexec/slack-mcp-token-helper"],
+      "timeout_secs": 300,
+      "cache_ttl_secs": 300,
+      "interaction": {
+        "open_urls": {
+          "allow_origins": [
+            "https://slack.com",
+            "https://app.slack.com"
+          ],
+          "allow_localhost": true
+        },
+        "allow_launch_services": true
+      }
+    }
+  },
+  "filesystem": {
+    "deny": ["$HOME/.mcp-auth"]
+  }
+}
+```
+
+The `open_urls` origins cover Slack's OAuth authorisation pages. The `filesystem.deny` entry prevents the sandboxed agent from reading the raw token cache directly — it can only obtain tokens through the proxy.
+
+---
+
 ## Pattern: Claude.ai session tokens
 
 Claude Code stores its session state in `~/.claude/.credentials.json`. When running Claude Code inside a nono sandbox, you can broker the `accessToken` the same way — the proxy injects it into `api.anthropic.com` requests while the file is denied to the agent directly.

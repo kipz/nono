@@ -980,6 +980,8 @@ mod tests {
                 tls_ca: Some("$HOME/.config/pki/ca.pem".to_string()),
                 tls_client_cert: Some("${NONO_TEST_PKI_DIR}/cert.pem".to_string()),
                 tls_client_key: Some("~/.config/pki/key.pem".to_string()),
+                aws_auth: None,
+                endpoint_policy: None,
             },
         );
 

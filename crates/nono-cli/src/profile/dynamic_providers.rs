@@ -257,13 +257,11 @@ fn expand_profile_tokens_with<F>(profile: &mut Profile, mut resolver: F) -> Resu
 where
     F: FnMut(&str, &str) -> Result<Vec<String>>,
 {
-    let fs = &mut profile.filesystem;
-    fs.allow = expand_path_list_with(&fs.allow, &mut resolver)?;
-    fs.read = expand_path_list_with(&fs.read, &mut resolver)?;
-    fs.write = expand_path_list_with(&fs.write, &mut resolver)?;
-    fs.allow_file = expand_path_list_with(&fs.allow_file, &mut resolver)?;
-    fs.read_file = expand_path_list_with(&fs.read_file, &mut resolver)?;
-    fs.write_file = expand_path_list_with(&fs.write_file, &mut resolver)?;
+    // Top-level `filesystem.*` fields are NOT expanded here: they're expanded
+    // later in `CapabilitySet::from_profile` (capability_ext.rs), which has
+    // access to the resolved workdir that workdir-dependent providers (e.g.
+    // `@git:common-dir`) need. Expanding them at finalize time — before a
+    // workdir is known — would resolve against the process cwd instead.
 
     for cmd in &mut profile.mediation.commands {
         if let Some(sandbox) = cmd.sandbox.as_mut() {
@@ -609,7 +607,9 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
     }
 
     #[test]
-    fn expand_profile_tokens_walks_filesystem_read_file() {
+    fn expand_profile_tokens_leaves_top_level_filesystem_fields_untouched() {
+        // Top-level filesystem.* tokens are expanded later, by
+        // CapabilitySet::from_profile, once a workdir is available.
         let mut profile = Profile::default();
         profile.filesystem.read_file =
             vec!["~/.gitconfig".to_string(), "@git:config-paths".to_string()];
@@ -617,7 +617,7 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             .expect("profile token expansion");
         assert_eq!(
             profile.filesystem.read_file,
-            vec!["~/.gitconfig", "/expanded/path"]
+            vec!["~/.gitconfig", "@git:config-paths"]
         );
     }
 

@@ -305,31 +305,31 @@ mod tests {
             pid: std::process::id(),
             cwd: None,
         };
-        let request_bytes = serde_json::to_vec(&request).unwrap();
+        let request_bytes = serde_json::to_vec(&request).expect("serialize request");
 
         let mock_response = serde_json::to_vec(&ShimResponse {
             stdout: "hello\n".to_string(),
             stderr: String::new(),
             exit_code: 0,
         })
-        .unwrap();
+        .expect("serialize mock response");
 
         // Server thread: verify protocol order and return a mock response.
         let server = std::thread::spawn({
             let mock_response = mock_response.clone();
             move || {
-                let (mut conn, _) = listener.accept().unwrap();
+                let (mut conn, _) = listener.accept().expect("accept connection");
 
                 // 1. Read length-prefixed JSON
                 let mut len_buf = [0u8; 4];
-                conn.read_exact(&mut len_buf).unwrap();
+                conn.read_exact(&mut len_buf).expect("read length prefix");
                 let len = u32::from_be_bytes(len_buf) as usize;
                 let mut body = vec![0u8; len];
-                conn.read_exact(&mut body).unwrap();
+                conn.read_exact(&mut body).expect("read request body");
 
                 // 2. Send ACK — signals the shim it may now sendmsg the fds
-                conn.write_all(&[0x06u8]).unwrap();
-                conn.flush().unwrap();
+                conn.write_all(&[0x06u8]).expect("write ACK byte");
+                conn.flush().expect("flush ACK byte");
 
                 // 3. Receive the three stdio fds via SCM_RIGHTS
                 let fd_size = std::mem::size_of::<RawFd>();
@@ -348,17 +348,27 @@ mod tests {
                 msg.msg_control = cmsg_buf.as_mut_ptr().cast::<libc::c_void>();
                 msg.msg_controllen = cmsg_space as _;
                 let received = unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) };
-                assert!(received >= 0, "recvmsg failed: {}", std::io::Error::last_os_error());
-                assert_eq!(msg.msg_flags & libc::MSG_CTRUNC, 0, "ancillary data truncated");
+                assert!(
+                    received >= 0,
+                    "recvmsg failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    msg.msg_flags & libc::MSG_CTRUNC,
+                    0,
+                    "ancillary data truncated"
+                );
 
                 // 4. Send mock response
                 let rlen = mock_response.len() as u32;
-                conn.write_all(&rlen.to_be_bytes()).unwrap();
-                conn.write_all(&mock_response).unwrap();
+                conn.write_all(&rlen.to_be_bytes())
+                    .expect("write response length prefix");
+                conn.write_all(&mock_response)
+                    .expect("write mock response body");
             }
         });
 
-        let client = UnixStream::connect(&sock_path).unwrap();
+        let client = UnixStream::connect(&sock_path).expect("connect to shim socket");
         let exit_code = execute_on_stream(client, request_bytes);
 
         server.join().expect("server thread panicked");

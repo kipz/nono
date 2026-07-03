@@ -2967,12 +2967,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_proxy_config_strict_filter_off_when_no_block() {
-        let proxy = ProxyLaunchOptions {
-            active: true,
-            network_block: false,
-            ..ProxyLaunchOptions::default()
-        };
+    fn test_build_proxy_config_strict_filter_off_by_default() {
+        let proxy = ProxyLaunchOptions::default();
         let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
             .expect("build_proxy_config_from_flags");
         assert!(
@@ -3962,7 +3958,8 @@ mod tests {
             }),
             ..ProxyLaunchOptions::default()
         };
-        let config = build_proxy_config_from_flags(&proxy).expect("build");
+        let config =
+            build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp")).expect("build");
         let github = config
             .routes
             .iter()
@@ -3985,7 +3982,8 @@ mod tests {
             }),
             ..ProxyLaunchOptions::default()
         };
-        let config = build_proxy_config_from_flags(&proxy).expect("build");
+        let config =
+            build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp")).expect("build");
         let openai = config
             .routes
             .iter()
@@ -4007,7 +4005,7 @@ mod tests {
             }),
             ..ProxyLaunchOptions::default()
         };
-        let result = build_proxy_config_from_flags(&proxy);
+        let result = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"));
         assert!(result.is_err());
         let err = result.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(
@@ -4027,7 +4025,7 @@ mod tests {
             }),
             ..ProxyLaunchOptions::default()
         };
-        let result = build_proxy_config_from_flags(&proxy);
+        let result = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"));
         assert!(
             result.is_err(),
             "--allow-endpoint for a service without --credential must error"
@@ -4074,7 +4072,8 @@ mod tests {
             ..ProxyLaunchOptions::default()
         };
 
-        let config = build_proxy_config_from_flags(&proxy).expect("provider proxy config builds");
+        let config = build_proxy_config_from_flags(&proxy, std::path::Path::new("/tmp"))
+            .expect("provider proxy config builds");
         assert!(
             config
                 .allowed_hosts

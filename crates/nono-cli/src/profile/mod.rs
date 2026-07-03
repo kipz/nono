@@ -4954,13 +4954,28 @@ mod tests {
 
     #[test]
     fn finalize_profile_errors_on_unknown_dynamic_provider_token() {
-        // An `@<provider>:<query>` token with an unrecognised provider
-        // should surface as a profile-load error rather than silently
-        // leaving the literal token in the path list (where it would
-        // later fail capability construction with a much less clear
-        // message about a missing file named `@foo:bar`).
+        // An `@<provider>:<query>` token with an unrecognised provider in a
+        // per-command sandbox path list should surface as a profile-load
+        // error rather than silently leaving the literal token in place
+        // (where it would later fail capability construction with a much
+        // less clear message about a missing file named `@foo:bar`).
+        //
+        // Top-level `filesystem.*` tokens are validated later instead, by
+        // `CapabilitySet::from_profile`, once a workdir is available.
         let mut profile = Profile::default();
-        profile.filesystem.read_file = vec!["@unknown:foo".to_string()];
+        profile
+            .mediation
+            .commands
+            .push(crate::mediation::CommandEntry {
+                name: "git".to_string(),
+                binary_path: None,
+                intercept: vec![],
+                sandbox: Some(crate::mediation::CommandSandbox {
+                    fs_read_file: vec!["@unknown:foo".to_string()],
+                    ..Default::default()
+                }),
+                caller_policy: Default::default(),
+            });
 
         let err = finalize_profile(profile).expect_err("expected unknown-provider error");
         let msg = format!("{err}");

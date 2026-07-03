@@ -322,7 +322,6 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
-            network_block_requested: false,
             mediation: mediation::MediationConfig::default(),
         };
 
@@ -391,7 +390,6 @@ mod tests {
             set_vars: None,
             profile_network_block: false,
             allow_http2_requested: false,
-            network_block_requested: false,
             mediation: mediation::MediationConfig::default(),
         };
 

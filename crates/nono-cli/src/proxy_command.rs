@@ -35,7 +35,9 @@ pub(crate) fn run_proxy(args: ProxyArgs, silent: bool) -> Result<()> {
     }
 
     let proxy = build_launch_options(&args)?;
-    let mut proxy_config = build_proxy_config_from_flags(&proxy)?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| NonoError::ConfigParse(format!("failed to resolve current directory: {e}")))?;
+    let mut proxy_config = build_proxy_config_from_flags(&proxy, &cwd)?;
 
     // Bind + auth settings come from the standalone flags, not the profile.
     proxy_config.bind_addr = args.listen;

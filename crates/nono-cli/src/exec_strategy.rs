@@ -2075,16 +2075,11 @@ fn wait_for_child_with_pty(
                 }
                 continue;
             }
-            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
-                pty.pause_terminal_for_prompt();
-                unsafe { libc::raise(libc::SIGTSTP) };
-                pty.resume_terminal_after_prompt();
-                let _ = signal::kill(child, Signal::SIGCONT);
-                continue;
-            }
             Ok(WaitStatus::Stopped(_, sig)) => {
                 // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
-                // Resume the child so the session doesn't hang stopped forever.
+                // Ctrl-Z job control is handled proactively by handle_pty_suspension()
+                // above; any stop observed here just gets resumed so the session
+                // doesn't hang stopped forever.
                 debug!("Child stopped by signal {}, resuming", sig);
                 let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
@@ -2692,20 +2687,11 @@ fn run_supervisor_loop(
                 }
                 continue;
             }
-            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
-                if let Some(ref mut p) = pty {
-                    p.pause_terminal_for_prompt();
-                }
-                unsafe { libc::raise(libc::SIGTSTP) };
-                if let Some(ref mut p) = pty {
-                    p.resume_terminal_after_prompt();
-                }
-                let _ = signal::kill(child, Signal::SIGCONT);
-                continue;
-            }
             Ok(WaitStatus::Stopped(_, sig)) => {
                 // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
-                // Resume the child so the session doesn't hang stopped forever.
+                // Ctrl-Z job control is handled proactively by handle_pty_suspension()
+                // above; any stop observed here just gets resumed so the session
+                // doesn't hang stopped forever.
                 debug!("Child stopped by signal {}, resuming", sig);
                 let _ = signal::kill(child, Signal::SIGCONT);
                 continue;
@@ -3056,20 +3042,11 @@ fn run_supervisor_loop(
                 }
                 continue;
             }
-            Ok(WaitStatus::Stopped(_, Signal::SIGTSTP)) => {
-                if let Some(ref mut p) = pty {
-                    p.pause_terminal_for_prompt();
-                }
-                unsafe { libc::raise(libc::SIGTSTP) };
-                if let Some(ref mut p) = pty {
-                    p.resume_terminal_after_prompt();
-                }
-                let _ = signal::kill(child, Signal::SIGCONT);
-                continue;
-            }
             Ok(WaitStatus::Stopped(_, sig)) => {
                 // WUNTRACED surfaces stops from any signal (e.g. SIGTTOU/SIGTTIN).
-                // Resume the child so the session doesn't hang stopped forever.
+                // Ctrl-Z job control is handled proactively by handle_pty_suspension()
+                // above; any stop observed here just gets resumed so the session
+                // doesn't hang stopped forever.
                 debug!("Child stopped by signal {}, resuming", sig);
                 let _ = signal::kill(child, Signal::SIGCONT);
                 continue;

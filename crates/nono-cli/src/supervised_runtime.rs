@@ -7,7 +7,7 @@ use crate::rollback_runtime::{
     AuditState, RollbackExitContext, create_audit_state, finalize_supervised_exit,
     initialize_audit_snapshots, initialize_rollback_state, warn_if_rollback_flags_ignored,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
     DETACHED_SESSION_ID_ENV, exec_strategy, output, protected_paths, pty_proxy, session,
@@ -17,7 +17,6 @@ use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
 use std::io::IsTerminal;
-use std::sync::{Arc, Mutex};
 
 struct SessionRuntimeState {
     started: String,

@@ -858,8 +858,7 @@ impl PtyProxy {
 
     /// Temporarily restore the local terminal so the parent can prompt.
     ///
-    /// Returns true when a terminal-backed client was paused and must later
-    /// be resumed with [`Self::resume_terminal_after_prompt`].
+    /// Returns true when a terminal-backed client was paused.
     pub fn pause_terminal_for_prompt(&mut self) -> bool {
         if self
             .client

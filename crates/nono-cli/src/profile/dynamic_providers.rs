@@ -217,6 +217,20 @@ pub(crate) mod git {
                 && dirs_seen.insert(value.to_string())
             {
                 out.dirs.push(value.to_string());
+            } else if (key_lower == "include.path"
+                || (key_lower.starts_with("includeif.") && key_lower.ends_with(".path")))
+                && files_seen.insert(value.to_string())
+            {
+                // `includeIf.<condition>.path` is listed here even when
+                // `<condition>` doesn't currently hold — git only *runs*
+                // the include when the condition fires, but the directive
+                // itself is a plain key in the file that declared it, so
+                // it always shows up in `--list` output. Grant it
+                // unconditionally: the condition (e.g. a matching remote
+                // URL) can start holding later without nono ever
+                // re-resolving this profile, and the file has no other
+                // legitimate reader in that case.
+                out.files.push(value.to_string());
             }
         }
         out
@@ -427,6 +441,32 @@ system\tfile:/etc/gitconfig\tcommit.template=/etc/git-template
                 "untrusted-scope path leaked: {leaked} in {out:?}",
             );
         }
+    }
+
+    #[test]
+    fn parse_paths_from_stdout_includes_non_firing_includeif_target() {
+        // `includeIf.<condition>.path` is a plain key in the file that
+        // declared it, so `git config --list` always surfaces it — even
+        // when `<condition>` doesn't currently hold (e.g. no remote
+        // matches its `hasconfig:remote.*.url:` pattern in this repo).
+        // The target file must still be granted: the condition can start
+        // firing later (a remote is added) without nono ever
+        // re-resolving this profile.
+        let stdout = "\
+global\tfile:/home/u/.gitconfig\tincludeif.hasconfig:remote.*.url:git@github.com:ddoghq/**.path=~/.gitconfig-ddoghq
+global\tfile:/home/u/.gitconfig\tinclude.path=~/.gitconfig-always
+";
+        let out = git::parse_paths_from_stdout(stdout);
+        assert!(
+            out.files.contains(&"~/.gitconfig-ddoghq".to_string()),
+            "non-firing includeIf target missing: {:?}",
+            out.files
+        );
+        assert!(
+            out.files.contains(&"~/.gitconfig-always".to_string()),
+            "unconditional include target missing: {:?}",
+            out.files
+        );
     }
 
     #[test]

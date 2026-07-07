@@ -138,6 +138,10 @@ fn merge_command_sandbox(base: CommandSandbox, child: CommandSandbox) -> Command
         allow_commands: dedup_append(&base.allow_commands, &child.allow_commands),
         keychain_access: base.keychain_access || child.keychain_access,
         allow_process_exec: base.allow_process_exec && child.allow_process_exec,
+        unsafe_macos_seatbelt_rules: dedup_append(
+            &base.unsafe_macos_seatbelt_rules,
+            &child.unsafe_macos_seatbelt_rules,
+        ),
     }
 }
 

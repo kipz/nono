@@ -210,6 +210,12 @@ pub struct CommandSandbox {
     /// macOS only; ignored on other platforms.
     #[serde(default)]
     pub allow_process_exec: bool,
+    /// Raw Seatbelt S-expressions appended to this command's per-command
+    /// sandbox profile. Mirrors the top-level `unsafe_macos_seatbelt_rules`
+    /// but scoped to a single command (e.g. an IOKit grant a binary needs
+    /// on startup). macOS only; ignored on other platforms.
+    #[serde(default)]
+    pub unsafe_macos_seatbelt_rules: Vec<String>,
 }
 
 /// Simple network config for per-command sandbox profiles.

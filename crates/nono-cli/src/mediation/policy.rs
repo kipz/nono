@@ -900,6 +900,20 @@ async fn exec_passthrough(
                 caps = caps.proxy_only(port);
             }
 
+            // Command-specific raw Seatbelt rules (e.g. IOKit grants some
+            // binaries need on startup). Mirrors the top-level
+            // `unsafe_macos_seatbelt_rules` handling but scoped to this
+            // command's own sandbox.
+            #[cfg(target_os = "macos")]
+            for rule in &sb.unsafe_macos_seatbelt_rules {
+                if let Err(e) = caps.add_platform_rule(rule) {
+                    warn!(
+                        "mediation: failed to add unsafe_macos_seatbelt_rules rule for '{}': {}",
+                        cmd_name, e
+                    );
+                }
+            }
+
             // Nono is responsible for ensuring sandboxed child processes can always
             // reach the mediation server via its Unix domain socket, regardless of
             // network mode. The shim injected into PATH needs AF_UNIX socket creation
@@ -2136,6 +2150,7 @@ mod tests {
                 allow_commands: vec!["ddtool".to_string()],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2230,6 +2245,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2295,6 +2311,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2362,6 +2379,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2426,6 +2444,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: true,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2486,6 +2505,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2547,6 +2567,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: true,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2610,6 +2631,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2673,6 +2695,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: true,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2755,6 +2778,7 @@ mod tests {
                 allow_commands: vec!["myhelper".to_string()],
                 keychain_access: false,
                 allow_process_exec: false,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };
@@ -2854,6 +2878,7 @@ mod tests {
                 allow_commands: vec![],
                 keychain_access: false,
                 allow_process_exec: true,
+                unsafe_macos_seatbelt_rules: vec![],
             }),
             caller_policy: CallerPolicy::default(),
         };

@@ -161,6 +161,41 @@ pub(super) mod git {
         Ok(run(cwd.as_deref(), None)?.dirs)
     }
 
+    /// Return git's exec-path directory (`git --exec-path`) — the directory
+    /// holding git's helper binaries (`git-remote-https`, `git-index-pack`,
+    /// `git-upload-pack`, …). git re-execs these by absolute path via its
+    /// compiled-in exec-path, so on Linux they must be added to a command's
+    /// execute allowlist (via `sandbox.exec_paths`) for network git
+    /// operations — clone/fetch/push — to work inside the sandbox.
+    ///
+    /// Unlike the other git providers, this reads NO repository config: it
+    /// reports only the compiled-in (or `GIT_EXEC_PATH`-overridden) directory,
+    /// so it is safe to compute even when `cwd` is an attacker-controlled
+    /// agent working directory. `GIT_EXEC_PATH` is cleared so the compiled
+    /// default is reported deterministically. Intended for `exec_paths`.
+    ///
+    /// Returns an empty list if git is absent or exits non-zero.
+    pub(crate) fn read_exec_path(_workdir: Option<&Path>) -> Result<Vec<String>> {
+        let mut cmd = Command::new("git");
+        cmd.arg("--exec-path");
+        cmd.env_remove("GIT_EXEC_PATH");
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(_) => return Ok(vec![]),
+        };
+        if !output.status.success() {
+            return Ok(vec![]);
+        }
+        let stdout = String::from_utf8(output.stdout).map_err(|e| {
+            NonoError::ProfileParse(format!("git --exec-path produced non-UTF-8: {e}"))
+        })?;
+        let path = stdout.trim();
+        if path.is_empty() {
+            return Ok(vec![]);
+        }
+        Ok(vec![path.to_string()])
+    }
+
     /// Return the path to the git common directory (`.git` or the main repo's
     /// `.git` when running inside a worktree).
     ///
@@ -451,6 +486,7 @@ fn dispatch_token(
             "worktree" => git::read_main_worktree(workdir),
             "toplevel" => git::read_toplevel(workdir),
             "toplevel-parent" => git::read_toplevel_parent(workdir),
+            "exec-path" => git::read_exec_path(workdir),
             other => Err(NonoError::ProfileParse(format!(
                 "unknown git provider query '{other}'"
             ))),
@@ -493,6 +529,7 @@ mod tests {
         assert_eq!(parse_token("@git:hooks-path"), Some(("git", "hooks-path")));
         assert_eq!(parse_token("@git:common-dir"), Some(("git", "common-dir")));
         assert_eq!(parse_token("@git:worktree"), Some(("git", "worktree")));
+        assert_eq!(parse_token("@git:exec-path"), Some(("git", "exec-path")));
         assert_eq!(parse_token("@git:toplevel"), Some(("git", "toplevel")));
         assert_eq!(
             parse_token("@git:toplevel-parent"),
@@ -536,6 +573,30 @@ mod tests {
         let input = vec!["@git:nonsense".to_string()];
         let err = expand_dynamic_tokens(&input, None).expect_err("unknown git query");
         assert!(format!("{err}").contains("nonsense"));
+    }
+
+    #[test]
+    fn git_exec_path_provider_returns_existing_dir_when_git_present() {
+        // Provider returns an empty list by contract when git is absent; skip
+        // the behavioural assertion in that case rather than fail.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let out = git::read_exec_path(None).expect("exec-path provider");
+        assert_eq!(
+            out.len(),
+            1,
+            "expected exactly one exec-path dir, got {out:?}"
+        );
+        assert!(
+            std::path::Path::new(&out[0]).is_dir(),
+            "git exec-path {:?} should be an existing directory",
+            out[0]
+        );
     }
 
     #[test]

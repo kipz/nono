@@ -3265,6 +3265,30 @@ fn build_child_launch_spec_for_binary(
             allowed_exec_paths.push(dep.as_os_str().as_bytes().to_vec());
         }
     }
+    // Policy-declared exec_paths: extra binaries this command may exec inside
+    // its OWN sandbox (no separate broker / no re-verification — same trust
+    // level as the command exec'ing any other allowed binary). This covers
+    // multi-call tools like git, which re-exec helpers from a compiled-in
+    // exec-path by absolute path, bypassing the PATH-based shim. Since
+    // restrict_execute uses PathBeneath, a directory entry (e.g.
+    // /usr/lib/git-core via @git:exec-path) covers every helper beneath it.
+    // Entries are dynamic-token-expanded and resolved like fs paths; a
+    // non-existent resolved path is skipped with a warning so cross-distro
+    // profiles do not hard-fail (restrict_execute would otherwise error when
+    // it cannot open the path). The main capability layer must still grant
+    // read/execute to these paths via fs_read.
+    for entry in &super::dynamic_providers::expand_dynamic_tokens(&policy.exec_paths, Some(&cwd))? {
+        let path = resolve_policy_path(entry, &state.policy_root, &cwd)?;
+        if path.exists() {
+            allowed_exec_paths.push(path.as_os_str().as_bytes().to_vec());
+        } else {
+            warn!(
+                "tool-sandbox: skipping exec_path '{}' (resolved from '{}'): path does not exist",
+                path.display(),
+                entry
+            );
+        }
+    }
 
     Ok(ToolSandboxChildLaunchSpec {
         real_binary: binary.canonical_path.as_os_str().as_bytes().to_vec(),

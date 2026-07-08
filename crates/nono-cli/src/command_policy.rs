@@ -694,6 +694,29 @@ pub struct CommandSandboxConfig {
     /// command (or per-intercept override). Ignored on Linux.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsafe_macos_seatbelt_rules: Vec<String>,
+    /// Linux-only: additional directories/files this command may `exec`
+    /// within its OWN child sandbox, appended to the Landlock execute
+    /// allowlist (which otherwise permits only the command's own binary,
+    /// its shared-library/interpreter closure, and the tool-sandbox shims).
+    ///
+    /// This exists for multi-call tools like `git`, which re-exec helper
+    /// binaries from a compiled-in exec-path (`/usr/lib/git-core`) by
+    /// absolute path — bypassing the PATH-based shim entirely, so pack
+    /// transfers (`git-index-pack`, `git-remote-https`, …) would otherwise
+    /// be blocked. The helpers run inside the SAME sandbox as the command
+    /// (same network/fs caps), not a separate broker. Because the execute
+    /// restriction uses `PathBeneath`, a directory entry covers every helper
+    /// beneath it.
+    ///
+    /// Entries are dynamic-token-expanded (e.g. `@git:exec-path`) and
+    /// `$VAR`/`~` resolved like the `fs_*` lists. A corresponding `fs_read`
+    /// grant is still required (the execute restriction only narrows the
+    /// second Landlock layer; the main layer must also grant read/execute).
+    /// Non-existent resolved paths are skipped with a warning so cross-distro
+    /// profiles need not hard-fail. Ignored on macOS (its exec gate is
+    /// allow-by-default with a per-command denylist, so helpers already run).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_paths: Vec<String>,
 }
 
 impl CommandSandboxConfig {
@@ -721,6 +744,7 @@ impl CommandSandboxConfig {
                 &self.unsafe_macos_seatbelt_rules,
                 &child.unsafe_macos_seatbelt_rules,
             ),
+            exec_paths: dedup_append(&self.exec_paths, &child.exec_paths),
         }
     }
 }
@@ -3373,6 +3397,38 @@ mod tests {
                 "(allow iokit-open)".to_string(),
                 "(allow process-exec* (literal \"/usr/bin/security\"))".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_exec_paths_merge_child_dedup_appends() {
+        let base = CommandSandboxConfig {
+            exec_paths: vec!["@git:exec-path".to_string()],
+            ..Default::default()
+        };
+        let child = CommandSandboxConfig {
+            exec_paths: vec![
+                "@git:exec-path".to_string(),
+                "/opt/tool/libexec".to_string(),
+            ],
+            ..Default::default()
+        };
+        let merged = base.merge_child(&child);
+        assert_eq!(
+            merged.exec_paths,
+            vec![
+                "@git:exec-path".to_string(),
+                "/opt/tool/libexec".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn command_sandbox_empty_exec_paths_omitted_from_serialization() {
+        let value = serde_json::to_value(CommandSandboxConfig::default()).expect("serialize");
+        assert!(
+            value.get("exec_paths").is_none(),
+            "empty exec_paths should be omitted, got {value}"
         );
     }
 

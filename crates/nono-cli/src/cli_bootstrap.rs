@@ -7,6 +7,53 @@ use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
+/// Raise the process's soft `RLIMIT_NOFILE` to `target` (default 65536)
+/// before any sandboxed work starts. The tool-sandbox host accumulates
+/// several file descriptors per mediated command (accepted socket + stdio);
+/// under a low platform default (e.g. macOS launchd's 256) a heavy parallel
+/// workload exhausts the fd table and mediated commands fail with EMFILE.
+/// Best-effort: only ever raises (never lowers) the limit, is clamped to the
+/// hard limit, and silently no-ops if the kernel rejects the request.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn raise_nofile_limit() {
+    const DEFAULT_TARGET: u64 = 65536;
+    let target: u64 = std::env::var("NONO_NOFILE_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TARGET);
+    if target == 0 {
+        return;
+    }
+
+    let mut rl = nix::libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: rlimit is plain old data; getrlimit/setrlimit are async-signal-safe.
+    if unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    if rl.rlim_cur != nix::libc::RLIM_INFINITY && rl.rlim_cur >= target {
+        return;
+    }
+
+    let mut new_cur = target;
+    if rl.rlim_max != nix::libc::RLIM_INFINITY {
+        new_cur = new_cur.min(rl.rlim_max);
+    }
+    if rl.rlim_cur != nix::libc::RLIM_INFINITY && new_cur <= rl.rlim_cur {
+        return;
+    }
+
+    rl.rlim_cur = new_cur;
+    // Best-effort — a rejected setrlimit leaves the process at its current
+    // limit, which is no worse than before this call.
+    unsafe { nix::libc::setrlimit(nix::libc::RLIMIT_NOFILE, &rl) };
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn raise_nofile_limit() {}
+
 pub(crate) fn normalize_legacy_flag_env_vars() {
     copy_legacy_env_var("NONO_NET_BLOCK", "NONO_BLOCK_NET");
     copy_legacy_env_var("NONO_NET_ALLOW", "NONO_ALLOW_NET");

@@ -23,6 +23,9 @@ use crate::tool_sandbox::protocol::{
     ToolSandboxShimResponse, UnixSocketGrantSpec, read_frame, recv_frame_ack, recv_stdio_fds,
     send_frame_ack, send_stdio_fds, validate_ipc_request, write_frame, write_response,
 };
+use crate::tool_sandbox::resource_limits::{
+    max_active_tool_sandbox_children, max_queued_shim_requests,
+};
 use landlock::{
     AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr,
@@ -56,11 +59,9 @@ use zeroize::Zeroizing;
 /// is active, read by run_shim() on entry to measure shim Rust-runtime startup.
 pub(crate) const TOOL_SANDBOX_PARENT_MONOTONIC_ENV: &str = "NONO_TOOL_SANDBOX_PARENT_MONOTONIC";
 
-const MAX_ACTIVE_TOOL_SANDBOX_CHILDREN: usize = 64;
 // Max raw bytes the Capture action may buffer before broker scanning.
 // Each byte serialises to ~4 chars in JSON; 256 KiB raw → ~1 MiB frame.
 const MAX_CAPTURE_STDOUT: usize = 256 * 1024;
-const MAX_QUEUED_SHIM_REQUESTS: usize = 128;
 const ANCESTRY_DEPTH_LIMIT: usize = 64;
 
 macro_rules! tool_sandbox_profile_log {
@@ -611,7 +612,7 @@ impl PreparedToolSandboxRuntime {
         audit_recorder: Option<Arc<Mutex<AuditRecorder>>>,
     ) -> Result<()> {
         let previous = self.inner.queued_requests.fetch_add(1, Ordering::SeqCst);
-        if previous >= MAX_QUEUED_SHIM_REQUESTS {
+        if previous >= max_queued_shim_requests() {
             self.inner.queued_requests.fetch_sub(1, Ordering::SeqCst);
             write_response(
                 &mut stream,
@@ -1651,7 +1652,7 @@ fn handle_shim_stream_inner(
         }
 
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
-        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+        if active >= max_active_tool_sandbox_children() {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
             record_command_policy_audit(
                 audit_recorder.as_ref(),
@@ -1739,7 +1740,7 @@ fn handle_shim_stream_inner(
         crate::command_policy::InterceptActionConfig::Capture
     ) {
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
-        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+        if active >= max_active_tool_sandbox_children() {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
             record_command_policy_audit(
                 audit_recorder.as_ref(),
@@ -1811,7 +1812,7 @@ fn handle_shim_stream_inner(
 
     if let crate::command_policy::InterceptActionConfig::Exec { command } = intercept_action {
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
-        if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+        if active >= max_active_tool_sandbox_children() {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
             record_command_policy_audit(
                 audit_recorder.as_ref(),
@@ -1892,7 +1893,7 @@ fn handle_shim_stream_inner(
     }
 
     let active = state.active_count.fetch_add(1, Ordering::SeqCst);
-    if active >= MAX_ACTIVE_TOOL_SANDBOX_CHILDREN {
+    if active >= max_active_tool_sandbox_children() {
         state.active_count.fetch_sub(1, Ordering::SeqCst);
         record_command_policy_audit(
             audit_recorder.as_ref(),

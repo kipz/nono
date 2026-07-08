@@ -96,7 +96,7 @@ use clap::Parser;
 use cli::Cli;
 use cli_bootstrap::{
     collect_legacy_network_warnings, init_theme, init_tracing, normalize_legacy_flag_env_vars,
-    print_legacy_network_warnings,
+    print_legacy_network_warnings, raise_nofile_limit,
 };
 use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
@@ -110,6 +110,7 @@ const DETACHED_SESSION_ID_ENV: &str = "NONO_DETACHED_SESSION_ID";
 pub(crate) use launch_runtime::rollback_base_exclusions;
 
 fn main() {
+    raise_nofile_limit();
     if tool_sandbox::maybe_run_internal_tool_sandbox_entrypoint() {
         return;
     }

@@ -42,6 +42,8 @@ mod policy;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod protocol;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod resource_limits;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) mod token_broker;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod url_shim;

@@ -1779,6 +1779,32 @@ pub(crate) fn filter_headers(header_bytes: &[u8], cred_header: &str) -> Vec<(Str
     headers
 }
 
+/// Whether a header's comma-separated value contains `token` as an exact,
+/// case-insensitive element (not a substring of some other token).
+fn header_has_token(header_bytes: &[u8], header_name: &str, token: &str) -> bool {
+    let header_str = std::str::from_utf8(header_bytes).unwrap_or("");
+    header_str.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case(header_name)
+                && value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+    })
+}
+
+/// Whether the request asks to upgrade to WebSocket: both `Upgrade: websocket`
+/// and `Connection: Upgrade` must be present as exact tokens (case-insensitive).
+/// Requiring both avoids misclassifying an `Upgrade` header lacking the
+/// `Connection: upgrade` token as an upgrade request, and matching tokens
+/// exactly (rather than by substring) avoids values like `notwebsocket`
+/// being mistaken for `websocket`. Such requests need a bidirectional relay
+/// after the handshake rather than the normal request/response forwarding.
+pub(crate) fn is_websocket_upgrade(header_bytes: &[u8]) -> bool {
+    header_has_token(header_bytes, "upgrade", "websocket")
+        && header_has_token(header_bytes, "connection", "upgrade")
+}
+
 /// Extract Content-Length value from raw headers.
 pub(crate) fn extract_content_length(header_bytes: &[u8]) -> Option<usize> {
     let header_str = std::str::from_utf8(header_bytes).ok()?;
@@ -2391,6 +2417,39 @@ mod tests {
         assert_eq!(method, "POST");
         assert_eq!(path, "/openai/v1/chat");
         assert_eq!(version, "HTTP/1.1");
+    }
+
+    #[test]
+    fn is_websocket_upgrade_detects_upgrade_header() {
+        assert!(is_websocket_upgrade(
+            b"Host: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        ));
+        // Case-insensitive header name and value.
+        assert!(is_websocket_upgrade(
+            b"UPGRADE: WebSocket\r\nConnection: upgrade\r\n"
+        ));
+        // Multi-token Connection header (e.g. `Connection: keep-alive, Upgrade`).
+        assert!(is_websocket_upgrade(
+            b"Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n"
+        ));
+        // No upgrade header.
+        assert!(!is_websocket_upgrade(b"Host: x\r\nAccept: */*\r\n"));
+        // Upgrade to something other than websocket.
+        assert!(!is_websocket_upgrade(
+            b"Upgrade: h2c\r\nConnection: Upgrade\r\n"
+        ));
+        // Upgrade header present but missing the Connection: upgrade token.
+        assert!(!is_websocket_upgrade(b"Upgrade: websocket\r\n"));
+        assert!(!is_websocket_upgrade(
+            b"Upgrade: websocket\r\nConnection: keep-alive\r\n"
+        ));
+        // Substring, not an exact token match, must not count.
+        assert!(!is_websocket_upgrade(
+            b"Upgrade: notwebsocket\r\nConnection: Upgrade\r\n"
+        ));
+        assert!(!is_websocket_upgrade(
+            b"Upgrade: websocket\r\nConnection: notupgrade\r\n"
+        ));
     }
 
     #[test]

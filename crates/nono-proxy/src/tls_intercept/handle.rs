@@ -924,6 +924,10 @@ where
     let host_port = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
     let is_oauth_capture_host = ctx.oauth_capture_store.host_policy(&host_port).is_some();
     let oauth_endpoint = ctx.oauth_capture_store.lookup(&host_port, &req.path);
+    // OAuth capture hosts must always go through the response-rewrite path;
+    // a client-supplied `Upgrade: websocket` header must not be able to
+    // switch them onto the opaque relay and skip the token rewrite.
+    let is_websocket = reverse::is_websocket_upgrade(&req.header_bytes) && !is_oauth_capture_host;
     let selected = if oauth_endpoint.is_some() {
         None
     } else {
@@ -1089,7 +1093,14 @@ where
             .unwrap_or_else(|| value.clone());
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
     }
-    request.push_str("Connection: close\r\n");
+    // A WebSocket handshake must keep `Connection: Upgrade` (the client's own
+    // Connection header was stripped by `filter_headers`); forcing
+    // `Connection: close` would make the upstream ignore the Upgrade token.
+    if is_websocket {
+        request.push_str("Connection: Upgrade\r\n");
+    } else {
+        request.push_str("Connection: close\r\n");
+    }
     if !body.is_empty() {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
@@ -1186,16 +1197,33 @@ where
         .as_ref()
         .map(|rewrite| rewrite.as_ref() as forward::ResponseRewrite<'_>);
 
-    if let Err(e) = forward::forward_request_with_response_rewrite(
-        tls_stream,
-        request.as_bytes(),
-        &body,
-        upstream_spec,
-        audit_ctx,
-        response_rewrite_ref,
-    )
-    .await
-    {
+    // WebSocket upgrades need a bidirectional relay after the handshake, which
+    // the request/response forwarder cannot provide. Credential injection has
+    // already been applied to the handshake request above. `is_websocket` is
+    // forced false for OAuth capture hosts/endpoints above, so no response
+    // rewrite is dropped here.
+    let forward_result = if is_websocket {
+        forward::forward_websocket(
+            tls_stream,
+            request.as_bytes(),
+            &body,
+            upstream_spec,
+            audit_ctx,
+        )
+        .await
+    } else {
+        forward::forward_request_with_response_rewrite(
+            tls_stream,
+            request.as_bytes(),
+            &body,
+            upstream_spec,
+            audit_ctx,
+            response_rewrite_ref,
+        )
+        .await
+    };
+
+    if let Err(e) = forward_result {
         warn!("tls_intercept: upstream forwarding failed: {}", e);
         audit::log_denied(
             ctx.audit_log,

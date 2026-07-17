@@ -159,6 +159,235 @@ where
     }
 }
 
+/// Cap on the WebSocket upgrade response head we buffer before the `101`.
+const MAX_WS_HEAD_BYTES: usize = 64 * 1024;
+
+/// Forward a WebSocket upgrade handshake and, on `101 Switching Protocols`,
+/// splice client and upstream into a bidirectional byte relay.
+///
+/// The caller may inject a credential into the handshake request (e.g.
+/// `Authorization: Bearer`), but once upgraded the connection is an opaque
+/// tunnel to the already-endpoint-authorized upstream — nono does not inspect
+/// post-upgrade frames, mirroring how a forward proxy treats CONNECT. A
+/// non-`101` response (e.g. `426`, `401`) is relayed unchanged so the client
+/// can react (clients commonly fall back to plain HTTP on `426`).
+pub async fn forward_websocket<S>(
+    inbound: &mut S,
+    request_bytes: &[u8],
+    body: &[u8],
+    upstream: UpstreamSpec<'_>,
+    audit: AuditCtx<'_>,
+) -> Result<u16>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let status = match upstream.scheme {
+        UpstreamScheme::Https => {
+            let mut up = open_https_upstream(&upstream).await?;
+            write_request(&mut up, request_bytes, body).await?;
+            relay_websocket(&mut up, inbound).await?
+        }
+        UpstreamScheme::Http => {
+            let mut up = open_http_upstream(&upstream).await?;
+            write_request(&mut up, request_bytes, body).await?;
+            relay_websocket(&mut up, inbound).await?
+        }
+    };
+
+    audit::log_l7_request(
+        audit.log,
+        audit.mode,
+        &audit.event_ctx,
+        audit.target,
+        audit.method,
+        audit.path,
+        status,
+    );
+    Ok(status)
+}
+
+/// Read the upstream response head, forward it to the client, then either run a
+/// bidirectional copy (on `101`) or relay the rest of a non-upgrade response.
+///
+/// Bytes read past the header terminator are already forwarded to the client
+/// before the bidirectional copy (or body relay) starts, so no frame or body
+/// data is lost.
+async fn relay_websocket<U, I>(upstream: &mut U, inbound: &mut I) -> Result<u16>
+where
+    U: AsyncRead + AsyncWrite + Unpin,
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let mut saw_head_end = false;
+    loop {
+        // An upstream that accepts the connection but never sends anything
+        // (or never finishes the header block) must not hang this relay
+        // forever either.
+        let n = match tokio::time::timeout(UPSTREAM_REWRITE_READ_TIMEOUT, upstream.read(&mut chunk))
+            .await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                debug!("WebSocket upstream read error before head complete: {}", e);
+                break;
+            }
+            Err(_) => {
+                debug!("WebSocket upstream response head timed out");
+                break;
+            }
+        };
+        head.extend_from_slice(&chunk[..n]);
+        // Check the size cap before the terminator: otherwise a single read
+        // that both crosses the limit and contains `\r\n\r\n` would find the
+        // terminator first and let an oversized header through unchecked.
+        if head.len() > MAX_WS_HEAD_BYTES {
+            return Err(ProxyError::HttpParse(
+                "WebSocket upgrade response head exceeded limit".to_string(),
+            ));
+        }
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            saw_head_end = true;
+            break;
+        }
+    }
+
+    // The upstream closed, errored, or timed out before sending a complete
+    // response head — there is no valid response to relay, so this must
+    // surface as an error rather than a fabricated status code.
+    if !saw_head_end {
+        return Err(ProxyError::HttpParse(
+            "WebSocket upgrade response closed before headers were complete".to_string(),
+        ));
+    }
+
+    // Safe: `saw_head_end` is only set once this position is found.
+    let header_end = head
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(head.len())
+        + 4;
+    let header_part_len = header_end;
+    let leftover = head.len() - header_part_len;
+    let status = parse_response_status(&head[..header_part_len]);
+    let content_length = crate::reverse::extract_content_length(&head[..header_part_len]);
+
+    // How much of what we already read is safe to forward as-is. For a
+    // non-101 response with a declared Content-Length, cap it there: bytes
+    // beyond that boundary belong to a subsequent message on the upstream
+    // connection (which this proxy never reuses across requests) and must
+    // never be relayed to the client as if they were part of this response.
+    // A 101 response has no body semantics, so its leftover bytes (the
+    // start of the frame stream) are always forwarded in full.
+    let forwarded_body_len = if status == 101 {
+        leftover
+    } else {
+        match content_length {
+            Some(total) => leftover.min(total),
+            None => leftover,
+        }
+    };
+    inbound
+        .write_all(&head[..header_part_len + forwarded_body_len])
+        .await?;
+    inbound.flush().await?;
+
+    if status == 101 {
+        // Opaque bidirectional relay until either side closes. Most errors
+        // here are ordinary teardown (a broken pipe when one side hangs up),
+        // but logging unconditionally means a genuine relay failure is at
+        // least visible in debug logs instead of vanishing silently.
+        if let Err(e) = tokio::io::copy_bidirectional(inbound, upstream).await {
+            debug!("WebSocket bidirectional relay ended: {}", e);
+        }
+    } else {
+        // Not an upgrade — relay the remainder of the response unchanged,
+        // bounded by the declared Content-Length so a keep-alive upstream
+        // that never closes the connection can't hang this task forever.
+        relay_remaining_response_body(upstream, inbound, content_length, forwarded_body_len)
+            .await?;
+    }
+    Ok(status)
+}
+
+/// Relay the remainder of a non-upgrade response body already partially
+/// consumed into the head buffer (`already_forwarded` bytes of it).
+///
+/// When `content_length` is known, reads exactly the remaining declared
+/// bytes and stops — this is what prevents a hang on a keep-alive upstream
+/// that never closes the connection. When it is unknown (e.g. chunked or
+/// close-delimited), relays whatever arrives next, but each read is bounded
+/// by [`UPSTREAM_REWRITE_READ_TIMEOUT`] so a connection that neither sends a
+/// body nor closes still can't hang indefinitely.
+async fn relay_remaining_response_body<U, I>(
+    upstream: &mut U,
+    inbound: &mut I,
+    content_length: Option<usize>,
+    already_forwarded: usize,
+) -> Result<()>
+where
+    U: AsyncRead + Unpin,
+    I: AsyncWrite + Unpin,
+{
+    let mut chunk = [0u8; 8192];
+    match content_length {
+        Some(total) => {
+            let mut remaining = total.saturating_sub(already_forwarded);
+            while remaining > 0 {
+                let want = remaining.min(chunk.len());
+                // A declared Content-Length is only a bound on how many
+                // bytes we'll accept, not a guarantee the upstream ever
+                // sends them — bound each read too, so a connection that
+                // stays open without completing the declared body can't
+                // hang this task forever either.
+                let n = match tokio::time::timeout(
+                    UPSTREAM_REWRITE_READ_TIMEOUT,
+                    upstream.read(&mut chunk[..want]),
+                )
+                .await
+                {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
+                        debug!("WebSocket non-upgrade response body read error: {}", e);
+                        break;
+                    }
+                    Err(_) => {
+                        debug!("WebSocket non-upgrade response body read timed out");
+                        break;
+                    }
+                };
+                inbound.write_all(&chunk[..n]).await?;
+                inbound.flush().await?;
+                remaining -= n;
+            }
+        }
+        None => loop {
+            let n = match tokio::time::timeout(
+                UPSTREAM_REWRITE_READ_TIMEOUT,
+                upstream.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    debug!("WebSocket non-upgrade response body read error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    debug!("WebSocket non-upgrade response body read timed out");
+                    break;
+                }
+            };
+            inbound.write_all(&chunk[..n]).await?;
+            inbound.flush().await?;
+        },
+    }
+    Ok(())
+}
+
 /// Open an upstream HTTPS connection (Direct TLS or ExternalProxy + TLS).
 async fn open_https_upstream(
     upstream: &UpstreamSpec<'_>,
@@ -523,5 +752,332 @@ mod tests {
                 .contains("content-encoded OAuth capture response"),
             "unexpected error: {err}"
         );
+    }
+
+    // Real WebSocket handshake + framing (masking, close frames) instead of
+    // hand-rolled byte fixtures — byte fixtures missed the dropped-body and
+    // non-101-keep-alive-hang bugs that these tests guard against.
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{Message, protocol::Role};
+    use tokio_tungstenite::{WebSocketStream, accept_async};
+
+    /// Read from `stream` until the `\r\n\r\n` header terminator, returning
+    /// `(header_bytes_including_terminator, bytes_already_read_past_it)`.
+    async fn read_http_response_head<S>(stream: &mut S) -> (Vec<u8>, Vec<u8>)
+    where
+        S: AsyncRead + Unpin,
+    {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(n, 0, "stream closed before response head was complete");
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(idx) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let split = idx + 4;
+                return (buf[..split].to_vec(), buf[split..].to_vec());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_splices_bidirectionally_on_101() {
+        // upstream: proxy side <-> fake server side; inbound: proxy side <-> fake client side.
+        let (mut up_proxy, up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        // A real client handshake request (RFC 6455 §1.3's example key).
+        up_proxy
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\
+                  Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let server = tokio::spawn(async move {
+            // Genuine server-side handshake: parses the request above and
+            // replies with a real 101 + computed Sec-WebSocket-Accept.
+            let mut ws = accept_async(up_server).await.unwrap();
+            ws.send(Message::text("hello from server")).await.unwrap();
+            let msg = ws.next().await.unwrap().unwrap();
+            assert_eq!(msg, Message::text("hello from client"));
+            // Dropping `ws` here closes `up_server`, ending the
+            // upstream->inbound half of the relay's bidirectional copy.
+        });
+
+        let relay =
+            tokio::spawn(async move { relay_websocket(&mut up_proxy, &mut in_proxy).await });
+
+        let (head, leftover) = read_http_response_head(&mut in_client).await;
+        assert!(String::from_utf8_lossy(&head).contains("101 Switching Protocols"));
+
+        // Wrap the remainder of the stream as real (masked) client frames —
+        // proves the relay preserves frame boundaries and masking, not just
+        // arbitrary bytes.
+        let mut client_ws =
+            WebSocketStream::from_partially_read(in_client, leftover, Role::Client, None).await;
+        let msg = client_ws.next().await.unwrap().unwrap();
+        assert_eq!(msg, Message::text("hello from server"));
+        client_ws
+            .send(Message::text("hello from client"))
+            .await
+            .unwrap();
+        // Dropping `client_ws` closes `in_client`, ending the
+        // inbound->upstream half of the relay's bidirectional copy.
+        drop(client_ws);
+
+        server.await.unwrap();
+        let status = relay.await.unwrap().unwrap();
+        assert_eq!(status, 101);
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_relays_non_upgrade_response() {
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let server = tokio::spawn(async move {
+            up_server
+                .write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 2\r\n\r\nno")
+                .await
+                .unwrap();
+            drop(up_server);
+        });
+
+        let relay =
+            tokio::spawn(async move { relay_websocket(&mut up_proxy, &mut in_proxy).await });
+
+        let mut seen = Vec::new();
+        loop {
+            let mut buf = [0u8; 64];
+            let n = in_client.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            seen.extend_from_slice(&buf[..n]);
+        }
+
+        let status = relay.await.unwrap().unwrap();
+        assert_eq!(status, 426);
+        assert!(String::from_utf8_lossy(&seen).contains("426 Upgrade Required"));
+        assert!(seen.ends_with(b"no"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_non_upgrade_keep_alive_does_not_hang() {
+        // Regression test for the bug this fixes: a keep-alive upstream that
+        // never closes the connection after rejecting the upgrade must not
+        // hang the relay. The old non-101 branch read until EOF, which a
+        // keep-alive connection never sends.
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let _server = tokio::spawn(async move {
+            up_server
+                .write_all(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 2\r\n\r\nno")
+                .await
+                .unwrap();
+            // Never close or write again — the old code would block here
+            // forever waiting for an EOF that never comes.
+            std::future::pending::<()>().await;
+        });
+
+        let relay_task =
+            tokio::spawn(async move { relay_websocket(&mut up_proxy, &mut in_proxy).await });
+        let status = tokio::time::timeout(Duration::from_secs(2), relay_task)
+            .await
+            .expect(
+                "relay must stop at Content-Length instead of hanging on a keep-alive connection",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, 426);
+
+        let mut seen = Vec::new();
+        in_client.read_to_end(&mut seen).await.unwrap();
+        assert!(String::from_utf8_lossy(&seen).contains("426 Upgrade Required"));
+        assert!(seen.ends_with(b"no"));
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_errors_when_head_incomplete() {
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, in_client) = tokio::io::duplex(4096);
+
+        let server = tokio::spawn(async move {
+            // Partial status line — the upstream closes before the header
+            // block is ever completed.
+            up_server.write_all(b"HTTP/1.1 101 Switch").await.unwrap();
+            drop(up_server);
+        });
+
+        let err = relay_websocket(&mut up_proxy, &mut in_proxy)
+            .await
+            .expect_err("an upstream that closes mid-header must error, not fabricate a response");
+        assert!(err.to_string().contains("headers were complete"));
+
+        server.await.unwrap();
+        drop(in_client);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_websocket_errors_when_head_never_arrives() {
+        // Regression test: an upstream that accepts the connection but never
+        // sends anything (or never finishes the header block) must not hang
+        // this relay forever — only the read-timeout fallback can end it.
+        let (mut up_proxy, up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, in_client) = tokio::io::duplex(4096);
+
+        // Keep `up_server` alive (captured here) and never write to it.
+        let _server = tokio::spawn(async move {
+            let _up_server = up_server;
+            std::future::pending::<()>().await;
+        });
+
+        let err = relay_websocket(&mut up_proxy, &mut in_proxy)
+            .await
+            .expect_err("an upstream that never sends a head must time out, not hang forever");
+        assert!(err.to_string().contains("headers were complete"));
+
+        drop(in_client);
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_relays_close_delimited_body_without_content_length() {
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let server = tokio::spawn(async move {
+            up_server
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\nBODYBYTES")
+                .await
+                .unwrap();
+            drop(up_server);
+        });
+
+        let status = relay_websocket(&mut up_proxy, &mut in_proxy).await.unwrap();
+        assert_eq!(status, 400);
+        // Close the inbound handle so `read_to_end` below observes EOF
+        // instead of waiting for bytes that will never arrive.
+        drop(in_proxy);
+
+        let mut seen = Vec::new();
+        in_client.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.ends_with(b"BODYBYTES"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_websocket_unknown_length_body_times_out_instead_of_hanging_forever() {
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let _server = tokio::spawn(async move {
+            up_server
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await
+                .unwrap();
+            // No Content-Length, no chunked encoding, no close, no further
+            // bytes: only the read-timeout fallback can end this relay.
+            std::future::pending::<()>().await;
+        });
+
+        let status = relay_websocket(&mut up_proxy, &mut in_proxy).await.unwrap();
+        assert_eq!(status, 400);
+        // Close the inbound handle so `read_to_end` below observes EOF
+        // instead of waiting for bytes that will never arrive.
+        drop(in_proxy);
+
+        let mut seen = Vec::new();
+        in_client.read_to_end(&mut seen).await.unwrap();
+        assert!(String::from_utf8_lossy(&seen).contains("400 Bad Request"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_websocket_content_length_body_times_out_instead_of_hanging_forever() {
+        // A declared Content-Length is only a bound, not a promise: an
+        // upstream that keeps the connection open without ever sending the
+        // rest of the declared body must not hang the relay either.
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let _server = tokio::spawn(async move {
+            up_server
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 100\r\n\r\nshort")
+                .await
+                .unwrap();
+            // Declared 100 bytes, sent 5, then never sends the rest and
+            // never closes.
+            std::future::pending::<()>().await;
+        });
+
+        let status = relay_websocket(&mut up_proxy, &mut in_proxy).await.unwrap();
+        assert_eq!(status, 400);
+        drop(in_proxy);
+
+        let mut seen = Vec::new();
+        in_client.read_to_end(&mut seen).await.unwrap();
+        assert!(seen.ends_with(b"short"));
+    }
+
+    #[tokio::test]
+    async fn relay_websocket_non_upgrade_never_forwards_bytes_past_content_length() {
+        // Bytes past the declared Content-Length (e.g. because they arrived
+        // in the same read as the header) belong to whatever the upstream
+        // sends next on that connection, which this proxy never reuses
+        // across requests — they must never be relayed to the client as if
+        // they were part of this response.
+        let (mut up_proxy, mut up_server) = tokio::io::duplex(4096);
+        let (mut in_proxy, mut in_client) = tokio::io::duplex(4096);
+
+        let server = tokio::spawn(async move {
+            up_server
+                .write_all(
+                    b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 2\r\n\r\n\
+                      noSURPLUS_BYTES_NOT_PART_OF_THIS_RESPONSE",
+                )
+                .await
+                .unwrap();
+            drop(up_server);
+        });
+
+        let status = relay_websocket(&mut up_proxy, &mut in_proxy).await.unwrap();
+        assert_eq!(status, 426);
+        drop(in_proxy);
+
+        let mut seen = Vec::new();
+        in_client.read_to_end(&mut seen).await.unwrap();
+        assert!(
+            seen.ends_with(b"no"),
+            "must end at the Content-Length boundary"
+        );
+        assert!(
+            !seen.windows(7).any(|w| w == b"SURPLUS"),
+            "must not forward bytes past the declared Content-Length"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_request_includes_body_bytes() {
+        // forward_websocket used to hardcode `&[]` here, silently dropping
+        // any request body while still emitting its Content-Length header
+        // upstream (the request would never complete).
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        write_request(
+            &mut a,
+            b"GET /ws HTTP/1.1\r\nContent-Length: 4\r\n\r\n",
+            b"BODY",
+        )
+        .await
+        .unwrap();
+        drop(a);
+
+        let mut received = Vec::new();
+        b.read_to_end(&mut received).await.unwrap();
+        assert!(received.ends_with(b"BODY"));
     }
 }

@@ -76,6 +76,12 @@ spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-sourc
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["test-util", "rt-multi-thread", "macros"] }
+# Real WebSocket handshake + framing for tls_intercept/forward relay tests
+# (masking, close/ping frames, fragmentation) — the relay is otherwise only
+# exercised with hand-rolled byte fixtures that miss protocol-level bugs.
+tokio-tungstenite = "0.30"
+# Sink/Stream trait methods (send/next) for tokio-tungstenite's WebSocketStream.
+futures-util = "0.3"
 
 [lints]
 workspace = true

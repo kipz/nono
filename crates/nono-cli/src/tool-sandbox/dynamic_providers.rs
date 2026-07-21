@@ -909,6 +909,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
                 "user.email=t@t.com",
                 "-c",
                 "user.name=T",
+                // Hermetic: never inherit ambient commit.gpgsign, which makes
+                // this commit race the signing agent under parallel test load.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -990,6 +994,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
                 "user.email=t@t.com",
                 "-c",
                 "user.name=T",
+                // Hermetic: never inherit ambient commit.gpgsign, which makes
+                // this commit race the signing agent under parallel test load.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -1075,6 +1083,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
                 "user.email=t@t.com",
                 "-c",
                 "user.name=T",
+                // Hermetic: never inherit ambient commit.gpgsign, which makes
+                // this commit race the signing agent under parallel test load.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -1229,6 +1241,10 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
                 "user.email=t@t.com",
                 "-c",
                 "user.name=T",
+                // Hermetic: never inherit ambient commit.gpgsign, which makes
+                // this commit race the signing agent under parallel test load.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",

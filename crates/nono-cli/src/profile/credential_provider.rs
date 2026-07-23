@@ -519,6 +519,7 @@ mod tests {
                     response_fields: vec![CredentialProviderResponseField {
                         path: "auth.client_token".to_string(),
                         kind: CredentialProviderResponseFieldKind::Opaque,
+                        format: None,
                     }],
                     request_body: CredentialProviderRequestBodyFormat::Auto,
                     // Capture-only endpoint: intentionally no request_nonce_fields.

@@ -4898,6 +4898,7 @@ mod tests {
                 env_var: None,
                 base_url_env_var: None,
                 endpoint_policy: None,
+                upgrades: vec![],
             }],
             ..ProxyLaunchOptions::default()
         };

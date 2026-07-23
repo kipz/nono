@@ -34,6 +34,17 @@ pub trait NonceResolver: Send + Sync {
     /// for `consumer` (`"proxy.<route_id>"`), or `None` otherwise (fail-closed).
     fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>>;
 
+    /// Resolve `nonce` iff its credential name is in `allowed_credentials`
+    /// (route-authoritative; ignores the grant set). Default `None` for
+    /// resolvers that don't track credential names (e.g. OAuth-capture store).
+    fn resolve_for_credentials(
+        &self,
+        _nonce: &str,
+        _allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        None
+    }
+
     /// Rewrite any phantom this resolver minted that appears in `value`,
     /// substituting the real credential for `consumer`. Returns the rewritten
     /// value, or `None` if no phantom for this resolver/consumer was found.

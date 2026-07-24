@@ -718,11 +718,12 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Lets libc command resolution get ENOENT (not a deny's EPERM, which aborts
     // the PATH walk) on ungranted/missing $PATH entries. Metadata only, emitted
     // last so it overrides read denies without exposing file contents.
-    // Separate sets: a dir may appear both as a $PATH target (needs subpath, to
-    // cover <dir>/<command>) and as another entry's ancestor (needs only
-    // literal). Tracking them together would let an ancestor-first literal
-    // suppress the later subpath and re-break nested lookups.
-    let mut seen_subpath = std::collections::HashSet::new();
+    // Separate sets: a dir may appear both as a $PATH target (needs a direct-
+    // children regex, to cover <dir>/<command>) and as another entry's
+    // ancestor (needs only literal). Tracking them together would let an
+    // ancestor-first literal suppress the later direct-children grant and
+    // re-break nested lookups.
+    let mut seen_dir = std::collections::HashSet::new();
     let mut seen_ancestor = std::collections::HashSet::new();
     for dir in caps.path_metadata_dirs() {
         let dir_str = dir.to_str().ok_or_else(|| {
@@ -731,15 +732,24 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
                 dir.display()
             ))
         })?;
-        if seen_subpath.insert(dir_str.to_string()) {
-            let escaped = escape_path(dir_str)?;
+        if seen_dir.insert(dir_str.to_string()) {
+            // Command resolution only stats direct children (`<dir>/<command>`),
+            // never descends recursively, so scope the grant to that instead of
+            // a recursive `subpath` — the latter would expose metadata for the
+            // entire subtree nested under a $PATH dir.
+            let literal = escape_path(dir_str)?;
             profile.push_str(&format!(
-                "(allow file-read-metadata (subpath \"{}\"))\n",
-                escaped
+                "(allow file-read-metadata (literal \"{}\"))\n",
+                literal
+            ));
+            let regex = regex_escape_path_for_seatbelt(dir_str)?;
+            profile.push_str(&format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))\n",
+                regex
             ));
         }
         // Ancestors (literal): Seatbelt checks metadata on every component
-        // during traversal. A subpath grant already covers a dir and its
+        // during traversal. A dir's own grant already covers it and its
         // ancestors-were-walked, so stop at the first already-covered one.
         let mut current = dir.parent();
         while let Some(parent) = current {
@@ -749,7 +759,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             if parent_str == "/" || parent_str.is_empty() {
                 break;
             }
-            if seen_subpath.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+            if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
                 break;
             }
             let escaped = escape_path(parent_str)?;
@@ -1082,11 +1092,22 @@ mod tests {
         let profile = generate_profile(&caps).unwrap();
 
         assert!(
-            profile.contains("(allow file-read-metadata (subpath \"/nonexistent/tools/bin\"))")
+            profile.contains("(allow file-read-metadata (literal \"/nonexistent/tools/bin\"))")
+        );
+        assert!(
+            profile
+                .contains("(allow file-read-metadata (regex \"^/nonexistent/tools/bin/[^/]+$\"))")
         );
         assert_eq!(
             profile
-                .matches("(allow file-read-metadata (subpath \"/opt/homebrew/bin\"))")
+                .matches("(allow file-read-metadata (literal \"/opt/homebrew/bin\"))")
+                .count(),
+            1,
+            "duplicate PATH dirs should emit a single rule"
+        );
+        assert_eq!(
+            profile
+                .matches("(allow file-read-metadata (regex \"^/opt/homebrew/bin/[^/]+$\"))")
                 .count(),
             1,
             "duplicate PATH dirs should emit a single rule"
@@ -1094,22 +1115,28 @@ mod tests {
         // Ancestors are literals so path resolution can traverse to the dir.
         assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent/tools\"))"));
         assert!(profile.contains("(allow file-read-metadata (literal \"/nonexistent\"))"));
-        // Metadata only — never grants data reads on PATH dirs.
+        // Metadata only, direct children only — never grants data reads or
+        // recursive metadata reads on PATH dirs.
         assert!(!profile.contains("(allow file-read* (subpath \"/nonexistent/tools/bin\"))"));
+        assert!(
+            !profile.contains("(allow file-read-metadata (subpath \"/nonexistent/tools/bin\"))")
+        );
+        assert!(!profile.contains("(allow file-read-metadata (subpath \"/opt/homebrew/bin\"))"));
     }
 
     #[test]
-    fn test_path_metadata_dir_that_is_also_an_ancestor_still_gets_subpath() {
+    fn test_path_metadata_dir_that_is_also_an_ancestor_still_gets_own_grant() {
         // Regression: a dir emitted as a literal ancestor of an earlier entry
-        // must still get its own subpath when it appears as a $PATH entry,
-        // otherwise nested lookups in it fail (EPERM aborts the walk).
+        // must still get its own direct-children grant when it appears as a
+        // $PATH entry, otherwise nested lookups in it fail (EPERM aborts the
+        // walk).
         let mut caps = CapabilitySet::new();
         caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew/bin")); // emits literal /opt/homebrew
-        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew")); // must still get a subpath
+        caps.add_path_metadata_dir(PathBuf::from("/opt/homebrew")); // must still get its own grant
 
         let profile = generate_profile(&caps).unwrap();
 
-        assert!(profile.contains("(allow file-read-metadata (subpath \"/opt/homebrew\"))"));
+        assert!(profile.contains("(allow file-read-metadata (regex \"^/opt/homebrew/[^/]+$\"))"));
     }
 
     #[test]

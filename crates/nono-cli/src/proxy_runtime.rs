@@ -2448,6 +2448,10 @@ pub(crate) fn build_proxy_config_from_flags(
     proxy_config.no_proxy = proxy.no_proxy.clone();
     synthesize_credential_provider_proxy_config(proxy, &mut proxy_config)?;
     if !proxy_config.oauth_capture.is_empty() {
+        // On macOS, `OAuthCaptureStore::load_with_runtime_persistence`
+        // ignores this path and persists to the Keychain instead — it's
+        // used only as the "persistence enabled" signal there. Non-macOS
+        // platforms still read/write this exact file.
         proxy_config.oauth_capture_store_path = Some(
             crate::state_paths::user_state_dir()?
                 .join("oauth-capture")

@@ -972,7 +972,10 @@ pub async fn start_with_nonce_resolver(
 
     info!("Proxy server listening on {}", local_addr);
 
-    let oauth_capture_store = OAuthCaptureStore::load_with_persistence(
+    // On macOS this routes to ACL-restricted Keychain persistence and the
+    // path is only used as the "persistence enabled" signal; on other
+    // platforms it's the file backend at this path, unchanged from before.
+    let oauth_capture_store = OAuthCaptureStore::load_with_runtime_persistence(
         &config.oauth_capture,
         config.oauth_capture_store_path.clone(),
     )?;

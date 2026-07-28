@@ -17,6 +17,32 @@ is shape and routing:
 - normal agent API calls resolve phantoms only through the admitted proxy route
 - denied Keychain or credential-store access does not prevent phantom-backed use
 
+## macOS Keychain persistence
+
+On macOS, captured real OAuth tokens persist to an ACL-restricted macOS
+Keychain item instead of `~/.local/state/nono/oauth-capture/providers.json`.
+The ACL trusts only the `nono` binary at the path it was saved from, so
+reading the item from any other process (including a bare `security` CLI
+invocation) triggers a system Allow/Deny dialog rather than a silent read —
+that dialog is the protection working, not a bug.
+
+After a login capture on macOS:
+
+- confirm `~/.local/state/nono/oauth-capture/providers.json` was **not**
+  created (macOS never writes this file)
+- from a separate terminal, run:
+
+  ```sh
+  security find-generic-password -s nono -a oauth_capture_store -w
+  ```
+
+  Expect either a system Allow/Deny dialog or a denial — a real token value
+  printed without a prompt would indicate the ACL is not restrictive enough
+- kill and restart the `nono run` session against the same profile and
+  confirm the previously captured phantom still resolves (`resolved OAuth
+  phantom token for admitted consumer`), proving persistence survived the
+  restart via Keychain rather than the file backend
+
 ## Claude Code
 
 Login capture:

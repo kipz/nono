@@ -247,6 +247,22 @@ async fn handle_h2_stream(
         method, path, ctx.host, ctx.port
     );
 
+    // RFC 8441 (WebSocket-over-HTTP/2 via extended CONNECT, ":protocol") is
+    // out of scope for this route type. `select_intercept_route` is only
+    // ever called here with `websocket_path: None`, so an extended CONNECT
+    // stream would silently skip `upgrade_rules` entirely and fall through
+    // into ordinary request/response forwarding. Reject it explicitly
+    // instead of relying on that omission, whether or not it carries an
+    // `h2::ext::Protocol` extension.
+    if method == http::Method::CONNECT {
+        warn!(
+            "h2_forward: rejecting CONNECT stream on {}:{} (h2 WebSocket upgrade is not supported)",
+            ctx.host, ctx.port
+        );
+        send_h2_error(&mut respond, 501)?;
+        return Ok(());
+    }
+
     let host_port = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
     if ctx.oauth_capture_store.host_policy(&host_port).is_some() {
         warn!(
@@ -1072,6 +1088,94 @@ mod tests {
         });
 
         (port, rx)
+    }
+
+    #[tokio::test]
+    async fn h2_forward_rejects_connect_stream_without_route_selection() {
+        use std::time::Duration;
+
+        let ca = Arc::new(EphemeralCa::generate().unwrap());
+        let (upstream_port, rx) = spawn_mock_h2_upstream(&ca).await;
+
+        let route_store = make_route_store(
+            "localhost",
+            upstream_port,
+            vec![EndpointRule {
+                method: "*".to_string(),
+                path: "/**".to_string(),
+            }],
+        )
+        .await;
+        let credential_store = make_credential_store("sk-test-secret-key");
+        let cert_cache = Arc::new(CertCache::new(Arc::clone(&ca)));
+        let tls_connector = h2_tls_connector_trusting(ca.cert_pem());
+        let filter = ProxyFilter::allow_all();
+        let session_token = Zeroizing::new("session-tok".to_string());
+
+        let ctx = InterceptCtx {
+            route_id: Some("test-svc"),
+            host: "localhost",
+            port: upstream_port,
+            route_store: Arc::new(route_store),
+            credential_store: Arc::new(credential_store),
+            oauth_capture_store: Arc::new(crate::oauth_capture::OAuthCaptureStore::empty()),
+            session_token: &session_token,
+            cert_cache,
+            tls_connector: &tls_connector,
+            tls_connector_h2: &tls_connector,
+            filter: &filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: true,
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                async {
+                    let _ = forward_h2_connection(server_io, &ctx).await;
+                },
+                async {
+                    let (mut h2_client, h2_conn) = h2::client::handshake(client_io).await.unwrap();
+                    let conn_handle = tokio::spawn(async move {
+                        let _ = h2_conn.await;
+                    });
+
+                    // Extended CONNECT (RFC 8441 WebSocket-over-h2) must be
+                    // rejected before it ever reaches route selection —
+                    // it must not silently bypass `upgrade_rules` by falling
+                    // through with `websocket_path: None`.
+                    let request = http::Request::builder()
+                        .method("CONNECT")
+                        .uri(format!("https://localhost:{}/ws", upstream_port))
+                        .body(())
+                        .unwrap();
+                    let (response_fut, _send_stream) =
+                        h2_client.send_request(request, true).unwrap();
+
+                    let response = response_fut.await.unwrap();
+                    assert_eq!(response.status(), 501);
+
+                    // The upstream must never see this stream.
+                    let upstream_saw_request =
+                        tokio::time::timeout(Duration::from_millis(200), rx).await;
+                    assert!(
+                        upstream_saw_request.is_err(),
+                        "CONNECT stream must not be forwarded to upstream"
+                    );
+
+                    drop(h2_client);
+                    conn_handle.abort();
+                    let _ = conn_handle.await;
+                }
+            );
+        })
+        .await;
+        assert!(result.is_ok(), "test timed out — h2 forwarding hung");
     }
 
     #[tokio::test]

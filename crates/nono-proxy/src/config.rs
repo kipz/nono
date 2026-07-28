@@ -1310,10 +1310,13 @@ fn endpoint_allowed(rules: &[EndpointRule], method: &str, path: &str) -> bool {
 }
 
 /// Normalize a URL path for matching: percent-decode, strip query string,
-/// collapse double slashes, strip trailing slash (but preserve root "/").
+/// collapse double slashes and `.`/`..` dot-segments, strip trailing slash
+/// (but preserve root "/").
 ///
 /// Percent-decoding prevents bypass via encoded characters (e.g.,
-/// `/api/%70rojects` evading a rule for `/api/projects/*`).
+/// `/api/%70rojects` evading a rule for `/api/projects/*`). Dot-segment
+/// collapsing prevents `/api/../secret` from being treated as a distinct
+/// path from its resolved form by matchers that assume a canonical path.
 fn normalize_path(path: &str) -> String {
     // Strip query string before percent-decoding: a literal %3F must not be
     // treated as a query delimiter, so the split must precede the decode.
@@ -1325,9 +1328,19 @@ fn normalize_path(path: &str) -> String {
     let binary = urlencoding::decode_binary(path.as_bytes());
     let decoded = String::from_utf8_lossy(&binary);
 
-    // Collapse double slashes by splitting on '/' and filtering empties,
-    // then rejoin. This also strips trailing slash.
-    let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
+    // Collapse double slashes and `.`/`..` dot-segments by splitting on '/'
+    // and resolving segments in order. Attempts to climb above root are
+    // clamped rather than allowed to escape (no negative traversal).
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in decoded.split('/').filter(|s| !s.is_empty()) {
+        match segment {
+            "." => {}
+            ".." => {
+                segments.pop();
+            }
+            _ => segments.push(segment),
+        }
+    }
     if segments.is_empty() {
         "/".to_string()
     } else {
@@ -2234,5 +2247,29 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_segments() {
+        assert_eq!(normalize_path("/a/../b"), "/b");
+        assert_eq!(normalize_path("/a/./b"), "/a/b");
+        assert_eq!(normalize_path("/a/b/.."), "/a");
+    }
+
+    #[test]
+    fn normalize_path_clamps_traversal_above_root() {
+        assert_eq!(normalize_path("/a/../../b"), "/b");
+        assert_eq!(normalize_path("/../../.."), "/");
+        assert_eq!(normalize_path(".."), "/");
+    }
+
+    #[test]
+    fn websocket_rules_do_not_match_dot_segment_traversal_of_denied_path() {
+        let compiled = CompiledUpgradeRules::compile(&[WebSocketRuleConfig {
+            path: "/backend-api/codex/responses".to_string(),
+        }])
+        .unwrap();
+        assert!(compiled.matches("/backend-api/codex/../codex/responses"));
+        assert!(!compiled.matches("/backend-api/codex/../other/responses"));
     }
 }

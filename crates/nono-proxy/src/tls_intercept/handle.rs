@@ -1553,6 +1553,14 @@ pub(crate) fn resolve_nonce_in_header_value(
     }
     let real = resolver.resolve(nonce, consumer)?;
     let real_str = std::str::from_utf8(&real).ok()?;
+    // Resolved values are interpolated directly into a raw "name: value\r\n"
+    // request line at every call site. A resolved secret containing CR, LF,
+    // or NUL would allow request-splitting/header injection into the
+    // upstream request, so reject rather than substitute (fail closed, same
+    // as any other unresolvable nonce).
+    if real_str.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
+        return None;
+    }
     Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
 }
 
@@ -1771,13 +1779,24 @@ where
         None => return Ok(()),
     };
 
-    // The handshake itself carries no body (enforced by
-    // `classify_upgrade_attempt`); read defensively for symmetry with the
-    // ordinary request path.
-    let content_length = reverse::extract_content_length(&req.header_bytes);
-    let _body = match reverse::read_request_body(tls_stream, content_length, &req.buffered).await? {
-        Some(b) => b,
-        None => return Ok(()),
+    // `classify_upgrade_attempt` guarantees a single, valid, base64-decoded
+    // Sec-WebSocket-Key before this handler is ever reached; extract it here
+    // (rather than unwrapping) so a defensive failure closes rather than
+    // panics if that invariant is ever violated.
+    let client_key = match super::http1::parse_header_fields(&req.header_bytes) {
+        Ok(fields) => match super::http1::values(&fields, "sec-websocket-key").as_slice() {
+            [key] => key.to_string(),
+            _ => {
+                warn!("tls_intercept: WS upgrade missing a single Sec-WebSocket-Key");
+                reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+                return Ok(());
+            }
+        },
+        Err(_) => {
+            warn!("tls_intercept: WS upgrade headers failed to parse");
+            reverse::send_error_generic(tls_stream, 400, "Bad Request").await?;
+            return Ok(());
+        }
     };
 
     let upstream_authority = reverse::format_host_header(UpstreamScheme::Https, ctx.host, ctx.port);
@@ -1843,8 +1862,76 @@ where
         }
     };
 
+    run_websocket_tunnel(
+        tls_stream,
+        &mut upstream,
+        ctx,
+        service,
+        cred,
+        req,
+        &request,
+        &client_key,
+    )
+    .await
+}
+
+/// Drive a WebSocket tunnel once the upstream connection is established:
+/// write the rewritten request headers plus any early client bytes the
+/// client sent immediately after its handshake headers (`req.buffered`,
+/// which a naive/optimistic client may fill with its first WS frame before
+/// waiting for `101`), validate the upstream's handshake response
+/// (including `Sec-WebSocket-Accept` per RFC 6455), and either relay an
+/// invalid response as a normal HTTP error or tunnel raw bytes
+/// bidirectionally.
+///
+/// Generic over the upstream stream so it's testable against
+/// `tokio::io::duplex` mocks without a real TLS/DNS dial.
+#[allow(clippy::too_many_arguments)]
+async fn run_websocket_tunnel<S, U>(
+    tls_stream: &mut S,
+    upstream: &mut U,
+    ctx: &InterceptCtx<'_>,
+    service: Option<&str>,
+    cred: Option<&crate::credential::LoadedCredential>,
+    req: &ParsedRequest,
+    request: &Zeroizing<String>,
+    client_key: &str,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let deny_ctx = audit::EventContext {
+        route_id: service,
+        denial_category: Some(nono::undo::NetworkAuditDenialCategory::UpstreamConnectFailed),
+        ..audit::EventContext::default()
+    };
+
     if let Err(e) = upstream.write_all(request.as_bytes()).await {
         warn!("tls_intercept: failed writing WS handshake upstream: {}", e);
+        audit::log_denied(
+            ctx.audit_log,
+            audit::ProxyMode::ConnectIntercept,
+            &deny_ctx,
+            ctx.host,
+            ctx.port,
+            &e.to_string(),
+        );
+        reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+        return Ok(());
+    }
+    // Forward any client bytes that arrived immediately after the handshake
+    // headers (an optimistic client's first WS frame) in order, before
+    // waiting on the handshake response. The handshake itself carries no
+    // body (enforced by `classify_upgrade_attempt`), so these bytes belong
+    // to the post-101 stream, not an HTTP request body.
+    if !req.buffered.is_empty()
+        && let Err(e) = upstream.write_all(&req.buffered).await
+    {
+        warn!(
+            "tls_intercept: failed writing buffered WS client bytes upstream: {}",
+            e
+        );
         audit::log_denied(
             ctx.audit_log,
             audit::ProxyMode::ConnectIntercept,
@@ -1865,7 +1952,7 @@ where
         return Ok(());
     }
 
-    let handshake = match websocket::read_response(&mut upstream, ctx.host).await {
+    let handshake = match websocket::read_response(upstream, ctx.host).await {
         Ok(h) => h,
         Err(e) => {
             warn!("tls_intercept: WS upstream handshake read failed: {}", e);
@@ -1882,7 +1969,7 @@ where
         }
     };
 
-    if !websocket::is_valid_response(handshake.status, &handshake.header_bytes) {
+    if !websocket::is_valid_response(handshake.status, &handshake.header_bytes, client_key) {
         warn!(
             "tls_intercept: upstream WS handshake response invalid (status {})",
             handshake.status
@@ -1908,7 +1995,7 @@ where
         tls_stream.write_all(b"\r\n").await?;
         tls_stream.flush().await?;
         super::http1::relay_response_body(
-            &mut upstream,
+            upstream,
             tls_stream,
             handshake.status,
             &handshake.header_fields,
@@ -1944,7 +2031,7 @@ where
     }
     tls_stream.flush().await?;
 
-    match tokio::io::copy_bidirectional(tls_stream, &mut upstream).await {
+    match tokio::io::copy_bidirectional(tls_stream, upstream).await {
         Ok((client_to_upstream, upstream_to_client)) => debug!(
             "tls_intercept: WS tunnel closed for {}:{} ({} bytes client->upstream, {} bytes upstream->client)",
             ctx.host, ctx.port, client_to_upstream, upstream_to_client
@@ -2053,16 +2140,30 @@ mod tests {
         assert!(websocket::parse_status_line("101 Switching Protocols\r\n").is_err());
     }
 
+    // RFC 6455 section 1.3 worked example.
+    const RFC6455_CLIENT_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+    const RFC6455_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+
+    #[test]
+    fn websocket_expected_accept_matches_rfc6455_example() {
+        assert_eq!(
+            websocket::expected_accept(RFC6455_CLIENT_KEY),
+            RFC6455_ACCEPT
+        );
+    }
+
     #[test]
     fn websocket_handshake_response_accepts_valid_101() {
         assert!(websocket::is_valid_response(
             101,
-            b"Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: abc\r\n"
+            format!("Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n").as_bytes(),
+            RFC6455_CLIENT_KEY,
         ));
         // Case-insensitivity and multi-token Connection values are legal.
         assert!(websocket::is_valid_response(
             101,
-            b"connection: keep-alive, Upgrade\r\nupgrade: WebSocket\r\n"
+            format!("connection: keep-alive, Upgrade\r\nupgrade: WebSocket\r\nsec-websocket-accept: {RFC6455_ACCEPT}\r\n").as_bytes(),
+            RFC6455_CLIENT_KEY,
         ));
     }
 
@@ -2070,11 +2171,13 @@ mod tests {
     fn websocket_handshake_response_rejects_wrong_status() {
         assert!(!websocket::is_valid_response(
             200,
-            b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+            format!("Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n").as_bytes(),
+            RFC6455_CLIENT_KEY,
         ));
         assert!(!websocket::is_valid_response(
             403,
-            b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+            format!("Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n").as_bytes(),
+            RFC6455_CLIENT_KEY,
         ));
     }
 
@@ -2082,17 +2185,34 @@ mod tests {
     fn websocket_handshake_response_rejects_missing_upgrade_headers() {
         assert!(!websocket::is_valid_response(
             101,
-            b"Connection: Upgrade\r\n"
+            b"Connection: Upgrade\r\n",
+            RFC6455_CLIENT_KEY,
         ));
         assert!(!websocket::is_valid_response(
             101,
-            b"Upgrade: websocket\r\n"
+            b"Upgrade: websocket\r\n",
+            RFC6455_CLIENT_KEY,
         ));
         assert!(!websocket::is_valid_response(
             101,
-            b"Connection: keep-alive\r\nUpgrade: websocket\r\n"
+            b"Connection: keep-alive\r\nUpgrade: websocket\r\n",
+            RFC6455_CLIENT_KEY,
         ));
-        assert!(!websocket::is_valid_response(101, b""));
+        assert!(!websocket::is_valid_response(101, b"", RFC6455_CLIENT_KEY));
+    }
+
+    #[test]
+    fn websocket_handshake_response_rejects_wrong_accept() {
+        assert!(!websocket::is_valid_response(
+            101,
+            format!("Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n").as_bytes(),
+            "a-different-client-key==",
+        ));
+        assert!(!websocket::is_valid_response(
+            101,
+            b"Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: not-the-right-value=\r\n",
+            RFC6455_CLIENT_KEY,
+        ));
     }
 
     #[tokio::test]
@@ -2525,6 +2645,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_resolved_value_containing_crlf() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"evil\r\nX-Injected: yes".to_vec(),
+            admitted_consumer: "proxy.svc".to_string(),
+        };
+        let value = format!("Bearer {nonce}");
+        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
+        assert!(
+            result.is_none(),
+            "CRLF in resolved value must not substitute"
+        );
+    }
+
+    #[test]
+    fn rejects_resolved_value_containing_nul() {
+        let nonce = make_nonce();
+        let resolver = TestResolver {
+            nonce: nonce.clone(),
+            real: b"evil\0byte".to_vec(),
+            admitted_consumer: "proxy.svc".to_string(),
+        };
+        let value = format!("Bearer {nonce}");
+        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
+        assert!(
+            result.is_none(),
+            "NUL in resolved value must not substitute"
+        );
+    }
+
+    #[test]
     fn preserves_prefix_and_suffix_around_nonce() {
         let nonce = make_nonce();
         let resolver = TestResolver {
@@ -2622,5 +2774,205 @@ mod tests {
         )
         .await;
         assert!(matches!(selection, RouteSelection::Rejected(403)));
+    }
+
+    fn test_intercept_ctx<'a>(
+        session_token: &'a Zeroizing<String>,
+        connector: &'a tokio_rustls::TlsConnector,
+        filter: &'a ProxyFilter,
+    ) -> InterceptCtx<'a> {
+        let ca = Arc::new(crate::tls_intercept::ca::EphemeralCa::generate().unwrap());
+        InterceptCtx {
+            route_id: None,
+            host: "example.com",
+            port: 443,
+            route_store: Arc::new(RouteStore::empty()),
+            credential_store: Arc::new(CredentialStore::empty()),
+            oauth_capture_store: Arc::new(OAuthCaptureStore::empty()),
+            session_token,
+            cert_cache: Arc::new(CertCache::new(ca)),
+            tls_connector: connector,
+            tls_connector_h2: connector,
+            filter,
+            audit_log: None,
+            upstream_proxy: None,
+            approval_backends: None,
+            credential_capture_backend: None,
+            nonce_resolver: None,
+            enable_h2: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_forwards_buffered_bytes_and_relays_handshake() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let connector = test_default_h2_connector();
+        let filter = ProxyFilter::allow_all();
+        let ctx = test_intercept_ctx(&session_token, &connector, &filter);
+
+        let (mut client_test_side, mut proxy_client_side) = tokio::io::duplex(4096);
+        let (mut proxy_upstream_side, mut upstream_test_side) = tokio::io::duplex(4096);
+
+        let request = Zeroizing::new(format!(
+            "GET /socket HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {RFC6455_CLIENT_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ));
+        let req = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: Vec::new(),
+            buffered: b"early-client-frame".to_vec(),
+        };
+
+        let tunnel_result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (tunnel, _driver) = tokio::join!(
+                run_websocket_tunnel(
+                    &mut proxy_client_side,
+                    &mut proxy_upstream_side,
+                    &ctx,
+                    None,
+                    None,
+                    &req,
+                    &request,
+                    RFC6455_CLIENT_KEY,
+                ),
+                async {
+                    // Upstream receives the rewritten request headers
+                    // immediately followed by the buffered early client
+                    // bytes, in order (regression test for the
+                    // buffered-bytes drop).
+                    let expected_upstream = format!(
+                        "GET /socket HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {RFC6455_CLIENT_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\nearly-client-frame"
+                    );
+                    let mut received = vec![0u8; expected_upstream.len()];
+                    upstream_test_side.read_exact(&mut received).await.unwrap();
+                    assert_eq!(received, expected_upstream.as_bytes());
+
+                    upstream_test_side
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n\r\nupstream-leftover"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    upstream_test_side.flush().await.unwrap();
+
+                    // Client receives the 101 status/headers followed by the
+                    // upstream's leftover bytes.
+                    let expected_client = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {RFC6455_ACCEPT}\r\n\r\nupstream-leftover"
+                    );
+                    let mut client_received = vec![0u8; expected_client.len()];
+                    client_test_side
+                        .read_exact(&mut client_received)
+                        .await
+                        .unwrap();
+                    assert_eq!(client_received, expected_client.as_bytes());
+
+                    // A further round-trip frame on each side shows up on
+                    // the other, validating the `copy_bidirectional` wiring.
+                    client_test_side
+                        .write_all(b"client-frame-2")
+                        .await
+                        .unwrap();
+                    client_test_side.flush().await.unwrap();
+                    let mut buf = vec![0u8; "client-frame-2".len()];
+                    upstream_test_side.read_exact(&mut buf).await.unwrap();
+                    assert_eq!(buf, b"client-frame-2");
+
+                    upstream_test_side
+                        .write_all(b"upstream-frame-2")
+                        .await
+                        .unwrap();
+                    upstream_test_side.flush().await.unwrap();
+                    let mut buf2 = vec![0u8; "upstream-frame-2".len()];
+                    client_test_side.read_exact(&mut buf2).await.unwrap();
+                    assert_eq!(buf2, b"upstream-frame-2");
+
+                    drop(client_test_side);
+                    drop(upstream_test_side);
+                }
+            );
+            tunnel
+        })
+        .await
+        .unwrap();
+
+        assert!(tunnel_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn websocket_tunnel_rejects_mismatched_accept_and_relays_as_error() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let session_token = Zeroizing::new("session-tok".to_string());
+        let connector = test_default_h2_connector();
+        let filter = ProxyFilter::allow_all();
+        let ctx = test_intercept_ctx(&session_token, &connector, &filter);
+
+        let (mut client_test_side, mut proxy_client_side) = tokio::io::duplex(4096);
+        let (mut proxy_upstream_side, mut upstream_test_side) = tokio::io::duplex(4096);
+
+        let request = Zeroizing::new(format!(
+            "GET /socket HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {RFC6455_CLIENT_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ));
+        let req = ParsedRequest {
+            method: "GET".to_string(),
+            path: "/socket".to_string(),
+            version: "HTTP/1.1".to_string(),
+            header_bytes: Vec::new(),
+            buffered: Vec::new(),
+        };
+
+        let bogus_response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: not-the-right-value=\r\n\r\n";
+
+        let tunnel_result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (tunnel, _driver) = tokio::join!(
+                run_websocket_tunnel(
+                    &mut proxy_client_side,
+                    &mut proxy_upstream_side,
+                    &ctx,
+                    None,
+                    None,
+                    &req,
+                    &request,
+                    RFC6455_CLIENT_KEY,
+                ),
+                async {
+                    // Drain the request the tunnel writes upstream so it
+                    // doesn't block on a full duplex buffer.
+                    let mut drained = vec![0u8; request.len()];
+                    upstream_test_side.read_exact(&mut drained).await.unwrap();
+
+                    upstream_test_side
+                        .write_all(bogus_response.as_bytes())
+                        .await
+                        .unwrap();
+                    upstream_test_side.flush().await.unwrap();
+
+                    // The tunnel must not be established: the mismatched
+                    // handshake is relayed to the client as a plain HTTP
+                    // response (status line + headers verbatim), not
+                    // raw-copied as a tunnel.
+                    let mut client_received = vec![0u8; bogus_response.len()];
+                    client_test_side
+                        .read_exact(&mut client_received)
+                        .await
+                        .unwrap();
+                    assert_eq!(client_received, bogus_response.as_bytes());
+                }
+            );
+            tunnel
+        })
+        .await
+        .unwrap();
+
+        assert!(tunnel_result.is_ok());
     }
 }

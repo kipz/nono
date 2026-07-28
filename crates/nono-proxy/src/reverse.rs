@@ -1848,31 +1848,6 @@ pub(crate) enum UpgradeAttempt {
     Valid,
 }
 
-/// Split raw header bytes into lowercased-name/raw-value pairs.
-///
-/// Rejects obsolete line folding (leading space/tab) the same way
-/// [`validate_phantom_token`] does, by simply not treating folded
-/// continuation lines as part of the preceding header — callers see
-/// them as malformed via a missing colon, which `split_once` handles
-/// by skipping the line.
-pub(crate) fn header_pairs(header_bytes: &[u8]) -> Option<Vec<(String, &str)>> {
-    let header_str = std::str::from_utf8(header_bytes).ok()?;
-    let mut pairs = Vec::new();
-    for line in header_str.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            // Obsolete line-folding: treat as unparseable rather than
-            // silently joining it to the previous header.
-            return None;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let (name, value) = line.split_once(':')?;
-        pairs.push((name.trim().to_lowercase(), value.trim()));
-    }
-    Some(pairs)
-}
-
 /// Check whether a `Connection` header value's comma-separated tokens
 /// include `upgrade` (case-insensitive).
 pub(crate) fn connection_has_upgrade_token(value: &str) -> bool {
@@ -2118,12 +2093,14 @@ fn log_upgrade_rejection(
     action: &str,
     reason: &str,
 ) {
-    let target = header_pairs(header_bytes)
-        .and_then(|pairs| {
-            pairs
-                .iter()
-                .find(|(name, _)| name == "host")
-                .map(|(_, v)| (*v).to_string())
+    let target = crate::tls_intercept::http1::parse_header_fields(header_bytes)
+        .ok()
+        .and_then(|fields| {
+            let hosts = crate::tls_intercept::http1::values(&fields, "host");
+            match hosts.as_slice() {
+                [host] => Some((*host).to_string()),
+                _ => None,
+            }
         })
         .unwrap_or_else(|| "-".to_string());
 

@@ -301,6 +301,31 @@ fn test_schema_validates_credential_route_with_upgrades() {
 }
 
 #[test]
+fn test_schema_rejects_malformed_credential_route_upgrades() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    for upgrade in [
+        json!({ "origin": "http://api.openai.com", "path": "/v1/realtime" }),
+        json!({ "origin": "https://api.openai.com/extra", "path": "/v1/realtime" }),
+        json!({ "origin": "https://api.openai.com", "path": "v1/realtime" }),
+        json!({ "origin": "https://api.openai.com", "path": "" }),
+    ] {
+        let profile = json!({
+            "credential_routes": [{
+                "name": "codex",
+                "provider": "codex",
+                "upgrades": [upgrade]
+            }]
+        });
+
+        assert!(
+            validator.validate(&profile).is_err(),
+            "malformed upgrades entry should be rejected by the schema"
+        );
+    }
+}
+
+#[test]
 fn test_schema_validates_intercept_match_rule() {
     let schema = load_schema();
     let validator = jsonschema::validator_for(&schema).expect("schema compiles");

@@ -536,11 +536,13 @@
       "required": ["origin", "path"],
       "properties": {
         "origin": {
-          "type": "string",
+          "$ref": "#/$defs/UrlOrigin",
           "description": "Allow-listed WebSocket origin; must match one of the provider's api_hosts."
         },
         "path": {
           "type": "string",
+          "minLength": 1,
+          "pattern": "^/",
           "description": "Allow-listed WebSocket upgrade path on the origin."
         }
       }

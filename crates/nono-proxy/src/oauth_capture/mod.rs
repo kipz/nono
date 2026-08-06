@@ -7,11 +7,12 @@
 //! only for admitted consumers on egress.
 
 mod endpoint;
+mod keystore;
 mod persist;
 mod rewrite;
 
 use self::endpoint::{LoadedOAuthEndpoint, load_endpoint, provider_consumer};
-use self::persist::{load_persisted_tokens, persist_tokens};
+use self::keystore::OAuthCaptureBackend;
 use crate::config::OAuthCaptureConfig;
 use crate::error::{ProxyError, Result};
 use crate::token::NonceResolver;
@@ -41,7 +42,7 @@ pub struct OAuthCaptureStore {
     endpoints: Vec<LoadedOAuthEndpoint>,
     by_host: HashMap<String, Vec<usize>>,
     phantoms: Mutex<HashMap<String, StoredOAuthToken>>,
-    persist_path: Option<PathBuf>,
+    persist_backend: Option<OAuthCaptureBackend>,
 }
 
 const MAX_PERSISTED_PHANTOMS: usize = 4096;
@@ -55,6 +56,18 @@ impl OAuthCaptureStore {
     pub fn load_with_persistence(
         configs: &[OAuthCaptureConfig],
         persist_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let backend = persist_path.map(OAuthCaptureBackend::default_for);
+        Self::load_with_backend(configs, backend)
+    }
+
+    /// Build a store against an explicit persistence backend.
+    ///
+    /// Tests use this with [`OAuthCaptureBackend::File`] so they never touch
+    /// the developer's real OS keychain.
+    fn load_with_backend(
+        configs: &[OAuthCaptureConfig],
+        backend: Option<OAuthCaptureBackend>,
     ) -> Result<Self> {
         let mut endpoints = Vec::new();
         let mut by_host: HashMap<String, Vec<usize>> = HashMap::new();
@@ -83,8 +96,8 @@ impl OAuthCaptureStore {
             }
         }
 
-        let phantoms = if let Some(path) = persist_path.as_deref() {
-            let mut phantoms = load_persisted_tokens(path)?;
+        let phantoms = if let Some(backend) = backend.as_ref() {
+            let mut phantoms = backend.load()?;
             prune_phantoms(&mut phantoms);
             phantoms
         } else {
@@ -95,7 +108,7 @@ impl OAuthCaptureStore {
             endpoints,
             by_host,
             phantoms: Mutex::new(phantoms),
-            persist_path,
+            persist_backend: backend,
         })
     }
 
@@ -184,10 +197,10 @@ impl OAuthCaptureStore {
     }
 
     fn persist_locked(&self, tokens: &HashMap<String, StoredOAuthToken>) -> Result<()> {
-        let Some(path) = self.persist_path.as_deref() else {
+        let Some(backend) = self.persist_backend.as_ref() else {
             return Ok(());
         };
-        persist_tokens(path, tokens)
+        backend.persist(tokens)
     }
 }
 
@@ -285,8 +298,10 @@ mod tests {
         .unwrap()
     }
 
+    /// Builds a persisted store against an explicit file backend. Never goes
+    /// through `default_for`, so tests cannot write to a real OS keychain.
     fn store_with_persistence(path: PathBuf) -> OAuthCaptureStore {
-        OAuthCaptureStore::load_with_persistence(
+        OAuthCaptureStore::load_with_backend(
             &[OAuthCaptureConfig {
                 provider: "codex".to_string(),
                 token_endpoints: vec![OAuthTokenEndpointConfig {
@@ -298,7 +313,7 @@ mod tests {
                 }],
                 admitted_consumers: vec!["proxy.openai_oauth".to_string()],
             }],
-            Some(path),
+            Some(OAuthCaptureBackend::File(path)),
         )
         .unwrap()
     }

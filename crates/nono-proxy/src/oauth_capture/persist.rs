@@ -25,26 +25,13 @@ struct PersistedOAuthToken {
     created_at_secs: u64,
 }
 
-pub(super) fn load_persisted_tokens(path: &Path) -> Result<HashMap<String, StoredOAuthToken>> {
-    let raw = match fs::read(path) {
-        Ok(raw) => raw,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(err) => {
-            return Err(ProxyError::Config(format!(
-                "failed to read OAuth capture store '{}': {err}",
-                path.display()
-            )));
-        }
-    };
+/// Decode a serialized OAuth capture store, regardless of backing medium.
+pub(super) fn decode_tokens(raw: &[u8]) -> Result<HashMap<String, StoredOAuthToken>> {
     if raw.is_empty() {
         return Ok(HashMap::new());
     }
-    let persisted: PersistedOAuthStore = serde_json::from_slice(&raw).map_err(|err| {
-        ProxyError::Config(format!(
-            "failed to parse OAuth capture store '{}': {err}",
-            path.display()
-        ))
-    })?;
+    let persisted: PersistedOAuthStore = serde_json::from_slice(raw)
+        .map_err(|err| ProxyError::Config(format!("failed to parse OAuth capture store: {err}")))?;
     let mut tokens = HashMap::new();
     for (phantom, token) in persisted.tokens {
         tokens.insert(
@@ -56,32 +43,11 @@ pub(super) fn load_persisted_tokens(path: &Path) -> Result<HashMap<String, Store
             },
         );
     }
-    debug!(
-        path = %path.display(),
-        count = tokens.len(),
-        "loaded persisted OAuth phantom mappings"
-    );
     Ok(tokens)
 }
 
-pub(super) fn persist_tokens(
-    path: &Path,
-    tokens: &HashMap<String, StoredOAuthToken>,
-) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Err(ProxyError::Config(format!(
-            "OAuth capture store path '{}' has no parent directory",
-            path.display()
-        )));
-    };
-    fs::create_dir_all(parent).map_err(|err| {
-        ProxyError::Config(format!(
-            "failed to create OAuth capture store directory '{}': {err}",
-            parent.display()
-        ))
-    })?;
-    set_owner_only_dir(parent)?;
-
+/// Encode an OAuth capture store for persistence, regardless of backing medium.
+pub(super) fn encode_tokens(tokens: &HashMap<String, StoredOAuthToken>) -> Result<Vec<u8>> {
     let mut persisted = PersistedOAuthStore {
         version: 1,
         tokens: HashMap::new(),
@@ -99,9 +65,56 @@ pub(super) fn persist_tokens(
             },
         );
     }
-    let raw = serde_json::to_vec_pretty(&persisted).map_err(|err| {
-        ProxyError::Config(format!("failed to encode OAuth capture store: {err}"))
+    serde_json::to_vec(&persisted)
+        .map_err(|err| ProxyError::Config(format!("failed to encode OAuth capture store: {err}")))
+}
+
+pub(super) fn load_persisted_tokens_from_file(
+    path: &Path,
+) -> Result<HashMap<String, StoredOAuthToken>> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => {
+            return Err(ProxyError::Config(format!(
+                "failed to read OAuth capture store '{}': {err}",
+                path.display()
+            )));
+        }
+    };
+    let tokens = decode_tokens(&raw).map_err(|err| {
+        ProxyError::Config(format!(
+            "failed to parse OAuth capture store '{}': {err}",
+            path.display()
+        ))
     })?;
+    debug!(
+        path = %path.display(),
+        count = tokens.len(),
+        "loaded persisted OAuth phantom mappings"
+    );
+    Ok(tokens)
+}
+
+pub(super) fn persist_tokens_to_file(
+    path: &Path,
+    tokens: &HashMap<String, StoredOAuthToken>,
+) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Err(ProxyError::Config(format!(
+            "OAuth capture store path '{}' has no parent directory",
+            path.display()
+        )));
+    };
+    fs::create_dir_all(parent).map_err(|err| {
+        ProxyError::Config(format!(
+            "failed to create OAuth capture store directory '{}': {err}",
+            parent.display()
+        ))
+    })?;
+    set_owner_only_dir(parent)?;
+
+    let raw = encode_tokens(tokens)?;
     let tmp = path.with_extension("json.tmp");
     write_owner_only_file(&tmp, &raw).map_err(|err| {
         ProxyError::Config(format!(

@@ -15,10 +15,14 @@ categories = ["network-programming", "web-programming"]
 default = ["system-keyring"]
 # Enables OS system keyring access (macOS Keychain / Linux Secret Service).
 # Headless/container consumers opt out with default-features = false.
-system-keyring = ["nono/system-keyring"]
+system-keyring = ["nono/system-keyring", "dep:keyring"]
 
 [dependencies]
 nono = { version = "0.71.0", path = "../nono", default-features = false }
+# Keychain-backed OAuth capture store (see oauth_capture/keystore.rs). Same
+# default-features = false discipline as nono's own declaration: only the
+# explicitly-listed backend below is ever compiled.
+keyring = { version = "3", optional = true, default-features = false }
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -72,6 +76,16 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # SPIFFE Workload API client. Aliased to avoid colliding with any future `spiffe`
 # naming in the workspace.
 spiffe-workload = { package = "spiffe", version = "0.16", features = ["jwt-source"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure-Rust Secret Service backend (zbus over the D-Bus socket), matching
+# nono's own Linux keyring config. Not exercised at runtime today (the
+# OAuth capture store defaults to the file backend on Linux), but the
+# `system-keyring` feature is compiled uniformly across targets.
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"], optional = true, default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"], optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true

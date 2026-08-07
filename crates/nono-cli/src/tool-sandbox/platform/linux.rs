@@ -913,7 +913,7 @@ fn run_child_launcher() -> Result<()> {
     let caps = caps_from_spec(&spec.caps)?;
     tool_sandbox_profile_log!("launcher:caps_from_spec: {:?}", start_caps_from.elapsed());
     let start_sandbox_apply = std::time::Instant::now();
-    Sandbox::apply_auto(&caps)?;
+    Sandbox::apply_seccomp(&caps, nono::SeccompOpts::network_baseline())?;
     tool_sandbox_profile_log!(
         "launcher:sandbox_apply: {:?}",
         start_sandbox_apply.elapsed()
@@ -1514,7 +1514,7 @@ fn handle_shim_stream_inner(
                 } else {
                     (
                         "invocation_approve_denied",
-                        Some("approval_denied".to_string()),
+                        Some(super::approval_deny_reason(&decision)),
                     )
                 };
                 record_command_policy_audit(
@@ -1639,7 +1639,10 @@ fn handle_shim_stream_inner(
         let (audit_decision, deny_reason) = if decision.is_granted() {
             ("approve_granted", None)
         } else {
-            ("approve_denied", Some("approval_denied".to_string()))
+            (
+                "approve_denied",
+                Some(super::approval_deny_reason(&decision)),
+            )
         };
         record_command_policy_audit(
             audit_recorder.as_ref(),

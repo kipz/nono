@@ -33,7 +33,11 @@ fn apply_pre_fork_sandbox(
             info!("Direct mode: detected {}", detected);
             match sandbox_policy {
                 LinuxSandboxPolicy::Auto => {
-                    Sandbox::apply_auto_with_abi(caps, &detected)?;
+                    Sandbox::apply_seccomp_with_abi(
+                        caps,
+                        &detected,
+                        nono::sandbox::SeccompOpts::network_baseline(),
+                    )?;
                 }
                 LinuxSandboxPolicy::Landlock => {
                     Sandbox::apply_landlock_with_abi(caps, &detected)?;
@@ -337,6 +341,7 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let cap_file = write_capability_state_file(
         &caps,
         &flags.bypass_protection_paths,
+        &deny_paths,
         &allowed_domain_strs,
         &domain_endpoints,
         flags.silent,
@@ -790,13 +795,15 @@ fn validate_command_policy_execution_support() -> Result<()> {
 fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[std::path::PathBuf],
+    deny_paths: &[std::path::PathBuf],
     allowed_domains: &[String],
     domain_endpoints: &[sandbox_state::DomainEndpointState],
     silent: bool,
 ) -> Option<std::path::PathBuf> {
-    let state = sandbox_state::SandboxState::from_caps(
+    let state = sandbox_state::SandboxState::from_caps_with_denies(
         caps,
         bypass_protection_paths,
+        deny_paths,
         allowed_domains,
         domain_endpoints,
     );

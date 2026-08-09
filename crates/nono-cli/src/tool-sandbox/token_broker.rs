@@ -68,6 +68,9 @@ type NamedEntry = (Zeroizing<Vec<u8>>, GrantSet, Option<PhantomTemplate>);
 pub(crate) struct TokenBroker {
     map: std::collections::HashMap<String, BrokerEntry>,
     named: std::collections::HashMap<String, NamedEntry>,
+    /// Nonce → credential name (named credentials only). Gate by name, not
+    /// value: one name (e.g. `ddtool-token`) holds different per-audience values.
+    nonce_names: std::collections::HashMap<String, String>,
     /// Distinct phantom templates seen across issued nonces. Used to recognise
     /// templated phantoms on the L7 egress and capture-redaction paths.
     templates: Vec<PhantomTemplate>,
@@ -78,6 +81,7 @@ impl TokenBroker {
         Self {
             map: std::collections::HashMap::new(),
             named: std::collections::HashMap::new(),
+            nonce_names: std::collections::HashMap::new(),
             templates: Vec::new(),
         }
     }
@@ -147,9 +151,13 @@ impl TokenBroker {
             );
         }
         let zeroized = Zeroizing::new(value);
-        self.named
-            .insert(name, (zeroized.clone(), grants.clone(), template.clone()));
-        self.issue_templated(zeroized, grants, template.as_ref())
+        self.named.insert(
+            name.clone(),
+            (zeroized.clone(), grants.clone(), template.clone()),
+        );
+        let phantom = self.issue_templated(zeroized, grants, template.as_ref());
+        self.nonce_names.insert(phantom.clone(), name);
+        phantom
     }
 
     /// Issue a fresh nonce for a previously stored named supervisor credential.
@@ -161,7 +169,9 @@ impl TokenBroker {
         let value = value.clone();
         let grants = grants.clone();
         let template = template.clone();
-        Some(self.issue_templated(value, grants, template.as_ref()))
+        let phantom = self.issue_templated(value, grants, template.as_ref());
+        self.nonce_names.insert(phantom.clone(), name.to_string());
+        Some(phantom)
     }
 
     /// If `env_entry` has the form `NAME=nono_<64hex>` and the nonce is known to
@@ -193,6 +203,27 @@ impl TokenBroker {
         if !grants.admits(consumer) {
             return None;
         }
+        Some(real.clone())
+    }
+
+    /// Resolve a nonce iff its credential name is in `allowed_credentials`.
+    ///
+    /// Grant set is not consulted (route's `redeem_phantoms` is the authority).
+    /// Only named-credential nonces resolve. Gates by name, not value: one name
+    /// (e.g. `ddtool-token`) holds different per-audience values over time.
+    pub(crate) fn resolve_nonce_for_credentials(
+        &self,
+        nonce: &str,
+        allowed_credentials: &[String],
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        if find_bare_nonce(nonce) != Some((0, BARE_NONCE_LEN)) {
+            return None;
+        }
+        let name = self.nonce_names.get(nonce)?;
+        if !allowed_credentials.iter().any(|a| a == name) {
+            return None;
+        }
+        let (real, _grants) = self.map.get(nonce)?;
         Some(real.clone())
     }
 
@@ -242,7 +273,14 @@ impl TokenBroker {
         while i < input.len() {
             // Templated phantom (no `nono_` marker) starting at i.
             if let Some((len, real, grants, template)) = self.templated_phantom_at(input, i) {
+                // Inherit the credential name so redeem_phantoms still resolves the reissue.
+                let name = std::str::from_utf8(&input[i..i.saturating_add(len)])
+                    .ok()
+                    .and_then(|phantom| self.nonce_names.get(phantom).cloned());
                 let new_phantom = self.issue_templated(real, grants, Some(&template));
+                if let Some(name) = name {
+                    self.nonce_names.insert(new_phantom.clone(), name);
+                }
                 out.extend_from_slice(new_phantom.as_bytes());
                 i += len;
                 continue;
@@ -254,8 +292,12 @@ impl TokenBroker {
                 && find_bare_nonce(s) == Some((0, BARE_NONCE_LEN))
                 && let Some((real, grants)) = self.map.get(s).cloned()
             {
-                // Re-issue a fresh nonce for the real value, inheriting grants
+                // Inherit the credential name so redeem_phantoms still resolves the reissue.
+                let name = self.nonce_names.get(s).cloned();
                 let new_nonce = self.issue_granted(real, grants);
+                if let Some(name) = name {
+                    self.nonce_names.insert(new_nonce.clone(), name);
+                }
                 out.extend_from_slice(new_nonce.as_bytes());
                 i += BARE_NONCE_LEN;
                 continue;
@@ -263,7 +305,13 @@ impl TokenBroker {
 
             if let Some((real, grants)) = self.longest_secret_value_at(&input[i..]) {
                 let len = real.len();
+                // Preserve the credential name so a redacted raw value stays
+                // redeemable by redeem_phantoms, like the nonce path above.
+                let name = self.credential_name_for_value(&real);
                 let new_nonce = self.issue_granted(real, grants);
+                if let Some(name) = name {
+                    self.nonce_names.insert(new_nonce.clone(), name);
+                }
                 out.extend_from_slice(new_nonce.as_bytes());
                 i += len;
                 continue;
@@ -273,6 +321,20 @@ impl TokenBroker {
             i = i.saturating_add(1);
         }
         out
+    }
+
+    /// Credential name for a raw `value`, via an existing nonce that carries it.
+    /// Uses `nonce_names` (which keeps every issued nonce's name) rather than
+    /// `named` (latest value per name only), so a historical/overwritten value
+    /// still relabels correctly. Ambiguous ties resolve to any match (same secret).
+    fn credential_name_for_value(&self, value: &[u8]) -> Option<String> {
+        self.map.iter().find_map(|(nonce, (v, _))| {
+            if v.as_slice() == value {
+                self.nonce_names.get(nonce).cloned()
+            } else {
+                None
+            }
+        })
     }
 
     /// If a known templated phantom starts at `offset` in `input`, return its
@@ -534,6 +596,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_nonce_for_credentials_gates_by_name() {
+        let mut broker = TokenBroker::new();
+        // GrantSet::All: the name allow-list, not the grant set, is the gate.
+        let dealership = broker.store_named(
+            "ddtool-token".to_string(),
+            b"real-dealership-jwt".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        let other = broker.store_named(
+            "orgstore".to_string(),
+            b"other-secret".to_vec(),
+            GrantSet::All,
+            None,
+        );
+
+        // Listed credential resolves.
+        let allowed = vec!["ddtool-token".to_string()];
+        let resolved = broker
+            .resolve_nonce_for_credentials(&dealership, &allowed)
+            .expect("listed credential must resolve");
+        assert_eq!(resolved.as_slice(), b"real-dealership-jwt");
+        // A phantom for a credential the route does not list fails closed.
+        assert!(
+            broker
+                .resolve_nonce_for_credentials(&other, &allowed)
+                .is_none()
+        );
+        // Empty allow-list never resolves.
+        assert!(
+            broker
+                .resolve_nonce_for_credentials(&dealership, &[])
+                .is_none()
+        );
+        // Non-nonce input fails closed.
+        assert!(
+            broker
+                .resolve_nonce_for_credentials("not-a-nonce", &allowed)
+                .is_none()
+        );
+        // An anonymous nonce (no credential name) never resolves route-side.
+        let anon = broker.issue(Zeroizing::new(b"anon".to_vec()));
+        assert!(
+            broker
+                .resolve_nonce_for_credentials(&anon, &allowed)
+                .is_none()
+        );
+    }
+
+    #[test]
     #[allow(clippy::unwrap_used)]
     fn templated_named_credential_follows_template_and_resolves() {
         let mut broker = TokenBroker::new();
@@ -588,6 +700,92 @@ mod tests {
                 .expect("reissued templated phantom resolves"),
             "Bearer real-oauth-token"
         );
+    }
+
+    #[test]
+    fn resolve_nonce_for_credentials_gates_by_name_not_value() {
+        // An earlier nonce must resolve to its own value even after a later
+        // store_named overwrites the name's value.
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["ddtool-token".to_string()];
+        let first = broker.store_named(
+            "ddtool-token".to_string(),
+            b"audience-A".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        // A later capture under the same name with a different value.
+        let second = broker.store_named(
+            "ddtool-token".to_string(),
+            b"audience-B".to_vec(),
+            GrantSet::All,
+            None,
+        );
+
+        let r1 = broker
+            .resolve_nonce_for_credentials(&first, &allowed)
+            .expect("first nonce resolves by name");
+        let r2 = broker
+            .resolve_nonce_for_credentials(&second, &allowed)
+            .expect("second nonce resolves by name");
+        assert_eq!(r1.as_slice(), b"audience-A");
+        assert_eq!(r2.as_slice(), b"audience-B");
+    }
+
+    #[test]
+    fn reissued_nonce_keeps_credential_name() {
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["ddtool-token".to_string()];
+        let original = broker.store_named(
+            "ddtool-token".to_string(),
+            b"jwt-value".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        let reissued_buf = broker.scan_and_reissue(original.as_bytes());
+        let reissued = std::str::from_utf8(&reissued_buf).expect("utf8 nonce");
+        assert_ne!(reissued, original, "reissue mints a fresh nonce");
+        let resolved = broker
+            .resolve_nonce_for_credentials(reissued, &allowed)
+            .expect("reissued nonce resolves by inherited name");
+        assert_eq!(resolved.as_slice(), b"jwt-value");
+    }
+
+    #[test]
+    fn reissued_raw_value_keeps_credential_name() {
+        // A raw credential value in captured stdout is redacted to a fresh
+        // nonce that stays redeemable by name — even for a historical value
+        // after store_named overwrote the name's current value.
+        let mut broker = TokenBroker::new();
+        let allowed = vec!["ddtool-token".to_string()];
+        broker.store_named(
+            "ddtool-token".to_string(),
+            b"audience-A".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        // Overwrite the name's current value with a newer audience.
+        broker.store_named(
+            "ddtool-token".to_string(),
+            b"audience-B".to_vec(),
+            GrantSet::All,
+            None,
+        );
+
+        let reissued_buf = broker.scan_and_reissue(b"prefix audience-A suffix");
+        let reissued = std::str::from_utf8(&reissued_buf).expect("utf8");
+        assert!(
+            !reissued.contains("audience-A"),
+            "historical raw value must be redacted"
+        );
+        let nonce = reissued
+            .split_whitespace()
+            .find(|w| find_bare_nonce(w) == Some((0, BARE_NONCE_LEN)))
+            .expect("a nonce replaced the raw value");
+        let resolved = broker
+            .resolve_nonce_for_credentials(nonce, &allowed)
+            .expect("historical raw value resolves by inherited name");
+        assert_eq!(resolved.as_slice(), b"audience-A");
     }
 
     #[test]

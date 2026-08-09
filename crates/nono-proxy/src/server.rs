@@ -177,8 +177,8 @@ fn strip_proxy_headers(header_bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Like [`strip_proxy_headers`], but also redeems any `nono_…` phantom nonce
-/// via `resolver`/`consumer`, fail-open per [`tls_intercept::handle::resolve_nonce_in_header_value`].
+/// Like [`strip_proxy_headers`], but also redeems any phantom nonce via
+/// `resolver`/`consumer`, fail-open per [`crate::token::NonceResolver::rewrite_header_value`].
 ///
 /// Returns the rewritten headers and whether a real credential was swapped in,
 /// so the audit event can distinguish an injected credential from a bare route
@@ -209,8 +209,7 @@ fn strip_and_redeem_proxy_headers(
             Some(v) => (v, "\r\n"),
             None => (rest, ""),
         };
-        match tls_intercept::handle::resolve_nonce_in_header_value(value.trim(), consumer, resolver)
-        {
+        match resolver.rewrite_header_value(value.trim(), consumer) {
             Some(resolved) => {
                 redeemed = true;
                 out.extend_from_slice(name.as_bytes());
@@ -911,6 +910,13 @@ impl crate::token::NonceResolver for CompositeNonceResolver {
             .as_ref()
             .and_then(|resolver| resolver.resolve(nonce, consumer))
             .or_else(|| self.oauth.resolve(nonce, consumer))
+    }
+
+    fn rewrite_header_value(&self, value: &str, consumer: &str) -> Option<String> {
+        self.external
+            .as_ref()
+            .and_then(|resolver| resolver.rewrite_header_value(value, consumer))
+            .or_else(|| self.oauth.rewrite_header_value(value, consumer))
     }
 }
 
@@ -2757,10 +2763,12 @@ mod tests {
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "access_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                         crate::config::OAuthTokenResponseFieldConfig {
                             path: "refresh_token".to_string(),
                             kind: crate::config::OAuthTokenResponseFieldKind::Opaque,
+                            format: None,
                         },
                     ],
                     request_body: crate::config::OAuthTokenRequestBodyFormat::Auto,

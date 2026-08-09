@@ -1260,7 +1260,7 @@ where
             .and_then(|consumer| {
                 ctx.nonce_resolver
                     .as_deref()
-                    .and_then(|resolver| resolve_nonce_in_header_value(value, consumer, resolver))
+                    .and_then(|resolver| resolver.rewrite_header_value(value, consumer))
             })
             .unwrap_or_else(|| value.clone());
         request.push_str(&format!("{}: {}\r\n", name, resolved_value));
@@ -1581,48 +1581,6 @@ where
         let _ = reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await;
     }
     Ok(())
-}
-
-/// Scan a header value for a tool-sandbox broker nonce (`nono_<64hex>`) and,
-/// if one is found and `resolver` admits `consumer`, return the header value
-/// with the nonce replaced by the real credential bytes (UTF-8).
-///
-/// Only the first nonce found is substituted. Non-UTF-8 real values are
-/// forwarded verbatim (fail-open for the substitution, not the request).
-/// If no nonce is found, or the resolver returns `None`, the original value
-/// is returned unchanged (fail-closed: the upstream sees the raw nonce and
-/// will reject the request, not a silently wrong credential).
-pub(crate) fn resolve_nonce_in_header_value(
-    value: &str,
-    consumer: &str,
-    resolver: &dyn crate::token::NonceResolver,
-) -> Option<String> {
-    const NONCE_PREFIX: &str = "nono_";
-    const NONCE_LEN: usize = 5 + 64; // "nono_" + 64 hex chars
-
-    let start = value.find(NONCE_PREFIX)?;
-    let end = start.checked_add(NONCE_LEN)?;
-    if end > value.len() {
-        return None;
-    }
-    let nonce = &value[start..end];
-    if !nonce[NONCE_PREFIX.len()..]
-        .bytes()
-        .all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let real = resolver.resolve(nonce, consumer)?;
-    let real_str = std::str::from_utf8(&real).ok()?;
-    // Resolved values are interpolated directly into a raw "name: value\r\n"
-    // request line at every call site. A resolved secret containing CR, LF,
-    // or NUL would allow request-splitting/header injection into the
-    // upstream request, so reject rather than substitute (fail closed, same
-    // as any other unresolvable nonce).
-    if real_str.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0)) {
-        return None;
-    }
-    Some(format!("{}{}{}", &value[..start], real_str, &value[end..]))
 }
 
 fn contains_phantom_nonce(value: &str) -> bool {
@@ -2131,7 +2089,7 @@ fn build_websocket_upstream_request(
             let resolver = nonce_resolver.ok_or_else(|| {
                 ProxyError::Credential("phantom nonce resolver is unavailable".to_string())
             })?;
-            resolve_nonce_in_header_value(&field.value, consumer, resolver).ok_or_else(|| {
+            resolver.rewrite_header_value(&field.value, consumer).ok_or_else(|| {
                 ProxyError::Credential(
                     "phantom nonce is invalid, expired, or not admitted for this route".to_string(),
                 )
@@ -2165,7 +2123,6 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use zeroize::Zeroizing;
 
     #[test]
     fn parse_request_line_extracts_components() {
@@ -2922,118 +2879,6 @@ mod tests {
         config.alpn_protocols = vec![b"h2".to_vec()];
         tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
     }
-
-    // --- resolve_nonce_in_header_value tests ---
-
-    struct TestResolver {
-        nonce: String,
-        real: Vec<u8>,
-        admitted_consumer: String,
-    }
-
-    impl crate::token::NonceResolver for TestResolver {
-        fn resolve(&self, nonce: &str, consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
-            if nonce == self.nonce && consumer == self.admitted_consumer {
-                Some(Zeroizing::new(self.real.clone()))
-            } else {
-                None
-            }
-        }
-    }
-
-    fn make_nonce() -> String {
-        format!("nono_{}", "a".repeat(64))
-    }
-
-    #[test]
-    fn resolves_bearer_nonce() {
-        let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"sk-ant-real".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
-        let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.anthropic", &resolver);
-        assert_eq!(result, Some("Bearer sk-ant-real".to_string()));
-    }
-
-    #[test]
-    fn returns_none_for_unadmitted_consumer() {
-        let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"sk-ant-real".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
-        let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.other", &resolver);
-        assert!(result.is_none(), "unadmitted consumer must not resolve");
-    }
-
-    #[test]
-    fn returns_none_when_no_nonce_present() {
-        let resolver = TestResolver {
-            nonce: make_nonce(),
-            real: b"secret".to_vec(),
-            admitted_consumer: "proxy.anthropic".to_string(),
-        };
-        let result =
-            resolve_nonce_in_header_value("Bearer plain-token", "proxy.anthropic", &resolver);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn detects_malformed_reserved_nonce_marker() {
-        assert!(contains_phantom_nonce("Bearer nono_too-short"));
-        assert!(!contains_phantom_nonce("Bearer ordinary-token"));
-    }
-
-    #[test]
-    fn rejects_resolved_value_containing_crlf() {
-        let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"evil\r\nX-Injected: yes".to_vec(),
-            admitted_consumer: "proxy.svc".to_string(),
-        };
-        let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
-        assert!(
-            result.is_none(),
-            "CRLF in resolved value must not substitute"
-        );
-    }
-
-    #[test]
-    fn rejects_resolved_value_containing_nul() {
-        let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"evil\0byte".to_vec(),
-            admitted_consumer: "proxy.svc".to_string(),
-        };
-        let value = format!("Bearer {nonce}");
-        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
-        assert!(
-            result.is_none(),
-            "NUL in resolved value must not substitute"
-        );
-    }
-
-    #[test]
-    fn preserves_prefix_and_suffix_around_nonce() {
-        let nonce = make_nonce();
-        let resolver = TestResolver {
-            nonce: nonce.clone(),
-            real: b"REAL".to_vec(),
-            admitted_consumer: "proxy.svc".to_string(),
-        };
-        let value = format!("prefix-{nonce}-suffix");
-        let result = resolve_nonce_in_header_value(&value, "proxy.svc", &resolver);
-        assert_eq!(result, Some("prefix-REAL-suffix".to_string()));
-    }
-
     #[test]
     fn websocket_request_rejects_nonce_for_wrong_consumer() {
         let nonce = make_nonce();

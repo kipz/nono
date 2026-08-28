@@ -420,10 +420,19 @@ fn is_locked_keychain_status(status: i32) -> bool {
     LOCKED_KEYCHAIN_STATUSES.contains(&status)
 }
 
+/// `errSecUserCanceled` — not re-exported by `security-framework-sys`. Surfaces
+/// when an existing entry's ACL predates the calling binary (e.g. after an
+/// upgrade): macOS shows an Allow/Deny prompt instead of reading silently, and
+/// a denied/dismissed prompt is indistinguishable from an unreadable entry.
+const ERR_SEC_USER_CANCELED: i32 = -128;
+
 /// How the load path should react to a `find_generic_password` OSStatus.
 #[derive(Debug, PartialEq, Eq)]
 enum LoadDisposition {
-    /// `errSecItemNotFound` — no entry has been persisted yet.
+    /// `errSecItemNotFound` — no entry has been persisted yet. Also
+    /// `errSecUserCanceled`: a denied/dismissed ACL prompt (stale ACL from a
+    /// prior binary) cannot be distinguished from an unreadable entry, so it
+    /// is treated the same as no entry.
     Empty,
     /// The keychain is locked or its nono-only ACL prompt cannot be presented
     /// (headless/SSH). The optional cache is unreadable this session; degrade
@@ -438,7 +447,7 @@ enum LoadDisposition {
 /// without a live keychain.
 fn classify_load_status(code: i32) -> LoadDisposition {
     use security_framework_sys::base::errSecItemNotFound;
-    if code == errSecItemNotFound {
+    if code == errSecItemNotFound || code == ERR_SEC_USER_CANCELED {
         LoadDisposition::Empty
     } else if is_locked_keychain_status(code) {
         LoadDisposition::Locked
@@ -606,12 +615,15 @@ mod tests {
         assert_eq!(classify_load_status(-25304), LoadDisposition::Locked);
         // No entry yet is a fresh, empty store.
         assert_eq!(classify_load_status(-25300), LoadDisposition::Empty);
+        // A denied/dismissed ACL prompt (stale ACL from a prior binary) is
+        // indistinguishable from an unreadable entry — treat as empty too.
+        assert_eq!(classify_load_status(-128), LoadDisposition::Empty);
         // A genuinely unexpected status still surfaces as a hard error.
         assert_eq!(classify_load_status(-1), LoadDisposition::Fatal);
 
         // Both recoverable dispositions keep startup alive (Ok in the caller);
         // only Fatal propagates.
-        for code in [-25308, -25293, -25304, -25300] {
+        for code in [-25308, -25293, -25304, -25300, -128] {
             assert_ne!(
                 classify_load_status(code),
                 LoadDisposition::Fatal,

@@ -825,6 +825,40 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
             ));
             current = parent.parent();
         }
+
+        // A $PATH dir reached through a multi-hop symlink needs metadata
+        // grants on the intermediate hops too, or the kernel denies EPERM
+        // (not ENOENT) dereferencing one, aborting the PATH walk.
+        for hop in collect_symlink_hops(dir) {
+            let Some(hop_str) = hop.to_str() else {
+                continue;
+            };
+            if !seen_dir.contains(hop_str) && seen_ancestor.insert(hop_str.to_string()) {
+                let escaped = escape_path(hop_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+            }
+            let mut current = hop.parent();
+            while let Some(parent) = current {
+                let Some(parent_str) = parent.to_str() else {
+                    break;
+                };
+                if parent_str == "/" || parent_str.is_empty() {
+                    break;
+                }
+                if seen_dir.contains(parent_str) || !seen_ancestor.insert(parent_str.to_string()) {
+                    break;
+                }
+                let escaped = escape_path(parent_str)?;
+                profile.push_str(&format!(
+                    "(allow file-read-metadata (literal \"{}\"))\n",
+                    escaped
+                ));
+                current = parent.parent();
+            }
+        }
     }
 
     // Network rules
@@ -1192,6 +1226,42 @@ mod tests {
         let profile = generate_profile(&caps).unwrap();
 
         assert!(profile.contains("(allow file-read-metadata (regex \"^/opt/homebrew/[^/]+$\"))"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_path_metadata_dir_through_multi_hop_symlink_grants_intermediate_hops() {
+        // Regression: a $PATH dir reached through a multi-hop symlink must
+        // get metadata grants on the intermediate hops, or the kernel denies
+        // EPERM (not ENOENT) dereferencing one, aborting the PATH walk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_bin = dir.path().join("real_bin");
+        std::fs::create_dir(&real_bin).expect("mkdir real_bin");
+        let hop1 = dir.path().join("hop1");
+        let hop2 = dir.path().join("hop2");
+        std::os::unix::fs::symlink(&real_bin, &hop2).expect("symlink hop2 -> real_bin");
+        std::os::unix::fs::symlink(&hop2, &hop1).expect("symlink hop1 -> hop2");
+
+        let mut caps = CapabilitySet::new();
+        caps.add_path_metadata_dir(hop1.clone());
+
+        let profile = generate_profile(&caps).unwrap();
+
+        let hop1_str = hop1.to_str().unwrap();
+        let hop2_str = hop2.to_str().unwrap();
+        assert!(
+            profile.contains(&format!(
+                "(allow file-read-metadata (literal \"{hop2_str}\"))"
+            )),
+            "intermediate hop hop2 missing metadata grant:\n{profile}"
+        );
+        assert!(
+            !profile.contains(&format!(
+                "(allow file-read-metadata (regex \"^{}/[^/]+$\"))",
+                regex_escape_path_for_seatbelt(hop2_str).unwrap()
+            )),
+            "intermediate hop must not get the direct-children regex, only the $PATH dir itself: {hop1_str}"
+        );
     }
 
     #[test]

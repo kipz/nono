@@ -9,6 +9,7 @@ use crate::capability::{
     AccessMode, CapabilitySet, MACOS_PORT_RANGE_LIMIT, NetworkMode, merge_port_ranges,
 };
 use crate::error::{NonoError, Result};
+use crate::path::collect_symlink_hops;
 use crate::sandbox::SupportInfo;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -185,6 +186,33 @@ pub fn support_info() -> SupportInfo {
 fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String> {
     let mut parents = std::collections::HashSet::new();
 
+    let insert_ancestors = |parents: &mut std::collections::HashSet<String>, path: &Path| {
+        let mut current = path.parent();
+        while let Some(parent) = current {
+            let parent_str = parent.to_string_lossy().to_string();
+
+            // Stop at root
+            if parent_str == "/" || parent_str.is_empty() {
+                break;
+            }
+
+            // If already present, ancestors were processed too - early exit
+            if !parents.insert(parent_str) {
+                break;
+            }
+            current = parent.parent();
+        }
+    };
+
+    // Intermediate hops need their own metadata grant, or the kernel
+    // denies access to them during dereference.
+    let grant_hops = |parents: &mut std::collections::HashSet<String>, original: &Path| {
+        for hop in collect_symlink_hops(original) {
+            insert_ancestors(parents, &hop);
+            parents.insert(hop.to_string_lossy().to_string());
+        }
+    };
+
     for cap in caps.fs_capabilities() {
         // Collect parents for both resolved and original paths.
         // On macOS, /tmp is a symlink to /private/tmp. If the user passes
@@ -197,22 +225,24 @@ fn collect_parent_dirs(caps: &CapabilitySet) -> std::collections::HashSet<String
         };
 
         for path in paths_to_walk {
-            let mut current = path.parent();
-            while let Some(parent) = current {
-                let parent_str = parent.to_string_lossy().to_string();
-
-                // Stop at root
-                if parent_str == "/" || parent_str.is_empty() {
-                    break;
-                }
-
-                // If already present, ancestors were processed too - early exit
-                if !parents.insert(parent_str) {
-                    break;
-                }
-                current = parent.parent();
-            }
+            insert_ancestors(&mut parents, path);
         }
+
+        grant_hops(&mut parents, &cap.original);
+    }
+
+    for cap in caps.unix_socket_capabilities() {
+        let paths_to_walk: Vec<&std::path::Path> = if cap.original != cap.resolved {
+            vec![cap.resolved.as_path(), cap.original.as_path()]
+        } else {
+            vec![cap.resolved.as_path()]
+        };
+
+        for path in paths_to_walk {
+            insert_ancestors(&mut parents, path);
+        }
+
+        grant_hops(&mut parents, &cap.original);
     }
 
     parents
@@ -1186,6 +1216,65 @@ mod tests {
 
         assert!(parents.contains("/Users"));
         assert!(parents.contains("/Users/test"));
+        assert!(!parents.contains("/"));
+    }
+
+    /// A symlinked leaf through a symlinked directory component:
+    /// `.gitconfig -> hosts/current/gitconfig -> hosts/mymac/gitconfig`.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_parent_dirs_grants_intermediate_symlink_hop() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_dir = dir.path().canonicalize().unwrap();
+
+        let hosts = canonical_dir.join("hosts");
+        let mymac = hosts.join("mymac");
+        std::fs::create_dir_all(&mymac).unwrap();
+        std::fs::write(mymac.join("gitconfig"), "[user]\n").unwrap();
+
+        let current = hosts.join("current");
+        std::os::unix::fs::symlink(&mymac, &current).unwrap();
+
+        let gitconfig_link = canonical_dir.join(".gitconfig");
+        std::os::unix::fs::symlink(current.join("gitconfig"), &gitconfig_link).unwrap();
+
+        let resolved = gitconfig_link.canonicalize().unwrap();
+
+        let mut caps = CapabilitySet::new();
+        caps.add_fs(FsCapability {
+            original: gitconfig_link,
+            resolved,
+            access: AccessMode::Read,
+            is_file: true,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains(&current.to_string_lossy().to_string()));
+
+        // Must not widen authority to a sibling under the same directory.
+        let sibling = hosts.join("other-host");
+        assert!(!parents.contains(&sibling.to_string_lossy().to_string()));
+    }
+
+    /// A single-hop socket symlink, to isolate `UnixSocketCapability`
+    /// ancestor grants from the multi-hop case tested above.
+    #[test]
+    fn test_collect_parent_dirs_grants_unix_socket_ancestors() {
+        let mut caps = CapabilitySet::new();
+        caps.add_unix_socket(crate::UnixSocketCapability {
+            original: PathBuf::from("/tmp/test.sock"),
+            resolved: PathBuf::from("/private/tmp/test.sock"),
+            scope: crate::SocketScope::File,
+            mode: crate::UnixSocketMode::Connect,
+            source: CapabilitySource::User,
+        });
+
+        let parents = collect_parent_dirs(&caps);
+
+        assert!(parents.contains("/private/tmp"));
+        assert!(parents.contains("/tmp"));
         assert!(!parents.contains("/"));
     }
 

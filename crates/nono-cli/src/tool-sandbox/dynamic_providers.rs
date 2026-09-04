@@ -108,7 +108,13 @@ pub(super) mod git {
         if raw.is_empty() {
             return None;
         }
-        let backlink = PathBuf::from(raw).canonicalize().ok()?;
+        let backlink_raw = PathBuf::from(raw);
+        let backlink_path = if backlink_raw.is_absolute() {
+            backlink_raw
+        } else {
+            canonical_candidate.join(backlink_raw)
+        };
+        let backlink = backlink_path.canonicalize().ok()?;
         let expected = dot_git.canonicalize().ok()?;
         (backlink == expected).then_some(canonical_candidate)
     }
@@ -1431,6 +1437,45 @@ global\tfile:/home/u/.gitconfig\tuser.name=Alice
             result.is_empty(),
             "must not resolve when the backlink names a different .git file, got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn git_read_fsmonitor_socket_accepts_gitdir_pointer_with_relative_backlink() {
+        // The private gitdir's own `gitdir` backlink file is resolved
+        // relative to the private gitdir itself, not the process cwd, so a
+        // valid relative backlink (as a real repository may write) must
+        // still verify.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&checkout).expect("mkdir checkout");
+        let private = tmp.path().join("repo/.git/worktrees/wt");
+        std::fs::create_dir_all(&private).expect("mkdir private gitdir");
+
+        std::fs::write(
+            checkout.join(".git"),
+            format!("gitdir: {}\n", private.display()),
+        )
+        .expect("write .git file");
+        // Relative from `private` (tmp/repo/.git/worktrees/wt) back up to
+        // `checkout/.git`.
+        std::fs::write(private.join("gitdir"), "../../../../checkout/.git\n")
+            .expect("write relative backlink");
+
+        let result = git::read_fsmonitor_socket_in(&checkout).expect("read_fsmonitor_socket");
+        assert_eq!(
+            result.len(),
+            1,
+            "a valid relative backlink must still resolve, got {:?}",
+            result
+        );
+        let socket = std::path::Path::new(&result[0]);
+        assert_eq!(
+            socket,
+            private
+                .canonicalize()
+                .expect("canonicalize")
+                .join("fsmonitor--daemon.ipc"),
         );
     }
 

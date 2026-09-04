@@ -3830,7 +3830,10 @@ fn add_policy_unix_sockets(
         .unwrap_or_else(|_| super::lexically_normalize(cwd));
     let write_access = |path: &Path| {
         let normalized = super::lexically_normalize(path);
-        if normalized.starts_with(&canonical_cwd)
+        // `normalized` is only lexically cleaned, not canonicalized, so it
+        // must be compared against both the raw and canonical cwd or a
+        // symlinked cwd bypasses the downgrade below.
+        if (normalized.starts_with(cwd) || normalized.starts_with(&canonical_cwd))
             && !super::agent_can_write(&normalized, policy_root, outer_caps, deny_paths)
         {
             AccessMode::Read
@@ -6894,6 +6897,53 @@ mod tests {
             AccessMode::Read,
             "socket under a cwd the agent cannot write must be downgraded to \
              Read even when cwd resolves through a symlink"
+        );
+        Ok(())
+    }
+
+    /// A literal (non-`@git:`) relative `unix_socket_bind` entry is resolved
+    /// against the raw `cwd`, so `normalized` is never canonicalized even
+    /// when `cwd` resolves through a symlink. The downgrade check must still
+    /// catch it by also comparing against the raw `cwd`.
+    #[test]
+    fn add_policy_unix_sockets_downgrades_to_read_for_literal_relative_socket_under_symlinked_cwd()
+    -> Result<()> {
+        let temp = test_tempdir()?;
+        let repo = temp.path().join("repo");
+        create_dir(&repo)?;
+
+        // policy_root (the agent's own --workdir) is a sibling of the repo,
+        // so the agent itself has no write authority under the repo.
+        let policy_root = temp.path().join("agent-workdir");
+        create_dir(&policy_root)?;
+
+        let policy = CommandSandboxConfig {
+            unix_socket_bind: vec!["my.sock".to_string()],
+            ..Default::default()
+        };
+        let outer_caps = CapabilitySet::new();
+        let mut caps = CapabilitySet::new();
+        // `repo` is passed raw (un-canonicalized), exactly as a real
+        // command's `cwd` would be.
+        add_policy_unix_sockets(&mut caps, &policy, &policy_root, &repo, &outer_caps, &[])?;
+
+        let canonical_repo =
+            repo.canonicalize()
+                .map_err(|source| NonoError::PathCanonicalization {
+                    path: repo.clone(),
+                    source,
+                })?;
+        let parent_grant = caps
+            .fs_capabilities()
+            .iter()
+            .find(|c| !c.is_file && c.resolved == canonical_repo)
+            .expect("implied parent-dir fs grant for the socket missing");
+        assert_eq!(
+            parent_grant.access,
+            AccessMode::Read,
+            "a literal relative socket path under a cwd the agent cannot \
+             write must be downgraded to Read even when cwd resolves \
+             through a symlink"
         );
         Ok(())
     }

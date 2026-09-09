@@ -167,6 +167,19 @@ impl OAuthCaptureStore {
                 None => {
                     if serde_json::from_slice::<Value>(body).is_ok() {
                         self.rewrite_json_response_body(endpoint, body)
+                    } else if looks_like_json(body) {
+                        // A body that opens like JSON but fails to parse is far
+                        // more likely truncated (e.g. from a peer closing
+                        // without TLS close_notify mid-response) than
+                        // genuinely form-urlencoded. `url::form_urlencoded`
+                        // accepts almost any bytes, so treating this as a form
+                        // body risks forwarding a real token still present in
+                        // the unparsed JSON text. Fail closed instead.
+                        Err(ProxyError::HttpParse(format!(
+                            "OAuth token response for provider '{}' looks like JSON but failed \
+                             to parse; refusing to reinterpret as form-urlencoded",
+                            endpoint.provider
+                        )))
                     } else {
                         self.rewrite_form_response_body(endpoint, body)
                     }
@@ -414,6 +427,16 @@ fn reject_unrewritten_token_fields_inner(
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `body` opens with a JSON container after leading whitespace, used
+/// to distinguish "truncated JSON" from "genuinely not JSON" when a strict
+/// parse has already failed.
+fn looks_like_json(body: &[u8]) -> bool {
+    matches!(
+        body.iter().find(|b| !b.is_ascii_whitespace()),
+        Some(b'{') | Some(b'[')
+    )
 }
 
 fn body_contains_token_field_marker(body: &[u8]) -> bool {
@@ -687,6 +710,28 @@ mod tests {
             b"error=invalid_request&error_description=missing+access_token&scope=read:access_token";
         let rewritten = store.rewrite_response_body(&endpoint, &[], body).unwrap();
         assert_eq!(rewritten, body);
+    }
+
+    #[test]
+    fn response_body_auto_rejects_truncated_json_instead_of_reinterpreting_as_form() {
+        // A JSON body truncated before any `=`/`&`-shaped delimiter appears
+        // (e.g. cut off mid-value) fails strict serde_json parsing. Without
+        // the looks_like_json guard, Auto-mode would silently fall back to
+        // form parsing, which folds the whole blob into one pair with an
+        // empty value that the form path's own scans skip entirely, letting
+        // the real token in the unparsed JSON text reach the client
+        // untouched. It must fail closed instead.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let body = br#"{"access_token":"real-access-token-value","token_typ"#;
+        let err = store
+            .rewrite_response_body(&endpoint, &[], body)
+            .expect_err("truncated JSON containing a real token must fail closed");
+        assert!(
+            err.to_string()
+                .contains("looks like JSON but failed to parse"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

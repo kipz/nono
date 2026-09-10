@@ -61,6 +61,23 @@ impl GrantSet {
 /// A stored phantom's real value and its redemption grants.
 type BrokerEntry = (Zeroizing<Vec<u8>>, GrantSet);
 
+/// How `store_named` treats a name that already has live phantoms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NamedValuePolicy {
+    /// Only one value is ever current for this name (ambient credentials:
+    /// there is exactly one real source, and every capture is a fresh read
+    /// of it). Storing a new value evicts every phantom previously issued
+    /// for the name, so a stale phantom can no longer resolve to a rotated
+    /// or expired value.
+    SingleActiveValue,
+    /// Multiple values may be concurrently live under the same name (e.g. a
+    /// credential captured once per audience). Older phantoms keep resolving
+    /// to the value they were issued for. No production call site uses this
+    /// today; it exists for callers that store more than one value per name.
+    #[allow(dead_code)]
+    MultipleConcurrentValues,
+}
+
 /// Holds real credential values in the supervisor's memory.
 /// All stored values are zeroed when the broker is dropped.
 pub(crate) struct TokenBroker {
@@ -130,12 +147,15 @@ impl TokenBroker {
     /// credential; `template`, when set, shapes every phantom issued for it.
     /// Never reissues a nonce over a previously captured value: each call is
     /// a fresh capture, so the credential source alone decides freshness.
+    /// `policy` decides what happens to phantoms already issued for `name`:
+    /// see [`NamedValuePolicy`].
     pub(crate) fn store_named(
         &mut self,
         name: String,
         value: Vec<u8>,
         grants: GrantSet,
         template: Option<PhantomTemplate>,
+        policy: NamedValuePolicy,
     ) -> String {
         if let Some(template) = &template
             && let Ok(real) = std::str::from_utf8(&value)
@@ -146,6 +166,18 @@ impl TokenBroker {
                 "ambient credential format does not match the captured token shape; \
                  a prefix-sniffing client may classify the phantom wrongly"
             );
+        }
+        if policy == NamedValuePolicy::SingleActiveValue {
+            let stale: Vec<String> = self
+                .phantom_names
+                .iter()
+                .filter(|(_, existing_name)| **existing_name == name)
+                .map(|(nonce, _)| nonce.clone())
+                .collect();
+            for nonce in stale {
+                self.map.remove(&nonce);
+                self.phantom_names.remove(&nonce);
+            }
         }
         let zeroized = Zeroizing::new(value);
         let nonce = self.issue_templated(zeroized, grants, template.as_ref());
@@ -574,6 +606,7 @@ mod tests {
             b"glpat-real".to_vec(),
             GrantSet::Specific(vec!["cmd.glab".to_string()]),
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         // Admitted
         assert!(broker.resolve_nonce(&n, "cmd.glab").is_some());
@@ -590,12 +623,14 @@ mod tests {
             b"real-partner-jwt".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         let other = broker.store_named(
             "orgstore".to_string(),
             b"other-secret".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         // Listed credential resolves.
@@ -641,6 +676,7 @@ mod tests {
             b"real-oauth-token".to_vec(),
             GrantSet::Specific(vec!["proxy.anthropic".to_string()]),
             Some(template),
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         // Visible phantom follows the template exactly: prefix + 64 hex, no marker.
@@ -687,6 +723,7 @@ mod tests {
             b"audience-A".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         // A later capture under the same name with a different value.
         let second = broker.store_named(
@@ -694,6 +731,7 @@ mod tests {
             b"audience-B".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         let r1 = broker
@@ -715,6 +753,7 @@ mod tests {
             b"jwt-value".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         let reissued_buf = broker.scan_and_reissue(original.as_bytes());
         let reissued = std::str::from_utf8(&reissued_buf).expect("utf8 phantom");
@@ -737,6 +776,7 @@ mod tests {
             b"audience-A".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         // Overwrite the name's current value with a newer audience.
         broker.store_named(
@@ -744,6 +784,7 @@ mod tests {
             b"audience-B".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         let reissued_buf = broker.scan_and_reissue(b"prefix audience-A suffix");
@@ -772,6 +813,7 @@ mod tests {
             b"real-oauth-token".to_vec(),
             GrantSet::Specific(vec!["proxy.anthropic".to_string()]),
             Some(template),
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         // A captured stdout line containing the templated phantom, mid-string.
@@ -814,6 +856,7 @@ mod tests {
             b"real-oauth-token".to_vec(),
             GrantSet::Specific(vec!["proxy.anthropic".to_string()]),
             Some(template),
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         let out = broker.scan_and_reissue(b"prefix real-oauth-token suffix");
@@ -848,6 +891,7 @@ mod tests {
             b"a-stored-secret-value-longer-than-any-bare-nonce-would-ever-be-here".to_vec(),
             GrantSet::All,
             Some(template),
+            NamedValuePolicy::MultipleConcurrentValues,
         );
 
         let reissued = broker.scan_and_reissue(phantom.as_bytes());
@@ -869,6 +913,7 @@ mod tests {
             b"unexpected-shape".to_vec(),
             GrantSet::All,
             Some(template),
+            NamedValuePolicy::MultipleConcurrentValues,
         );
         assert!(phantom.starts_with("sk-ant-oat01-"));
         assert_eq!(
@@ -887,6 +932,7 @@ mod tests {
             b"ghp_real".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::SingleActiveValue,
         );
         // Every capture is a fresh call to the real credential source; the
         // broker must not reissue a nonce over a previously stored value.
@@ -895,13 +941,37 @@ mod tests {
             b"ghp_rotated".to_vec(),
             GrantSet::All,
             None,
+            NamedValuePolicy::SingleActiveValue,
         );
         assert_ne!(first, second);
-        let first_resolved =
-            resolve_entry(&broker, format!("GH_TOKEN={first}").as_bytes(), "cmd.gh");
         let second_resolved =
             resolve_entry(&broker, format!("GH_TOKEN={second}").as_bytes(), "cmd.gh");
-        assert_eq!(first_resolved, b"GH_TOKEN=ghp_real");
         assert_eq!(second_resolved, b"GH_TOKEN=ghp_rotated");
+    }
+
+    #[test]
+    fn store_named_evicts_the_stale_phantom_for_the_same_name() {
+        let mut broker = TokenBroker::new();
+        let first = broker.store_named(
+            "github".to_string(),
+            b"ghp_real".to_vec(),
+            GrantSet::All,
+            None,
+            NamedValuePolicy::SingleActiveValue,
+        );
+        // A rotated capture must retire the old phantom: a caller that held
+        // onto it must not still be able to redeem the now-stale value.
+        broker.store_named(
+            "github".to_string(),
+            b"ghp_rotated".to_vec(),
+            GrantSet::All,
+            None,
+            NamedValuePolicy::SingleActiveValue,
+        );
+        assert_eq!(
+            broker.resolve_env_entry(format!("GH_TOKEN={first}").as_bytes(), "cmd.gh"),
+            None,
+            "the evicted phantom must no longer resolve"
+        );
     }
 }

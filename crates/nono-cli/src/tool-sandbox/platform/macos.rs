@@ -1464,7 +1464,13 @@ fn handle_shim_stream_inner(
                             "tool-sandbox token broker lock poisoned".to_string(),
                         )
                     })?;
-                    broker.store_named(credential.clone(), captured, grants.clone(), template)
+                    broker.store_named(
+                        credential.clone(),
+                        captured,
+                        grants.clone(),
+                        template,
+                        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
+                    )
                 };
                 record_command_policy_audit(
                     audit_recorder.as_ref(),
@@ -4246,6 +4252,7 @@ fn issue_existing_ambient_credential_nonce(
         value,
         grants,
         template,
+        crate::tool_sandbox::token_broker::NamedValuePolicy::SingleActiveValue,
     )))
 }
 

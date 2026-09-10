@@ -61,14 +61,10 @@ impl GrantSet {
 /// A stored phantom's real value and its redemption grants.
 type BrokerEntry = (Zeroizing<Vec<u8>>, GrantSet);
 
-/// A named credential's value, grants, and optional visible-phantom template.
-type NamedEntry = (Zeroizing<Vec<u8>>, GrantSet, Option<PhantomTemplate>);
-
 /// Holds real credential values in the supervisor's memory.
 /// All stored values are zeroed when the broker is dropped.
 pub(crate) struct TokenBroker {
     map: std::collections::HashMap<String, BrokerEntry>,
-    named: std::collections::HashMap<String, NamedEntry>,
     /// Phantom → credential name (named credentials only). Gate by name, not
     /// value: one name (e.g. `partner-token`) holds different per-audience values.
     phantom_names: std::collections::HashMap<String, String>,
@@ -81,7 +77,6 @@ impl TokenBroker {
     pub(crate) fn new() -> Self {
         Self {
             map: std::collections::HashMap::new(),
-            named: std::collections::HashMap::new(),
             phantom_names: std::collections::HashMap::new(),
             templates: Vec::new(),
         }
@@ -129,10 +124,12 @@ impl TokenBroker {
         phantom
     }
 
-    /// Store or replace a named supervisor credential and issue a nonce for it.
+    /// Store a named supervisor credential and issue a nonce for it.
     ///
     /// `grants` scopes which consumers may redeem phantoms issued for this
     /// credential; `template`, when set, shapes every phantom issued for it.
+    /// Never reissues a nonce over a previously captured value: each call is
+    /// a fresh capture, so the credential source alone decides freshness.
     pub(crate) fn store_named(
         &mut self,
         name: String,
@@ -151,27 +148,9 @@ impl TokenBroker {
             );
         }
         let zeroized = Zeroizing::new(value);
-        self.named.insert(
-            name.clone(),
-            (zeroized.clone(), grants.clone(), template.clone()),
-        );
         let nonce = self.issue_templated(zeroized, grants, template.as_ref());
         self.phantom_names.insert(nonce.clone(), name);
         nonce
-    }
-
-    /// Issue a fresh nonce for a previously stored named supervisor credential.
-    ///
-    /// The new phantom inherits the grant set and template from the stored
-    /// credential. Returns `None` if the credential is not registered.
-    pub(crate) fn issue_named(&mut self, name: &str) -> Option<String> {
-        let (value, grants, template) = self.named.get(name)?;
-        let value = value.clone();
-        let grants = grants.clone();
-        let template = template.clone();
-        let nonce = self.issue_templated(value, grants, template.as_ref());
-        self.phantom_names.insert(nonce.clone(), name.to_string());
-        Some(nonce)
     }
 
     /// If `env_entry` has the form `NAME=nono_<64hex>` and the nonce is known to
@@ -454,29 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn named_credential_issues_fresh_resolvable_nonces() {
-        let mut broker = TokenBroker::new();
-        let first = broker.store_named(
-            "github".to_string(),
-            b"ghp_real".to_vec(),
-            GrantSet::All,
-            None,
-        );
-        let second = match broker.issue_named("github") {
-            Some(value) => value,
-            None => panic!("named credential must issue nonce"),
-        };
-
-        assert_ne!(first, second, "named credential should issue fresh nonces");
-        let first_resolved =
-            resolve_entry(&broker, format!("GH_TOKEN={first}").as_bytes(), "cmd.gh");
-        let second_resolved =
-            resolve_entry(&broker, format!("GH_TOKEN={second}").as_bytes(), "cmd.gh");
-        assert_eq!(first_resolved, b"GH_TOKEN=ghp_real");
-        assert_eq!(second_resolved, b"GH_TOKEN=ghp_real");
-    }
-
-    #[test]
     fn resolve_non_nonce_returns_none() {
         let broker = TokenBroker::new();
         let entry = b"MY_VAR=plain_value".to_vec();
@@ -623,12 +579,6 @@ mod tests {
         assert!(broker.resolve_nonce(&n, "cmd.glab").is_some());
         // Not admitted
         assert!(broker.resolve_nonce(&n, "cmd.curl").is_none());
-        // issue_named inherits grants
-        let n2 = broker
-            .issue_named("gitlab")
-            .expect("stored gitlab credential should be available");
-        assert!(broker.resolve_nonce(&n2, "cmd.glab").is_some());
-        assert!(broker.resolve_nonce(&n2, "cmd.curl").is_none());
     }
 
     #[test]
@@ -723,18 +673,6 @@ mod tests {
         assert!(
             broker.resolve_env_entry(&entry, "proxy.other").is_none(),
             "unadmitted consumer must not resolve templated env entry"
-        );
-
-        // A fresh phantom for the same named credential reuses the template and
-        // resolves to the same real value.
-        let phantom2 = broker.issue_named("anthropic").unwrap();
-        assert!(phantom2.starts_with("sk-ant-oat01-"));
-        assert_ne!(phantom, phantom2);
-        assert_eq!(
-            broker
-                .rewrite_header_value(&format!("Bearer {phantom2}"), "proxy.anthropic")
-                .expect("reissued templated phantom resolves"),
-            "Bearer real-oauth-token"
         );
     }
 
@@ -939,5 +877,31 @@ mod tests {
                 .expect("resolves despite drift"),
             "Bearer unexpected-shape"
         );
+    }
+
+    #[test]
+    fn store_named_always_issues_fresh_nonce_without_caching_invocation() {
+        let mut broker = TokenBroker::new();
+        let first = broker.store_named(
+            "github".to_string(),
+            b"ghp_real".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        // Every capture is a fresh call to the real credential source; the
+        // broker must not reissue a nonce over a previously stored value.
+        let second = broker.store_named(
+            "github".to_string(),
+            b"ghp_rotated".to_vec(),
+            GrantSet::All,
+            None,
+        );
+        assert_ne!(first, second);
+        let first_resolved =
+            resolve_entry(&broker, format!("GH_TOKEN={first}").as_bytes(), "cmd.gh");
+        let second_resolved =
+            resolve_entry(&broker, format!("GH_TOKEN={second}").as_bytes(), "cmd.gh");
+        assert_eq!(first_resolved, b"GH_TOKEN=ghp_real");
+        assert_eq!(second_resolved, b"GH_TOKEN=ghp_rotated");
     }
 }

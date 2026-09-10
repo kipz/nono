@@ -1567,7 +1567,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         let claude_dir = home_path.join(".claude");
         if let Err(error) = std::fs::create_dir_all(&claude_dir) {
             warn!("Failed to create ~/.claude: {error}");
-        } else if !std::env::var_os("CLAUDE_CONFIG_DIR").is_some() {
+        } else if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
             profile_set_vars.get_or_insert_with(Vec::new).push((
                 "CLAUDE_CONFIG_DIR".to_string(),
                 claude_dir.to_string_lossy().into_owned(),

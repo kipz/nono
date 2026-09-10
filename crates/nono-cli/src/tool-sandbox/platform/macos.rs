@@ -4224,20 +4224,13 @@ fn join_relay_thread(
     })?
 }
 
+/// Re-derives a nonce by re-reading `credential`'s statically configured
+/// source; `None` means it has none, so the caller re-runs the capture.
 fn issue_existing_ambient_credential_nonce(
     state: &ToolSandboxState,
     credential: &str,
     grants: crate::tool_sandbox::token_broker::GrantSet,
 ) -> Result<Option<String>> {
-    {
-        let mut broker = state.token_broker.lock().map_err(|_| {
-            NonoError::SandboxInit("tool-sandbox token broker lock poisoned".to_string())
-        })?;
-        if let Some(nonce) = broker.issue_named(credential) {
-            return Ok(Some(nonce));
-        }
-    }
-
     let Some(value) = load_ambient_credential_source(state, credential)? else {
         return Ok(None);
     };

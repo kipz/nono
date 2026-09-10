@@ -1848,10 +1848,12 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // sandbox (see derive_oauth_capture_security_mediation).
     // `credential_providers` are OAuth-capture providers (the only provider
     // type today), so a non-empty map means OAuth capture is enabled.
-    let oauth_capture_keychain_active = cfg!(target_os = "macos")
-        && !profile_credential_providers.is_empty()
-        && profile_oauth_capture_store_backend
-            != nono_proxy::config::OAuthCaptureStoreBackend::File;
+    // Shared with the stale-plaintext-store warning so the mediation and the
+    // warning can never disagree about which backend is live.
+    let oauth_capture_keychain_active = crate::oauth_capture_legacy::keychain_backend_active(
+        profile_credential_providers.len(),
+        profile_oauth_capture_store_backend,
+    );
     crate::command_policy::derive_oauth_capture_security_mediation(
         &mut command_policies,
         oauth_capture_keychain_active,
@@ -1923,6 +1925,31 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     use tempfile::tempdir;
+
+    /// `oauth_capture_keychain_active` was an inline expression before the
+    /// stale-store warning needed the same condition. Pin the extraction as
+    /// behaviour-preserving: the derived `security` mediation and the warning
+    /// must never disagree about which backend is live.
+    #[test]
+    fn keychain_backend_predicate_matches_the_inline_expression() {
+        use nono_proxy::config::OAuthCaptureStoreBackend as Backend;
+
+        for (providers, backend) in [
+            (0usize, Backend::Auto),
+            (0, Backend::File),
+            (0, Backend::Keychain),
+            (1, Backend::Auto),
+            (1, Backend::File),
+            (1, Backend::Keychain),
+        ] {
+            let inline = cfg!(target_os = "macos") && providers > 0 && backend != Backend::File;
+            assert_eq!(
+                crate::oauth_capture_legacy::keychain_backend_active(providers, backend),
+                inline,
+                "providers={providers} backend={backend:?}"
+            );
+        }
+    }
 
     /// `check_writable_path_dirs` reads real PATH, so these mutate it under
     /// the shared env lock rather than mocking — mirrors the pattern used

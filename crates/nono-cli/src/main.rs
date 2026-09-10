@@ -41,6 +41,7 @@ mod lineage_cgroup;
 mod macos_trust;
 mod migration;
 mod network_policy;
+mod oauth_capture_legacy;
 mod open_url_runtime;
 mod output;
 mod pack_update_hint;

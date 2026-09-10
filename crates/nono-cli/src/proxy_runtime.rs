@@ -2498,11 +2498,8 @@ pub(crate) fn build_proxy_config_from_flags(
         // ignores this path and persists to the Keychain instead — it's
         // used only as the "persistence enabled" signal there. Non-macOS
         // platforms still read/write this exact file.
-        proxy_config.oauth_capture_store_path = Some(
-            crate::state_paths::user_state_dir()?
-                .join("oauth-capture")
-                .join("providers.json"),
-        );
+        proxy_config.oauth_capture_store_path =
+            Some(crate::state_paths::oauth_capture_store_path()?);
         proxy_config.oauth_capture_store_backend = proxy.oauth_capture_store_backend;
     }
 

@@ -764,11 +764,59 @@ For an SSO profile, run `aws sso login --profile <name>` outside the sandbox fir
 Do not grant the command sandbox access to `~/.aws`.
 
 `aws_auth` is valid only on `proxy` credentials and cannot be combined with
-`credential_key` or `source`. As with every command-scoped proxy credential, each
+`credential_key`, `source`, or `redeem_phantoms`. As with every command-scoped proxy credential, each
 grant must include an `endpoint_policy`. See
 [AWS SigV4 Signing](/cli/features/credential-injection#aws-sigv4-signing) for the
 profile, region, service, and credential-resolution behavior shared with
 session-level routes.
+
+### Redeeming caller-presented phantoms
+
+A mediated command's scoped proxy carries only the proxy credentials its selected
+sandbox is granted. Session-level `network.custom_credentials` routes are not
+present there. When a command presents a broker phantom itself, for example a CLI
+that stored the nonce returned by a `capture_credential` intercept in its own
+config and sends it as `Authorization: token nono_<hex>`, grant it a `proxy`
+credential with `redeem_phantoms`. The scoped route then swaps a presented phantom
+for the real value when the phantom's credential name is in the list. This is the
+same by-value redemption as `redeem_phantoms` on a session-level custom credential.
+
+```json
+{
+  "command_policies": {
+    "credentials": {
+      "partner-token": { "type": "ambient" },
+      "partner-api": {
+        "type": "proxy",
+        "upstream": "https://api.partner.example",
+        "redeem_phantoms": ["partner-token"]
+      }
+    },
+    "commands": {
+      "partner-cli": {
+        "sandbox": {
+          "credentials": [
+            {
+              "name": "partner-api",
+              "endpoint_policy": {
+                "default": "deny",
+                "allow": [{ "method": "GET", "path": "/v1/**" }]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+A credential with `redeem_phantoms` and no `credential_key` or `source` is
+redeem-only. It holds no secret of its own and mints no phantom, so it must not set
+`env_var`. `redeem_phantoms` may also be combined with `credential_key` or `source`,
+in which case `env_var` is still required for the route's own phantom. It cannot be
+combined with `aws_auth`. Names must match `[A-Za-z0-9._+-]`. Commands that are not
+granted the credential get no route, so a phantom they send is forwarded unchanged.
 
 ### Shaping an ambient credential's phantom
 

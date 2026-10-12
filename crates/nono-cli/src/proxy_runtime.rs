@@ -1882,6 +1882,19 @@ fn collect_tool_sandbox_proxy_grants(
             ))
         })?;
         let env_var = credential.env_var.clone();
+        let redeem_only = credential.is_redeem_only_proxy();
+        if redeem_only && env_var.is_some() {
+            return Err(NonoError::ConfigParse(format!(
+                "command sandbox proxy credential '{}' only redeems caller phantoms and cannot define env_var",
+                grant.name
+            )));
+        }
+        if !credential.redeem_phantoms.is_empty() && credential.aws_auth.is_some() {
+            return Err(NonoError::ConfigParse(format!(
+                "command sandbox proxy credential '{}' cannot combine redeem_phantoms with aws_auth",
+                grant.name
+            )));
+        }
         if let Some(env_var) = &env_var {
             nono::validate_destination_env_var(env_var).map_err(|err| {
                 NonoError::ConfigParse(format!(
@@ -1889,7 +1902,7 @@ fn collect_tool_sandbox_proxy_grants(
                     grant.name
                 ))
             })?;
-        } else if credential.aws_auth.is_none() {
+        } else if credential.aws_auth.is_none() && !redeem_only {
             return Err(NonoError::ConfigParse(format!(
                 "command sandbox proxy credential '{}' missing env_var",
                 grant.name
@@ -1914,7 +1927,7 @@ fn collect_tool_sandbox_proxy_grants(
         };
 
         let route = crate::profile::CustomCredentialDef {
-            redeem_phantoms: Vec::new(),
+            redeem_phantoms: credential.redeem_phantoms.clone(),
             upstream,
             credential_key,
             auth: None,
@@ -3497,7 +3510,7 @@ fn tool_sandbox_proxy_credential_env_vars(
                 ))
             })?;
         env_vars.push((env_var.clone(), token_value));
-    } else if route.aws_auth.is_none() {
+    } else if route.aws_auth.is_none() && !is_redeem_only_route(route) {
         return Err(NonoError::ConfigParse(format!(
             "command sandbox proxy credential '{credential_name}' missing env_var"
         )));
@@ -3509,6 +3522,16 @@ fn tool_sandbox_proxy_credential_env_vars(
         ));
     }
     Ok(env_vars)
+}
+
+/// A route that holds no credential of its own and only redeems caller phantoms,
+/// so the proxy mints no phantom for it and there is no env_var to deliver.
+fn is_redeem_only_route(route: &nono_proxy::config::RouteConfig) -> bool {
+    !route.redeem_phantoms.is_empty()
+        && route.credential_key.is_none()
+        && route.oauth2.is_none()
+        && route.aws_auth.is_none()
+        && route.spiffe.is_none()
 }
 
 /// Choose the directory the proxy will write the TLS-intercept trust bundle
@@ -4796,6 +4819,380 @@ mod tests {
             tool_sandbox_proxy_credential_env_vars(&proxy, &proxy_config, &[], 7777, "bedrock")?;
 
         assert!(vars.is_empty());
+        Ok(())
+    }
+
+    fn allow_all_get_policy() -> EndpointPolicyConfig {
+        EndpointPolicyConfig {
+            default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
+            allow: vec![EndpointRuleConfig {
+                method: "GET".to_string(),
+                path: "/**".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            ..EndpointPolicyConfig::default()
+        }
+    }
+
+    fn policies_granting(
+        credential: CommandCredentialConfig,
+        network: Option<CommandNetworkConfig>,
+    ) -> CommandPoliciesConfig {
+        let mut policies = CommandPoliciesConfig::default();
+        policies
+            .credentials
+            .insert("partner-api".to_string(), credential);
+        policies.commands.insert(
+            "partner-cli".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    network,
+                    credentials: vec![CommandCredentialGrantConfig::Policy(
+                        CommandCredentialGrantPolicyConfig {
+                            name: "partner-api".to_string(),
+                            endpoint_policy: Some(allow_all_get_policy()),
+                        },
+                    )],
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+        policies
+    }
+
+    type CollectedRoutes = (
+        Vec<String>,
+        HashMap<String, crate::profile::CustomCredentialDef>,
+        HashSet<String>,
+    );
+
+    fn collect_routes(policies: &CommandPoliciesConfig) -> Result<CollectedRoutes> {
+        let mut credentials = Vec::new();
+        let mut custom_credentials = HashMap::new();
+        let mut proxy_source_env_vars = HashMap::new();
+        let mut base_url_env_vars = HashMap::new();
+        let mut tool_sandbox_proxy_credentials = HashSet::new();
+        extend_proxy_settings_with_tool_sandbox_credentials(
+            Some(policies),
+            &nono::CapabilitySet::default(),
+            &mut credentials,
+            &mut custom_credentials,
+            &mut proxy_source_env_vars,
+            &mut base_url_env_vars,
+            &mut tool_sandbox_proxy_credentials,
+        )?;
+        Ok((
+            credentials,
+            custom_credentials,
+            tool_sandbox_proxy_credentials,
+        ))
+    }
+
+    #[test]
+    fn tool_sandbox_redeem_only_route_carries_redeem_list_without_env_var() -> Result<()> {
+        let policies = policies_granting(
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.partner.example".to_string()),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..CommandCredentialConfig::default()
+            },
+            None,
+        );
+
+        let (credentials, custom_credentials, scoped) = collect_routes(&policies)?;
+
+        assert_eq!(credentials, ["partner-api".to_string()]);
+        assert!(scoped.contains("partner-api"));
+        let route = custom_credentials
+            .get("partner-api")
+            .ok_or_else(|| NonoError::ConfigParse("missing partner-api route".to_string()))?;
+        assert_eq!(route.redeem_phantoms, ["partner-token".to_string()]);
+        assert!(route.credential_key.is_none());
+        assert!(route.env_var.is_none());
+        assert!(route.endpoint_policy.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_redeem_phantoms_compose_with_credential_key() -> Result<()> {
+        let policies = policies_granting(
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.partner.example".to_string()),
+                credential_key: Some("partner-managed".to_string()),
+                env_var: Some("PARTNER_TOKEN".to_string()),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..CommandCredentialConfig::default()
+            },
+            None,
+        );
+
+        let (_, custom_credentials, _) = collect_routes(&policies)?;
+
+        let route = custom_credentials
+            .get("partner-api")
+            .ok_or_else(|| NonoError::ConfigParse("missing partner-api route".to_string()))?;
+        assert_eq!(route.redeem_phantoms, ["partner-token".to_string()]);
+        assert_eq!(route.credential_key.as_deref(), Some("partner-managed"));
+        assert_eq!(route.env_var.as_deref(), Some("PARTNER_TOKEN"));
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_redeem_only_route_rejects_env_var() -> Result<()> {
+        let policies = policies_granting(
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://api.partner.example".to_string()),
+                env_var: Some("PARTNER_TOKEN".to_string()),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..CommandCredentialConfig::default()
+            },
+            None,
+        );
+
+        let err = collect_routes(&policies)
+            .err()
+            .ok_or_else(|| NonoError::ConfigParse("expected env_var rejection".to_string()))?;
+        assert!(err.to_string().contains("cannot define env_var"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_redeem_phantoms_with_aws_auth_rejected() -> Result<()> {
+        let policies = policies_granting(
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some("https://bedrock-runtime.us-east-1.amazonaws.com".to_string()),
+                aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..CommandCredentialConfig::default()
+            },
+            None,
+        );
+
+        let err = collect_routes(&policies)
+            .err()
+            .ok_or_else(|| NonoError::ConfigParse("expected aws_auth rejection".to_string()))?;
+        assert!(err.to_string().contains("redeem_phantoms"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn tool_sandbox_redeem_only_env_vars_allow_missing_route_env_var() -> Result<()> {
+        let proxy = ProxyLaunchOptions::default();
+        let mut proxy_config = nono_proxy::config::ProxyConfig::default();
+        proxy_config.routes.push(nono_proxy::config::RouteConfig {
+            prefix: "partner-api".to_string(),
+            upstream: "https://api.partner.example".to_string(),
+            redeem_phantoms: vec!["partner-token".to_string()],
+            ..nono_proxy::config::RouteConfig::default()
+        });
+
+        let vars = tool_sandbox_proxy_credential_env_vars(
+            &proxy,
+            &proxy_config,
+            &[],
+            7777,
+            "partner-api",
+        )?;
+        assert!(vars.is_empty());
+
+        // A credential_key route without env_var still mints a phantom, so it
+        // must keep failing closed.
+        proxy_config.routes[0].credential_key = Some("partner-managed".to_string());
+        assert!(
+            tool_sandbox_proxy_credential_env_vars(
+                &proxy,
+                &proxy_config,
+                &[],
+                7777,
+                "partner-api",
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    fn test_io_err(err: std::io::Error) -> NonoError {
+        NonoError::ConfigParse(err.to_string())
+    }
+
+    const TEST_PHANTOM: &str =
+        "nono_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    /// Admits the test phantom only by credential name, never via the grant set,
+    /// so a swap proves the route's `redeem_phantoms` authorized it.
+    struct NameOnlyResolver;
+
+    impl nono_proxy::NonceResolver for NameOnlyResolver {
+        fn resolve(&self, _nonce: &str, _consumer: &str) -> Option<Zeroizing<Vec<u8>>> {
+            None
+        }
+
+        fn resolve_for_credentials(
+            &self,
+            nonce: &str,
+            allowed_credentials: &[String],
+        ) -> Option<Zeroizing<Vec<u8>>> {
+            (nonce == TEST_PHANTOM && allowed_credentials.iter().any(|n| n == "partner-token"))
+                .then(|| Zeroizing::new(b"real-secret".to_vec()))
+        }
+    }
+
+    /// One-shot HTTP origin that returns the raw request it received.
+    fn spawn_recording_origin() -> Result<(u16, std::sync::mpsc::Receiver<String>)> {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(test_io_err)?;
+        let port = listener.local_addr().map_err(test_io_err)?.port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+                let _ = sock.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        Ok((port, rx))
+    }
+
+    /// Send an absolute-form request carrying the phantom through the scope's
+    /// proxy, as a CLI with `HTTP_PROXY` set would, and return what the origin saw.
+    fn send_phantom_through_scope(
+        scope_env: &[(String, String)],
+        origin_port: u16,
+        origin_rx: &std::sync::mpsc::Receiver<String>,
+    ) -> Result<String> {
+        use base64::Engine as _;
+        use std::io::{Read as _, Write as _};
+        let proxy_url = scope_env
+            .iter()
+            .find_map(|(k, v)| (k == "HTTP_PROXY").then_some(v.as_str()))
+            .ok_or_else(|| NonoError::ConfigParse("scope HTTP_PROXY missing".to_string()))?;
+        let (userinfo, host_port) = proxy_url
+            .trim_start_matches("http://")
+            .split_once('@')
+            .ok_or_else(|| NonoError::ConfigParse("malformed HTTP_PROXY".to_string()))?;
+        let mut stream = std::net::TcpStream::connect(host_port).map_err(test_io_err)?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(test_io_err)?;
+        let creds = base64::engine::general_purpose::STANDARD.encode(userinfo);
+        let request = format!(
+            "GET http://127.0.0.1:{origin_port}/data HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nProxy-Authorization: Basic {creds}\r\nAuthorization: token {TEST_PHANTOM}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).map_err(test_io_err)?;
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response);
+        let response = String::from_utf8_lossy(&response);
+        if !response.starts_with("HTTP/1.1 200") {
+            return Err(NonoError::ConfigParse(format!(
+                "expected upstream 200 through scoped proxy, got: {response}"
+            )));
+        }
+        origin_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| NonoError::ConfigParse(format!("origin saw no request: {e}")))
+    }
+
+    fn scoped_proxy_launch_options(policies: CommandPoliciesConfig) -> Result<ProxyLaunchOptions> {
+        let (credentials, custom_credentials, tool_sandbox_proxy_credentials) =
+            collect_routes(&policies)?;
+        Ok(ProxyLaunchOptions {
+            credentials: Some(CredentialProxyIntent {
+                credentials,
+                custom_credentials,
+                endpoint_restrictions: Vec::new(),
+            }),
+            command_policies: Some(policies),
+            tool_sandbox_proxy_credentials,
+            ..ProxyLaunchOptions::default()
+        })
+    }
+
+    #[test]
+    fn scoped_proxy_redeems_phantom_only_for_granted_command() -> Result<()> {
+        let (origin_port, origin_rx) = spawn_recording_origin()?;
+        let loopback = Some(CommandNetworkConfig {
+            allow_domain: vec!["127.0.0.1".to_string()],
+            ..CommandNetworkConfig::default()
+        });
+        let mut policies = policies_granting(
+            CommandCredentialConfig {
+                credential_type: CommandCredentialType::Proxy,
+                upstream: Some(format!("http://127.0.0.1:{origin_port}")),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..CommandCredentialConfig::default()
+            },
+            loopback.clone(),
+        );
+        // Same network reach, no credential grant: its scoped proxy has no route.
+        policies.commands.insert(
+            "other-cli".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    network: loopback,
+                    ..CommandSandboxConfig::default()
+                }),
+                ..CommandPolicyConfig::default()
+            },
+        );
+        let proxy = scoped_proxy_launch_options(policies)?;
+        let base = build_proxy_config_from_flags(&proxy)?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(test_io_err)?;
+        let (envs, handles) = start_command_scoped_proxies(
+            &proxy,
+            &base,
+            &rt,
+            None,
+            None,
+            Some(Arc::new(NameOnlyResolver)),
+        )?;
+
+        let granted = envs
+            .get(&crate::tool_sandbox::proxy_scope_key(
+                "partner-cli",
+                "session",
+                None,
+            ))
+            .ok_or_else(|| NonoError::ConfigParse("granted scope missing".to_string()))?;
+        let received = send_phantom_through_scope(granted, origin_port, &origin_rx)?;
+        assert!(
+            received.contains("Authorization: token real-secret"),
+            "granted scope must redeem the phantom: {received:?}"
+        );
+        assert!(!received.contains(TEST_PHANTOM), "{received:?}");
+
+        let (origin_port, origin_rx) = spawn_recording_origin()?;
+        let ungranted = envs
+            .get(&crate::tool_sandbox::proxy_scope_key(
+                "other-cli",
+                "session",
+                None,
+            ))
+            .ok_or_else(|| NonoError::ConfigParse("ungranted scope missing".to_string()))?;
+        let received = send_phantom_through_scope(ungranted, origin_port, &origin_rx)?;
+        assert!(
+            received.contains(&format!("Authorization: token {TEST_PHANTOM}")),
+            "ungranted scope must not redeem the phantom: {received:?}"
+        );
+        assert!(!received.contains("real-secret"), "{received:?}");
+
+        for handle in handles {
+            handle.shutdown();
+        }
         Ok(())
     }
 

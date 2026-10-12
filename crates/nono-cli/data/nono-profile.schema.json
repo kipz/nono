@@ -1661,7 +1661,7 @@
         },
         "env_var": {
           "type": "string",
-          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for ordinary proxy credentials this receives the phantom token. Optional for aws_auth proxy credentials, which sign requests host-side without delivering a credential variable."
+          "description": "Environment variable mapped into the child. For local-socket this receives the resolved socket path; for ordinary proxy credentials this receives the phantom token. Optional for aws_auth proxy credentials, which sign requests host-side without delivering a credential variable. Not allowed on redeem-only proxy credentials (redeem_phantoms without source or credential_key)."
         },
         "upstream": {
           "type": "string",
@@ -1708,7 +1708,13 @@
             { "$ref": "#/$defs/AwsAuthConfig" },
             { "type": "null" }
           ],
-          "description": "Optional AWS SigV4 signing configuration for proxy credentials. Mutually exclusive with source and credential_key. Does not require env_var."
+          "description": "Optional AWS SigV4 signing configuration for proxy credentials. Mutually exclusive with source, credential_key, and redeem_phantoms. Does not require env_var."
+        },
+        "redeem_phantoms": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z0-9._+-]+$" },
+          "default": [],
+          "description": "Proxy credentials only. Broker credential names whose caller-presented phantoms the command's scoped proxy route resolves from request headers, with the same meaning as network.custom_credentials redeem_phantoms: a presented phantom resolves only if its credential name is in this list. May stand alone (a redeem-only route, which must not set env_var because it mints no phantom) or combine with source/credential_key (env_var still required). Cannot combine with aws_auth."
         }
       }
     },

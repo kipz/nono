@@ -447,6 +447,23 @@ pub struct CommandCredentialConfig {
     /// infrastructure from #1981.
     #[serde(default)]
     pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
+    /// Broker credential names whose caller-presented phantoms the scoped proxy
+    /// route redeems by value, as `network.custom_credentials.<r>.redeem_phantoms`.
+    /// `proxy` credentials only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redeem_phantoms: Vec<String>,
+}
+
+impl CommandCredentialConfig {
+    /// A proxy route that holds no credential of its own and only redeems
+    /// caller-presented phantoms named in `redeem_phantoms`.
+    pub(crate) fn is_redeem_only_proxy(&self) -> bool {
+        self.credential_type == CommandCredentialType::Proxy
+            && !self.redeem_phantoms.is_empty()
+            && self.source.is_none()
+            && self.credential_key.is_none()
+            && self.aws_auth.is_none()
+    }
 }
 
 impl Default for CommandCredentialConfig {
@@ -467,6 +484,7 @@ impl Default for CommandCredentialConfig {
             source: None,
             format: None,
             aws_auth: None,
+            redeem_phantoms: Vec::new(),
         }
     }
 }
@@ -2627,6 +2645,14 @@ fn validate_credential(
             );
         }
     }
+    if !credential.redeem_phantoms.is_empty()
+        && credential.credential_type != CommandCredentialType::Proxy
+    {
+        report.error(
+            "invalid_credential",
+            format!("credential '{name}' redeem_phantoms is only valid for proxy credentials"),
+        );
+    }
     match credential.credential_type {
         CommandCredentialType::LocalSocket => {
             if credential.path.as_deref().unwrap_or_default().is_empty() {
@@ -2714,13 +2740,25 @@ fn validate_credential(
                     format!("proxy credential '{name}' must define upstream"),
                 );
             }
-            if credential.env_var.as_deref().is_some_and(str::is_empty)
+            let redeem_only = credential.is_redeem_only_proxy();
+            if redeem_only {
+                // The route mints no phantom of its own, so the proxy would
+                // never populate this variable and launch would fail later.
+                if credential.env_var.is_some() {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' only redeems caller phantoms and cannot define env_var"
+                        ),
+                    );
+                }
+            } else if credential.env_var.as_deref().is_some_and(str::is_empty)
                 || (credential.env_var.is_none() && credential.aws_auth.is_none())
             {
                 report.error(
                     "invalid_credential",
                     format!(
-                        "proxy credential '{name}' must define a non-empty env_var unless using aws_auth"
+                        "proxy credential '{name}' must define a non-empty env_var unless using aws_auth or only redeem_phantoms"
                     ),
                 );
             }
@@ -2741,13 +2779,34 @@ fn validate_credential(
             if credential.source.is_none()
                 && credential.credential_key.is_none()
                 && credential.aws_auth.is_none()
+                && credential.redeem_phantoms.is_empty()
             {
                 report.error(
                     "invalid_credential",
                     format!(
-                        "proxy credential '{name}' must define source, credential_key, or aws_auth"
+                        "proxy credential '{name}' must define source, credential_key, aws_auth, or redeem_phantoms"
                     ),
                 );
+            }
+            // aws_auth replaces the auth header wholesale and never runs the
+            // phantom-resolution loop, so redeem_phantoms would be ignored.
+            if credential.aws_auth.is_some() && !credential.redeem_phantoms.is_empty() {
+                report.error(
+                    "invalid_credential",
+                    format!(
+                        "proxy credential '{name}' cannot combine redeem_phantoms with aws_auth"
+                    ),
+                );
+            }
+            for redeem_name in &credential.redeem_phantoms {
+                if !crate::profile::is_valid_redeem_phantom_name(redeem_name) {
+                    report.error(
+                        "invalid_credential",
+                        format!(
+                            "proxy credential '{name}' has an invalid redeem_phantoms entry '{redeem_name}'; names must be non-empty and contain only [A-Za-z0-9._+-]"
+                        ),
+                    );
+                }
             }
             // aws_auth is mutually exclusive with source and credential_key —
             // same constraint as the session-level config.
@@ -6715,6 +6774,176 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.message.contains("env_var")),
             "expected missing env_var error, got {errors:?}"
+        );
+    }
+
+    fn redeem_only_proxy_credential() -> CommandCredentialConfig {
+        CommandCredentialConfig {
+            credential_type: CommandCredentialType::Proxy,
+            upstream: Some("https://api.example.com".to_string()),
+            redeem_phantoms: vec!["partner-token".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn validation_messages(cred: &CommandCredentialConfig) -> Vec<String> {
+        validate_one(cred)
+            .errors
+            .into_iter()
+            .map(|finding| finding.message)
+            .collect()
+    }
+
+    #[test]
+    fn proxy_credential_redeem_phantoms_parses_from_json() {
+        let cred: CommandCredentialConfig = serde_json::from_value(serde_json::json!({
+            "type": "proxy",
+            "upstream": "https://api.example.com",
+            "redeem_phantoms": ["partner-token", "other.token"]
+        }))
+        .expect("redeem_phantoms should deserialize");
+        assert_eq!(cred.redeem_phantoms, ["partner-token", "other.token"]);
+        assert!(cred.is_redeem_only_proxy());
+
+        let default: CommandCredentialConfig = serde_json::from_value(serde_json::json!({
+            "type": "proxy",
+            "upstream": "https://api.example.com",
+            "credential_key": "api-token",
+            "env_var": "API_TOKEN"
+        }))
+        .expect("credential without redeem_phantoms should deserialize");
+        assert!(default.redeem_phantoms.is_empty());
+        assert!(!default.is_redeem_only_proxy());
+    }
+
+    #[test]
+    fn redeem_only_proxy_credential_accepted_without_env_var() {
+        let errors = validation_messages(&redeem_only_proxy_credential());
+        assert!(
+            errors.is_empty(),
+            "redeem-only proxy should validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn redeem_only_proxy_credential_with_env_var_rejected() {
+        let cred = CommandCredentialConfig {
+            env_var: Some("API_TOKEN".to_string()),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&cred);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("only redeems caller phantoms and cannot define env_var")),
+            "expected redeem-only env_var error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn redeem_phantoms_composes_with_credential_key_and_source() {
+        let with_key = CommandCredentialConfig {
+            credential_key: Some("api-token".to_string()),
+            env_var: Some("API_TOKEN".to_string()),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&with_key);
+        assert!(errors.is_empty(), "redeem + credential_key: {errors:?}");
+
+        let with_source = CommandCredentialConfig {
+            source: Some(AmbientCredentialSourceConfig::Keystore {
+                key: "api-token".to_string(),
+            }),
+            env_var: Some("API_TOKEN".to_string()),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&with_source);
+        assert!(errors.is_empty(), "redeem + source: {errors:?}");
+    }
+
+    #[test]
+    fn redeem_phantoms_with_credential_key_still_requires_env_var() {
+        let cred = CommandCredentialConfig {
+            credential_key: Some("api-token".to_string()),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&cred);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must define a non-empty env_var")),
+            "a credential_key route still mints a phantom and needs env_var: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn redeem_phantoms_with_aws_auth_rejected() {
+        let cred = CommandCredentialConfig {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig::default()),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&cred);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("cannot combine redeem_phantoms with aws_auth")),
+            "expected aws_auth conflict, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn redeem_phantoms_rejects_invalid_names() {
+        for bad in ["", "has space", "slash/name", "new\nline"] {
+            let cred = CommandCredentialConfig {
+                redeem_phantoms: vec![bad.to_string()],
+                ..redeem_only_proxy_credential()
+            };
+            let errors = validation_messages(&cred);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("invalid redeem_phantoms entry")),
+                "expected invalid-name error for {bad:?}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redeem_phantoms_rejected_on_non_proxy_credentials() {
+        for credential_type in [
+            CommandCredentialType::LocalSocket,
+            CommandCredentialType::RawFile,
+            CommandCredentialType::Ambient,
+        ] {
+            let cred = CommandCredentialConfig {
+                credential_type,
+                path: Some("/tmp/example".to_string()),
+                redeem_phantoms: vec!["partner-token".to_string()],
+                ..Default::default()
+            };
+            let errors = validation_messages(&cred);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("redeem_phantoms is only valid for proxy credentials")),
+                "expected non-proxy rejection for {credential_type:?}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_credential_without_any_mechanism_rejected() {
+        let cred = CommandCredentialConfig {
+            redeem_phantoms: Vec::new(),
+            ..redeem_only_proxy_credential()
+        };
+        let errors = validation_messages(&cred);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e
+                    .contains("must define source, credential_key, aws_auth, or redeem_phantoms")),
+            "expected missing-mechanism error, got {errors:?}"
         );
     }
 

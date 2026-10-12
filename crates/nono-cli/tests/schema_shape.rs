@@ -606,6 +606,7 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
             "inject_header",
             "mode",
             "path",
+            "redeem_phantoms",
             "source",
             "tls_ca",
             "tls_client_cert",
@@ -764,6 +765,42 @@ fn test_schema_validates_command_proxy_credential_with_aws_auth() {
     validator
         .validate(&profile)
         .expect("command proxy credential with aws_auth should validate");
+}
+
+#[test]
+fn test_schema_validates_command_proxy_credential_with_redeem_phantoms() {
+    let schema = load_schema();
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    let profile = json!({
+        "command_policies": {
+            "credentials": {
+                "partner-api": {
+                    "type": "proxy",
+                    "upstream": "https://api.partner.example",
+                    "redeem_phantoms": ["partner-token"]
+                }
+            }
+        }
+    });
+    validator
+        .validate(&profile)
+        .expect("redeem-only command proxy credential should validate");
+
+    let bad_name = json!({
+        "command_policies": {
+            "credentials": {
+                "partner-api": {
+                    "type": "proxy",
+                    "upstream": "https://api.partner.example",
+                    "redeem_phantoms": ["has space"]
+                }
+            }
+        }
+    });
+    assert!(
+        validator.validate(&bad_name).is_err(),
+        "redeem_phantoms names outside [A-Za-z0-9._+-] must not validate"
+    );
 }
 
 #[test]

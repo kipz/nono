@@ -591,6 +591,14 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
     }
 }
 
+/// Whether `name` is an acceptable `redeem_phantoms` entry: non-empty `[A-Za-z0-9._+-]`.
+pub(crate) fn is_valid_redeem_phantom_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
 /// Validate a custom credential definition for security issues.
 ///
 /// Checks:
@@ -659,11 +667,7 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     }
 
     for cred_name in &cred.redeem_phantoms {
-        if cred_name.is_empty()
-            || !cred_name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
-        {
+        if !is_valid_redeem_phantom_name(cred_name) {
             return Err(NonoError::ProfileParse(format!(
                 "custom credential '{}' has an invalid 'redeem_phantoms' entry '{}'; \
                  names must be non-empty and contain only [A-Za-z0-9._+-]",

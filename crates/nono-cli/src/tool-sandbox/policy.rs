@@ -165,6 +165,19 @@ fn intercept_argv_matcher_matches(
                     .all(|(expected, actual)| expected.as_bytes() == *actual)
             });
     }
+    if let Some(substring) = &matcher.substring {
+        // Byte mirrors of the String matcher: inert on an empty needle
+        // list, and an empty needle never widens the match.
+        if substring.is_empty() {
+            return false;
+        }
+        return substring.iter().any(|needle| {
+            !needle.is_empty()
+                && args
+                    .iter()
+                    .any(|arg| arg.windows(needle.len()).any(|w| w == needle.as_bytes()))
+        });
+    }
     false
 }
 
@@ -570,6 +583,16 @@ fn argv_matcher_matches(
                     .windows(contains.len())
                     .any(|window| window == contains.as_slice()));
     }
+    if let Some(substring) = &matcher.substring {
+        // An empty needle list is inert: validation rejects it, and the
+        // runtime must not let it widen a rule to match-everything.
+        if substring.is_empty() {
+            return false;
+        }
+        return substring
+            .iter()
+            .any(|needle| !needle.is_empty() && args.iter().any(|arg| arg.contains(needle)));
+    }
     false
 }
 
@@ -819,6 +842,7 @@ mod intercept_tests {
                         exact: None,
                         prefix: None,
                         contains: Some(vec!["push".to_string(), "--force".to_string()]),
+                        substring: None,
                     }),
                     env: BTreeMap::new(),
                 }),
@@ -855,6 +879,7 @@ mod intercept_tests {
                         exact: None,
                         prefix: Some(vec!["push".to_string()]),
                         contains: None,
+                        substring: None,
                     }),
                     env: BTreeMap::new(),
                 }),
@@ -885,6 +910,7 @@ mod intercept_tests {
                         exact: Some(vec!["push".to_string(), "--force".to_string()]),
                         prefix: None,
                         contains: None,
+                        substring: None,
                     }),
                     env: BTreeMap::new(),
                 }),
@@ -918,16 +944,19 @@ mod intercept_tests {
                 exact: Some(Vec::new()),
                 prefix: None,
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: Some(Vec::new()),
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: None,
                 contains: Some(Vec::new()),
+                substring: None,
             },
         ] {
             let config = CommandPolicyConfig {
@@ -1086,6 +1115,7 @@ mod intercept_tests {
                             exact: Some(vec!["status".to_string()]),
                             prefix: None,
                             contains: None,
+                            substring: None,
                         }),
                         env: BTreeMap::new(),
                     }),
@@ -1120,6 +1150,7 @@ mod intercept_tests {
                             exact: Some(vec!["status".to_string()]),
                             prefix: None,
                             contains: None,
+                            substring: None,
                         }),
                         env: BTreeMap::new(),
                     }),
@@ -1234,6 +1265,7 @@ mod intercept_tests {
                     prefix: Some(vec!["apply".to_string()]),
                     exact: None,
                     contains: None,
+                    substring: None,
                 }),
                 env: BTreeMap::new(),
                 backend: None,
@@ -1245,6 +1277,7 @@ mod intercept_tests {
                     prefix: Some(vec!["apply".to_string(), "-refresh-only".to_string()]),
                     exact: None,
                     contains: None,
+                    substring: None,
                 }),
                 env: BTreeMap::new(),
                 backend: None,
@@ -1286,6 +1319,7 @@ mod intercept_tests {
                     contains: Some(vec!["--repo".to_string(), "acme/widget".to_string()]),
                     exact: None,
                     prefix: None,
+                    substring: None,
                 }),
                 env: env_match,
                 backend: None,
@@ -1304,6 +1338,147 @@ mod intercept_tests {
         ];
         let env = vec![b"ENVIRONMENT=STAGING".to_vec()];
         let outcome = evaluate_invocation_policy(&policy, &argv, &env)?;
+
+        assert_eq!(outcome, InvocationPolicyOutcome::Allow);
+        Ok(())
+    }
+
+    fn substring_deny_policy() -> InvocationPolicyConfig {
+        InvocationPolicyConfig {
+            default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
+            deny: vec![InvocationRuleConfig {
+                argv: Some(ArgvMatcherConfig {
+                    substring: Some(vec!["secret".to_string()]),
+                    exact: None,
+                    prefix: None,
+                    contains: None,
+                }),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: Some("secret store is off limits".to_string()),
+                timeout_secs: None,
+            }],
+            allow: vec![InvocationRuleConfig {
+                argv: Some(ArgvMatcherConfig {
+                    prefix: Some(vec!["dump".to_string(), "-k".to_string()]),
+                    exact: None,
+                    contains: None,
+                    substring: None,
+                }),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            approve: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn invocation_policy_substring_deny_blocks_bundled_short_options() -> nono::Result<()> {
+        let policy = substring_deny_policy();
+        // The bundled token is a single argv element, so no whole-token
+        // matcher can see the embedded name, while substring can.
+        let argv = vec![
+            b"tool".to_vec(),
+            b"dump".to_vec(),
+            b"-k".to_vec(),
+            b"user".to_vec(),
+            b"-wsecret".to_vec(),
+        ];
+        let outcome = evaluate_invocation_policy(&policy, &argv, &[])?;
+
+        assert_eq!(
+            outcome,
+            InvocationPolicyOutcome::Deny {
+                reason: "secret store is off limits".to_string()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_policy_substring_deny_ignores_clean_argv() -> nono::Result<()> {
+        let policy = substring_deny_policy();
+        let argv = vec![
+            b"tool".to_vec(),
+            b"dump".to_vec(),
+            b"-k".to_vec(),
+            b"user".to_vec(),
+            b"-w".to_vec(),
+        ];
+        let outcome = evaluate_invocation_policy(&policy, &argv, &[])?;
+
+        assert_eq!(outcome, InvocationPolicyOutcome::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_policy_empty_substring_list_matches_nothing() -> nono::Result<()> {
+        // Validation rejects empty substring lists; this pins the runtime
+        // fallback so a hand-built rule can never widen to match-everything.
+        let policy = InvocationPolicyConfig {
+            default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
+            deny: vec![InvocationRuleConfig {
+                argv: Some(ArgvMatcherConfig {
+                    substring: Some(Vec::new()),
+                    exact: None,
+                    prefix: None,
+                    contains: None,
+                }),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: Some("inert".to_string()),
+                timeout_secs: None,
+            }],
+            allow: vec![InvocationRuleConfig {
+                argv: Some(ArgvMatcherConfig {
+                    prefix: Some(vec!["dump".to_string()]),
+                    exact: None,
+                    contains: None,
+                    substring: None,
+                }),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            approve: Vec::new(),
+        };
+        let argv = vec![b"tool".to_vec(), b"dump".to_vec(), b"-k".to_vec()];
+        let outcome = evaluate_invocation_policy(&policy, &argv, &[])?;
+
+        assert_eq!(outcome, InvocationPolicyOutcome::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn invocation_policy_substring_allow_matches_fragment() -> nono::Result<()> {
+        // substring is deliberately broader than contains: a fragment
+        // matches any single argument embedding it.
+        let policy = InvocationPolicyConfig {
+            default: PolicyDecisionConfig::Decision(PolicyDecision::Deny),
+            allow: vec![InvocationRuleConfig {
+                argv: Some(ArgvMatcherConfig {
+                    substring: Some(vec!["force".to_string()]),
+                    exact: None,
+                    prefix: None,
+                    contains: None,
+                }),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+            deny: Vec::new(),
+            approve: Vec::new(),
+        };
+        let argv = vec![
+            b"git".to_vec(),
+            b"push".to_vec(),
+            b"--force-with-lease".to_vec(),
+        ];
+        let outcome = evaluate_invocation_policy(&policy, &argv, &[])?;
 
         assert_eq!(outcome, InvocationPolicyOutcome::Allow);
         Ok(())

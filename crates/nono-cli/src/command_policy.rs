@@ -1031,6 +1031,8 @@ pub struct ArgvMatcherConfig {
     pub prefix: Option<Vec<String>>,
     #[serde(default)]
     pub contains: Option<Vec<String>>,
+    #[serde(default)]
+    pub substring: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2491,7 +2493,8 @@ fn validate_argv_matcher(
 ) {
     let matcher_count = usize::from(argv.exact.is_some())
         + usize::from(argv.prefix.is_some())
-        + usize::from(argv.contains.is_some());
+        + usize::from(argv.contains.is_some())
+        + usize::from(argv.substring.is_some());
     if matcher_count != 1 {
         report.error(
             code,
@@ -2503,10 +2506,26 @@ fn validate_argv_matcher(
         .iter()
         .chain(argv.prefix.iter())
         .chain(argv.contains.iter())
+        .chain(argv.substring.iter())
         .flat_map(|values| values.iter())
     {
         if value.contains('\0') {
             report.error(code, format!("{label} argv matcher contains NUL"));
+        }
+    }
+    // No legacy profile carries substring rules, so empty needles are author
+    // error on every rule kind, not an intercept-only compatibility case.
+    for values in argv.substring.iter() {
+        if values.is_empty() {
+            report.error(code, format!("{label} substring matcher cannot be empty"));
+        }
+        for value in values {
+            if value.is_empty() {
+                report.error(
+                    code,
+                    format!("{label} substring matcher cannot hold empty needles"),
+                );
+            }
         }
     }
     if reject_empty_matcher {
@@ -5639,6 +5658,7 @@ mod tests {
                         exact: None,
                         prefix: None,
                         contains: Some(vec!["push".to_string(), "--force".to_string()]),
+                        substring: None,
                     }),
                     env: BTreeMap::from([(
                         "GIT_SSH_COMMAND".to_string(),
@@ -5677,6 +5697,7 @@ mod tests {
                         exact: None,
                         prefix: Some(vec!["push".to_string()]),
                         contains: None,
+                        substring: None,
                     }),
                     env: BTreeMap::new(),
                 }),
@@ -5762,6 +5783,7 @@ mod tests {
                         exact: Some(vec!["push".to_string()]),
                         prefix: Some(vec!["push".to_string()]),
                         contains: None,
+                        substring: None,
                     }),
                     env: BTreeMap::from([(
                         "BAD=NAME".to_string(),
@@ -5815,16 +5837,19 @@ mod tests {
                 exact: Some(Vec::new()),
                 prefix: None,
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: Some(Vec::new()),
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: None,
                 contains: Some(Vec::new()),
+                substring: None,
             },
         ] {
             let mut config = active_git_config();
@@ -5862,16 +5887,19 @@ mod tests {
                 exact: Some(Vec::new()),
                 prefix: None,
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: Some(Vec::new()),
                 contains: None,
+                substring: None,
             },
             ArgvMatcherConfig {
                 exact: None,
                 prefix: None,
                 contains: Some(Vec::new()),
+                substring: None,
             },
         ] {
             let mut report = CommandPolicyValidationReport::default();
@@ -5899,6 +5927,109 @@ mod tests {
                 report.errors
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_empty_substring_matchers() {
+        // substring has no legacy profiles, so an empty needle list and an
+        // empty needle are author error on every rule kind.
+        for argv in [
+            ArgvMatcherConfig {
+                substring: Some(Vec::new()),
+                exact: None,
+                prefix: None,
+                contains: None,
+            },
+            ArgvMatcherConfig {
+                substring: Some(vec![String::new()]),
+                exact: None,
+                prefix: None,
+                contains: None,
+            },
+        ] {
+            let mut report = CommandPolicyValidationReport::default();
+            let rule = InvocationRuleConfig {
+                argv: Some(argv.clone()),
+                env: BTreeMap::new(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            };
+            validate_invocation_rule(
+                "commands.git.from.session.invocation_policy.deny[0]",
+                "deny",
+                &rule,
+                &CommandPoliciesConfig::default(),
+                &mut report,
+            );
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_invocation_matcher"
+                        && f.message.contains("substring")),
+                "expected empty substring validation: {:?}",
+                report.errors
+            );
+
+            let mut config = active_git_config();
+            if let Some(git) = config.commands.get_mut("git") {
+                git.intercept = vec![InterceptRuleConfig {
+                    args: None,
+                    match_config: Some(InterceptRuleMatchConfig {
+                        argv: Some(argv.clone()),
+                        env: BTreeMap::new(),
+                    }),
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: None,
+                }];
+            }
+            let report =
+                validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|f| f.code == "invalid_intercept_matcher"
+                        && f.message.contains("substring")),
+                "expected empty substring intercept validation: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
+    fn validate_substring_counts_toward_single_matcher() {
+        let mut report = CommandPolicyValidationReport::default();
+        let rule = InvocationRuleConfig {
+            argv: Some(ArgvMatcherConfig {
+                exact: Some(vec!["status".to_string()]),
+                substring: Some(vec!["status".to_string()]),
+                prefix: None,
+                contains: None,
+            }),
+            env: BTreeMap::new(),
+            backend: None,
+            reason: None,
+            timeout_secs: None,
+        };
+        validate_invocation_rule(
+            "commands.git.from.session.invocation_policy.deny[0]",
+            "deny",
+            &rule,
+            &CommandPoliciesConfig::default(),
+            &mut report,
+        );
+
+        assert!(
+            report.errors.iter().any(
+                |f| f.code == "invalid_invocation_matcher" && f.message.contains("exactly one")
+            ),
+            "expected exactly-one-matcher validation: {:?}",
+            report.errors
+        );
     }
 
     #[test]
@@ -5981,6 +6112,7 @@ mod tests {
                     exact: None,
                     prefix: Some(vec!["push".to_string()]),
                     contains: None,
+                    substring: None,
                 }),
                 env: BTreeMap::new(),
             }),
@@ -6541,6 +6673,7 @@ mod tests {
                                 prefix: Some(vec!["issue".to_string(), "comment".to_string()]),
                                 exact: None,
                                 contains: None,
+                                substring: None,
                             }),
                             env: BTreeMap::new(),
                             backend: Some("human".to_string()),

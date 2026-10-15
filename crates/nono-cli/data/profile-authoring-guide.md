@@ -231,7 +231,7 @@ nono profile validate <profile>
 
 Look under `command_policies.commands.<command>.from.<caller>.invocation_policy` for argv or environment rules. For commands started directly by the sandboxed session, the caller is usually `session`; for a mediated command launched by another controlled command, the caller is the parent command name.
 
-`invocation_policy` evaluates in this order: `deny`, then `approve`, then `allow`, then `default`. The `argv` matcher compares against the command arguments after the command name, so `gh issue comment 1052` matches `{"argv": {"prefix": ["issue", "comment"]}}`.
+`invocation_policy` evaluates in this order: `deny`, then `approve`, then `allow`, then `default`. The `argv` matcher compares against the command arguments after the command name, so `gh issue comment 1052` matches `{"argv": {"prefix": ["issue", "comment"]}}`. The `contains` matcher requires its listed tokens to appear as consecutive whole argv tokens; to catch a fragment embedded inside a single argument (for example a bundled short-option string like `-wsecret`), use `substring`, which matches when any single argument contains any listed fragment. `substring` is broader than `contains`: a rule matching `force` also matches `--force-with-lease`. Empty substring lists and empty fragments are rejected at validation.
 
 ```json
 {

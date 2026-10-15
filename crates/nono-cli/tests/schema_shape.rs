@@ -685,12 +685,12 @@ fn test_schema_command_policies_match_tool_sandbox_guide_shape() {
     assert_schema_properties(
         &schema,
         "ArgvMatcherConfig",
-        &["contains", "exact", "prefix"],
+        &["contains", "exact", "prefix", "substring"],
     );
     assert_schema_properties(
         &schema,
         "InterceptArgvMatcherConfig",
-        &["contains", "exact", "prefix"],
+        &["contains", "exact", "prefix", "substring"],
     );
     assert_schema_properties(&schema, "EnvMatcherConfig", &["equals", "one_of"]);
     assert_schema_properties(

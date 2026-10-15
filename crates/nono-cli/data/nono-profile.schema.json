@@ -2167,6 +2167,10 @@
         "contains": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "substring": {
+          "type": "array",
+          "items": { "type": "string" }
         }
       }
     },
@@ -2177,19 +2181,25 @@
         {
           "required": ["exact"],
           "not": {
-            "anyOf": [{ "required": ["prefix"] }, { "required": ["contains"] }]
+            "anyOf": [{ "required": ["prefix"] }, { "required": ["contains"] }, { "required": ["substring"] }]
           }
         },
         {
           "required": ["prefix"],
           "not": {
-            "anyOf": [{ "required": ["exact"] }, { "required": ["contains"] }]
+            "anyOf": [{ "required": ["exact"] }, { "required": ["contains"] }, { "required": ["substring"] }]
           }
         },
         {
           "required": ["contains"],
           "not": {
-            "anyOf": [{ "required": ["exact"] }, { "required": ["prefix"] }]
+            "anyOf": [{ "required": ["exact"] }, { "required": ["prefix"] }, { "required": ["substring"] }]
+          }
+        },
+        {
+          "required": ["substring"],
+          "not": {
+            "anyOf": [{ "required": ["exact"] }, { "required": ["prefix"] }, { "required": ["contains"] }]
           }
         }
       ],
@@ -2205,6 +2215,11 @@
           "items": { "type": "string" }
         },
         "contains": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "substring": {
           "type": "array",
           "minItems": 1,
           "items": { "type": "string" }

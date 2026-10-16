@@ -330,7 +330,12 @@ impl OAuthCaptureStore {
         }
         marker_names.sort_unstable();
         marker_names.dedup();
-        for (name, _value) in &parsed {
+        let token_shaped = |field: &str| {
+            marker_names
+                .iter()
+                .any(|marker| field.contains(marker.as_str()))
+        };
+        for (name, value) in &parsed {
             if rewritten_names.contains(name.as_ref()) {
                 continue;
             }
@@ -338,15 +343,24 @@ impl OAuthCaptureStore {
             // Substring, not just exact or suffix: form_urlencoded folds a
             // body with no `=` into a pair whose name is the entire blob, so
             // token material can hide in a name while the value stays empty.
-            if marker_names
-                .iter()
-                .any(|marker| lname.contains(marker.as_str()))
-            {
+            if token_shaped(&lname) {
                 return Err(ProxyError::HttpParse(format!(
                     "OAuth token response for provider '{}' contains unrewritten or \
                      unrecognized token-shaped material",
                     endpoint.provider
                 )));
+            }
+            // A pair value that is itself a JSON document is not opaque text,
+            // so token-shaped material inside it must fail closed rather
+            // than reach the sandbox hidden under a benign form name. Values
+            // inside pairs are never rewritten, so no configured path is
+            // exempt from the walk.
+            if let Ok(json) = serde_json::from_slice::<Value>(value.as_bytes()) {
+                reject_unrewritten_token_fields(
+                    &json,
+                    &HashSet::new(),
+                    &format!("provider '{}'", endpoint.provider),
+                )?;
             }
         }
 
@@ -975,6 +989,54 @@ mod tests {
         assert!(
             err.to_string().contains("unrewritten or unrecognized"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn form_response_rejects_token_material_hidden_in_a_pair_value() {
+        // Auto mode's form fallback accepts almost any bytes; a value that
+        // is itself a JSON document is not opaque text, so a token field
+        // inside it must fail closed rather than forward unchanged.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(&endpoint, &[], br#"x={"access_token":"real-access-token"}"#)
+            .expect_err("token material in a JSON value under a benign name must fail closed");
+        assert!(
+            err.to_string().contains("unrewritten token field"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn form_response_without_token_material_passes_through_unchanged() {
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let body = b"error=authorization_pending&error_description=slow+down";
+        let out = store.rewrite_response_body(&endpoint, &[], body).unwrap();
+        assert_eq!(out, body.to_vec());
+    }
+
+    #[test]
+    fn form_response_forwards_marker_mentions_alongside_rewritten_fields() {
+        // Once the token itself is rewritten, remaining values are opaque
+        // text exactly as string values are in the JSON path; an error
+        // description quoting the field name must not block the response.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let body = b"access_token=real-access-token&error_description=the+access_token+was+rotated";
+        let out = store.rewrite_response_body(&endpoint, &[], body).unwrap();
+        let parsed = url::form_urlencoded::parse(&out)
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_ne!(
+            parsed.get("access_token").unwrap(),
+            "real-access-token",
+            "the configured field must be rewritten"
+        );
+        assert_eq!(
+            parsed.get("error_description").unwrap(),
+            "the access_token was rotated"
         );
     }
 

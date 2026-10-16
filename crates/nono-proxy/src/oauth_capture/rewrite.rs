@@ -282,21 +282,27 @@ impl OAuthCaptureStore {
         let mut changed = false;
         let mut rewritten_fields = 0usize;
         let mut rewritten_names = HashSet::new();
-        let mut serialized = url::form_urlencoded::Serializer::new(String::new());
 
+        // Phase 1: mint phantoms for the whole body before storing anything,
+        // so a body the marker check below rejects leaves no orphaned,
+        // unreachable secrets in the store.
+        enum Slot {
+            Plain,
+            Phantom { key: String, visible: String },
+        }
+        let mut slots = Vec::with_capacity(parsed.len());
         for (name, value) in &parsed {
             if let Some(field) = response_fields.get(name.as_ref())
                 && !value.is_empty()
             {
                 let (key, visible) = mint_response_phantom(&endpoint.provider, field, value)?;
-                self.store_phantom(&key, value.as_bytes(), &endpoint.admitted_consumers)?;
-                serialized.append_pair(name, &visible);
+                slots.push(Slot::Phantom { key, visible });
                 changed = true;
                 rewritten_fields += 1;
                 rewritten_names.insert(name.to_string());
                 continue;
             }
-            serialized.append_pair(name, value);
+            slots.push(Slot::Plain);
         }
 
         let mut marker_names: Vec<String> = vec![
@@ -338,6 +344,21 @@ impl OAuthCaptureStore {
                 endpoint.provider
             );
             return Ok(body.to_vec());
+        }
+
+        // Phase 2: the body passed every check, so the minted phantoms can
+        // now be committed and the response serialized.
+        let mut serialized = url::form_urlencoded::Serializer::new(String::new());
+        for ((name, value), slot) in parsed.iter().zip(&slots) {
+            match slot {
+                Slot::Plain => {
+                    serialized.append_pair(name, value);
+                }
+                Slot::Phantom { key, visible } => {
+                    self.store_phantom(key, value.as_bytes(), &endpoint.admitted_consumers)?;
+                    serialized.append_pair(name, visible);
+                }
+            }
         }
 
         debug!(
@@ -473,18 +494,39 @@ enum ContentTypeHint {
 /// Returns `None` when no `Content-Type` header is present, so callers can
 /// fall back to their own default rather than treating an absent header the
 /// same as an unrecognized one.
+///
+/// The media type must match exactly once parameters are stripped: a
+/// substring match would let a type smuggled into a parameter value or a
+/// lookalike such as `application/jsonx` select a rewrite path. Every
+/// `Content-Type` header is consulted and all must agree, so conflicting
+/// duplicates are unclassifiable and the caller fails closed rather than
+/// trusting whichever header arrived first.
 fn content_type_hint(headers: &[(String, String)]) -> Option<ContentTypeHint> {
-    let value = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-        .map(|(_, value)| value.to_ascii_lowercase())?;
-    if value.contains("application/json") {
-        Some(ContentTypeHint::Json)
-    } else if value.contains("application/x-www-form-urlencoded") {
-        Some(ContentTypeHint::Form)
-    } else {
-        Some(ContentTypeHint::Other)
+    let mut hint: Option<ContentTypeHint> = None;
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("content-type") {
+            continue;
+        }
+        let media_type = value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let this = if media_type == "application/json" {
+            ContentTypeHint::Json
+        } else if media_type == "application/x-www-form-urlencoded" {
+            ContentTypeHint::Form
+        } else {
+            ContentTypeHint::Other
+        };
+        match hint {
+            None => hint = Some(this),
+            Some(prev) if prev == this => {}
+            Some(_) => return Some(ContentTypeHint::Other),
+        }
     }
+    hint
 }
 
 /// Mint a phantom for a real token value captured from a response field,
@@ -664,6 +706,30 @@ mod tests {
     }
 
     #[test]
+    fn form_response_rejection_leaves_no_stored_phantom() {
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(
+                &endpoint,
+                &[],
+                b"access_token=real-access-token&id_token=real-id-token",
+            )
+            .expect_err("unconfigured sensitive field must fail closed");
+        assert!(
+            err.to_string().contains("unrewritten or unrecognized"),
+            "unexpected error: {err}"
+        );
+        // The `access_token` phantom is minted before the `id_token` marker
+        // check rejects the body, so rejection must also discard it: an
+        // unreachable secret left in the store serves no one.
+        assert!(
+            store.phantoms.lock().unwrap().is_empty(),
+            "a rejected form response must not leave phantoms in the store"
+        );
+    }
+
+    #[test]
     fn form_response_rewrites_every_duplicate_key_occurrence() {
         let store = form_store();
         let endpoint = form_endpoint(&store);
@@ -769,6 +835,70 @@ mod tests {
             err.to_string().contains("neither"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn content_type_hint_requires_an_exact_media_type() {
+        // A media type smuggled into a parameter value, or a lookalike that
+        // merely contains the string, must not select a rewrite path.
+        assert_eq!(
+            content_type_hint(&[(
+                "Content-Type".to_string(),
+                "text/plain; charset=application/json".to_string()
+            )]),
+            Some(ContentTypeHint::Other)
+        );
+        assert_eq!(
+            content_type_hint(&[("Content-Type".to_string(), "application/jsonx".to_string())]),
+            Some(ContentTypeHint::Other)
+        );
+        assert_eq!(
+            content_type_hint(&[("Content-Type".to_string(), "json".to_string())]),
+            Some(ContentTypeHint::Other)
+        );
+    }
+
+    #[test]
+    fn content_type_hint_treats_conflicting_duplicate_headers_as_other() {
+        // Two Content-Type headers naming different encodings cannot be
+        // trusted, whichever arrives first.
+        assert_eq!(
+            content_type_hint(&[
+                ("Content-Type".to_string(), "application/json".to_string()),
+                ("Content-Type".to_string(), "text/html".to_string()),
+            ]),
+            Some(ContentTypeHint::Other)
+        );
+    }
+
+    #[test]
+    fn content_type_hint_strips_parameters_and_matches_case_insensitively() {
+        assert_eq!(
+            content_type_hint(&[(
+                "Content-Type".to_string(),
+                "Application/JSON; charset=utf-8".to_string()
+            )]),
+            Some(ContentTypeHint::Json)
+        );
+        assert_eq!(
+            content_type_hint(&[(
+                "content-type".to_string(),
+                " application/x-www-form-urlencoded ".to_string()
+            )]),
+            Some(ContentTypeHint::Form)
+        );
+        // Duplicate headers that agree remain classifiable.
+        assert_eq!(
+            content_type_hint(&[
+                ("Content-Type".to_string(), "application/json".to_string()),
+                (
+                    "Content-Type".to_string(),
+                    "application/json; charset=utf-8".to_string()
+                ),
+            ]),
+            Some(ContentTypeHint::Json)
+        );
+        assert_eq!(content_type_hint(&[]), None);
     }
 
     #[test]

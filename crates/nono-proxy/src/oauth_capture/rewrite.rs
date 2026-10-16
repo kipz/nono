@@ -146,7 +146,18 @@ impl OAuthCaptureStore {
             return Ok(body.to_vec());
         }
 
-        let hint = content_type_hint(headers);
+        // config.rs documents that a Content-Type matching neither encoding is
+        // rejected rather than guessed at, in every mode, not only Auto.
+        let hint = match content_type_hint(headers) {
+            Some(ContentTypeHint::Other) => {
+                return Err(ProxyError::HttpParse(format!(
+                    "OAuth token response for provider '{}' has a Content-Type that is neither \
+                     JSON nor form-urlencoded",
+                    endpoint.provider
+                )));
+            }
+            hint => hint,
+        };
         match endpoint.response_body {
             OAuthTokenRequestBodyFormat::Json => {
                 if matches!(hint, Some(ContentTypeHint::Form)) {
@@ -168,18 +179,16 @@ impl OAuthCaptureStore {
                 }
                 self.rewrite_form_response_body(endpoint, body)
             }
-            OAuthTokenRequestBodyFormat::Auto => match hint {
-                Some(ContentTypeHint::Json) => self.rewrite_json_response_body(endpoint, body),
-                Some(ContentTypeHint::Form) => self.rewrite_form_response_body(endpoint, body),
-                Some(ContentTypeHint::Other) => Err(ProxyError::HttpParse(format!(
-                    "OAuth token response for provider '{}' has a Content-Type that is neither \
-                     JSON nor form-urlencoded",
-                    endpoint.provider
-                ))),
-                None => {
+            OAuthTokenRequestBodyFormat::Auto => {
+                if matches!(hint, Some(ContentTypeHint::Json)) {
+                    self.rewrite_json_response_body(endpoint, body)
+                } else if matches!(hint, Some(ContentTypeHint::Form)) {
+                    self.rewrite_form_response_body(endpoint, body)
+                } else {
                     if serde_json::from_slice::<Value>(body).is_ok() {
-                        self.rewrite_json_response_body(endpoint, body)
-                    } else if looks_like_json(body) {
+                        return self.rewrite_json_response_body(endpoint, body);
+                    }
+                    if looks_like_json(body) {
                         // A body that opens like JSON but fails to parse is far
                         // more likely truncated (e.g. from a peer closing
                         // without TLS close_notify mid-response) than
@@ -187,16 +196,15 @@ impl OAuthCaptureStore {
                         // accepts almost any bytes, so treating this as a form
                         // body risks forwarding a real token still present in
                         // the unparsed JSON text. Fail closed instead.
-                        Err(ProxyError::HttpParse(format!(
+                        return Err(ProxyError::HttpParse(format!(
                             "OAuth token response for provider '{}' looks like JSON but failed \
                              to parse; refusing to reinterpret as form-urlencoded",
                             endpoint.provider
-                        )))
-                    } else {
-                        self.rewrite_form_response_body(endpoint, body)
+                        )));
                     }
+                    self.rewrite_form_response_body(endpoint, body)
                 }
-            },
+            }
         }
     }
 
@@ -265,10 +273,10 @@ impl OAuthCaptureStore {
     ///
     /// `url::form_urlencoded::parse` accepts almost any byte string as *some*
     /// sequence of pairs, so unlike the JSON path a parse failure can never be
-    /// relied on to fail closed. Instead this scans the raw body for every
-    /// configured field name and every generically sensitive token field name
-    /// (case-insensitively, since the structured parse above is exact-case)
-    /// and requires that every occurrence actually got rewritten; anything
+    /// relied on to fail closed. Instead every parsed key is checked against
+    /// every configured field name and every generically sensitive token field
+    /// name (case-insensitively and by substring, since the structured rewrite
+    /// above is exact-case) and must have actually been rewritten; anything
     /// else is rejected rather than forwarded.
     fn rewrite_form_response_body(
         &self,
@@ -308,26 +316,25 @@ impl OAuthCaptureStore {
             "refresh_token".to_string(),
             "id_token".to_string(),
         ];
-        for field in endpoint
-            .response_fields
-            .iter()
-            .filter(|f| !f.path.contains('.'))
-        {
+        for field in &endpoint.response_fields {
+            // Dotted paths describe nested JSON fields with no rewrite as a
+            // flat form pair, so they join the markers: a literal occurrence
+            // as a form key is token-shaped material this path must reject.
             marker_names.push(field.path.to_ascii_lowercase());
         }
         marker_names.sort_unstable();
         marker_names.dedup();
-        for (name, value) in &parsed {
-            if value.is_empty() {
-                continue;
-            }
+        for (name, _value) in &parsed {
             if rewritten_names.contains(name.as_ref()) {
                 continue;
             }
             let lname = name.to_ascii_lowercase();
+            // Substring, not just exact or suffix: form_urlencoded folds a
+            // body with no `=` into a pair whose name is the entire blob, so
+            // token material can hide in a name while the value stays empty.
             if marker_names
                 .iter()
-                .any(|marker| lname == marker.as_str() || lname.ends_with(marker.as_str()))
+                .any(|marker| lname.contains(marker.as_str()))
             {
                 return Err(ProxyError::HttpParse(format!(
                     "OAuth token response for provider '{}' contains unrewritten or \
@@ -445,6 +452,10 @@ fn reject_unrewritten_token_fields_inner(
 /// to distinguish "truncated JSON" from "genuinely not JSON" when a strict
 /// parse has already failed.
 fn looks_like_json(body: &[u8]) -> bool {
+    // A UTF-8 BOM breaks strict serde_json parsing but is still a JSON body,
+    // so skip it before deciding; otherwise a BOM-prefixed token response
+    // falls through to the form path and its blob-shaped pair names.
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
     matches!(
         body.iter().find(|b| !b.is_ascii_whitespace()),
         Some(b'{') | Some(b'[')
@@ -801,6 +812,144 @@ mod tests {
             .expect_err("form-configured endpoint must reject a JSON Content-Type");
         assert!(
             err.to_string().contains("form-urlencoded"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn form_response_rejects_configured_dotted_path_present_as_a_form_key() {
+        // A dotted path describes a nested JSON field and has no rewrite as a
+        // flat form pair, so a literal occurrence as a form key is token-shaped
+        // material that must fail closed rather than forward.
+        let store = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://github.com".to_string(),
+                path: "/login/oauth/access_token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "credentials.token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy.github".to_string()],
+        }])
+        .unwrap();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(&endpoint, &[], b"credentials.token=real-access-token")
+            .expect_err("configured dotted path arriving as a form key must fail closed");
+        assert!(
+            err.to_string().contains("unrewritten or unrecognized"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn response_body_auto_rejects_bom_prefixed_json_instead_of_reinterpreting_as_form() {
+        // A UTF-8 BOM breaks strict serde_json parsing, so without BOM handling
+        // in looks_like_json the body falls to the form path, which folds the
+        // whole blob into one pair with an empty value and forwards the real
+        // token untouched. It must fail closed like any other unparseable JSON.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let mut body = b"\xEF\xBB\xBF".to_vec();
+        body.extend_from_slice(br#"{"access_token":"real-access-token"}"#);
+        let err = store
+            .rewrite_response_body(&endpoint, &[], &body)
+            .expect_err("BOM-prefixed JSON containing a real token must fail closed");
+        assert!(
+            err.to_string()
+                .contains("looks like JSON but failed to parse"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn form_response_rejects_token_marker_smuggled_in_a_pair_name() {
+        // form_urlencoded folds a body with no `=` into a single pair whose
+        // name is the whole blob, so token material can hide in a name while
+        // the value stays empty; a marker in a non-rewritten name must reject
+        // regardless of the pair's value.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(&endpoint, &[], br#"x{"access_token":"real-token"}"#)
+            .expect_err("token material smuggled in a pair name must fail closed");
+        assert!(
+            err.to_string().contains("unrewritten or unrecognized"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn response_body_json_configured_rejects_other_content_type() {
+        // config.rs documents that a Content-Type matching neither JSON nor
+        // form is rejected rather than guessed at; an explicit Json setting
+        // must not be looser than Auto.
+        let store = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://github.com".to_string(),
+                path: "/login/oauth/access_token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Json,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy.github".to_string()],
+        }])
+        .unwrap();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(
+                &endpoint,
+                &[("Content-Type".to_string(), "text/plain".to_string())],
+                br#"{"access_token":"real-access-token"}"#,
+            )
+            .expect_err("explicit Json mode must reject an unrecognized Content-Type");
+        assert!(
+            err.to_string().contains("neither"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn response_body_form_configured_rejects_other_content_type() {
+        let store = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://github.com".to_string(),
+                path: "/login/oauth/access_token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Form,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy.github".to_string()],
+        }])
+        .unwrap();
+        let endpoint = form_endpoint(&store);
+        let err = store
+            .rewrite_response_body(
+                &endpoint,
+                &[("Content-Type".to_string(), "text/plain".to_string())],
+                b"access_token=real-access-token",
+            )
+            .expect_err("explicit Form mode must reject an unrecognized Content-Type");
+        assert!(
+            err.to_string().contains("neither"),
             "unexpected error: {err}"
         );
     }

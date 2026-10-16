@@ -55,6 +55,10 @@ pub struct EphemeralCa {
     cert_der: Vec<u8>,
     /// Cached PEM encoding of the public certificate.
     cert_pem: String,
+    /// CA certificate validity start. Rotation rejects replacements whose
+    /// window has not started, which would serve TLS with a cert no client
+    /// accepts yet.
+    not_before: SystemTime,
     /// CA certificate expiry. Leaf certificates are minted with this same
     /// `not_after` so they never outlive the issuer.
     not_after: SystemTime,
@@ -101,6 +105,7 @@ impl EphemeralCa {
                 "failed to reconstruct issuer from persisted material: {e}"
             ))
         })?;
+        let not_before = extract_not_before_from_der(&cert_der)?;
         let not_after = extract_not_after_from_der(&cert_der)?;
 
         Ok(Self {
@@ -108,6 +113,7 @@ impl EphemeralCa {
             issuer,
             cert_der,
             cert_pem: cert_pem.to_string(),
+            not_before,
             not_after,
         })
     }
@@ -124,11 +130,31 @@ impl EphemeralCa {
     /// Used by `--trust-proxy-ca` to create a CA with `CN=nono-proxy-ca` so
     /// it appears with a recognizable name in macOS Keychain and trust store.
     pub fn generate_with_cn(cn: &str, validity: Duration) -> Result<Self> {
+        Self::generate_with_cn_between(cn, SystemTime::now(), validity)
+    }
+
+    /// Test support: generate a fresh CA whose validity window starts
+    /// `start_offset` from now, to prove rotation rejects replacements that
+    /// are not valid yet.
+    #[cfg(test)]
+    pub(crate) fn generate_with_cn_starting_at(
+        cn: &str,
+        start_offset: Duration,
+        validity: Duration,
+    ) -> Result<Self> {
+        Self::generate_with_cn_between(cn, SystemTime::now() + start_offset, validity)
+    }
+
+    fn generate_with_cn_between(
+        cn: &str,
+        not_before: SystemTime,
+        validity: Duration,
+    ) -> Result<Self> {
         let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
             ProxyError::Config(format!("failed to generate ephemeral CA key pair: {}", e))
         })?;
         let key_pkcs8_der = Zeroizing::new(key_pair.serialize_der());
-        let (params, not_after) = ca_params(cn, validity)?;
+        let (params, not_before, not_after) = ca_params_between(cn, not_before, validity)?;
 
         let self_signed = params
             .self_signed(&key_pair)
@@ -142,6 +168,7 @@ impl EphemeralCa {
             issuer,
             cert_der,
             cert_pem,
+            not_before,
             not_after,
         })
     }
@@ -151,11 +178,33 @@ impl EphemeralCa {
     /// Subject, key and the key-derived authority key id are unchanged, so leaves
     /// minted under the old cert still chain to the new one.
     pub fn reissue_with_cn(key_der: &[u8], cn: &str, validity: Duration) -> Result<Self> {
+        Self::reissue_with_cn_between(key_der, cn, SystemTime::now(), validity)
+    }
+
+    /// Test support: re-issue over an existing key with a validity window
+    /// starting `start_offset` from now, to prove rotation rejects
+    /// replacements that are not valid yet.
+    #[cfg(test)]
+    pub(crate) fn reissue_with_cn_starting_at(
+        key_der: &[u8],
+        cn: &str,
+        start_offset: Duration,
+        validity: Duration,
+    ) -> Result<Self> {
+        Self::reissue_with_cn_between(key_der, cn, SystemTime::now() + start_offset, validity)
+    }
+
+    fn reissue_with_cn_between(
+        key_der: &[u8],
+        cn: &str,
+        not_before: SystemTime,
+        validity: Duration,
+    ) -> Result<Self> {
         let pkcs8 = PrivatePkcs8KeyDer::from(key_der);
         let key_pair = KeyPair::from_der_and_sign_algo(&pkcs8.into(), &PKCS_ECDSA_P256_SHA256)
             .map_err(|e| ProxyError::Config(format!("failed to load CA key for re-issue: {e}")))?;
         let key_pkcs8_der = Zeroizing::new(key_der.to_vec());
-        let (params, not_after) = ca_params(cn, validity)?;
+        let (params, not_before, not_after) = ca_params_between(cn, not_before, validity)?;
 
         let self_signed = params
             .self_signed(&key_pair)
@@ -169,6 +218,7 @@ impl EphemeralCa {
             issuer,
             cert_der,
             cert_pem,
+            not_before,
             not_after,
         })
     }
@@ -219,6 +269,13 @@ impl EphemeralCa {
         &self.issuer
     }
 
+    /// CA certificate validity start, for rotation to reject a replacement
+    /// whose window has not started: serving it would break TLS until it
+    /// does.
+    pub(super) fn not_before(&self) -> SystemTime {
+        self.not_before
+    }
+
     /// CA certificate expiry time. Leaf certs are minted with this same
     /// `not_after` so they never outlive the issuer.
     pub(super) fn not_after(&self) -> SystemTime {
@@ -259,6 +316,25 @@ fn validate_key_cert_binding(key_pair: &KeyPair, cert_der: &[u8]) -> Result<()> 
         ));
     }
     Ok(())
+}
+
+/// Extract the `not_before` timestamp from a DER-encoded X.509 certificate.
+fn extract_not_before_from_der(cert_der: &[u8]) -> Result<SystemTime> {
+    use x509_parser::prelude::FromDer;
+
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der).map_err(|e| {
+        ProxyError::Config(format!(
+            "failed to parse cert DER for not_before extraction: {e}"
+        ))
+    })?;
+    let not_before_epoch = cert.validity().not_before.timestamp();
+    let secs = u64::try_from(not_before_epoch).map_err(|_| {
+        ProxyError::Config(format!(
+            "CA certificate not_before is before Unix epoch (timestamp={not_before_epoch})"
+        ))
+    })?;
+    let not_before = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    Ok(not_before)
 }
 
 /// Extract the `not_after` timestamp from a DER-encoded X.509 certificate.
@@ -316,10 +392,16 @@ pub fn split_key_cert_pem(combined: &str) -> Result<(Zeroizing<Vec<u8>>, String)
     Ok((key_der, cert_pem))
 }
 
-/// Convert `SystemTime` to the `time::OffsetDateTime` that `rcgen` expects.
-/// Shared by fresh generation and re-issue, so a re-issued cert differs from its
-/// predecessor only in its validity window.
-fn ca_params(cn: &str, validity: Duration) -> Result<(CertificateParams, SystemTime)> {
+/// Certificate params for a validity window starting at `not_before`.
+///
+/// Shared by fresh generation and re-issue, so a re-issued cert differs from
+/// its predecessor only in its validity window. Tests pass a future start to
+/// prove rotation rejects replacements that are not valid yet.
+fn ca_params_between(
+    cn: &str,
+    not_before: SystemTime,
+    validity: Duration,
+) -> Result<(CertificateParams, SystemTime, SystemTime)> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![
@@ -329,16 +411,15 @@ fn ca_params(cn: &str, validity: Duration) -> Result<(CertificateParams, SystemT
     ];
     params.serial_number = Some(random_serial_number()?);
 
-    let now = SystemTime::now();
-    let not_after = now + validity;
-    params.not_before = system_time_to_offset(now)?;
+    let not_after = not_before + validity;
+    params.not_before = system_time_to_offset(not_before)?;
     params.not_after = system_time_to_offset(not_after)?;
 
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, cn);
     params.distinguished_name = dn;
 
-    Ok((params, not_after))
+    Ok((params, not_before, not_after))
 }
 
 /// Draw a random, non-zero 16-byte serial number.
@@ -418,6 +499,22 @@ mod tests {
 
         let reconstructed = EphemeralCa::from_existing(&key_der, &cert_pem).unwrap();
         assert_eq!(reconstructed.cert_pem(), cert_pem);
+    }
+
+    #[test]
+    fn from_existing_reads_the_certificate_validity_window() {
+        let original =
+            EphemeralCa::generate_with_cn("nono-proxy-ca", Duration::from_secs(86_400)).unwrap();
+        let reloaded = EphemeralCa::from_existing(original.key_der(), original.cert_pem()).unwrap();
+        let now = SystemTime::now();
+        assert!(
+            reloaded.not_before() <= now,
+            "the validity start parsed from DER must be the generation time"
+        );
+        assert!(
+            reloaded.not_after() > now,
+            "the expiry parsed from DER must be in the future"
+        );
     }
 
     #[test]

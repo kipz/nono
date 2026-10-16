@@ -453,7 +453,8 @@ fn find_header_end(raw: &[u8]) -> Option<usize> {
 
 /// Whether `raw` already holds a complete HTTP/1.1 response by its own framing:
 /// a `Content-Length` body that has been fully received, or a chunked body
-/// whose terminal chunk has arrived.
+/// whose terminal chunk has arrived. Conflicting duplicate `Content-Length`
+/// values never count as complete.
 ///
 /// A body with neither header is close-delimited per RFC 7230 §3.3.3, but this
 /// function is only reached on a peer closing *without* TLS `close_notify` —
@@ -474,7 +475,7 @@ fn is_complete_http1_response(raw: &[u8]) -> bool {
     };
     let body = &raw[header_end + 4..];
 
-    let mut content_length: Option<usize> = None;
+    let mut content_lengths: Vec<usize> = Vec::new();
     let mut chunked = false;
     for line in head_str.split("\r\n").skip(1) {
         let Some((name, value)) = line.split_once(':') else {
@@ -490,15 +491,21 @@ fn is_complete_http1_response(raw: &[u8]) -> bool {
             chunked = true;
         }
         if name.eq_ignore_ascii_case("content-length") {
-            content_length = value.parse().ok();
+            // Conflicting duplicate values are a request-smuggling vector
+            // (RFC 7230 §3.3.2) and an unparseable one proves nothing, so
+            // neither may vouch for the body's completeness.
+            let Ok(len) = value.parse::<usize>() else {
+                return false;
+            };
+            content_lengths.push(len);
         }
     }
 
     if chunked {
         return decode_chunked_body(body).is_ok();
     }
-    if let Some(len) = content_length {
-        return body.len() >= len;
+    if let Some(first) = content_lengths.first() {
+        return content_lengths.iter().all(|len| len == first) && body.len() >= *first;
     }
     false
 }
@@ -645,6 +652,26 @@ mod tests {
         // distinguished from truncation, so it must not be treated as complete
         // even when the server declares `Connection: close`.
         let raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nwhatever bytes arrived";
+        assert!(!is_complete_http1_response(raw));
+    }
+
+    #[test]
+    fn is_complete_http1_response_rejects_conflicting_duplicate_content_length() {
+        // RFC 7230 §3.3.2 treats conflicting values as a smuggling vector, so
+        // the last parseable copy must not be able to vouch for the whole body.
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nContent-Length: 4\r\n\r\nabcd";
+        assert!(!is_complete_http1_response(raw));
+    }
+
+    #[test]
+    fn is_complete_http1_response_allows_repeated_identical_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\nabcd";
+        assert!(is_complete_http1_response(raw));
+    }
+
+    #[test]
+    fn is_complete_http1_response_rejects_unparseable_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\nabcd";
         assert!(!is_complete_http1_response(raw));
     }
 }

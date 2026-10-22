@@ -343,7 +343,7 @@ impl OAuthCaptureStore {
             // Substring, not just exact or suffix: form_urlencoded folds a
             // body with no `=` into a pair whose name is the entire blob, so
             // token material can hide in a name while the value stays empty.
-            if token_shaped(&lname) {
+            if token_shaped(&lname) && !is_expiry_metadata(&lname, value, &marker_names) {
                 return Err(ProxyError::HttpParse(format!(
                     "OAuth token response for provider '{}' contains unrewritten or \
                      unrecognized token-shaped material",
@@ -502,6 +502,16 @@ fn body_contains_token_field_marker(body: &[u8]) -> bool {
     ["access_token", "refresh_token", "id_token"]
         .iter()
         .any(|needle| haystack.contains(needle))
+}
+
+/// `<marker>_expires_in` with a numeric value, such as
+/// `refresh_token_expires_in=15897600`, is lifetime metadata, not token material.
+fn is_expiry_metadata(name: &str, value: &str, markers: &[String]) -> bool {
+    markers
+        .iter()
+        .any(|marker| name.strip_suffix("_expires_in") == Some(marker.as_str()))
+        && !value.is_empty()
+        && value.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn is_sensitive_token_field(field: &str) -> bool {
@@ -769,6 +779,40 @@ mod tests {
         let rewritten_str = String::from_utf8(rewritten).unwrap();
         assert!(!rewritten_str.contains("real-one"));
         assert!(!rewritten_str.contains("real-two"));
+    }
+
+    #[test]
+    fn form_response_allows_numeric_token_expiry_metadata() {
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let rewritten = store
+            .rewrite_response_body(
+                &endpoint,
+                &[],
+                b"access_token=real-access-token&expires_in=28800&refresh_token_expires_in=15897600",
+            )
+            .expect("numeric expiry metadata is not token material");
+        let rewritten_str = String::from_utf8(rewritten).unwrap();
+        assert!(!rewritten_str.contains("real-access-token"));
+        assert!(rewritten_str.contains("refresh_token_expires_in=15897600"));
+    }
+
+    #[test]
+    fn form_response_rejects_non_numeric_or_blob_shaped_expiry_names() {
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        for body in [
+            &b"access_token=real-access-token&refresh_token_expires_in=real-refresh-token"[..],
+            b"access_token=real-access-token&refresh_token_expires_in=",
+            b"access_token=real-access-token&refresh_token%3Dreal-refresh_expires_in=1",
+            b"access_token=real-access-token&refresh_token_secret_expires_in=1",
+        ] {
+            assert!(
+                store.rewrite_response_body(&endpoint, &[], body).is_err(),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

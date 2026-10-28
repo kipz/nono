@@ -7633,6 +7633,23 @@ mod tests {
     }
 
     #[test]
+    fn set_vars_expands_leading_home_and_overrides_inherited_value() {
+        let home = std::env::var("HOME").expect("HOME is set for tests");
+        let policy = policy_with_set_var("HOME", "$HOME");
+        let mut env = vec![b"HOME=/tmp/caller-chosen".to_vec()];
+        apply_environment_set_vars(&mut env, &policy).expect("set_vars applies");
+        assert_eq!(env, vec![format!("HOME={home}").into_bytes()]);
+
+        let policy = policy_with_set_var("XDG_CONFIG_HOME", "~/.config");
+        let mut env = vec![];
+        apply_environment_set_vars(&mut env, &policy).expect("set_vars applies");
+        assert_eq!(
+            env,
+            vec![format!("XDG_CONFIG_HOME={home}/.config").into_bytes()]
+        );
+    }
+
+    #[test]
     fn nonce_stdout_appends_no_trailing_newline() {
         let phantom = format!("nono_{}", "a".repeat(64));
         let stdout = nonce_stdout(phantom.clone());

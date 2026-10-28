@@ -607,6 +607,8 @@ Pattern syntax is intentionally small:
 
 `PATH` and `NONO_*` are reserved and cannot be set with `set_vars`.
 
+A value that is `~`, `$HOME`, or starts with `~/` or `$HOME/` expands from nono's own `HOME`, the same way path fields do. This lets a profile pin a variable to the user's home directory, for example `"HOME": "$HOME"` so the command cannot be pointed at a configuration directory chosen by its caller. No other variable is expanded, and the caller's environment does not affect the result.
+
 ### Forwarding Caller Variables
 
 `allow_vars` filters the environment nono builds. It does not let a calling command pass its own variables through to a command it invokes — that is what `export_env` is for:

@@ -9261,6 +9261,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_environment_set_vars_expands_leading_home_and_overrides_inherited_value() {
+        let home = std::env::var("HOME").expect("HOME is set for tests");
+        let mut vars = BTreeMap::new();
+        vars.insert("HOME".to_string(), "$HOME".to_string());
+        vars.insert("GH_CONFIG_DIR".to_string(), "~/.config/gh".to_string());
+        vars.insert("TMPDIR".to_string(), "/var/tmp/".to_string());
+        let policy = policy_with_env(None, vars);
+        let mut env = vec![b"HOME=/tmp/caller-chosen".to_vec()];
+        apply_environment_set_vars(&mut env, &policy).expect("set_vars applies");
+        env.sort();
+        assert_eq!(
+            env,
+            vec![
+                format!("GH_CONFIG_DIR={home}/.config/gh").into_bytes(),
+                format!("HOME={home}").into_bytes(),
+                b"TMPDIR=/var/tmp/".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
     fn passthrough_uses_intercept_sandbox_override_when_present() {
         // Mirrors the dispatch selection shared by every launching action:
         //   let effective_sandbox = intercept.sandbox.unwrap_or(policy);

@@ -117,6 +117,11 @@ pub(crate) fn apply_environment_set_vars(
                 "command-mediation environment.set_vars rejects dangerous key '{name}'"
             )));
         }
+        let value = if needs_home_expansion(value) {
+            expand_home_prefix(value, &crate::config::validated_home()?)
+        } else {
+            value.clone()
+        };
         let prefix = format!("{name}=");
         env.retain(|entry| !entry.starts_with(prefix.as_bytes()));
         let mut entry = name.as_bytes().to_vec();
@@ -125,6 +130,25 @@ pub(crate) fn apply_environment_set_vars(
         env.push(entry);
     }
     Ok(())
+}
+
+fn needs_home_expansion(value: &str) -> bool {
+    value == "~" || value == "$HOME" || value.starts_with("~/") || value.starts_with("$HOME/")
+}
+
+/// Expands a leading `~` or `$HOME` the way path fields do. `home` is nono's own
+/// `HOME`, so a sandboxed caller cannot steer it; no other `$VAR` is expanded.
+fn expand_home_prefix(value: &str, home: &str) -> String {
+    if value == "~" || value == "$HOME" {
+        return home.to_string();
+    }
+    match value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("$HOME/"))
+    {
+        Some(rest) => format!("{}/{}", home.trim_end_matches('/'), rest),
+        None => value.to_string(),
+    }
 }
 
 /// Copies `export_patterns`-matching vars from `request.env` into `env` verbatim,
@@ -296,6 +320,30 @@ pub(crate) fn env_shebang_target_interpreter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expand_home_prefix_expands_only_a_leading_home() {
+        let home = "/Users/dev";
+        assert_eq!(expand_home_prefix("~", home), "/Users/dev");
+        assert_eq!(expand_home_prefix("$HOME", home), "/Users/dev");
+        assert_eq!(expand_home_prefix("~/.config", home), "/Users/dev/.config");
+        assert_eq!(
+            expand_home_prefix("$HOME/.config/gh", home),
+            "/Users/dev/.config/gh"
+        );
+        assert_eq!(expand_home_prefix("~/x", "/Users/dev/"), "/Users/dev/x");
+        for literal in [
+            "/var/tmp/",
+            "~user/x",
+            "$HOMEDIR",
+            "a/$HOME",
+            "$TMPDIR/x",
+            "x~/y",
+        ] {
+            assert_eq!(expand_home_prefix(literal, home), literal);
+            assert!(!needs_home_expansion(literal), "{literal}");
+        }
+    }
     use crate::command_policy::{ResolvedExecutableKind, ResolvedExecutableShape};
     use crate::exec_strategy::env_sanitization::is_env_var_allowed;
 

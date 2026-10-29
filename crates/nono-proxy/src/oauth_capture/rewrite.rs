@@ -705,7 +705,7 @@ fn basic_scheme_payload(value: &str) -> Option<&str> {
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
-    Some(rest.trim_start())
+    Some(rest.trim())
 }
 
 /// Percent-encode a credential component per RFC 6749 §2.3.1, so both
@@ -1662,5 +1662,22 @@ mod tests {
         assert!(!store.basic_authorization_hides_phantom(&basic_header("id:real-secret")));
         assert!(!store.basic_authorization_hides_phantom("Bearer gho_plain"));
         assert!(!store.basic_authorization_hides_phantom("Basic %%%"));
+    }
+
+    #[test]
+    fn basic_authorization_tolerates_whitespace_around_credentials() {
+        // Trailing whitespace must not hide the phantom from the scan or
+        // break the redemption decode.
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+        let padded = format!("{}  ", basic_header(&format!("id:{phantom}")));
+
+        assert!(store.basic_authorization_hides_phantom(&padded));
+        let rewritten = store
+            .rewrite_request_basic_authorization(&endpoint, &padded)
+            .unwrap()
+            .expect("a padded payload must still redeem");
+        assert_eq!(rewritten, basic_header("id:real-client-secret"));
     }
 }

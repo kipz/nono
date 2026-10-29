@@ -4,9 +4,11 @@ use crate::config::OAuthTokenRequestBodyFormat;
 use crate::error::{ProxyError, Result};
 use crate::jwt_phantom::jwt_shaped_phantom;
 use crate::token::NonceResolver;
+use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use tracing::debug;
+use zeroize::Zeroizing;
 
 impl OAuthCaptureStore {
     /// Resolve an OAuth-capture phantom in a token endpoint request header
@@ -19,6 +21,103 @@ impl OAuthCaptureStore {
     ) -> Option<String> {
         let consumer = provider_consumer(&endpoint.provider);
         self.rewrite_header_value(value, &consumer)
+    }
+
+    /// Resolve a phantom in the password slot of `Authorization: Basic`
+    /// credentials (RFC 6749 §2.3.1); base64 hides it from the marker scan.
+    pub fn rewrite_request_basic_authorization(
+        &self,
+        endpoint: &LoadedOAuthEndpoint,
+        value: &str,
+    ) -> Result<Option<String>> {
+        let Some(credentials) = basic_scheme_payload(value) else {
+            return Ok(None);
+        };
+        let decoded = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(credentials)
+                .map_err(|_| {
+                    ProxyError::Credential(format!(
+                        "Basic credentials on token endpoint for provider '{}' are not standard \
+                         padded base64",
+                        endpoint.provider
+                    ))
+                })?,
+        );
+        let decoded = std::str::from_utf8(&decoded).map_err(|_| {
+            ProxyError::Credential(format!(
+                "Basic credentials on token endpoint for provider '{}' are not UTF-8",
+                endpoint.provider
+            ))
+        })?;
+        let (username, password) = decoded.split_once(':').ok_or_else(|| {
+            ProxyError::Credential(format!(
+                "Basic credentials on token endpoint for provider '{}' contain no ':' separator",
+                endpoint.provider
+            ))
+        })?;
+
+        let username_carries_phantom = self.contains_phantom(username.as_bytes());
+        let password_carries_phantom = self.contains_phantom(password.as_bytes());
+        if !username_carries_phantom && !password_carries_phantom {
+            return Ok(None);
+        }
+        if username_carries_phantom {
+            // Only the password slot carries a redeemable secret.
+            return Err(ProxyError::Credential(format!(
+                "Basic credentials on token endpoint for provider '{}' carry a phantom in the \
+                 username",
+                endpoint.provider
+            )));
+        }
+        if !endpoint
+            .request_nonce_fields
+            .iter()
+            .any(|field| field == "client_secret")
+        {
+            return Err(ProxyError::Credential(format!(
+                "Basic credentials on token endpoint for provider '{}' carry a phantom, but \
+                 the provider does not redeem client_secret",
+                endpoint.provider
+            )));
+        }
+        // `resolve` admits only exact provider-minted phantoms.
+        let real = self
+            .resolve(password, &provider_consumer(&endpoint.provider))
+            .ok_or_else(|| {
+                ProxyError::Credential(format!(
+                    "Basic credentials on token endpoint for provider '{}' carry an invalid or \
+                     unadmitted phantom",
+                    endpoint.provider
+                ))
+            })?;
+        // Only the replaced secret is form-encoded; the username stays verbatim.
+        let encoded_secret = basic_credentials_form_urlencode(&real);
+        let mut combined = Zeroizing::new(Vec::with_capacity(
+            username.len() + encoded_secret.len() + 1,
+        ));
+        combined.extend_from_slice(username.as_bytes());
+        combined.push(b':');
+        combined.extend_from_slice(&encoded_secret);
+        Ok(Some(format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(combined.as_slice())
+        )))
+    }
+
+    /// Whether decoded Basic credentials carry a phantom, which the raw
+    /// marker scan cannot see through base64; callers must reject, not forward.
+    pub fn basic_authorization_hides_phantom(&self, value: &str) -> bool {
+        let Some(credentials) = basic_scheme_payload(value) else {
+            return false;
+        };
+        let Ok(decoded) = base64::engine::general_purpose::STANDARD
+            .decode(credentials)
+            .map(Zeroizing::new)
+        else {
+            return false;
+        };
+        self.contains_phantom(&decoded)
     }
 
     pub fn rewrite_request_body(
@@ -598,6 +697,35 @@ fn mint_response_phantom(
             }
         }
     }
+}
+
+/// The credentials payload of an `Authorization: Basic` value, per RFC 7235.
+fn basic_scheme_payload(value: &str) -> Option<&str> {
+    let (scheme, rest) = value.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    Some(rest.trim_start())
+}
+
+/// Percent-encode a credential component per RFC 6749 §2.3.1, so both
+/// form-decoding and percent-only-decoding issuers recover the secret.
+fn basic_credentials_form_urlencode(value: &[u8]) -> Zeroizing<Vec<u8>> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = Vec::with_capacity(value.len() * 3);
+    for &byte in value {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte);
+            }
+            _ => {
+                encoded.push(b'%');
+                encoded.push(HEX[usize::from(byte >> 4)]);
+                encoded.push(HEX[usize::from(byte & 0x0f)]);
+            }
+        }
+    }
+    Zeroizing::new(encoded)
 }
 
 #[cfg(test)]
@@ -1188,5 +1316,351 @@ mod tests {
             err.to_string().contains("neither"),
             "unexpected error: {err}"
         );
+    }
+
+    // --- Authorization: Basic on token endpoint requests ---
+
+    fn atlassian_capture_config() -> OAuthCaptureConfig {
+        OAuthCaptureConfig {
+            provider: "atlassian_mcp".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://auth.atlassian.com".to_string(),
+                path: "/oauth/token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec![
+                    "refresh_token".to_string(),
+                    "client_secret".to_string(),
+                ],
+            }],
+            admitted_consumers: vec!["proxy.atlassian_mcp".to_string()],
+        }
+    }
+
+    fn basic_store() -> OAuthCaptureStore {
+        OAuthCaptureStore::load(&[atlassian_capture_config()]).unwrap()
+    }
+
+    fn basic_endpoint(store: &OAuthCaptureStore) -> LoadedOAuthEndpoint {
+        store
+            .lookup("auth.atlassian.com:443", "/oauth/token")
+            .unwrap()
+            .clone()
+    }
+
+    fn mint_client_phantom(store: &OAuthCaptureStore, endpoint: &LoadedOAuthEndpoint) -> String {
+        let rewritten = store
+            .rewrite_response_body(endpoint, &[], br#"{"access_token":"real-client-secret"}"#)
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        json["access_token"].as_str().unwrap().to_string()
+    }
+
+    fn basic_header(credentials: &str) -> String {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(credentials)
+        )
+    }
+
+    #[test]
+    fn basic_authorization_rewrites_password_phantom() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+
+        let rewritten = store
+            .rewrite_request_basic_authorization(
+                &endpoint,
+                &basic_header(&format!("nono-client-id:{phantom}")),
+            )
+            .unwrap()
+            .expect("the password phantom must be redeemed");
+        assert_eq!(rewritten, basic_header("nono-client-id:real-client-secret"));
+    }
+
+    #[test]
+    fn basic_authorization_form_urlencodes_secret_and_preserves_username() {
+        // Only the replaced secret is encoded; pre-encoded username bytes
+        // must not be double-encoded.
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let rewritten = store
+            .rewrite_response_body(
+                &endpoint,
+                &[],
+                r#"{"access_token":"re+al se%cr:ü"}"#.as_bytes(),
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["access_token"].as_str().unwrap().to_string();
+
+        let rewritten = store
+            .rewrite_request_basic_authorization(
+                &endpoint,
+                &basic_header(&format!("nono%20client:{phantom}")),
+            )
+            .unwrap()
+            .expect("the password phantom must be redeemed");
+        assert_eq!(
+            rewritten,
+            basic_header("nono%20client:re%2Bal%20se%25cr%3A%C3%BC")
+        );
+    }
+
+    #[test]
+    fn basic_authorization_scheme_is_case_insensitive() {
+        // RFC 7235 matches the scheme case-insensitively and allows
+        // multiple spaces before the credentials.
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+
+        let credentials = base64::engine::general_purpose::STANDARD.encode(format!("id:{phantom}"));
+        let value = format!("basic  {credentials}");
+        let rewritten = store
+            .rewrite_request_basic_authorization(&endpoint, &value)
+            .unwrap()
+            .expect("a lowercase scheme must still redeem");
+        assert_eq!(rewritten, basic_header("id:real-client-secret"));
+    }
+
+    #[test]
+    fn basic_authorization_passes_real_credentials_through() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+
+        assert_eq!(
+            store
+                .rewrite_request_basic_authorization(
+                    &endpoint,
+                    &basic_header("nono-client-id:real-secret")
+                )
+                .unwrap(),
+            None,
+            "credentials carrying no phantom must pass through unchanged"
+        );
+        // Bearer-shaped values take the header rewrite path, not this one.
+        assert_eq!(
+            store
+                .rewrite_request_basic_authorization(&endpoint, "Bearer gho_plain")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn basic_authorization_fails_closed_on_phantom_username() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+
+        let err = store
+            .rewrite_request_basic_authorization(
+                &endpoint,
+                &basic_header(&format!("{phantom}:real-secret")),
+            )
+            .expect_err("a phantom username must fail closed");
+        assert!(
+            err.to_string().contains("username"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn basic_authorization_fails_closed_without_client_secret_redemption() {
+        // This provider never receives a client_secret, so there is nothing to redeem.
+        let store = form_store();
+        let endpoint = form_endpoint(&store);
+        let rewritten = store
+            .rewrite_response_body(&endpoint, &[], b"access_token=real-access-token")
+            .unwrap();
+        let parsed = url::form_urlencoded::parse(&rewritten)
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let phantom = parsed.get("access_token").unwrap();
+
+        let err = store
+            .rewrite_request_basic_authorization(
+                &endpoint,
+                &basic_header(&format!("client-id:{phantom}")),
+            )
+            .expect_err("a provider without client_secret redemption must fail closed");
+        assert!(
+            err.to_string().contains("does not redeem client_secret"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn basic_authorization_fails_closed_on_unresolvable_password_phantom() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+
+        // Unknown and embedded phantoms are both unredeemable and fail closed.
+        for password in [format!("nono_{}", "e".repeat(64)), format!("x{phantom}x")] {
+            store
+                .rewrite_request_basic_authorization(
+                    &endpoint,
+                    &basic_header(&format!("id:{password}")),
+                )
+                .expect_err("an unresolvable password phantom must fail closed");
+        }
+    }
+
+    #[test]
+    fn basic_authorization_fails_closed_on_malformed_credentials() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let non_utf8 = base64::engine::general_purpose::STANDARD.encode([0xff, 0xfe, 0xff, 0xfe]);
+        let unpadded = base64::engine::general_purpose::STANDARD
+            .encode("user:sec")
+            .trim_end_matches('=')
+            .to_string();
+
+        for value in [
+            "Basic %%%not-base64%%%".to_string(),
+            basic_header("no-colon-here"),
+            format!("Basic {non_utf8}"),
+            format!("Basic {unpadded}"),
+        ] {
+            let err = store
+                .rewrite_request_basic_authorization(&endpoint, &value)
+                .expect_err("malformed Basic credentials on a token endpoint must fail closed");
+            assert!(
+                matches!(err, ProxyError::Credential(_)),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_authorization_fails_closed_on_cross_provider_phantom() {
+        // A github phantom must not redeem as the atlassian provider's
+        // secret; the admitted-consumer gate separates providers.
+        let github = OAuthCaptureConfig {
+            provider: "github".to_string(),
+            token_endpoints: vec![OAuthTokenEndpointConfig {
+                host: "https://github.com".to_string(),
+                path: "/login/oauth/access_token".to_string(),
+                response_fields: vec![OAuthTokenResponseFieldConfig {
+                    path: "access_token".to_string(),
+                    kind: OAuthTokenResponseFieldKind::Opaque,
+                    format: None,
+                }],
+                request_body: OAuthTokenRequestBodyFormat::Auto,
+                response_body: OAuthTokenRequestBodyFormat::Auto,
+                request_nonce_fields: vec![],
+            }],
+            admitted_consumers: vec!["proxy.github".to_string()],
+        };
+        let store = OAuthCaptureStore::load(&[atlassian_capture_config(), github]).unwrap();
+        let github_endpoint = store
+            .lookup("github.com:443", "/login/oauth/access_token")
+            .unwrap()
+            .clone();
+        let rewritten = store
+            .rewrite_response_body(&github_endpoint, &[], b"access_token=github-real-secret")
+            .unwrap();
+        let parsed = url::form_urlencoded::parse(&rewritten)
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        let phantom = parsed.get("access_token").unwrap().to_string();
+
+        let err = store
+            .rewrite_request_basic_authorization(
+                &basic_endpoint(&store),
+                &basic_header(&format!("id:{phantom}")),
+            )
+            .expect_err("a cross-provider phantom must fail closed");
+        assert!(
+            err.to_string().contains("unadmitted"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn basic_authorization_redeems_phantom_from_another_endpoint_of_the_provider() {
+        // Provider-granular redemption: a phantom minted at registration
+        // resolves at the token endpoint, as DCR requires.
+        let register = OAuthTokenEndpointConfig {
+            host: "https://auth.atlassian.com".to_string(),
+            path: "/dcr/register".to_string(),
+            response_fields: vec![OAuthTokenResponseFieldConfig {
+                path: "client_secret".to_string(),
+                kind: OAuthTokenResponseFieldKind::Opaque,
+                format: None,
+            }],
+            request_body: OAuthTokenRequestBodyFormat::Json,
+            response_body: OAuthTokenRequestBodyFormat::Json,
+            request_nonce_fields: vec!["client_secret".to_string()],
+        };
+        let token = OAuthTokenEndpointConfig {
+            host: "https://auth.atlassian.com".to_string(),
+            path: "/oauth/token".to_string(),
+            response_fields: vec![OAuthTokenResponseFieldConfig {
+                path: "access_token".to_string(),
+                kind: OAuthTokenResponseFieldKind::Opaque,
+                format: None,
+            }],
+            request_body: OAuthTokenRequestBodyFormat::Form,
+            response_body: OAuthTokenRequestBodyFormat::Json,
+            request_nonce_fields: vec!["client_secret".to_string()],
+        };
+        let store = OAuthCaptureStore::load(&[OAuthCaptureConfig {
+            provider: "atlassian_mcp".to_string(),
+            token_endpoints: vec![register, token],
+            admitted_consumers: vec!["proxy.atlassian_mcp".to_string()],
+        }])
+        .unwrap();
+        let register_endpoint = store
+            .lookup("auth.atlassian.com:443", "/dcr/register")
+            .unwrap()
+            .clone();
+        let token_endpoint = store
+            .lookup("auth.atlassian.com:443", "/oauth/token")
+            .unwrap()
+            .clone();
+        let rewritten = store
+            .rewrite_response_body(
+                &register_endpoint,
+                &[],
+                br#"{"client_id":"nono-client-id","client_secret":"real-dcr-secret"}"#,
+            )
+            .unwrap();
+        let json: Value = serde_json::from_slice(&rewritten).unwrap();
+        let phantom = json["client_secret"].as_str().unwrap();
+
+        let rewritten = store
+            .rewrite_request_basic_authorization(
+                &token_endpoint,
+                &basic_header(&format!("nono-client-id:{phantom}")),
+            )
+            .unwrap()
+            .expect("a provider phantom must redeem at any of its endpoints");
+        assert_eq!(rewritten, basic_header("nono-client-id:real-dcr-secret"));
+    }
+
+    #[test]
+    fn basic_authorization_hides_phantom_detects_encoded_phantom() {
+        let store = basic_store();
+        let endpoint = basic_endpoint(&store);
+        let phantom = mint_client_phantom(&store, &endpoint);
+        let value = basic_header(&format!("id:{phantom}"));
+
+        // The raw marker scan cannot see the phantom through base64, which
+        // is why the decoded scan must gate requests off the token endpoint.
+        assert!(!store.contains_phantom(value.as_bytes()));
+        assert!(store.basic_authorization_hides_phantom(&value));
+
+        assert!(!store.basic_authorization_hides_phantom(&basic_header("id:real-secret")));
+        assert!(!store.basic_authorization_hides_phantom("Bearer gho_plain"));
+        assert!(!store.basic_authorization_hides_phantom("Basic %%%"));
     }
 }
